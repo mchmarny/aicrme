@@ -1,0 +1,167 @@
+version: "2"
+
+# Run configuration
+run:
+  go: "1.26"
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+  # Queue behind golangci-lint's machine-wide lock instead of failing with
+  # "parallel golangci-lint is running". With multiple concurrent sessions on
+  # one dev machine (e.g. several AI coding agents linting different
+  # worktrees), the fail-fast default aborts whole `make qualify` runs over a
+  # transient lock. Runs stay strictly serialized — same mutual exclusion,
+  # same cache safety — the second run just waits its turn. Inert in CI,
+  # where each job has an isolated runner.
+  allow-serial-runners: true
+
+# Output configuration
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+      colors: true
+  sort-order:
+    - linter
+    - severity
+    - file
+
+linters:
+  enable:
+    # Bug detection
+    - bodyclose       # HTTP response body must be closed
+    - copyloopvar     # Loop variable capture issues (Go 1.22+)
+    - errorlint       # Error wrapping and comparison
+    - nilnil          # Nil/nil returns
+    - staticcheck     # Advanced static analysis
+
+    # Code quality
+    - asciicheck      # Non-ASCII identifiers
+    - dogsled         # Too many blank identifiers
+    - dupl            # Duplicate code detection
+    - exhaustive      # Enum exhaustiveness
+    - funlen          # Function length
+    - goconst         # Repeated strings
+    - gocritic        # Opinionated checks
+    - govet           # Go vet checks
+    - misspell        # Spelling
+    - nakedret        # Naked returns
+    - prealloc        # Slice preallocation
+    - revive          # Golint replacement
+    - unconvert       # Unnecessary conversions
+    - unparam         # Unused parameters
+    - whitespace      # Whitespace issues
+
+    # Security
+    - gosec           # Security checks
+
+    # HTTP/Context
+    - contextcheck    # Context propagation in function calls
+    - noctx           # HTTP requests without context
+
+    # Dependency management
+    - depguard        # Ban deprecated/unwanted packages
+
+    # Testing
+    - tparallel       # t.Parallel() usage
+
+    # Style
+    - importas        # Import aliasing
+
+  settings:
+    funlen:
+      lines: 200
+      statements: 70
+      ignore-comments: true
+
+    gocognit:
+      min-complexity: 20
+
+    govet:
+      enable:
+        - shadow
+
+    misspell:
+      mode: restricted
+      locale: US
+
+    unparam:
+      check-exported: true
+
+    whitespace:
+      multi-if: true
+      multi-func: true
+
+    dupl:
+      threshold: 200
+
+    goconst:
+      min-occurrences: 3
+      ignore-tests: true
+
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+          arguments:
+            - disableStutteringCheck
+
+    depguard:
+      rules:
+        main:
+          list-mode: lax
+          deny:
+            - pkg: io/ioutil
+              desc: "Deprecated since Go 1.16. Use io and os packages instead."
+            - pkg: math/rand$
+              desc: "Use math/rand/v2 for new code, or crypto/rand for security-sensitive code."
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Relaxed rules for test files
+      - linters:
+          - dupl
+          - errcheck
+          - funlen
+          - gocognit
+          - goconst
+          - gocyclo
+          - gosec
+          - noctx
+        path: _test\.go
+      # SA5011 false positive: staticcheck doesn't know t.Fatal stops execution
+      - linters:
+          - staticcheck
+        text: "SA5011"
+        path: _test\.go
+      # Relaxed rules for main entry points
+      - linters:
+          - funlen
+        path: cmd/.*/main\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
