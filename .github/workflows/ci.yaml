@@ -23,8 +23,9 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: sudo apt-get update && sudo apt-get install -y bc
-      - uses: mikefarah/yq@master
+      - uses: mikefarah/yq@v4.53.3
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
       - run: make test-coverage
+      - run: make check-aicr-pin

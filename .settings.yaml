@@ -7,7 +7,12 @@ linting:
 
 build_tools:
   ko: 'v0.19.1'
+  yq: 'v4.53.3'
 
 test_tools:
   kind: 'v0.31.0'
   kwok: 'v0.8.0'
+
+dependencies:
+  # renovate: datasource=go depName=github.com/NVIDIA/aicr depType=dependencies
+  aicr: 'v0.19.0'

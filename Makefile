@@ -28,13 +28,30 @@ test: ## Runs unit tests with race detector and coverage
 
 .PHONY: test-coverage
 test-coverage: test ## Runs tests and enforces the coverage floor
-	@if [ -z "$(COVERAGE_THRESHOLD)" ]; then \
-		echo "ERROR: COVERAGE_THRESHOLD is empty — could not read quality.coverage_threshold from .settings.yaml (is yq installed?)"; exit 1; \
-	fi
+	@case "$(COVERAGE_THRESHOLD)" in \
+		''|*[!0-9.]*) \
+			echo "ERROR: COVERAGE_THRESHOLD ('$(COVERAGE_THRESHOLD)') is not a valid number — check quality.coverage_threshold in .settings.yaml (is yq installed?)"; \
+			exit 1 ;; \
+	esac
 	@coverage=$$(go tool cover -func=coverage.out | grep total: | awk '{print substr($$3, 1, length($$3)-1)}'); \
 	echo "Coverage: $$coverage% (threshold: $(COVERAGE_THRESHOLD)%)"; \
 	if [ $$(echo "$$coverage < $(COVERAGE_THRESHOLD)" | bc) -eq 1 ]; then \
 		echo "ERROR: coverage $$coverage% below threshold $(COVERAGE_THRESHOLD)%"; exit 1; \
+	fi
+
+.PHONY: check-aicr-pin
+check-aicr-pin: ## Verifies go.mod pins github.com/NVIDIA/aicr to the version recorded in .settings.yaml
+	@expected=$$(yq -r '.dependencies.aicr' .settings.yaml); \
+	case "$$expected" in \
+		''|null) echo "ERROR: dependencies.aicr is not set in .settings.yaml (is yq installed?)"; exit 1 ;; \
+	esac; \
+	actual=$$(go list -m -f '{{.Version}}' github.com/NVIDIA/aicr 2>/dev/null || true); \
+	if [ -z "$$actual" ]; then \
+		echo "check-aicr-pin: OK — github.com/NVIDIA/aicr not yet required by go.mod (pin: $$expected)"; \
+	elif [ "$$actual" != "$$expected" ]; then \
+		echo "ERROR: go.mod requires github.com/NVIDIA/aicr@$$actual, expected $$expected (see .settings.yaml dependencies.aicr)"; exit 1; \
+	else \
+		echo "check-aicr-pin: OK — github.com/NVIDIA/aicr@$$actual matches pin"; \
 	fi
 
 .PHONY: web
@@ -46,4 +63,4 @@ build: web ## Builds the aicrme binary with the SPA embedded
 	go build -ldflags "$(LDFLAGS)" -o bin/aicrme ./cmd/aicrme
 
 .PHONY: qualify
-qualify: lint test-coverage ## Full local gate — must match CI exactly
+qualify: lint test-coverage check-aicr-pin ## Full local gate — must match CI exactly
