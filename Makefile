@@ -66,4 +66,10 @@ build: web ## Builds the aicrme binary with the SPA embedded
 	go build -ldflags "$(LDFLAGS)" -o bin/aicrme ./cmd/aicrme
 
 .PHONY: qualify
-qualify: lint test-coverage check-aicr-pin ## Full local gate — must match CI exactly
+qualify: web lint test-coverage check-aicr-pin ## Full local gate — must match CI exactly
+# web comes first: internal/web/dist holds only .gitkeep on a clean
+# checkout, and go test ./internal/web/... (part of test-coverage) needs the
+# real embedded index.html, not just a directory that satisfies go:embed.
+# CI gets this for free from its own step ordering (lint, then make web,
+# then make test-coverage); qualify has to build it in for the same
+# guarantee to hold locally, on a pristine tree, without a prior `make web`.

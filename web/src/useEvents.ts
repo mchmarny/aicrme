@@ -46,15 +46,42 @@ export function detectGap(lastId: number, id: number): boolean {
   return lastId > 0 && id > lastId + 1
 }
 
+/**
+ * Caps how many consecutive gap-triggered reconnects useEvents attempts
+ * before giving up on filling a hole. A gap can be transient — the replay
+ * ring is mid-eviction relative to when the subscriber registered — and
+ * usually clears on the first retry. Past that, the gap is real: the ring
+ * evicted past lastId for good, and reopening again just asks the server to
+ * serialize its whole backlog (up to bus.replayCapacity events) for no gain.
+ * A tab left open against a permanently unfillable hole would otherwise
+ * reconnect forever — a self-inflicted denial of service against the same
+ * console it's displaying. 3 attempts bounds that to 3 backlog
+ * serializations per genuine hole, and is generous enough that a transient
+ * eviction race (which should clear on attempt 1) has margin to spare.
+ */
+export const MAX_GAP_RECONNECT_ATTEMPTS = 3
+
+/**
+ * Base delay for the exponential backoff between gap-triggered reconnects:
+ * 250ms, 500ms, 1000ms for attempts 1-3. Keeps a genuine, unfillable hole
+ * from hammering the server with back-to-back full-backlog requests, while
+ * keeping the worst-case total delay (1.75s) short enough that a transient
+ * gap resolves without the user noticing a stall.
+ */
+export const GAP_RECONNECT_BASE_DELAY_MS = 250
+
 /** useEvents subscribes to /api/events and accumulates the ordered timeline. */
 export function useEvents() {
   const [events, setEvents] = useState<AicrEvent[]>([])
   const [connected, setConnected] = useState(false)
+  const [eventsLost, setEventsLost] = useState(0)
   const lastId = useRef(0)
+  const gapAttempts = useRef(0)
 
   useEffect(() => {
     let source: EventSource
     let torndown = false
+    let backoffTimer: ReturnType<typeof setTimeout> | undefined
 
     // EventSource sends Last-Event-ID automatically on reconnect; ?since
     // seeds the very first connection after a full page reload, and reseeds
@@ -65,14 +92,34 @@ export function useEvents() {
       source.onerror = () => setConnected(false)
       source.onmessage = (msg: MessageEvent<string>) => {
         const parsed = JSON.parse(msg.data) as AicrEvent
-        if (detectGap(lastId.current, parsed.id)) {
+        if (detectGap(lastId.current, parsed.id) && gapAttempts.current < MAX_GAP_RECONNECT_ATTEMPTS) {
           // The bus silently dropped events for this subscriber. Reopen from
           // lastId so the server replays the hole instead of leaving it
-          // unfilled; parsed itself arrives again as part of that replay.
+          // unfilled; parsed itself arrives again as part of that replay —
+          // unless the ring already evicted past lastId too, in which case
+          // this fires again and the attempt cap above eventually gives up
+          // rather than reconnecting forever.
+          gapAttempts.current++
           source.close()
-          if (!torndown) connect()
+          const delay = GAP_RECONNECT_BASE_DELAY_MS * 2 ** (gapAttempts.current - 1)
+          backoffTimer = setTimeout(() => {
+            if (!torndown) connect()
+          }, delay)
           return
         }
+        // Either contiguous, or a gap that survived MAX_GAP_RECONNECT_ATTEMPTS
+        // reconnects: accept it, count what was lost so the UI can surface
+        // it instead of hiding it, and resume streaming rather than retrying
+        // a hole that isn't going to fill. `lost` is computed here, before
+        // lastId.current is mutated below, and captured by value in the
+        // updater closure — reading lastId.current lazily inside the
+        // updater would see the post-mutation value once React gets around
+        // to invoking it, silently corrupting the count.
+        if (detectGap(lastId.current, parsed.id)) {
+          const lost = parsed.id - lastId.current - 1
+          setEventsLost(n => n + lost)
+        }
+        gapAttempts.current = 0
         lastId.current = Math.max(lastId.current, parsed.id)
         setEvents(prev => mergeEvents(prev, parsed))
       }
@@ -83,12 +130,15 @@ export function useEvents() {
     // dev. torndown stops a reconnect (from detectGap or a future retry)
     // scheduled by the first mount's EventSource from racing the second
     // mount's; closing here always tears down whichever EventSource is
-    // current, so no connection outlives the effect that owns it.
+    // current, and clearing backoffTimer stops a pending gap-reconnect from
+    // firing after teardown, so no connection outlives the effect that owns
+    // it.
     return () => {
       torndown = true
+      clearTimeout(backoffTimer)
       source.close()
     }
   }, [])
 
-  return { events, connected }
+  return { events, connected, eventsLost }
 }
