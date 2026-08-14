@@ -4,15 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/snapshotter"
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/steps"
+	"gopkg.in/yaml.v3"
 )
 
 func recipeFixture() *aicr.RecipeResult {
@@ -33,6 +36,29 @@ func recipeFixture() *aicr.RecipeResult {
 // measurements. TestRecommendResolveAgainstRealFixture below is what
 // exercises the real captured measurements.
 const minimalSnapshot = "apiVersion: aicr.nvidia.com/v1\nkind: Snapshot\n"
+
+// loadH100Snapshot loads the KWOK fixture captured from a cluster carrying
+// AICR's own simulated H100 nodes (kwok/profiles/eks/p5-h100.yaml in the
+// AICR reference checkout, applied via kwok/scripts/apply-nodes.sh) --
+// unlike testdata/snapshot-kwok.yaml (the original, real capture from a
+// control-plane-only cluster with no worker nodes at all), this fixture's
+// node topology carries real nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3
+// labels the fingerprint package can actually derive an accelerator from.
+// See task-10-report.md for exactly how this was captured.
+func loadH100Snapshot(t *testing.T) *aicr.Snapshot {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/snapshot-kwok-h100.yaml")
+	if err != nil {
+		t.Fatalf("fixture read error = %v", err)
+	}
+	var s snapshotter.Snapshot
+	if err := yaml.Unmarshal(raw, &s); err != nil {
+		t.Fatalf("parse fixture error = %v", err)
+	}
+	wrapped := aicr.WrapSnapshot(&s)
+	wrapped.Raw = raw
+	return wrapped
+}
 
 func TestRecommendRequiresExactlyTwoDecisions(t *testing.T) {
 	step := steps.NewRecommend(&aicrclient.Fake{})
@@ -303,19 +329,30 @@ func TestRecommendFailsOnZeroSpecificityCriteria(t *testing.T) {
 	}
 }
 
-// TestRecommendKWOKPlannedOptionsAllFail pins the full, honest answer to
-// "can Task 13's end-to-end KWOK run through Recommend work as scoped": it
-// runs every (intent, platform) pair Task 11's brief plans to offer
-// (Intents: training/inference, Platforms: kubeflow/slurm/runai/none)
-// through the real Recommend step against the real KWOK fixture, and
-// records that every single one fails today. This is not a bug in this
-// step — see TestRecommendResolveAgainstRealFixture — it is the KWOK demo
-// path's real limitation (no GPU hardware to derive an accelerator from,
-// plus a "none" platform value the catalog's registry does not recognize
-// at all) recorded in code instead of folklore. If any of these starts
-// succeeding (a catalog change, a fixture recapture, or a registry addition
-// for "none"), this test will fail and say exactly which pair changed.
-func TestRecommendKWOKPlannedOptionsAllFail(t *testing.T) {
+// kwokIntents and kwokPlatforms are the values Recommend's own facade
+// actually accepts (verified against pkg/recipe/criteria.go's ParseIntent/
+// ParsePlatform fast paths): training/inference, and dynamo/kubeflow/nim/
+// runai/slurm plus "any" for "just the runtime, no specific platform" --
+// the product spec's fourth user-facing platform option. An earlier round of
+// this task used "none" here, which is not a value AICR's criteria registry
+// recognizes at all; every pair that included it failed for that reason
+// alone, which was hiding the real picture. These are the correct values.
+var (
+	kwokIntents   = []string{"training", "inference"}
+	kwokPlatforms = []string{"dynamo", "kubeflow", "nim", "runai", "slurm", "any"}
+)
+
+// TestRecommendKWOKGPUlessFixtureMatrix pins the full, honest picture for
+// the original KWOK fixture (a real capture from a control-plane-only
+// cluster with no worker nodes at all -- see discover_test.go's
+// loadSnapshot): every (intent, platform) pair fails except
+// (inference, any), which needs no accelerator and so is the one
+// combination a snapshot with zero derivable hardware can still satisfy.
+// This is not a bug in Recommend -- see TestRecommendResolveAgainstRealFixture
+// -- it is this fixture's real, permanent limitation: it was captured from a
+// cluster with no GPU hardware and no simulated GPU nodes, so accelerator can
+// never be derived from it. Contrast with TestRecommendResolvesAgainstSimulatedH100Fixture.
+func TestRecommendKWOKGPUlessFixtureMatrix(t *testing.T) {
 	client, err := aicrclient.New()
 	if err != nil {
 		t.Fatalf("aicrclient.New() error = %v", err)
@@ -323,12 +360,13 @@ func TestRecommendKWOKPlannedOptionsAllFail(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	snap := loadSnapshot(t)
-	intents := []string{"training", "inference"}
-	platforms := []string{"kubeflow", "slurm", "runai", "none"}
+	succeeds := map[string]bool{"inference/any": true}
 
-	for _, intent := range intents {
-		for _, platform := range platforms {
-			t.Run(intent+"/"+platform, func(t *testing.T) {
+	for _, intent := range kwokIntents {
+		for _, platform := range kwokPlatforms {
+			key := intent + "/" + platform
+			wantErr := !succeeds[key]
+			t.Run(key, func(t *testing.T) {
 				step := steps.NewRecommend(client)
 				run := newRun()
 				run.Decisions["intent"] = intent
@@ -336,12 +374,89 @@ func TestRecommendKWOKPlannedOptionsAllFail(t *testing.T) {
 				run.Artifacts["snapshot.yaml"] = snap.Raw
 
 				runErr := step.Run(context.Background(), run, func(bus.Event) {})
-				if runErr == nil {
-					t.Fatalf("intent=%s platform=%s: Run() succeeded against the KWOK fixture — "+
-						"AICR's catalog (or this console's static option list) changed; "+
-						"update task-10-report.md and re-evaluate the Task 13 plan", intent, platform)
+				if wantErr && runErr == nil {
+					t.Fatalf("intent=%s platform=%s: Run() succeeded against the GPU-less KWOK fixture — "+
+						"AICR's catalog changed; update task-10-report.md and re-evaluate the Task 13 plan",
+						intent, platform)
 				}
-				t.Logf("intent=%s platform=%s: %v", intent, platform, runErr)
+				if !wantErr && runErr != nil {
+					t.Fatalf("intent=%s platform=%s: Run() error = %v, want success "+
+						"(this pair needs no accelerator)", intent, platform, runErr)
+				}
+				t.Logf("intent=%s platform=%s: err=%v", intent, platform, runErr)
+			})
+		}
+	}
+}
+
+// TestRecommendResolvesAgainstSimulatedH100Fixture is the answer to the
+// question the GPU-less fixture cannot answer: with a real accelerator
+// signal in the snapshot (AICR's own simulated H100 nodes, applied via
+// AICR's own kwok/scripts/apply-nodes.sh -- see loadH100Snapshot and
+// task-10-report.md), does Recommend's fingerprint-derived criteria
+// actually resolve a real, sensibly-shaped recipe? For five of the twelve
+// (intent, platform) pairs, yes -- pinned here with real client,
+// real fixture, real resolution, and an assertion that every resolved
+// component carries a name and a pinned version. The other seven still
+// fail, for reasons that have nothing to do with accelerator (no catalog
+// overlay combines service=kind with that platform at all); those are
+// pinned too, so a change in either direction fails this test loudly.
+func TestRecommendResolvesAgainstSimulatedH100Fixture(t *testing.T) {
+	client, err := aicrclient.New()
+	if err != nil {
+		t.Fatalf("aicrclient.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	snap := loadH100Snapshot(t)
+	succeeds := map[string]bool{
+		"training/kubeflow": true,
+		"training/slurm":    true,
+		"training/any":      true,
+		"inference/dynamo":  true,
+		"inference/any":     true,
+	}
+
+	for _, intent := range kwokIntents {
+		for _, platform := range kwokPlatforms {
+			key := intent + "/" + platform
+			wantErr := !succeeds[key]
+			t.Run(key, func(t *testing.T) {
+				step := steps.NewRecommend(client)
+				run := newRun()
+				run.Decisions["intent"] = intent
+				run.Decisions["platform"] = platform
+				run.Artifacts["snapshot.yaml"] = snap.Raw
+
+				runErr := step.Run(context.Background(), run, func(bus.Event) {})
+				if wantErr {
+					if runErr == nil {
+						t.Fatalf("intent=%s platform=%s: Run() succeeded against the simulated-H100 fixture — "+
+							"AICR's catalog changed; update task-10-report.md and re-evaluate the Task 13 plan",
+							intent, platform)
+					}
+					t.Logf("intent=%s platform=%s: err=%v", intent, platform, runErr)
+					return
+				}
+				if runErr != nil {
+					t.Fatalf("intent=%s platform=%s: Run() error = %v, want success", intent, platform, runErr)
+				}
+
+				var summary steps.RecipeSummary
+				if err := json.Unmarshal(run.Artifacts["recipe.json"], &summary); err != nil {
+					t.Fatalf("intent=%s platform=%s: recipe.json decode error = %v", intent, platform, err)
+				}
+				if summary.ComponentCount == 0 || len(summary.Components) == 0 {
+					t.Fatalf("intent=%s platform=%s: resolved recipe has no components", intent, platform)
+				}
+				for _, c := range summary.Components {
+					if c.Name == "" || c.Version == "" {
+						t.Errorf("intent=%s platform=%s: component missing name or pinned version: %+v",
+							intent, platform, c)
+					}
+				}
+				t.Logf("intent=%s platform=%s: OK name=%s version=%s components=%d",
+					intent, platform, summary.Name, summary.Version, summary.ComponentCount)
 			})
 		}
 	}
