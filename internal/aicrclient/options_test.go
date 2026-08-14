@@ -128,6 +128,31 @@ func TestAvailableOptionsVerificationFailureExcludesAllPairs(t *testing.T) {
 	}
 }
 
+// TestAvailableOptionsFailsOnCanceledContext pins the guard in
+// AvailableOptions's stage-2 loop: a context canceled mid-verification makes
+// every remaining ResolveRecipeFromSnapshot call fail, which is
+// indistinguishable from "nothing resolves" unless the call fails outright
+// instead of silently returning a shrunken, wrong offered set.
+func TestAvailableOptionsFailsOnCanceledContext(t *testing.T) {
+	fake := &aicrclient.Fake{
+		Registry: recipe.NewCriteriaRegistry(),
+		CatalogEntries: []aicr.CatalogEntry{
+			{Name: "a", Criteria: aicr.Criteria{Intent: "training", Platform: "kubeflow"}},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := aicrclient.AvailableOptions(ctx, fake, loadH100Raw(t))
+	if err == nil {
+		t.Fatal("AvailableOptions() returned nil for a canceled context")
+	}
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeTimeout {
+		t.Errorf("error = %v, want a StructuredError with ErrCodeTimeout", err)
+	}
+}
+
 func TestAvailableOptionsExcludesIntentWithNoCoverage(t *testing.T) {
 	callCount := 0
 	fake := &aicrclient.Fake{Registry: recipe.NewCriteriaRegistry()}
