@@ -4,7 +4,9 @@ package api
 
 import (
 	"io/fs"
+	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -74,7 +76,77 @@ func (s *Server) Handler() http.Handler {
 	// — and panics at registration time. "/" with no method matches strictly
 	// more than "/api/" does, so it can only ever apply as the fallback.
 	mux.Handle("/", spaHandler(s.static))
-	return securityHeaders(mux)
+	return securityHeaders(requireSameOrigin(mux))
+}
+
+// requireSameOrigin rejects state-changing requests that did not originate
+// from this same origin. SameSite=Strict does not cover this on its own:
+// SameSite is computed from the registrable "site" (scheme + registrable
+// domain), not the full origin, so two different ports on localhost — e.g.
+// a console on :8080 and an unrelated dev server on :3000 — count as
+// same-site, and the session cookie is sent on a cross-origin POST from one
+// to the other regardless of SameSite. Wrapping the whole handler here,
+// rather than checking inside each mutating handler, means a route added
+// later can't forget the check. Safe methods are exempted unconditionally,
+// so GET /api/events — which EventSource cannot attach custom headers to —
+// keeps working.
+func requireSameOrigin(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			h.ServeHTTP(w, r)
+			return
+		}
+		if !sameOrigin(r) {
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// sameOrigin reports whether r was issued by this same origin. It checks
+// Sec-Fetch-Site first — sent by every browser since 2023 and not settable
+// by page script — and falls back to comparing the Origin header's host
+// against the request's Host for older clients. A request carrying neither
+// header is ordinarily same-origin browser traffic or a non-browser client
+// (curl, a health probe), and is allowed — UNLESS its Content-Type is one a
+// plain HTML <form> can produce. A cross-site <form> submission is a
+// navigation, not a fetch/XHR call, and needs neither JavaScript nor a
+// readable response to work: it is the one request shape that can reach a
+// mutating handler without either header ever being set.
+func sameOrigin(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "":
+		// Fall through to the Origin check.
+	case "same-origin":
+		return true
+	default:
+		return false
+	}
+
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		return err == nil && u.Host == r.Host
+	}
+
+	return !isFormContentType(r.Header.Get("Content-Type"))
+}
+
+// isFormContentType reports whether ct is one of the three content types a
+// plain HTML <form> can submit without any script: application/x-www-form-
+// urlencoded (the default), multipart/form-data, and text/plain.
+func isFormContentType(ct string) bool {
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	switch mediaType {
+	case "application/x-www-form-urlencoded", "multipart/form-data", "text/plain":
+		return true
+	default:
+		return false
+	}
 }
 
 // spaHandler serves static assets, falling back to index.html so client-side
@@ -111,11 +183,29 @@ func cleanPath(p string) string {
 	return p[1:]
 }
 
+// contentSecurityPolicy assumes a self-contained SPA: its own JS and CSS,
+// same origin, no third-party origins. A vanilla Vite production build
+// extracts CSS to an external, content-hashed stylesheet linked via
+// <link rel="stylesheet"> rather than inline <style> blocks, so style-src
+// 'self' should hold; this has not been verified against a real build,
+// since no web/ directory exists in this repo yet (Task 5). If a future
+// UI library injects inline styles at runtime (CSS-in-JS, inline style=
+// attributes for dynamic positioning), add 'unsafe-inline' to style-src
+// only — never to default-src or script-src.
+const contentSecurityPolicy = "default-src 'self'; style-src 'self'; connect-src 'self'"
+
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		// Run state and session cookies must never be cached; static assets
+		// (content-hashed, served from s.static) are deliberately excluded so
+		// they stay cacheable.
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		h.ServeHTTP(w, r)
 	})
 }
