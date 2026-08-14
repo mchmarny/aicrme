@@ -7,12 +7,21 @@ import (
 
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/fingerprint"
+	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/snapshotter"
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"gopkg.in/yaml.v3"
 )
+
+// criteriaAny is the sentinel AICR's recipe package uses for an unset
+// criteria dimension (pkg/recipe.CriteriaServiceAny et al. all stringify to
+// this). Duplicated here as a plain string, rather than importing the typed
+// constants, because facade Criteria fields are plain strings, not the
+// recipe package's enum types.
+const criteriaAny = "any"
 
 // ComponentSummary is one reviewable component in the resolved recipe.
 type ComponentSummary struct {
@@ -33,13 +42,15 @@ type RecipeSummary struct {
 }
 
 type recommend struct {
-	client aicrclient.Resolver
+	client aicrclient.API
 }
 
 // NewRecommend returns the Recommend step. It gates on the only two decisions
-// the console asks for: intent and platform. Service, accelerator, OS,
-// component set, versions, and values are all derived by AICR.
-func NewRecommend(c aicrclient.Resolver) engine.Step {
+// the console asks for: intent and platform. Service, accelerator, and OS are
+// derived from the snapshot's own fingerprint (see buildCriteria); component
+// set, versions, and values are all then derived by AICR from the resolved
+// recipe.
+func NewRecommend(c aicrclient.API) engine.Step {
 	return &recommend{client: c}
 }
 
@@ -67,14 +78,28 @@ func (r *recommend) Run(ctx context.Context, run *engine.Run, emit engine.Emit) 
 			"intent and platform decisions must be non-empty")
 	}
 
-	// Only intent and platform come from the user. Every other criteria
-	// dimension is left unset here; AICR resolves the recipe from whatever
-	// overlays the catalog covers for this combination and evaluates
-	// constraints against the snapshot along the way.
-	criteria := &aicr.Criteria{Intent: intent, Platform: platform}
+	criteria, err := buildCriteria(r.client, snap, intent, platform)
+	if err != nil {
+		return err
+	}
+
+	// Belt-and-suspenders alongside the blank-decision check above: that
+	// check catches an empty string, not an explicit "any" (or a snapshot
+	// that fingerprints to nothing at all). AICR's facade does not itself
+	// guard against zero-specificity criteria -- see task-10-report.md for
+	// the empirical proof that resolving one succeeds with a generic,
+	// non-representative fallback recipe instead of erroring (issue #1888).
+	// Recommend fails closed here the way AICR's own CLI does in
+	// pkg/cli/query.go, rather than trusting the facade to.
+	if specificity(criteria) == 0 {
+		return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			"criteria(any): the snapshot and the intent/platform decisions identify no service, "+
+				"accelerator, os, or platform to resolve against")
+	}
 
 	emit(bus.Event{Kind: bus.KindLog, Message: fmt.Sprintf(
-		"resolving recipe for intent=%s platform=%s", criteria.Intent, criteria.Platform)})
+		"resolving recipe for intent=%s platform=%s (snapshot-derived service=%s accelerator=%s os=%s nodes=%d)",
+		criteria.Intent, criteria.Platform, criteria.Service, criteria.Accelerator, criteria.OS, criteria.Nodes)})
 
 	result, err := r.client.ResolveRecipeFromSnapshot(ctx, criteria, snap)
 	if err != nil {
@@ -138,4 +163,68 @@ func decodeSnapshot(raw []byte) (*aicr.Snapshot, error) {
 	wrapped := aicr.WrapSnapshot(&inner)
 	wrapped.Raw = raw
 	return wrapped, nil
+}
+
+// buildCriteria derives Service, Accelerator, OS, and Nodes from the
+// snapshot's own measurements via AICR's fingerprint package, then overlays
+// the user's intent and platform decisions on top. This mirrors what AICR's
+// own CLI does for `aicr recipe --snapshot`
+// (pkg/cli/query.go: `fingerprint.FromMeasurements(snap.Measurements).ToCriteria(reg)`,
+// then CLI-flag criteria layered on top via applyCriteriaOverrides) rather
+// than reimplementing that mapping: intent and platform are, in
+// fingerprint.Fingerprint.ToCriteria's own words, "recipe-author choices the
+// cluster cannot reveal" -- they always come back "any" from the fingerprint
+// alone, so this console's two decisions are the only way they are ever set.
+//
+// Everything else -- service, accelerator, OS, node count -- comes from
+// whatever the snapshot's measurements actually contain. On a cluster with
+// no GPU hardware (e.g. the KWOK demo path), the accelerator and OS
+// dimensions may come back unset: a real GPU cannot be invented from a
+// snapshot that never observed one, and ResolveRecipeFromSnapshot will
+// reject the resulting criteria if the catalog's overlays require an
+// accelerator this combination doesn't supply. That is a limitation of the
+// hardware being simulated, not of this derivation -- see task-10-report.md.
+func buildCriteria(client aicrclient.CriteriaRegistrar, snap *aicr.Snapshot, intent, platform string) (*aicr.Criteria, error) {
+	reg := client.CriteriaRegistry()
+	if reg == nil {
+		// Client.CriteriaRegistry() only returns nil for a nil Client; kept
+		// here because aicrclient.Fake's zero value also returns nil, and
+		// reg.ParseIntent/ParsePlatform below would panic on a nil receiver
+		// for any value that isn't one of the hardcoded fast-path strings
+		// (unlike fingerprint.Fingerprint.ToCriteria, which already guards
+		// this internally).
+		reg = recipe.NewCriteriaRegistry()
+	}
+
+	fp := fingerprint.FromMeasurements(snap.Unwrap().Measurements)
+	criteria := aicr.WrapCriteria(fp.ToCriteria(reg))
+
+	parsedIntent, err := reg.ParseIntent(intent)
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, "invalid intent", err)
+	}
+	parsedPlatform, err := reg.ParsePlatform(platform)
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, "invalid platform", err)
+	}
+	criteria.Intent = string(parsedIntent)
+	criteria.Platform = string(parsedPlatform)
+	return criteria, nil
+}
+
+// specificity counts how many of criteria's six dimensions are stated (not
+// blank and not the "any" wildcard) -- the facade-side equivalent of
+// pkg/recipe.Criteria.Specificity(), which is unavailable here because the
+// facade Criteria carries plain strings, not that package's enum types.
+func specificity(c *aicr.Criteria) int {
+	n := 0
+	for _, v := range []string{c.Service, c.Accelerator, c.Intent, c.OS, c.Platform} {
+		if v != "" && v != criteriaAny {
+			n++
+		}
+	}
+	if c.Nodes != 0 {
+		n++
+	}
+	return n
 }
