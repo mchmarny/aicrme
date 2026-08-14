@@ -1,0 +1,280 @@
+[
+  {
+    "id": 1,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.975795Z",
+    "kind": "phase",
+    "phase": "discover",
+    "level": "info",
+    "message": "phase started"
+  },
+  {
+    "id": 2,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.975797Z",
+    "kind": "log",
+    "phase": "discover",
+    "level": "info",
+    "message": "deploying cluster snapshot agent"
+  },
+  {
+    "id": 3,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.976067Z",
+    "kind": "log",
+    "phase": "discover",
+    "level": "info",
+    "message": "This is a kind cluster with 7 node(s) and no GPU hardware detected.",
+    "data": {
+      "headline": "This is a kind cluster with 7 node(s) and no GPU hardware detected.",
+      "detail": "Kubernetes v1.36.1, Debian GNU/Linux 13 (trixie)",
+      "punchline": "No GPU hardware detected — this is a simulated cluster.",
+      "gaps": [
+        {
+          "id": "gpu-driver",
+          "title": "No GPU driver installed, the kernel does not see the devices",
+          "detail": "GPU.hardware reports driver-loaded=false: the NVIDIA driver is not loaded, so nvidia-smi and the device nodes are unavailable.",
+          "component": "gpu-operator"
+        },
+        {
+          "id": "device-plugin",
+          "title": "No device plugin, Kubernetes cannot schedule nvidia.com/gpu",
+          "detail": "K8s.policy (the GPU Operator's ClusterPolicy) was collected and is empty: no ClusterPolicy exists, so the device plugin DaemonSet it manages is not running. K8s.image is non-empty, so this is a real read, not a degraded collector.",
+          "component": "gpu-operator"
+        },
+        {
+          "id": "gpu-metrics",
+          "title": "No GPU metrics, utilization is invisible",
+          "detail": "Same evidence as device-plugin: K8s.policy is collected-empty (no ClusterPolicy) with a non-empty K8s.image corroborating a healthy collector, so the DCGM exporter — also GPU-Operator-managed via ClusterPolicy's dcgm.enabled/dcgmExporter.enabled — is not running either.",
+          "component": "gpu-operator"
+        },
+        {
+          "id": "gpu-scheduler",
+          "title": "No GPU-aware scheduler, no gang scheduling for multi-node jobs",
+          "detail": "K8s.image lists every unique container image running in the cluster and none of them are kai-scheduler's (podgrouper, podgroupcontroller, queuecontroller). kube-scheduler is present but does not gang-schedule.",
+          "component": "kai-scheduler"
+        }
+      ],
+      "usableGpus": 0,
+      "totalGpus": 0
+    }
+  },
+  {
+    "id": 4,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.976069Z",
+    "kind": "cluster",
+    "phase": "discover",
+    "level": "warn",
+    "message": "No GPU driver installed, the kernel does not see the devices"
+  },
+  {
+    "id": 5,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.976069Z",
+    "kind": "cluster",
+    "phase": "discover",
+    "level": "warn",
+    "message": "No device plugin, Kubernetes cannot schedule nvidia.com/gpu"
+  },
+  {
+    "id": 6,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.97607Z",
+    "kind": "cluster",
+    "phase": "discover",
+    "level": "warn",
+    "message": "No GPU metrics, utilization is invisible"
+  },
+  {
+    "id": 7,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.97607Z",
+    "kind": "cluster",
+    "phase": "discover",
+    "level": "warn",
+    "message": "No GPU-aware scheduler, no gang scheduling for multi-node jobs"
+  },
+  {
+    "id": 8,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.97607Z",
+    "kind": "log",
+    "phase": "discover",
+    "level": "info",
+    "message": "No GPU hardware detected — this is a simulated cluster."
+  },
+  {
+    "id": 9,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.976105Z",
+    "kind": "phase",
+    "phase": "discover",
+    "level": "info",
+    "message": "phase complete"
+  },
+  {
+    "id": 10,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.976119Z",
+    "kind": "decision",
+    "phase": "recommend",
+    "level": "info",
+    "message": "awaiting decision"
+  },
+  {
+    "id": 11,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.976152Z",
+    "kind": "phase",
+    "phase": "recommend",
+    "level": "info",
+    "message": "phase started"
+  },
+  {
+    "id": 12,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.979669Z",
+    "kind": "log",
+    "phase": "recommend",
+    "level": "info",
+    "message": "resolving recipe for intent=training platform=kubeflow (snapshot-derived service=kind accelerator=h100 os=any nodes=7)"
+  },
+  {
+    "id": 13,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.995837Z",
+    "kind": "log",
+    "phase": "recommend",
+    "level": "info",
+    "message": "13 components, every version pinned",
+    "data": {
+      "name": "criteria(service=kind, accelerator=h100, intent=training, platform=kubeflow, nodes=7)",
+      "version": "dev",
+      "componentCount": 13,
+      "components": [
+        {
+          "name": "cert-manager",
+          "kind": "Helm",
+          "version": "v1.20.2",
+          "namespace": "cert-manager",
+          "chart": "cert-manager",
+          "source": "https://charts.jetstack.io"
+        },
+        {
+          "name": "gpu-operator",
+          "kind": "Helm",
+          "version": "v26.3.3",
+          "namespace": "gpu-operator",
+          "chart": "gpu-operator",
+          "source": "https://helm.ngc.nvidia.com/nvidia"
+        },
+        {
+          "name": "k8s-ephemeral-storage-metrics",
+          "kind": "Helm",
+          "version": "1.19.2",
+          "namespace": "monitoring",
+          "chart": "k8s-ephemeral-storage-metrics",
+          "source": "https://jmcgrath207.github.io/k8s-ephemeral-storage-metrics/chart"
+        },
+        {
+          "name": "kai-scheduler",
+          "kind": "Helm",
+          "version": "v0.14.1",
+          "namespace": "kai-scheduler",
+          "chart": "kai-scheduler",
+          "source": "oci://ghcr.io/kai-scheduler/kai-scheduler"
+        },
+        {
+          "name": "kube-prometheus-stack",
+          "kind": "Helm",
+          "version": "84.4.0",
+          "namespace": "monitoring",
+          "chart": "kube-prometheus-stack",
+          "source": "https://prometheus-community.github.io/helm-charts"
+        },
+        {
+          "name": "kubeflow-trainer",
+          "kind": "Helm",
+          "version": "2.2.0",
+          "namespace": "kubeflow",
+          "chart": "kubeflow-trainer",
+          "source": "oci://ghcr.io/kubeflow/charts"
+        },
+        {
+          "name": "network-operator",
+          "kind": "Helm",
+          "version": "26.4.1",
+          "namespace": "nvidia-network-operator",
+          "chart": "network-operator",
+          "source": "https://helm.ngc.nvidia.com/nvidia"
+        },
+        {
+          "name": "nfd",
+          "kind": "Helm",
+          "version": "0.19.0",
+          "namespace": "node-feature-discovery",
+          "chart": "node-feature-discovery",
+          "source": "https://kubernetes-sigs.github.io/node-feature-discovery/charts"
+        },
+        {
+          "name": "nodewright-operator",
+          "kind": "Helm",
+          "version": "v0.17.1",
+          "namespace": "skyhook",
+          "chart": "nodewright",
+          "source": "oci://ghcr.io/nvidia/nodewright/charts"
+        },
+        {
+          "name": "nvidia-dra-driver-gpu",
+          "kind": "Helm",
+          "version": "0.4.1",
+          "namespace": "nvidia-dra-driver",
+          "chart": "dra-driver-nvidia-gpu",
+          "source": "oci://registry.k8s.io/dra-driver-nvidia/charts"
+        },
+        {
+          "name": "nvsentinel",
+          "kind": "Helm",
+          "version": "v1.9.0",
+          "namespace": "nvsentinel",
+          "chart": "nvsentinel",
+          "source": "oci://ghcr.io/nvidia"
+        },
+        {
+          "name": "prometheus-adapter",
+          "kind": "Helm",
+          "version": "5.3.0",
+          "namespace": "monitoring",
+          "chart": "prometheus-adapter",
+          "source": "https://prometheus-community.github.io/helm-charts"
+        },
+        {
+          "name": "prometheus-operator-crds",
+          "kind": "Helm",
+          "version": "28.0.1",
+          "namespace": "monitoring",
+          "chart": "prometheus-operator-crds",
+          "source": "https://prometheus-community.github.io/helm-charts"
+        }
+      ]
+    }
+  },
+  {
+    "id": 14,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.995856Z",
+    "kind": "phase",
+    "phase": "recommend",
+    "level": "info",
+    "message": "phase complete"
+  },
+  {
+    "id": 15,
+    "runId": "553a423750e2797b",
+    "at": "2026-08-14T21:19:31.995872Z",
+    "kind": "phase",
+    "level": "info",
+    "message": "run done"
+  }
+]

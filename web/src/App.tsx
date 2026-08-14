@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { startRun } from './api'
 import { Login } from './components/Login'
-import { Timeline } from './components/Timeline'
+import { Wizard } from './components/Wizard'
 import { useEvents } from './useEvents'
 
 export default function App() {
@@ -24,6 +25,17 @@ export default function App() {
 
 function Console() {
   const { events, connected, eventsLost } = useEvents()
+
+  // Discover "runs automatically on first load -- no decisions gate it"
+  // (see internal/steps/discover.go's doc comment), so the console starts a
+  // run itself rather than waiting on a button. A 409 here means a run is
+  // already in progress -- e.g. a page reload -- and the SSE stream (backed
+  // by the bus's replay ring) already carries its state, so there is
+  // nothing more to do about that case than let it through silently.
+  useEffect(() => {
+    startRun().catch(() => {})
+  }, [])
+
   return (
     <main className="p-8">
       <header className="mb-6 flex items-center gap-3">
@@ -37,7 +49,7 @@ function Console() {
           {eventsLost} event{eventsLost === 1 ? '' : 's'} could not be recovered after a connection gap.
         </p>
       )}
-      <Timeline events={events} />
+      <Wizard events={events} />
     </main>
   )
 }
