@@ -27,5 +27,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
+      - run: make web
+      - run: cd web && npm test
       - run: make test-coverage
       - run: make check-aicr-pin

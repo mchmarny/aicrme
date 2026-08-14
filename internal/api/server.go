@@ -184,15 +184,25 @@ func cleanPath(p string) string {
 }
 
 // contentSecurityPolicy assumes a self-contained SPA: its own JS and CSS,
-// same origin, no third-party origins. A vanilla Vite production build
-// extracts CSS to an external, content-hashed stylesheet linked via
-// <link rel="stylesheet"> rather than inline <style> blocks, so style-src
-// 'self' should hold; this has not been verified against a real build,
-// since no web/ directory exists in this repo yet (Task 5). If a future
-// UI library injects inline styles at runtime (CSS-in-JS, inline style=
-// attributes for dynamic positioning), add 'unsafe-inline' to style-src
-// only — never to default-src or script-src.
-const contentSecurityPolicy = "default-src 'self'; style-src 'self'; connect-src 'self'"
+// same origin, no third-party origins. Verified against the real Task 5
+// build (`cd web && npm run build`, output inspected under web/dist):
+//   - style-src 'self' holds. The Vite production build extracts CSS to an
+//     external, content-hashed stylesheet linked via <link rel="stylesheet">,
+//     not inline <style> blocks.
+//   - img-src needs data: in addition to 'self'. Vite inlines any imported
+//     asset under its 4096-byte assetsInlineLimit as a data: URI directly in
+//     the JS bundle rather than emitting a separate file; a same-origin-only
+//     img-src would silently block that image at runtime. The current
+//     bundle imports no such asset (grepping web/dist/assets/*.{js,css} for
+//     data:image|font|application finds nothing today), but importing one
+//     tiny SVG and rebuilding reproduced a `data:image/svg+xml,...` URI in
+//     the output, confirming the failure mode this guards against before it
+//     ever ships.
+//
+// If a future UI library injects inline styles at runtime (CSS-in-JS,
+// inline style= attributes for dynamic positioning), add 'unsafe-inline' to
+// style-src only — never to default-src or script-src.
+const contentSecurityPolicy = "default-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'"
 
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

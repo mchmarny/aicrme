@@ -55,8 +55,11 @@ check-aicr-pin: ## Verifies go.mod pins github.com/NVIDIA/aicr to the version re
 	fi
 
 .PHONY: web
-web: ## Builds the SPA into web/dist
+web: ## Builds the SPA into web/dist and syncs it into internal/web/dist for go:embed
 	cd web && npm ci && npm run build
+	rm -rf internal/web/dist
+	cp -R web/dist internal/web/dist
+	touch internal/web/dist/.gitkeep
 
 .PHONY: build
 build: web ## Builds the aicrme binary with the SPA embedded

@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Web SPA (built by `make web`; see internal/web/embed.go)
+web/node_modules/
+web/dist/
+internal/web/dist/*
+!internal/web/dist/.gitkeep
+
+# Compiled binaries
+bin/

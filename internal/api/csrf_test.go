@@ -49,6 +49,34 @@ func TestSecFetchSiteCrossSiteRejected(t *testing.T) {
 	}
 }
 
+// TestSecFetchSiteSameSiteRejected guards the precise attack the same-origin
+// check exists for: a page on http://localhost:3000 posting to this console
+// on http://localhost:8080. Those two are different origins but the same
+// registrable "site" — Sec-Fetch-Site reports "same-site" for that request,
+// distinct from both "same-origin" and "cross-site", and the switch in
+// sameOrigin must fall through its default case to reject it rather than
+// matching neither case and allowing it through unchecked.
+func TestSecFetchSiteSameSiteRejected(t *testing.T) {
+	h := newTestServer(t)
+	ts, client := loggedInClient(t, h)
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("NewRequest error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
 func TestCrossOriginCreateRunRejected(t *testing.T) {
 	h := newTestServer(t)
 	ts, client := loggedInClient(t, h)
@@ -154,7 +182,7 @@ func TestSecurityHeadersIncludeCSP(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	csp := rec.Header().Get("Content-Security-Policy")
-	for _, want := range []string{"default-src 'self'", "style-src 'self'", "connect-src 'self'"} {
+	for _, want := range []string{"default-src 'self'", "style-src 'self'", "img-src 'self' data:", "connect-src 'self'"} {
 		if !strings.Contains(csp, want) {
 			t.Errorf("CSP = %q, missing %q", csp, want)
 		}
