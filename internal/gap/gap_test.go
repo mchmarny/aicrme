@@ -298,3 +298,61 @@ func TestPunchlineWithGPUs(t *testing.T) {
 		t.Errorf("Punchline = %q, want %q", report.Punchline, want)
 	}
 }
+
+// fullyCapableSnapshot builds a synthetic snapshot with a GPU measurement
+// that clears usableGPUs' bar (present, driver loaded) and a K8s measurement
+// that clears every rule's absence check: policy is collected and non-empty
+// (so gpuOperatorAbsent is false, closing device-plugin and gpu-metrics) and
+// image lists one of kaiSchedulerImageNames (so gpuSchedulerAbsent is false,
+// closing gpu-scheduler). No fixture the repo has reaches this state — the
+// KWOK captures are deliberately gap-heavy demo material — so this is
+// synthetic, the same way gpuSnapshot() above is.
+func fullyCapableSnapshot() *aicr.Snapshot {
+	return aicr.WrapSnapshot(&snapshotter.Snapshot{
+		Measurements: []*measurement.Measurement{
+			{
+				Type: measurement.TypeGPU,
+				Subtypes: []measurement.Subtype{{
+					Name: "hardware",
+					Data: map[string]measurement.Reading{
+						measurement.KeyGPUCount:        measurement.Int64(8),
+						measurement.KeyGPUPresent:      measurement.Bool(true),
+						measurement.KeyGPUDriverLoaded: measurement.Bool(true),
+					},
+				}},
+			},
+			{
+				Type: measurement.TypeK8s,
+				Subtypes: []measurement.Subtype{
+					{Name: "image", Data: map[string]measurement.Reading{
+						"podgrouper": measurement.Str("v0.14.1"),
+					}},
+					{Name: "policy", Data: map[string]measurement.Reading{
+						"devicePlugin.enabled": measurement.Str("true"),
+					}},
+				},
+			},
+		},
+	})
+}
+
+// TestAnalyzeFullyCapableClusterHasNoGaps is the state Task 12's Discover
+// screen crashed on: Report.Gaps carries no `omitempty` (its json tag is
+// just `"gaps"`), so a cluster with every gap closed marshals it as JSON
+// null, not `[]`. This pins that the Go side genuinely produces a nil slice
+// here -- not just an empty one -- so a client-side fix has a real case to
+// guard, and separately exercises punchline's non-zero-GPU branch
+// (gap.go:85) end to end from a report with zero gaps, which
+// TestPunchlineWithGPUs alone (a bare GPU-only synthetic snapshot) does not
+// cover.
+func TestAnalyzeFullyCapableClusterHasNoGaps(t *testing.T) {
+	report := gap.Analyze(fullyCapableSnapshot())
+
+	if report.Gaps != nil {
+		t.Errorf("Gaps = %v, want nil -- a fully capable cluster has nothing left to close", report.Gaps)
+	}
+	const want = "8 of 8 GPUs are usable by a workload today."
+	if report.Punchline != want {
+		t.Errorf("Punchline = %q, want %q", report.Punchline, want)
+	}
+}

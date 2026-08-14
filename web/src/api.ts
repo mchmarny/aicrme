@@ -1,3 +1,18 @@
+/**
+ * ApiError carries the HTTP status alongside the message, so a caller can
+ * tell an expected failure (e.g. 409 "a run is already in progress" on
+ * startRun, which a page reload triggers routinely) apart from one worth
+ * surfacing to the user.
+ */
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 export async function login(username: string, password: string): Promise<void> {
   const res = await fetch('/api/login', {
     method: 'POST',
@@ -21,7 +36,7 @@ export interface Run {
 
 export async function startRun(): Promise<Run> {
   const res = await fetch('/api/runs', { method: 'POST' })
-  if (!res.ok) throw new Error('Failed to start run')
+  if (!res.ok) throw new ApiError(res.status, 'Failed to start run')
   return res.json()
 }
 
@@ -42,7 +57,7 @@ export interface Options {
 
 export async function fetchOptions(): Promise<Options> {
   const res = await fetch('/api/options')
-  if (!res.ok) throw new Error('Failed to fetch options')
+  if (!res.ok) throw new ApiError(res.status, 'Failed to fetch options')
   return res.json()
 }
 
@@ -52,6 +67,6 @@ export async function decide(runId: string, decisions: Record<string, string>): 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(decisions),
   })
-  if (!res.ok) throw new Error('Failed to submit decision')
+  if (!res.ok) throw new ApiError(res.status, 'Failed to submit decision')
   return res.json()
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { startRun } from './api'
+import { ApiError, startRun } from './api'
 import { Login } from './components/Login'
 import { Wizard } from './components/Wizard'
 import { useEvents } from './useEvents'
@@ -25,16 +25,29 @@ export default function App() {
 
 function Console() {
   const { events, connected, eventsLost } = useEvents()
+  const [startError, setStartError] = useState('')
+  const [retryToken, setRetryToken] = useState(0)
 
   // Discover "runs automatically on first load -- no decisions gate it"
   // (see internal/steps/discover.go's doc comment), so the console starts a
   // run itself rather than waiting on a button. A 409 here means a run is
   // already in progress -- e.g. a page reload -- and the SSE stream (backed
-  // by the bus's replay ring) already carries its state, so there is
-  // nothing more to do about that case than let it through silently.
+  // by the bus's replay ring) already carries its state, so that specific
+  // failure is expected and silent. Any other failure (network error, 401
+  // from an expired session, a 5xx) previously hit the same
+  // `.catch(() => {})` and left the console showing nothing forever with no
+  // way to recover short of a manual page reload -- surfaced here instead,
+  // with a retry the user can act on.
   useEffect(() => {
-    startRun().catch(() => {})
-  }, [])
+    let canceled = false
+    setStartError('')
+    startRun().catch(err => {
+      if (canceled) return
+      if (err instanceof ApiError && err.status === 409) return
+      setStartError(err instanceof Error ? err.message : 'Failed to start a run')
+    })
+    return () => { canceled = true }
+  }, [retryToken])
 
   return (
     <main className="p-8">
@@ -48,6 +61,17 @@ function Console() {
         <p className="mb-4 text-amber-400 text-xs">
           {eventsLost} event{eventsLost === 1 ? '' : 's'} could not be recovered after a connection gap.
         </p>
+      )}
+      {startError && (
+        <div className="mb-4 space-y-2">
+          <p className="text-red-400 text-sm">{startError}</p>
+          <button
+            onClick={() => setRetryToken(n => n + 1)}
+            className="rounded border border-slate-700 px-3 py-1 text-sm text-slate-200"
+          >
+            Retry
+          </button>
+        </div>
       )}
       <Wizard events={events} />
     </main>
