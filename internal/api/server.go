@@ -34,11 +34,12 @@ type Config struct {
 
 // Server wires the HTTP routes.
 type Server struct {
-	auth   *authenticator
-	bus    *bus.Bus
-	engine *engine.Engine
-	static fs.FS
-	aicr   aicrclient.API
+	auth    *authenticator
+	bus     *bus.Bus
+	engine  *engine.Engine
+	static  fs.FS
+	aicr    aicrclient.API
+	options aicrclient.OptionsCache
 }
 
 // New validates cfg and returns a Server.

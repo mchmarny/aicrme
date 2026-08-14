@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -83,38 +85,32 @@ func TestOptionsEndpointFiltersThroughTheCatalog(t *testing.T) {
 	if !equalStrings(got.Platforms, wantPlatforms) {
 		t.Errorf("platforms = %v, want %v", got.Platforms, wantPlatforms)
 	}
+	for _, intent := range wantIntents {
+		if !equalStrings(got.PlatformsByIntent[intent], wantPlatforms) {
+			t.Errorf("platformsByIntent[%q] = %v, want %v", intent, got.PlatformsByIntent[intent], wantPlatforms)
+		}
+	}
+	// No run has started, so handleOptions has no snapshot-derived service
+	// to filter by yet: the response must say so.
+	if !got.Provisional {
+		t.Error("provisional = false, want true with no run started")
+	}
 }
 
-// snapshotStep hands Recommend-shaped Discover output to a run so
-// TestOptionsUsesCurrentRunSnapshotWhenAvailable can exercise the
-// snapshot-aware branch of handleOptions.
-type snapshotStep struct{}
+// rawSnapshotStep hands a fixed byte slice to a run as its Discover output,
+// so options_test.go's tests can exercise handleOptions's snapshot-aware
+// branch with content of their choosing.
+type rawSnapshotStep struct{ raw []byte }
 
-func (snapshotStep) Phase() engine.Phase { return engine.PhaseDiscover }
-func (snapshotStep) Requires() []string  { return nil }
-func (snapshotStep) Run(_ context.Context, r *engine.Run, _ engine.Emit) error {
-	r.Artifacts["snapshot.yaml"] = []byte("apiVersion: aicr.nvidia.com/v1\nkind: Snapshot\n")
+func (rawSnapshotStep) Phase() engine.Phase { return engine.PhaseDiscover }
+func (rawSnapshotStep) Requires() []string  { return nil }
+func (s rawSnapshotStep) Run(_ context.Context, r *engine.Run, _ engine.Emit) error {
+	r.Artifacts["snapshot.yaml"] = s.raw
 	return nil
 }
 
-// TestOptionsUsesCurrentRunSnapshotWhenAvailable proves handleOptions
-// consults the engine's current run for a snapshot rather than always
-// filtering unconstrained: once a run has produced snapshot.yaml,
-// /api/options still answers 200 (aicrclient.ServiceFromSnapshot degrades
-// to "" on a snapshot this thin rather than erroring the whole request --
-// see its own tests in internal/aicrclient for the real derivation).
-func TestOptionsUsesCurrentRunSnapshotWhenAvailable(t *testing.T) {
-	fake := &aicrclient.Fake{Registry: recipe.NewCriteriaRegistry()}
-	b := bus.New(8)
-	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: fake,
-	}, b, engine.New(b, engine.NewMemoryStore(), snapshotStep{}), testfs.Static())
-	if err != nil {
-		t.Fatalf("api.New() error = %v", err)
-	}
-	ts, client := loggedInClient(t, srv.Handler())
-
+func startAndAwaitDone(t *testing.T, ts *httptest.Server, client *http.Client) aicrclient.Options {
+	t.Helper()
 	createResp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatalf("POST /api/runs error = %v", err)
@@ -134,6 +130,69 @@ func TestOptionsUsesCurrentRunSnapshotWhenAvailable(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got aicrclient.Options
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode error = %v", err)
+	}
+	return got
+}
+
+// TestOptionsUsesCurrentRunSnapshotWhenAvailable proves handleOptions
+// consults the engine's current run for a snapshot rather than always
+// filtering unconstrained. It also pins the sharp edge Options.Provisional's
+// doc comment calls out: a snapshot this thin (no measurements) makes
+// aicrclient.ServiceFromSnapshot degrade to "" rather than error, so
+// Provisional stays true even though a run now exists and completed --
+// "a run exists" is not proof the options are cluster-accurate.
+func TestOptionsUsesCurrentRunSnapshotWhenAvailable(t *testing.T) {
+	fake := &aicrclient.Fake{Registry: recipe.NewCriteriaRegistry()}
+	b := bus.New(8)
+	step := rawSnapshotStep{raw: []byte("apiVersion: aicr.nvidia.com/v1\nkind: Snapshot\n")}
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: fake,
+	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	ts, client := loggedInClient(t, srv.Handler())
+
+	got := startAndAwaitDone(t, ts, client)
+	if !got.Provisional {
+		t.Error("provisional = false, want true: this snapshot has no measurements to derive a service from")
+	}
+}
+
+// TestOptionsProvisionalClearsOnceASnapshotYieldsARealService is the "clear
+// after" half of the contract Options.Provisional documents: reusing the
+// real simulated-H100 KWOK fixture already pinned in
+// internal/steps/recommend_test.go (TestRecommendResolvesAgainstSimulatedH100Fixture),
+// a run whose snapshot fingerprints to a real, non-empty service must
+// report Provisional=false -- not just "some run exists", which
+// TestOptionsUsesCurrentRunSnapshotWhenAvailable already proves is not
+// enough on its own.
+func TestOptionsProvisionalClearsOnceASnapshotYieldsARealService(t *testing.T) {
+	raw, err := os.ReadFile("../steps/testdata/snapshot-kwok-h100.yaml")
+	if err != nil {
+		t.Fatalf("fixture read error = %v", err)
+	}
+
+	fake := &aicrclient.Fake{Registry: recipe.NewCriteriaRegistry()}
+	b := bus.New(8)
+	step := rawSnapshotStep{raw: raw}
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: fake,
+	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	ts, client := loggedInClient(t, srv.Handler())
+
+	got := startAndAwaitDone(t, ts, client)
+	if got.Provisional {
+		t.Error("provisional = true, want false once the snapshot fingerprints to a real service (kind)")
 	}
 }
 

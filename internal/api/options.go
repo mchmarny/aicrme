@@ -1,45 +1,50 @@
 package api
 
-import (
-	"log/slog"
-	"net/http"
-
-	"github.com/mchmarny/aicrme/internal/aicrclient"
-)
+import "net/http"
 
 // handleOptions returns the two decisions the console ever asks for --
-// intent and platform -- filtered to what the AICR catalog can actually
-// resolve (spec §2: "filtered to those with an overlay matching this
-// cluster's coordinates"). Everything else -- service, accelerator, OS,
-// component set, versions, values -- is derived by the AICR recipe engine
-// and never offered as a choice.
+// intent and platform -- filtered to what this cluster can actually run
+// (spec §2: "filtered to those with an overlay matching this cluster's
+// coordinates"). Everything else -- service, accelerator, OS, component set,
+// versions, values -- is derived by the AICR recipe engine and never offered
+// as a choice.
 //
-// The filter is keyed on the most recently started run's own snapshot, once
-// Discover has produced one: aicrclient.AvailableOptions asks the live
-// catalog which pairs have an overlay for that cluster's own detected
-// service, rather than a value hardcoded in this handler. Before any run has
-// produced a snapshot -- including before the very first run starts --
-// there is no cluster-specific coordinate yet, so the filter runs
-// unconstrained by service: still a real, catalog-verified answer, just not
-// yet narrowed to this cluster. See aicrclient.AvailableOptions for the full
-// reasoning and internal/aicrclient/options_test.go and
-// internal/steps/options_cross_test.go for what pins it against real
-// resolution.
+// The response body is aicrclient.Options. Read platformsByIntent, not the
+// flat platforms list, to decide what to offer: the flat list is the union
+// across intents and so still contains platforms that are dead for the
+// intent currently selected.
+//
+// CLIENT CONTRACT -- this response is not safe to fetch once on mount and
+// cache. Two states are possible:
+//
+//   - provisional=false. Every pair in platformsByIntent was verified by
+//     actually resolving it against this run's snapshot, so no offered pair
+//     can dead-end in Recommend. This is final; present it as such.
+//
+//   - provisional=true. No snapshot was available yet (or it carried nothing
+//     the fingerprint could turn into a service), so the answer is a widened
+//     catalog-wide upper bound. It contains every pair that will eventually
+//     be offered plus some that will fail -- typically because the catalog's
+//     overlay for the pair needs an accelerator this cluster does not have.
+//
+// A client that fetches at mount will normally get provisional=true, because
+// the first request precedes Discover. It MUST re-fetch when the run enters
+// StateAwaitingDecision -- the point at which the wizard actually needs the
+// answer and the point at which snapshot.yaml exists -- and MUST NOT keep
+// showing a provisional set once a verified one is available. Waiting for
+// awaiting_decision is a client-side discipline, not something this handler
+// can enforce: it answers whatever is true at request time.
+//
+// Results are memoized against the snapshot they were computed from (see
+// aicrclient.OptionsCache), so the mandatory re-fetch costs a digest compare
+// rather than a fresh catalog probe.
 func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request) {
-	var service string
+	var raw []byte
 	if run := s.engine.Current(); run != nil {
-		if raw := run.Artifacts["snapshot.yaml"]; len(raw) > 0 {
-			svc, err := aicrclient.ServiceFromSnapshot(s.aicr, raw)
-			if err != nil {
-				slog.Warn("options: deriving cluster service from snapshot failed, filtering catalog-wide",
-					"run", run.ID, "error", err)
-			} else {
-				service = svc
-			}
-		}
+		raw = run.Artifacts["snapshot.yaml"]
 	}
 
-	opts, err := aicrclient.AvailableOptions(r.Context(), s.aicr, service)
+	opts, err := s.options.Get(r.Context(), s.aicr, raw)
 	if err != nil {
 		writeErr(w, err)
 		return
