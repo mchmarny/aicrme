@@ -54,7 +54,7 @@ would just be a second identity for the same privilege.
 {{- end -}}
 
 {{/*
-Resolves the auth password once per render and caches it in .Values.global:
+Resolves the auth password once per render and caches it on .Values:
 explicit .Values.auth.password, else the existing Secret's password (via
 lookup, so `helm upgrade` doesn't rotate it), else a fresh random one.
 secret.yaml and deployment.yaml's checksum/secret annotation both call this.
@@ -64,12 +64,19 @@ render — the real Secret would get one, the checksum the other, so the
 very next upgrade (which then deterministically reuses the real Secret's
 password from both call sites) would compute a different checksum than
 installation did, and needlessly roll the pod despite nothing changing.
-.Values.global is a plain Go map shared by reference across every template
-in the render, and is always present (Helm guarantees it), so the cache
-works regardless of which of the two call sites happens to run first.
+Cached under a chart-private key on .Values itself (always a non-nil map,
+never propagated to subcharts) rather than .Values.global: global is
+Helm's reserved table for passing values *into* subcharts, so stashing an
+implementation-private cache key there would publish it as a de facto
+user-facing value (`--set global.aicrmeAuthPassword=...` would "work"),
+and values.yaml would need a `global: {}` stanza just to guarantee the map
+exists — which breaks the moment a user's own values set `global: null`
+or a bare `global:` key, since that overwrites ours to nil and the next
+`.foo` lookup on it errors out. .Values needs no such declaration: Helm
+always hands templates a non-nil map for it.
 */}}
 {{- define "aicrme.authPassword" -}}
-{{- if not .Values.global.aicrmeAuthPassword -}}
+{{- if not .Values.aicrmeAuthPasswordCache -}}
 {{- $name := printf "%s-auth" (include "aicrme.fullname" .) -}}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace $name -}}
 {{- $password := .Values.auth.password -}}
@@ -80,7 +87,7 @@ works regardless of which of the two call sites happens to run first.
 {{- $password = randAlphaNum 24 -}}
 {{- end -}}
 {{- end -}}
-{{- $_ := set .Values.global "aicrmeAuthPassword" $password -}}
+{{- $_ := set .Values "aicrmeAuthPasswordCache" $password -}}
 {{- end -}}
-{{- .Values.global.aicrmeAuthPassword -}}
+{{- .Values.aicrmeAuthPasswordCache -}}
 {{- end -}}

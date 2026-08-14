@@ -32,7 +32,11 @@ RUN CGO_ENABLED=0 go build \
       -o /out/aicrme ./cmd/aicrme
 
 # The console shells out to the bundle's deploy.sh, which needs bash, helm,
-# kubectl, and jq (the webhook preflight degrades without jq).
+# kubectl, and jq (the webhook preflight degrades without jq). curl and tar
+# are removed below once used for the helm/kubectl fetch — that narrows
+# fetch/archive tooling in this cluster-admin image, it does not eliminate
+# it: alpine's busybox (already part of the base image) still ships its own
+# minimal tar and wget applets regardless of what this stage adds/removes.
 FROM alpine:3.22
 ARG HELM_VERSION
 ARG KUBECTL_VERSION
