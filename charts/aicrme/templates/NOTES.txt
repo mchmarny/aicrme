@@ -1,0 +1,18 @@
+aicrme is installed.
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "aicrme.fullname" . }} 8080:{{ .Values.service.port }}
+
+Then open:  http://localhost:8080
+
+  Username: {{ .Values.auth.username }}
+  Password: kubectl -n {{ .Release.Namespace }} get secret {{ include "aicrme.fullname" . }}-auth -o jsonpath='{.data.password}' | base64 -d
+
+SECURITY: this console runs with cluster-admin. It installs privileged
+DaemonSets, CRDs, and cluster-scoped resources, and the AICR snapshot agent
+runs privileged pods on GPU nodes. It is a DEMO AND EVAL TOOL. Do not install
+it on a production cluster, and do not expose it with service.type=LoadBalancer
+on an untrusted network — a cluster-admin console behind one password is a
+cluster-takeover surface.
+
+This console requires direct internet access to ghcr.io, nvcr.io, and the
+upstream Helm repositories. Air-gapped clusters are not supported.

@@ -1,0 +1,16 @@
+image:
+  repository: ghcr.io/mchmarny/aicrme/aicrme
+  tag: ""          # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP  # LoadBalancer exposes a cluster-admin console; see NOTES.txt
+  port: 8080
+
+auth:
+  username: admin
+  password: ""     # generated when empty, preserved across upgrade
+
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits:   { memory: 512Mi }

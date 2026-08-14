@@ -1,0 +1,17 @@
+# The console installs gpu-operator, cert-manager, DRA drivers, CRDs, and
+# privileged DaemonSets, and creates namespaces. That is cluster-admin. Any
+# hand-enumerated role breaks the first time a recipe gains a component.
+# Demo and eval clusters only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "aicrme.fullname" . }}
+  labels: {{- include "aicrme.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "aicrme.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

@@ -1,0 +1,13 @@
+# Non-secret runtime config. AICRME_USERNAME/AICRME_PASSWORD (secret.yaml)
+# are the only other env vars cmd/aicrme reads; everything sensitive stays
+# out of this object.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aicrme.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "aicrme.labels" . | nindent 4 }}
+data:
+  # No TLS termination at the pod: reached via port-forward or an
+  # Ingress/LoadBalancer that terminates TLS in front of it.
+  AICRME_TLS: "false"

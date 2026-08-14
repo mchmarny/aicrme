@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aicrme.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "aicrme.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "aicrme.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aicrme.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "aicrme.serviceAccountName" . }}
+      # Must agree with the Dockerfile's `USER 10001` / `adduser -u 10001`.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aicrme
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: AICRME_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aicrme.fullname" . }}-auth
+                  key: username
+            - name: AICRME_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aicrme.fullname" . }}-auth
+                  key: password
+            - name: AICRME_TLS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "aicrme.fullname" . }}
+                  key: AICRME_TLS
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
