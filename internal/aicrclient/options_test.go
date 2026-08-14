@@ -153,6 +153,38 @@ func TestAvailableOptionsFailsOnCanceledContext(t *testing.T) {
 	}
 }
 
+// TestAvailableOptionsDegradesOnUnparseableSnapshot pins the corrupt-artifact
+// contract: a snapshot.yaml that cannot be parsed must not fail the call.
+// This endpoint asks the console's only two questions, so going dark on a
+// corrupt artifact would brick the wizard; instead the answer degrades to the
+// widened catalog-wide candidate set and says so via Provisional, leaving
+// steps.Recommend to refuse the same bytes loudly if the user proceeds.
+func TestAvailableOptionsDegradesOnUnparseableSnapshot(t *testing.T) {
+	fake := &aicrclient.Fake{
+		Registry: recipe.NewCriteriaRegistry(),
+		CatalogEntries: []aicr.CatalogEntry{
+			{Name: "a", Criteria: aicr.Criteria{Platform: "kubeflow"}},
+			{Name: "b", Criteria: aicr.Criteria{Platform: ""}},
+		},
+	}
+
+	got, err := aicrclient.AvailableOptions(
+		context.Background(), fake, []byte("- this\n- is\n- a list, not a Snapshot\n"))
+	if err != nil {
+		t.Fatalf("AvailableOptions() error = %v, want a degraded result rather than a failure", err)
+	}
+	if !got.Provisional {
+		t.Error("Provisional = false, want true -- the answer is not snapshot-derived")
+	}
+	wantPlatforms := []string{"any", "kubeflow"}
+	if !equalStrings(got.Platforms, wantPlatforms) {
+		t.Errorf("Platforms = %v, want %v -- the widened candidate set", got.Platforms, wantPlatforms)
+	}
+	if fake.ResolveCalls != 0 {
+		t.Errorf("ResolveCalls = %d, want 0 -- there is no usable snapshot to verify against", fake.ResolveCalls)
+	}
+}
+
 func TestAvailableOptionsExcludesIntentWithNoCoverage(t *testing.T) {
 	callCount := 0
 	fake := &aicrclient.Fake{Registry: recipe.NewCriteriaRegistry()}

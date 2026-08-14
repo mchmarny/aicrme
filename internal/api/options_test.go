@@ -196,6 +196,40 @@ func TestOptionsProvisionalClearsOnceASnapshotYieldsARealService(t *testing.T) {
 	}
 }
 
+// TestOptionsDegradesToProvisionalOnCorruptSnapshot pins that a corrupt
+// snapshot.yaml does not take the endpoint down. /api/options supplies the
+// only two questions this console ever asks, so a 400 here would brick the
+// wizard with no way forward; the contract is a 200 carrying the widened
+// provisional set, with steps.Recommend left as the fail-loud backstop on the
+// same bytes.
+func TestOptionsDegradesToProvisionalOnCorruptSnapshot(t *testing.T) {
+	fake := &aicrclient.Fake{
+		Registry: recipe.NewCriteriaRegistry(),
+		CatalogEntries: []aicr.CatalogEntry{
+			{Name: "h100-kind-training-kubeflow", Criteria: aicr.Criteria{Platform: "kubeflow"}},
+		},
+	}
+	b := bus.New(8)
+	step := rawSnapshotStep{raw: []byte("- this\n- is\n- a list, not a Snapshot\n")}
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: fake,
+	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	ts, client := loggedInClient(t, srv.Handler())
+
+	got := startAndAwaitDone(t, ts, client)
+	if !got.Provisional {
+		t.Error("provisional = false, want true -- the snapshot could not be parsed")
+	}
+	if !equalStrings(got.Platforms, []string{"kubeflow"}) {
+		t.Errorf("platforms = %v, want [kubeflow] -- the widened candidate set, not an empty answer",
+			got.Platforms)
+	}
+}
+
 // TestNewRequiresAICRClient mirrors TestEmptyPasswordRejected: a nil AICR
 // client would panic the first time handleOptions runs, so api.New must
 // reject it at construction like every other required Config field.

@@ -3,6 +3,7 @@ package aicrclient
 import (
 	"context"
 	"crypto/sha256"
+	"log/slog"
 	"sort"
 	"sync"
 
@@ -99,7 +100,10 @@ type Options struct {
 // rawSnapshot is the run's snapshot.yaml artifact. Pass nil before Discover
 // has produced one: with no cluster coordinate there is nothing to resolve
 // against, so the result is the stage-1 candidate set alone and Provisional
-// is set to say so.
+// is set to say so. A rawSnapshot that cannot be parsed is treated the same
+// way -- logged and degraded to that provisional set, never an error, because
+// this endpoint asks the console's only two questions and must not go dark on
+// a corrupt artifact.
 func AvailableOptions(ctx context.Context, client API, rawSnapshot []byte) (Options, error) {
 	reg := client.CriteriaRegistry()
 	if reg == nil {
@@ -110,13 +114,25 @@ func AvailableOptions(ctx context.Context, client API, rawSnapshot []byte) (Opti
 	var base *aicr.Criteria
 	var service string
 	if len(rawSnapshot) > 0 {
-		var err error
-		snap, err = decodeSnapshot(rawSnapshot)
+		decoded, err := decodeSnapshot(rawSnapshot)
 		if err != nil {
-			return Options{}, err
+			// A corrupt snapshot must not brick the wizard. This endpoint
+			// supplies the only two questions the console ever asks, so an
+			// unreadable artifact degrades to the widened, unverified
+			// candidate set (Provisional=true) instead of failing the
+			// request. steps.Recommend still refuses the same bytes loudly
+			// and specifically if the user proceeds -- the same division of
+			// responsibility the rest of this design relies on, where the
+			// run pipeline is the backstop and the options endpoint stays
+			// available.
+			slog.WarnContext(ctx,
+				"options: snapshot unparseable, degrading to provisional catalog-wide options",
+				"error", err, "snapshotBytes", len(rawSnapshot))
+		} else {
+			snap = decoded
+			base = aicr.WrapCriteria(fingerprint.FromMeasurements(snap.Unwrap().Measurements).ToCriteria(reg))
+			service = base.Service
 		}
-		base = aicr.WrapCriteria(fingerprint.FromMeasurements(snap.Unwrap().Measurements).ToCriteria(reg))
-		service = base.Service
 	}
 
 	candidates, err := catalogCandidates(ctx, client, reg, service)

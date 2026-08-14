@@ -21,11 +21,17 @@ import "net/http"
 //     actually resolving it against this run's snapshot, so no offered pair
 //     can dead-end in Recommend. This is final; present it as such.
 //
-//   - provisional=true. No snapshot was available yet (or it carried nothing
-//     the fingerprint could turn into a service), so the answer is a widened
-//     catalog-wide upper bound. It contains every pair that will eventually
+//   - provisional=true. No usable snapshot yet -- none stored, or it carried
+//     nothing the fingerprint could turn into a service, or it was corrupt
+//     and could not be parsed at all. The answer is then a widened
+//     catalog-wide upper bound: it contains every pair that will eventually
 //     be offered plus some that will fail -- typically because the catalog's
 //     overlay for the pair needs an accelerator this cluster does not have.
+//
+// A corrupt snapshot.yaml deliberately degrades to provisional rather than
+// erroring: this endpoint asks the console's only two questions, so it must
+// stay available, and steps.Recommend refuses the same bytes loudly if the
+// user proceeds. The parse failure is logged by aicrclient.AvailableOptions.
 //
 // A client that fetches at mount will normally get provisional=true, because
 // the first request precedes Discover. It MUST re-fetch when the run enters
