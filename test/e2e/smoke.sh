@@ -6,12 +6,38 @@ set -euo pipefail
 CLUSTER="${CLUSTER:-aicrme-e2e}"
 NS="${NS:-aicrme}"
 IMAGE="${IMAGE:-aicrme:e2e}"
+PF_PID=""
+ec=0
 
-cleanup() { kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+# On failure, dump what a human needs before the cluster disappears: pod
+# status, recent namespace events, and the console's own logs. Task 13
+# extends this script, so a failing run that leaves nothing behind costs
+# real debugging time later.
+diagnose() {
+  echo "--- FAILURE: diagnostics before teardown ---" >&2
+  kubectl -n "${NS}" get pods -o wide >&2 2>&1 || true
+  kubectl -n "${NS}" get events --sort-by=.lastTimestamp >&2 2>&1 || true
+  kubectl -n "${NS}" logs deploy/aicrme --all-containers --tail=500 >&2 2>&1 || true
+}
+
+cleanup() {
+  local exit_code="$1"
+  if [[ -n "${PF_PID}" ]]; then
+    kill "${PF_PID}" 2>/dev/null || true
+  fi
+  if [[ "${exit_code}" -ne 0 ]]; then
+    diagnose
+  fi
+  kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
+}
+# Exit status is captured before cleanup runs anything else, and re-asserted
+# with an explicit exit at the end: bash otherwise reports the EXIT trap's
+# own last command status (from `kind delete cluster ... || true`, always 0)
+# as the script's exit code, which would hide a real failure from CI.
+trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
 
 kind create cluster --name "${CLUSTER}" --wait 120s
-docker build -t "${IMAGE}" .
+make image IMAGE="${IMAGE}"
 kind load docker-image "${IMAGE}" --name "${CLUSTER}"
 
 helm install aicrme charts/aicrme -n "${NS}" --create-namespace \
@@ -22,7 +48,6 @@ kubectl -n "${NS}" rollout status deploy/aicrme --timeout=120s
 
 kubectl -n "${NS}" port-forward svc/aicrme 18080:8080 >/dev/null 2>&1 &
 PF_PID=$!
-trap 'kill "${PF_PID}" 2>/dev/null || true; cleanup' EXIT
 sleep 3
 
 echo "--- GET / serves the SPA"

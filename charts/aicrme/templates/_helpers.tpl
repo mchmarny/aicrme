@@ -52,3 +52,35 @@ would just be a second identity for the same privilege.
 {{- define "aicrme.serviceAccountName" -}}
 {{- include "aicrme.fullname" . -}}
 {{- end -}}
+
+{{/*
+Resolves the auth password once per render and caches it in .Values.global:
+explicit .Values.auth.password, else the existing Secret's password (via
+lookup, so `helm upgrade` doesn't rotate it), else a fresh random one.
+secret.yaml and deployment.yaml's checksum/secret annotation both call this.
+Without the cache, a fresh install would call randAlphaNum from each call
+site independently, producing two different random strings in the same
+render — the real Secret would get one, the checksum the other, so the
+very next upgrade (which then deterministically reuses the real Secret's
+password from both call sites) would compute a different checksum than
+installation did, and needlessly roll the pod despite nothing changing.
+.Values.global is a plain Go map shared by reference across every template
+in the render, and is always present (Helm guarantees it), so the cache
+works regardless of which of the two call sites happens to run first.
+*/}}
+{{- define "aicrme.authPassword" -}}
+{{- if not .Values.global.aicrmeAuthPassword -}}
+{{- $name := printf "%s-auth" (include "aicrme.fullname" .) -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name -}}
+{{- $password := .Values.auth.password -}}
+{{- if not $password -}}
+{{- if $existing -}}
+{{- $password = index $existing.data "password" | b64dec -}}
+{{- else -}}
+{{- $password = randAlphaNum 24 -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set .Values.global "aicrmeAuthPassword" $password -}}
+{{- end -}}
+{{- .Values.global.aicrmeAuthPassword -}}
+{{- end -}}

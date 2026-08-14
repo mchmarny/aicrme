@@ -65,6 +65,12 @@ web: ## Builds the SPA into web/dist and syncs it into internal/web/dist for go:
 build: web ## Builds the aicrme binary with the SPA embedded
 	go build -ldflags "$(LDFLAGS)" -o bin/aicrme ./cmd/aicrme
 
+IMAGE ?= aicrme:dev
+
+.PHONY: image
+image: ## Builds the container image; GO_VERSION comes from .go-version, never hardcoded
+	docker build --build-arg GO_VERSION=$(GO_VERSION) -t $(IMAGE) .
+
 .PHONY: qualify
 qualify: web lint test-coverage check-aicr-pin ## Full local gate — must match CI exactly
 # web comes first: internal/web/dist holds only .gitkeep on a clean

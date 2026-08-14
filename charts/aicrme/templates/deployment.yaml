@@ -11,6 +11,16 @@ spec:
   template:
     metadata:
       labels: {{- include "aicrme.labels" . | nindent 8 }}
+      annotations:
+        # Forces a rollout when the auth Secret's content actually changes
+        # (e.g. `--set auth.password=new`), and only then. Hashes the
+        # memoized aicrme.authPassword helper rather than re-rendering
+        # secret.yaml wholesale: that would call its randAlphaNum generation
+        # path a second, independent time on a fresh install, producing a
+        # different random string than the one actually written to the
+        # Secret and causing the very next upgrade to see a changed checksum
+        # (and roll the pod) despite the real password never changing.
+        checksum/secret: {{ include "aicrme.authPassword" . | sha256sum }}
     spec:
       serviceAccountName: {{ include "aicrme.serviceAccountName" . }}
       # Must agree with the Dockerfile's `USER 10001` / `adduser -u 10001`.

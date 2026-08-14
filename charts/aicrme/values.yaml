@@ -1,3 +1,8 @@
+# Not user-facing: a real (not nil) map is required so _helpers.tpl's
+# aicrme.authPassword can cache the resolved password into it once per
+# render (see the comment there for why that cache exists).
+global: {}
+
 image:
   repository: ghcr.io/mchmarny/aicrme/aicrme
   tag: ""          # defaults to .Chart.AppVersion

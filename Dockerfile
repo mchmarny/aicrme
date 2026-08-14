@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
-ARG GO_VERSION=1.26.5
+# GO_VERSION has no default: .go-version is the single source of truth for
+# the toolchain version (see CLAUDE.md), so an unset build-arg here must
+# fail the build (empty tag -> invalid `FROM golang:-alpine` reference)
+# rather than silently drifting from it. `make image` supplies it.
+ARG GO_VERSION
 ARG HELM_VERSION=3.19.0
 ARG KUBECTL_VERSION=1.34.1
 
@@ -39,6 +43,7 @@ RUN apk add --no-cache bash ca-certificates curl jq tar && \
     curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" && \
     chmod +x /usr/local/bin/kubectl && \
     rm -rf /tmp/linux-${TARGETARCH} && \
+    apk del curl tar && \
     adduser -D -u 10001 aicrme
 COPY --from=build /out/aicrme /usr/local/bin/aicrme
 USER 10001
