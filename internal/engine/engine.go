@@ -116,6 +116,20 @@ func (e *Engine) Decide(runID string, decisions map[string]string) error {
 	return nil
 }
 
+// Current returns a copy of the most recently started run, or nil if none
+// has been started yet. Unlike Get, it needs no run ID -- callers that care
+// about "whatever this single-replica console is doing right now" (e.g. the
+// options endpoint deriving cluster coordinates from the latest snapshot)
+// would otherwise have no way to find it.
+func (e *Engine) Current() *Run {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.current == nil {
+		return nil
+	}
+	return e.current.Clone()
+}
+
 // Get returns a copy of the run's current state.
 func (e *Engine) Get(runID string) (*Run, error) {
 	e.mu.Lock()

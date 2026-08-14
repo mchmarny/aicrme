@@ -9,16 +9,20 @@ import (
 // Fake is a scripted API for step tests. It records call counts so tests can
 // assert a step did not re-collect a snapshot it already had.
 type Fake struct {
-	Snapshot    *aicr.Snapshot
-	Recipe      *aicr.RecipeResult
-	Registry    *aicr.CriteriaRegistry
-	SnapshotErr error
-	ResolveErr  error
+	Snapshot       *aicr.Snapshot
+	Recipe         *aicr.RecipeResult
+	Registry       *aicr.CriteriaRegistry
+	CatalogEntries []aicr.CatalogEntry
+	SnapshotErr    error
+	ResolveErr     error
+	CatalogErr     error
 
-	SnapshotCalls   int
-	ResolveCalls    int
-	LastCriteria    *aicr.Criteria
-	LastAgentConfig *aicr.AgentConfig
+	SnapshotCalls     int
+	ResolveCalls      int
+	CatalogCalls      int
+	LastCriteria      *aicr.Criteria
+	LastAgentConfig   *aicr.AgentConfig
+	LastCatalogFilter *aicr.Criteria
 }
 
 var _ API = (*Fake)(nil)
@@ -55,6 +59,17 @@ func (f *Fake) ResolveRecipeFromSnapshot(_ context.Context, c *aicr.Criteria, _ 
 
 // CriteriaRegistry returns the configured Registry, which may be nil.
 func (f *Fake) CriteriaRegistry() *aicr.CriteriaRegistry { return f.Registry }
+
+// ListCatalog records the call and the filter it was given, then returns the
+// configured CatalogEntries.
+func (f *Fake) ListCatalog(_ context.Context, filter *aicr.Criteria) ([]aicr.CatalogEntry, error) {
+	f.CatalogCalls++
+	f.LastCatalogFilter = filter
+	if f.CatalogErr != nil {
+		return nil, f.CatalogErr
+	}
+	return f.CatalogEntries, nil
+}
 
 // Close is a no-op; Fake holds no resources to release.
 func (f *Fake) Close() error { return nil }

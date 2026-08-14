@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
@@ -17,6 +18,7 @@ func TestCreateAndGetRun(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{},
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -54,6 +56,7 @@ func TestGetUnknownRunIs404(t *testing.T) {
 	b := bus.New(8)
 	srv, _ := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{},
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	ts, client := loggedInClient(t, srv.Handler())
 

@@ -27,19 +27,29 @@ type CriteriaRegistrar interface {
 	CriteriaRegistry() *aicr.CriteriaRegistry
 }
 
+// CatalogLister lists the recipe catalog's overlays, optionally narrowed by
+// criteria. This is what makes /api/options honest: querying the live
+// catalog for which (intent, platform) pairs have an overlay for a given
+// cluster's coordinates, rather than offering a static list that can
+// dead-end (see options.go's AvailableOptions).
+type CatalogLister interface {
+	ListCatalog(ctx context.Context, filter *aicr.Criteria) ([]aicr.CatalogEntry, error)
+}
+
 // API is the whole console-facing AICR surface.
 type API interface {
 	Snapshotter
 	Resolver
 	CriteriaRegistrar
+	CatalogLister
 	Close() error
 }
 
 // *aicr.Client satisfies API verbatim: CollectSnapshot, ResolveRecipeFromSnapshot,
-// CriteriaRegistry, and Close all match the signatures above exactly (confirmed
-// against `go doc github.com/NVIDIA/aicr/pkg/client/v1 Client`), so no adapter is
-// needed. This assertion makes a future AICR bump that renames or reshapes one of
-// those methods fail to compile here rather than somewhere subtler.
+// CriteriaRegistry, ListCatalog, and Close all match the signatures above exactly
+// (confirmed against `go doc github.com/NVIDIA/aicr/pkg/client/v1 Client`), so no
+// adapter is needed. This assertion makes a future AICR bump that renames or
+// reshapes one of those methods fail to compile here rather than somewhere subtler.
 var _ API = (*aicr.Client)(nil)
 
 // New returns a client backed by the recipe catalog embedded in the pinned

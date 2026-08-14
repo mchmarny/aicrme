@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
@@ -49,6 +50,7 @@ func TestLogoutClearsSession(t *testing.T) {
 func TestSessionExpiresAndIsUnauthorized(t *testing.T) {
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: 10 * time.Millisecond, LoginRate: 100,
+		AICR: &aicrclient.Fake{},
 	}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -68,7 +70,7 @@ func TestSessionExpiresAndIsUnauthorized(t *testing.T) {
 }
 
 func TestConfigDefaultsApply(t *testing.T) {
-	srv, err := api.New(api.Config{Password: "pw"}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
+	srv, err := api.New(api.Config{Password: "pw", AICR: &aicrclient.Fake{}}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
@@ -86,6 +88,7 @@ func TestEventStreamSinceQueryParamFallback(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{},
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)

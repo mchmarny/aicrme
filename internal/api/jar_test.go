@@ -2,9 +2,12 @@ package api_test
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"sync"
 )
+
+func newRecorder() *httptest.ResponseRecorder { return httptest.NewRecorder() }
 
 type cookieJar struct {
 	mu      sync.Mutex

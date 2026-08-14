@@ -12,9 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/steps"
 	"github.com/mchmarny/aicrme/internal/version"
 	"github.com/mchmarny/aicrme/internal/web"
 )
@@ -37,8 +39,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	client, err := aicrclient.New()
+	if err != nil {
+		slog.Error("AICR client init failed", "error", err)
+		os.Exit(1)
+	}
+
 	b := bus.New(replayCapacity)
-	eng := engine.New(b, engine.NewMemoryStore())
+	eng := engine.New(b, engine.NewMemoryStore(),
+		steps.NewDiscover(client, steps.DiscoverConfig{
+			Namespace:  envOr("AICRME_NAMESPACE", "aicrme"),
+			Image:      os.Getenv("AICRME_SNAPSHOT_IMAGE"),
+			Privileged: true,
+			Timeout:    10 * time.Minute,
+		}),
+		steps.NewRecommend(client),
+	)
 
 	srv, err := api.New(api.Config{
 		Username:   envOr("AICRME_USERNAME", "admin"),
@@ -46,11 +62,13 @@ func main() {
 		SessionTTL: 8 * time.Hour,
 		LoginRate:  10,
 		TLS:        os.Getenv("AICRME_TLS") == "true",
+		AICR:       client,
 	}, b, eng, static)
 	if err != nil {
 		slog.Error("server configuration invalid", "error", err)
 		os.Exit(1)
 	}
+	defer func() { _ = client.Close() }()
 
 	httpSrv := &http.Server{
 		Addr:              *addr,

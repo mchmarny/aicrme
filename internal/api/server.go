@@ -12,6 +12,7 @@ import (
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 )
@@ -25,6 +26,10 @@ type Config struct {
 	LoginRate int
 	// TLS marks the session cookie Secure.
 	TLS bool
+	// AICR backs GET /api/options: it asks the live recipe catalog which
+	// intents and platforms actually have an overlay for this cluster,
+	// rather than the console offering a static list that can dead-end.
+	AICR aicrclient.API
 }
 
 // Server wires the HTTP routes.
@@ -33,6 +38,7 @@ type Server struct {
 	bus    *bus.Bus
 	engine *engine.Engine
 	static fs.FS
+	aicr   aicrclient.API
 }
 
 // New validates cfg and returns a Server.
@@ -49,7 +55,10 @@ func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error
 	if cfg.LoginRate <= 0 {
 		cfg.LoginRate = 10
 	}
-	return &Server{auth: newAuthenticator(cfg), bus: b, engine: e, static: static}, nil
+	if cfg.AICR == nil {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "aicr client must not be nil")
+	}
+	return &Server{auth: newAuthenticator(cfg), bus: b, engine: e, static: static, aicr: cfg.AICR}, nil
 }
 
 // Handler returns the fully routed http.Handler.
@@ -65,6 +74,7 @@ func (s *Server) Handler() http.Handler {
 
 	protected := http.NewServeMux()
 	protected.HandleFunc("GET /api/events", s.handleEvents)
+	protected.HandleFunc("GET /api/options", s.handleOptions)
 	protected.HandleFunc("POST /api/runs", s.handleCreateRun)
 	protected.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
 	protected.HandleFunc("POST /api/runs/{id}/decide", s.handleDecide)

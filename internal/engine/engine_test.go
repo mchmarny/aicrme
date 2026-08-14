@@ -171,6 +171,30 @@ func TestGetDuringStepIsRaceFree(t *testing.T) {
 	}
 }
 
+func TestCurrentReturnsNilBeforeAnyRun(t *testing.T) {
+	e := engine.New(bus.New(8), engine.NewMemoryStore())
+	if got := e.Current(); got != nil {
+		t.Errorf("Current() = %v, want nil before Start", got)
+	}
+}
+
+func TestCurrentReturnsCopyOfLatestRun(t *testing.T) {
+	b := bus.New(64)
+	e := engine.New(b, engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	run, _ := e.Start(context.Background())
+	waitState(t, e, run.ID, engine.StateDone)
+
+	got := e.Current()
+	if got == nil || got.ID != run.ID {
+		t.Fatalf("Current() = %v, want run %q", got, run.ID)
+	}
+	got.Decisions["tamper"] = "yes"
+	again := e.Current()
+	if _, ok := again.Decisions["tamper"]; ok {
+		t.Error("Current() returned a live reference, not a copy")
+	}
+}
+
 func TestPhaseEventsPublished(t *testing.T) {
 	b := bus.New(64)
 	e := engine.New(b, engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))

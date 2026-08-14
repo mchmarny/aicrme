@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
@@ -20,6 +21,7 @@ func newTestServer(t *testing.T) http.Handler {
 		Password:   "correct-horse",
 		SessionTTL: time.Hour,
 		LoginRate:  100,
+		AICR:       &aicrclient.Fake{},
 	}, bus.New(64), engine.New(bus.New(64), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -82,7 +84,7 @@ func TestProtectedRoutesRequireSession(t *testing.T) {
 
 func TestLoginRateLimited(t *testing.T) {
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "pw", SessionTTL: time.Hour, LoginRate: 2,
+		Username: "admin", Password: "pw", SessionTTL: time.Hour, LoginRate: 2, AICR: &aicrclient.Fake{},
 	}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
