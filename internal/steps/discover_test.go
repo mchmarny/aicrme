@@ -129,6 +129,56 @@ func TestDiscoverEmitsGapWarnings(t *testing.T) {
 	}
 }
 
+// TestDiscoverPlumbsAgentConfig proves DiscoverConfig actually reaches the
+// AgentConfig CollectSnapshot is called with — every field non-default so the
+// test cannot pass against an accidentally empty *aicr.AgentConfig{}.
+// Fake.LastAgentConfig only exists because CollectSnapshot used to discard
+// its cfg argument entirely, which meant no test (including the six that
+// existed before this one) could have caught Run() passing the wrong values,
+// or none at all.
+func TestDiscoverPlumbsAgentConfig(t *testing.T) {
+	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
+	cfg := steps.DiscoverConfig{
+		Namespace:       "aicrme",
+		Image:           "ghcr.io/nvidia/aicr:v0.19.0",
+		Timeout:         3 * time.Minute,
+		Privileged:      true,
+		RequireGPU:      true,
+		DiscoverNetwork: true,
+	}
+	step := steps.NewDiscover(fake, cfg)
+
+	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	got := fake.LastAgentConfig
+	if got == nil {
+		t.Fatal("CollectSnapshot was called with a nil AgentConfig")
+	}
+	if got.Namespace != cfg.Namespace {
+		t.Errorf("Namespace = %q, want %q", got.Namespace, cfg.Namespace)
+	}
+	if got.Image != cfg.Image {
+		t.Errorf("Image = %q, want %q", got.Image, cfg.Image)
+	}
+	if got.Timeout != cfg.Timeout {
+		t.Errorf("Timeout = %v, want %v", got.Timeout, cfg.Timeout)
+	}
+	if got.Privileged != cfg.Privileged {
+		t.Errorf("Privileged = %v, want %v", got.Privileged, cfg.Privileged)
+	}
+	if got.RequireGPU != cfg.RequireGPU {
+		t.Errorf("RequireGPU = %v, want %v", got.RequireGPU, cfg.RequireGPU)
+	}
+	if got.DiscoverNetwork != cfg.DiscoverNetwork {
+		t.Errorf("DiscoverNetwork = %v, want %v", got.DiscoverNetwork, cfg.DiscoverNetwork)
+	}
+	if !got.Cleanup {
+		t.Error("Cleanup = false, want true — Discover must never leave the agent Job/RBAC behind")
+	}
+}
+
 func TestDiscoverPropagatesFailure(t *testing.T) {
 	boom := errors.New("agent job timed out")
 	fake := &aicrclient.Fake{SnapshotErr: boom}
@@ -157,5 +207,13 @@ func TestDiscoverDefaultsTimeout(t *testing.T) {
 
 	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
 		t.Fatalf("Run() error = %v", err)
+	}
+
+	const wantDefault = 10 * time.Minute
+	if fake.LastAgentConfig == nil {
+		t.Fatal("CollectSnapshot was called with a nil AgentConfig")
+	}
+	if fake.LastAgentConfig.Timeout != wantDefault {
+		t.Errorf("Timeout = %v, want default %v", fake.LastAgentConfig.Timeout, wantDefault)
 	}
 }

@@ -113,6 +113,18 @@ func TestFakeCollectSnapshot(t *testing.T) {
 	}
 }
 
+func TestFakeCollectSnapshotCapturesAgentConfig(t *testing.T) {
+	f := &aicrclient.Fake{}
+	cfg := &aicr.AgentConfig{Namespace: "aicrme", Image: "ghcr.io/nvidia/aicr:v1", Privileged: true, RequireGPU: true}
+
+	if _, err := f.CollectSnapshot(context.Background(), cfg); err != nil {
+		t.Fatalf("CollectSnapshot() error = %v", err)
+	}
+	if f.LastAgentConfig != cfg {
+		t.Fatalf("LastAgentConfig = %v, want %v", f.LastAgentConfig, cfg)
+	}
+}
+
 func TestFakeResolveRecipeFromSnapshot(t *testing.T) {
 	wantErr := errors.New("boom")
 	wantRecipe := &aicr.RecipeResult{}

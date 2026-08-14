@@ -2,6 +2,7 @@ package gap_test
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
@@ -84,10 +85,9 @@ func TestEveryGapNamesItsClosingComponent(t *testing.T) {
 }
 
 // TestGapRulesFireAgainstFixture is the table-driven check Task 9 Step 5
-// calls for: one row per rule the KWOK fixture actually proves. Rules for
-// device plugin, GPU-aware scheduler, EFA plugin, and GPU metrics are not
-// present in internal/gap/rules.go at all — see the package comment there —
-// so they have no row here either.
+// calls for: one row per rule the KWOK fixture actually proves. EFA plugin
+// has no row — see the package comment on rules in internal/gap/rules.go for
+// why it stays deferred to a real EKS fixture.
 func TestGapRulesFireAgainstFixture(t *testing.T) {
 	report := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"))
 
@@ -102,6 +102,9 @@ func TestGapRulesFireAgainstFixture(t *testing.T) {
 		component string
 	}{
 		{id: "gpu-driver", wantFire: true, component: "gpu-operator"},
+		{id: "device-plugin", wantFire: true, component: "gpu-operator"},
+		{id: "gpu-metrics", wantFire: true, component: "gpu-operator"},
+		{id: "gpu-scheduler", wantFire: true, component: "kai-scheduler"},
 	}
 
 	for _, tc := range tests {
@@ -115,6 +118,104 @@ func TestGapRulesFireAgainstFixture(t *testing.T) {
 				}
 			}
 		})
+	}
+	if len(report.Gaps) != len(tests) {
+		t.Errorf("Analyze produced %d gaps, want exactly %d (%v)", len(report.Gaps), len(tests), fired)
+	}
+}
+
+// k8sSnapshot builds a synthetic snapshot carrying a single TypeK8s
+// measurement with the given subtypes, so gpuOperatorAbsent's degraded-
+// collector guard and gpuSchedulerAbsent's image-list check can be exercised
+// with combinations the KWOK fixture alone cannot produce (it only ever shows
+// the "GPU Operator genuinely absent" case).
+func k8sSnapshot(subtypes ...measurement.Subtype) *aicr.Snapshot {
+	return aicr.WrapSnapshot(&snapshotter.Snapshot{
+		Measurements: []*measurement.Measurement{
+			{Type: measurement.TypeK8s, Subtypes: subtypes},
+		},
+	})
+}
+
+// TestDegradedK8sCollectorEmitsNoGuessedGaps is the explicit degraded-
+// collector case the review called for: an empty K8s.policy is only evidence
+// of a genuinely absent GPU Operator when K8s.image is non-empty, proving the
+// collector actually ran. When both are empty — what
+// pkg/collector/k8s/k8s.go's emptyK8sMeasurement produces on a client or
+// discovery failure — device-plugin and gpu-metrics must not fire.
+func TestDegradedK8sCollectorEmitsNoGuessedGaps(t *testing.T) {
+	tests := []struct {
+		name     string
+		subtypes []measurement.Subtype
+		wantIDs  map[string]bool
+	}{
+		{
+			name: "healthy collector, GPU Operator genuinely absent",
+			subtypes: []measurement.Subtype{
+				{Name: "image", Data: map[string]measurement.Reading{"coredns": measurement.Str("v1.13.1")}},
+				{Name: "policy", Data: map[string]measurement.Reading{}},
+			},
+			wantIDs: map[string]bool{"device-plugin": true, "gpu-metrics": true, "gpu-scheduler": true},
+		},
+		{
+			name: "degraded collector: image and policy both empty",
+			subtypes: []measurement.Subtype{
+				{Name: "image", Data: map[string]measurement.Reading{}},
+				{Name: "policy", Data: map[string]measurement.Reading{}},
+			},
+			wantIDs: map[string]bool{},
+		},
+		{
+			name: "ClusterPolicy present: GPU Operator genuinely installed",
+			subtypes: []measurement.Subtype{
+				{Name: "image", Data: map[string]measurement.Reading{"k8s-device-plugin": measurement.Str("v0.17.4")}},
+				{Name: "policy", Data: map[string]measurement.Reading{"devicePlugin.enabled": measurement.Str("true")}},
+			},
+			wantIDs: map[string]bool{"gpu-scheduler": true},
+		},
+		{
+			name: "policy subtype missing entirely, not just collected-empty",
+			subtypes: []measurement.Subtype{
+				{Name: "image", Data: map[string]measurement.Reading{"coredns": measurement.Str("v1.13.1")}},
+			},
+			wantIDs: map[string]bool{"gpu-scheduler": true},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			report := gap.Analyze(k8sSnapshot(tc.subtypes...))
+			got := map[string]bool{}
+			for _, g := range report.Gaps {
+				got[g.ID] = true
+			}
+			for id := range tc.wantIDs {
+				if !got[id] {
+					t.Errorf("gap %q did not fire, want fire", id)
+				}
+			}
+			for id := range got {
+				if !tc.wantIDs[id] {
+					t.Errorf("gap %q fired, want no fire", id)
+				}
+			}
+		})
+	}
+}
+
+// TestHeadlineWithoutProviderIsGrammatical locks in the Minor 4 fix: a
+// snapshot whose K8s.node.provider is unreadable must not produce
+// "This is a the cluster...".
+func TestHeadlineWithoutProviderIsGrammatical(t *testing.T) {
+	report := gap.Analyze(k8sSnapshot(measurement.Subtype{
+		Name: "server",
+		Data: map[string]measurement.Reading{measurement.KeyVersion: measurement.Str("1.30.0")},
+	}))
+	if report.Headline == "" {
+		t.Fatal("Headline is empty when provider is unreadable")
+	}
+	if strings.Contains(report.Headline, "a the cluster") {
+		t.Errorf("Headline = %q, contains broken %q copy", report.Headline, "a the cluster")
 	}
 }
 

@@ -15,18 +15,24 @@ type Fake struct {
 	SnapshotErr error
 	ResolveErr  error
 
-	SnapshotCalls int
-	ResolveCalls  int
-	LastCriteria  *aicr.Criteria
+	SnapshotCalls   int
+	ResolveCalls    int
+	LastCriteria    *aicr.Criteria
+	LastAgentConfig *aicr.AgentConfig
 }
 
 var _ API = (*Fake)(nil)
 
-// CollectSnapshot records the call and returns the configured Snapshot, or a
-// zero-value one when Snapshot is unset so callers can assert on a non-nil
-// result without scripting every field.
-func (f *Fake) CollectSnapshot(_ context.Context, _ *aicr.AgentConfig) (*aicr.Snapshot, error) {
+// CollectSnapshot records the call and the AgentConfig it was given, then
+// returns the configured Snapshot, or a zero-value one when Snapshot is unset
+// so callers can assert on a non-nil result without scripting every field.
+// LastAgentConfig lets a test verify a step actually plumbed its
+// DiscoverConfig through — namespace, image, timeout, privileged, and
+// require-GPU are otherwise invisible to a fake that only returns a
+// pre-scripted Snapshot regardless of what it was asked to collect.
+func (f *Fake) CollectSnapshot(_ context.Context, cfg *aicr.AgentConfig) (*aicr.Snapshot, error) {
 	f.SnapshotCalls++
+	f.LastAgentConfig = cfg
 	if f.SnapshotErr != nil {
 		return nil, f.SnapshotErr
 	}

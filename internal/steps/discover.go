@@ -21,6 +21,16 @@ type DiscoverConfig struct {
 	Timeout    time.Duration
 	Privileged bool
 	RequireGPU bool
+
+	// DiscoverNetwork enables live l8k network-fabric discovery, populating
+	// the snapshot's TypeNetworkTopology measurement — the signal the EFA
+	// plugin gap needs (see internal/gap/rules.go) and that this console does
+	// not yet key any rule on. Defaults off: per aicr.AgentConfig's doc, it is
+	// NOT read-only — discovery writes nvidia.kubernetes-launch-kit.* node
+	// labels and may patch NicClusterPolicy via server-side-apply. Reachable
+	// here so a later task (or the Phase 4 EKS fixture capture) can turn it
+	// on without touching this file again.
+	DiscoverNetwork bool
 }
 
 type discover struct {
@@ -44,12 +54,13 @@ func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) err
 	emit(bus.Event{Kind: bus.KindLog, Message: "deploying cluster snapshot agent"})
 
 	snap, err := d.client.CollectSnapshot(ctx, &aicr.AgentConfig{
-		Namespace:  d.cfg.Namespace,
-		Image:      d.cfg.Image,
-		Timeout:    d.cfg.Timeout,
-		Privileged: d.cfg.Privileged,
-		RequireGPU: d.cfg.RequireGPU,
-		Cleanup:    true,
+		Namespace:       d.cfg.Namespace,
+		Image:           d.cfg.Image,
+		Timeout:         d.cfg.Timeout,
+		Privileged:      d.cfg.Privileged,
+		RequireGPU:      d.cfg.RequireGPU,
+		DiscoverNetwork: d.cfg.DiscoverNetwork,
+		Cleanup:         true,
 	})
 	if err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "cluster snapshot failed", err)
