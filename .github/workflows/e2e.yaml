@@ -5,9 +5,18 @@ on:
 permissions:
   contents: read
 
+# One run per ref at a time: a newer push cancels an in-flight run rather
+# than queuing behind it. Each job below stands up its own Kind cluster and
+# builds an image, so a stale, superseded run left alive just burns runner
+# minutes for a result nobody will read.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - id: go
@@ -24,6 +33,7 @@ jobs:
 
   discover-recommend:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - id: go
@@ -39,3 +49,22 @@ jobs:
         with:
           install_only: true
       - run: test/e2e/discover-recommend.sh
+
+  apply-dryrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - id: go
+        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+      # install_only: apply-dryrun.sh creates and tears down its own Kind
+      # cluster (plus the KWOK controller and simulated GPU nodes inside
+      # it) and builds+loads the production console image itself; this
+      # step only needs to put kind, kubectl, and helm on the runner.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: test/e2e/apply-dryrun.sh
