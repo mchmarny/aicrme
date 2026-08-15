@@ -65,12 +65,12 @@ func (r *recommend) Run(ctx context.Context, run *engine.Run, emit engine.Emit) 
 
 	// Requires() only gates key presence in Run.Decisions, not that the
 	// values are non-blank (see engine.Engine.awaitDecisions). AICR's facade
-	// does not itself reject zero-specificity criteria -- empirically,
-	// resolving &aicr.Criteria{} against a real snapshot succeeds and
-	// returns a generic, non-representative fallback recipe instead of
-	// erroring (see task-10-report.md). A blank intent or platform would
-	// silently reproduce exactly that failure mode, so Recommend guards it
-	// here rather than trusting the facade to.
+	// does not itself reject zero-specificity criteria -- resolving
+	// &aicr.Criteria{} against a real snapshot succeeds and returns a
+	// generic, non-representative fallback recipe instead of erroring
+	// (reproduced against the embedded v0.19.0 catalog; AICR issue #1888). A
+	// blank intent or platform would silently reproduce exactly that failure
+	// mode, so Recommend guards it here rather than trusting the facade to.
 	intent := run.Decisions["intent"]
 	platform := run.Decisions["platform"]
 	if intent == "" || platform == "" {
@@ -86,11 +86,11 @@ func (r *recommend) Run(ctx context.Context, run *engine.Run, emit engine.Emit) 
 	// Belt-and-suspenders alongside the blank-decision check above: that
 	// check catches an empty string, not an explicit "any" (or a snapshot
 	// that fingerprints to nothing at all). AICR's facade does not itself
-	// guard against zero-specificity criteria -- see task-10-report.md for
-	// the empirical proof that resolving one succeeds with a generic,
-	// non-representative fallback recipe instead of erroring (issue #1888).
-	// Recommend fails closed here the way AICR's own CLI does in
-	// pkg/cli/query.go, rather than trusting the facade to.
+	// guard against zero-specificity criteria: resolving one succeeds with a
+	// generic, non-representative fallback recipe instead of erroring (AICR
+	// issue #1888; TestRecommendFailsOnZeroSpecificityCriteria pins this
+	// console's behavior). Recommend fails closed here the way AICR's own
+	// CLI does in pkg/cli/query.go, rather than trusting the facade to.
 	if specificity(criteria) == 0 {
 		return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
 			"criteria(any): the snapshot and the intent/platform decisions identify no service, "+
@@ -113,6 +113,11 @@ func (r *recommend) Run(ctx context.Context, run *engine.Run, emit engine.Emit) 
 		Name:           result.Name,
 		Version:        result.Version,
 		ComponentCount: len(result.Components),
+		// Non-nil even for a zero-component recipe: a nil slice marshals to
+		// `"components":null`, and the SPA types this field as an array and
+		// maps over it unguarded (web/src/components/Wizard.tsx's
+		// ResolvedRecommend), so a null blanks the screen.
+		Components: make([]ComponentSummary, 0, len(result.Components)),
 	}
 	for _, c := range result.Components {
 		summary.Components = append(summary.Components, ComponentSummary{
@@ -144,7 +149,7 @@ func (r *recommend) Run(ctx context.Context, run *engine.Run, emit engine.Emit) 
 // every unit test in this file (aicrclient.Fake does not validate its
 // arguments) to the first real run; and a criteria-only resolve is exactly
 // the zero-specificity, generic-fallback failure mode AICR issue #1888
-// warns about (see task-10-report.md for the empirical reproduction).
+// warns about.
 //
 // The reconstruction itself must go through snapshotter.Snapshot and
 // aicr.WrapSnapshot, not a bare &aicr.Snapshot{Raw: raw} literal: Snapshot's
@@ -183,7 +188,10 @@ func decodeSnapshot(raw []byte) (*aicr.Snapshot, error) {
 // snapshot that never observed one, and ResolveRecipeFromSnapshot will
 // reject the resulting criteria if the catalog's overlays require an
 // accelerator this combination doesn't supply. That is a limitation of the
-// hardware being simulated, not of this derivation -- see task-10-report.md.
+// hardware being simulated, not of this derivation --
+// TestRecommendKWOKGPUlessFixtureMatrix and
+// TestRecommendResolvesAgainstSimulatedH100Fixture pin both sides of that
+// line against real fixtures.
 func buildCriteria(client aicrclient.CriteriaRegistrar, snap *aicr.Snapshot, intent, platform string) (*aicr.Criteria, error) {
 	reg := client.CriteriaRegistry()
 	if reg == nil {

@@ -129,8 +129,7 @@ describe('useEvents connection lifecycle', () => {
   // Regression coverage for: a gap that never fills (the ring evicted past
   // lastId for good) reconnecting forever, each time asking the server to
   // serialize its whole backlog. Confirmed this test fails against the
-  // pre-fix code — see task-5-report.md's Round 1 fix report for the
-  // captured before/after.
+  // pre-fix code, which had no attempt ceiling at all.
   it('stops reconnecting after MAX_GAP_RECONNECT_ATTEMPTS and resumes consuming events', () => {
     vi.useFakeTimers()
     const { result } = renderHook(() => useEvents())

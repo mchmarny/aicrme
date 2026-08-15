@@ -6,7 +6,9 @@ import kwokRun from '../fixtures/kwok-run.json'
 
 // kwok-run.json is a real, recorded stream from the production bus + engine
 // + steps pipeline (internal/steps.NewDiscover / NewRecommend), not
-// hand-typed JSON -- see task-12-report.md for exactly how it was captured.
+// hand-typed JSON: it was captured by driving a real run against a KWOK
+// cluster carrying AICR's simulated H100 nodes (test/e2e/discover-recommend.sh
+// stands up the same cluster) and saving GET /api/events verbatim.
 // Slicing it at known offsets exercises Wizard against the exact event
 // shapes the server emits at each stage of a real run: events[0..8] cover
 // the discover phase ending with the capability report on event id 3;
@@ -86,8 +88,8 @@ describe('Wizard', () => {
     expect(JSON.parse(init!.body as string)).toEqual({ intent: 'training', platform: 'kubeflow' })
   })
 
-  // Important 2 (task-12 review round 1): this test used to render the full,
-  // completed stream and assert the two radiogroups were still present --
+  // Regression guard: this test used to render the full, completed stream
+  // and assert the two radiogroups were still present --
   // locking in a defect where a finished run kept an enabled Continue button
   // that would 409 against Decide's "run is not awaiting a decision" guard.
   // The correct behaviour is the opposite: once the run has moved past
@@ -105,8 +107,8 @@ describe('Wizard', () => {
     expect(screen.getByText('deploying cluster snapshot agent')).toBeDefined()
   })
 
-  // Important 3 (task-12 review round 1): the bus's replay ring is global
-  // across every run this process has started, and a page reload starts a
+  // Regression guard: the bus's replay ring is global across every run
+  // this process has started, and a page reload starts a
   // fresh run whenever the previous one is no longer live. Without
   // partitioning by runId, a reload that replays both runs' events rendered
   // the finished run A's capability report as though it belonged to the
@@ -139,8 +141,8 @@ describe('Wizard', () => {
     expect(screen.getByText('Discovering the cluster…')).toBeDefined()
   })
 
-  // Important 4 (task-12 review round 1): a failed /api/options fetch used
-  // to be swallowed by a bare `.catch(() => {})`, leaving the loading
+  // Regression guard: a failed /api/options fetch used to be swallowed by
+  // a bare `.catch(() => {})`, leaving the loading
   // placeholder on screen forever with no way to recover.
   it('surfaces a failed options fetch and recovers once the user retries', async () => {
     let calls = 0
@@ -158,7 +160,7 @@ describe('Wizard', () => {
     await waitFor(() => expect(screen.getAllByRole('radiogroup')).toHaveLength(2))
   })
 
-  // Important 5 (task-12 review round 1): internal/api/options.go's
+  // Regression guard: internal/api/options.go's
   // handleOptions doc comment is explicit that a client "MUST NOT keep
   // showing a provisional set once a verified one is available" -- Wizard
   // used to fetch once and hand the result straight to Recommend regardless

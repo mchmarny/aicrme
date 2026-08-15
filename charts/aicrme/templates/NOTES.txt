@@ -4,7 +4,7 @@ aicrme is installed.
 
 Then open:  http://localhost:8080
 
-  Username: {{ .Values.auth.username }}
+  Username: {{ include "aicrme.authUsername" . }}
   Password: kubectl -n {{ .Release.Namespace }} get secret {{ include "aicrme.fullname" . }}-auth -o jsonpath='{.data.password}' | base64 -d
 
 SECURITY: this console runs with cluster-admin. It installs privileged

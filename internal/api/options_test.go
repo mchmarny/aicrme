@@ -80,7 +80,7 @@ func TestOptionsEndpointFiltersThroughTheCatalog(t *testing.T) {
 		t.Errorf("intents = %v, want %v", got.Intents, wantIntents)
 	}
 	// "kubeflow" from the entry that names it, "any" from the entry whose
-	// Platform is unset -- the "just the runtime" option (task-10-report.md).
+	// Platform is unset -- the "just the runtime" option.
 	wantPlatforms := []string{"any", "kubeflow"}
 	if !equalStrings(got.Platforms, wantPlatforms) {
 		t.Errorf("platforms = %v, want %v", got.Platforms, wantPlatforms)

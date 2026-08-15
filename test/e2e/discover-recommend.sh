@@ -9,7 +9,8 @@
 # Why simulated GPU nodes are mandatory, not optional: a plain KWOK cluster
 # with no worker nodes has no derivable accelerator in its snapshot, so
 # every intent/platform pair fails AICR's coverage post-condition and
-# Recommend fails closed (see task-10-report.md). Of the (intent, platform)
+# Recommend fails closed (pinned by internal/steps'
+# TestRecommendKWOKGPUlessFixtureMatrix). Of the (intent, platform)
 # pairs AICR's catalog can resolve against a simulated-H100 EKS/Ubuntu
 # cluster, training/kubeflow is one -- this script drives exactly that pair,
 # never a hardcoded assumption that any pair resolves.

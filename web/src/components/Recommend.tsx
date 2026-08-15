@@ -47,9 +47,12 @@ function Choice({ name, legend, values, value, onChange, describe }: {
   )
 }
 
-export function Recommend({ options, recipe, onDecide }: {
+// Recommend is the ask-form only. It never renders the resolved recipe:
+// Wizard mounts it solely while the run is awaiting_decision, and the recipe
+// does not exist until after the decisions are submitted. Wizard's own
+// ResolvedRecommend renders it once it does.
+export function Recommend({ options, onDecide }: {
   options: Options
-  recipe: RecipeSummary | null
   onDecide: (d: { intent: string; platform: string }) => void
 }) {
   const [intent, setIntent] = useState('')
@@ -78,19 +81,6 @@ export function Recommend({ options, recipe, onDecide }: {
       >
         Continue
       </button>
-
-      {recipe && (
-        <details className="rounded border border-slate-800 bg-slate-900 p-3">
-          <summary className="cursor-pointer text-slate-200">
-            <strong>{recipe.componentCount} components</strong>, every version pinned and signed
-          </summary>
-          <ul className="mt-3 space-y-1 font-mono text-xs text-slate-400">
-            {recipe.components.map(c => (
-              <li key={c.name}>{c.name} {c.version} → {c.namespace}</li>
-            ))}
-          </ul>
-        </details>
-      )}
     </section>
   )
 }

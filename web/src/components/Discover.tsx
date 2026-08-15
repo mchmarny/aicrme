@@ -50,13 +50,12 @@ export function Discover({ report }: { report: CapabilityReport }) {
       </p>
 
       {/*
-        Minor 6 (task-12 review round 1): this used to promise "node detail,
-        driver versions, taints, labels, raw snapshot" behind the fold, none
-        of which the SPA has -- the browser only ever receives the fields in
-        CapabilityReport above (see the "how the screens get their data"
-        section of task-12-report.md), not the raw snapshot.yaml artifact.
-        The copy now describes exactly what is dumped below: this same
-        report, as JSON.
+        The fold deliberately promises nothing beyond CapabilityReport. The
+        browser only ever receives that struct, published as the Data field
+        of the discover phase's log event (internal/steps/discover.go) --
+        the raw snapshot.yaml artifact never reaches the SPA, so copy
+        offering "node detail, driver versions, taints, labels, raw
+        snapshot" here would be advertising data this screen cannot show.
       */}
       <details className="text-sm text-slate-500">
         <summary className="cursor-pointer">Full capability report as JSON</summary>

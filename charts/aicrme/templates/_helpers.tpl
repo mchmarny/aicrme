@@ -54,6 +54,16 @@ would just be a second identity for the same privilege.
 {{- end -}}
 
 {{/*
+The console's single login username. Deliberately a fixed literal rather
+than a value: the product is single-user with no user management, the server
+falls back to this same name when AICRME_USERNAME is unset (internal/api.New),
+and the SPA's login form posts it verbatim (web/src/components/Login.tsx). A
+--set-able username could only ever make those three disagree, and the
+symptom would be a permanent 401 against an otherwise-healthy console.
+*/}}
+{{- define "aicrme.authUsername" -}}admin{{- end -}}
+
+{{/*
 Resolves the auth password once per render and caches it on .Values:
 explicit .Values.auth.password, else the existing Secret's password (via
 lookup, so `helm upgrade` doesn't rotate it), else a fresh random one.

@@ -196,8 +196,8 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
   }
 
   function renderRecommend() {
-    // Important 2 (task-12 review round 1): the run's own state, not just
-    // its phase, gates the ask-form. Phase stays "recommend" for the rest
+    // Regression guard: the run's own state, not just its phase, gates
+    // the ask-form. Phase stays "recommend" for the rest
     // of the run once reached -- finish() (internal/engine/engine.go:262)
     // emits no Phase on "run done"/"run failed" -- so gating on phase alone
     // kept re-rendering an enabled Continue button after the decision was
@@ -232,7 +232,7 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
             These options could not be verified against the cluster snapshot — some may not resolve.
           </p>
         )}
-        <Recommend options={options} recipe={run.recipe} onDecide={handleDecide} />
+        <Recommend options={options} onDecide={handleDecide} />
       </div>
     )
   }

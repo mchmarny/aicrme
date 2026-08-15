@@ -19,9 +19,10 @@ import (
 // platform dimension (pkg/recipe.CriteriaPlatformAny stringifies to this).
 // An overlay whose own Criteria.Platform is blank or this value applies
 // regardless of the platform decision -- the "just the runtime, no specific
-// platform" option (the product spec's fourth user-facing platform choice;
-// see task-10-report.md for how "none", an earlier and invalid guess at this
-// value, was ruled out).
+// platform" option (the product spec's fourth user-facing platform choice).
+// It must be exactly this string: pkg/recipe's ParsePlatform rejects "none",
+// so spelling it that way would silently make every "just the runtime" pair
+// unofferable.
 const platformAny = "any"
 
 // Options is the two decisions the console ever asks for.

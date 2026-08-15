@@ -44,7 +44,6 @@ const minimalSnapshot = "apiVersion: aicr.nvidia.com/v1\nkind: Snapshot\n"
 // control-plane-only cluster with no worker nodes at all), this fixture's
 // node topology carries real nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3
 // labels the fingerprint package can actually derive an accelerator from.
-// See task-10-report.md for exactly how this was captured.
 func loadH100Snapshot(t *testing.T) *aicr.Snapshot {
 	t.Helper()
 	raw, err := os.ReadFile("testdata/snapshot-kwok-h100.yaml")
@@ -95,6 +94,72 @@ func TestRecommendMapsDecisionsToCriteria(t *testing.T) {
 	}
 	if fake.LastCriteria.Platform != "kubeflow" {
 		t.Errorf("Criteria.Platform = %q, want %q", fake.LastCriteria.Platform, "kubeflow")
+	}
+}
+
+// TestRecommendDerivesCriteriaFromTheSnapshot is the one thing the whole
+// Recommend step exists to do: everything except intent and platform is
+// derived from the cluster's own snapshot, never asked for. The other
+// criteria tests here run against minimalSnapshot, which carries no
+// measurements at all, so they can only ever pin the two decisions the user
+// overlays -- a regression that dropped the fingerprint derivation entirely
+// (or stopped passing it to the resolver) would leave every one of them
+// green. This asserts the derived dimensions actually reach the resolver,
+// using the real captured H100 fixture and a Fake that records the criteria
+// verbatim.
+func TestRecommendDerivesCriteriaFromTheSnapshot(t *testing.T) {
+	fake := &aicrclient.Fake{Recipe: recipeFixture()}
+	step := steps.NewRecommend(fake)
+
+	run := newRun()
+	run.Decisions["intent"] = "training"
+	run.Decisions["platform"] = "kubeflow"
+	run.Artifacts["snapshot.yaml"] = loadH100Snapshot(t).Raw
+
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	got := fake.LastCriteria
+	if got == nil {
+		t.Fatal("resolver was called without criteria")
+	}
+	if got.Service != "kind" {
+		t.Errorf("Criteria.Service = %q, want %q — the fixture's own measurements say kind", got.Service, "kind")
+	}
+	if got.Accelerator == "" || got.Accelerator == "any" {
+		t.Errorf("Criteria.Accelerator = %q, want the fixture's simulated H100 accelerator", got.Accelerator)
+	}
+	if got.Nodes == 0 {
+		t.Error("Criteria.Nodes = 0, want the fixture's node count")
+	}
+	if got.Intent != "training" || got.Platform != "kubeflow" {
+		t.Errorf("Criteria intent/platform = %q/%q, want the user's decisions overlaid on the derivation",
+			got.Intent, got.Platform)
+	}
+}
+
+// TestRecommendMarshalsEmptyComponentsAsArray pins the JSON shape the SPA
+// depends on: recipe.json's `components` is typed as an array and mapped
+// over unguarded in web/src/components/Wizard.tsx, so a nil slice marshaling
+// to `null` blanks the Recommend screen. A recipe that resolves zero
+// components is unusual but not impossible, and it must serialize as [].
+func TestRecommendMarshalsEmptyComponentsAsArray(t *testing.T) {
+	fake := &aicrclient.Fake{Recipe: &aicr.RecipeResult{Name: "empty", Version: "0.19.0"}}
+	step := steps.NewRecommend(fake)
+
+	run := newRun()
+	run.Decisions["intent"] = "training"
+	run.Decisions["platform"] = "kubeflow"
+	run.Artifacts["snapshot.yaml"] = []byte(minimalSnapshot)
+
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	encoded := string(run.Artifacts["recipe.json"])
+	if !strings.Contains(encoded, `"components":[]`) {
+		t.Errorf("recipe.json = %s, want components encoded as [] (null blanks the SPA)", encoded)
 	}
 }
 
@@ -253,10 +318,10 @@ func TestRecommendRejectsEmptyDecisionValues(t *testing.T) {
 // aicrclient.Fake never rejects anything, so a regression here would pass
 // every other test in this file while failing on every real run.
 //
-// Empirically (aicr v0.19.0, embedded catalog, round 2 of this task):
-// buildCriteria correctly derives service="kind" and nodes=1 from the KWOK
-// fixture's own measurements (confirmed via a throwaway diagnostic script,
-// not shipped) — the fingerprint-derivation wiring itself works. Resolution
+// Empirically (aicr v0.19.0, embedded catalog): buildCriteria correctly
+// derives service="kind" and nodes=1 from the KWOK fixture's own
+// measurements — the fingerprint-derivation wiring itself works, and
+// TestRecommendDerivesCriteriaFromTheSnapshot pins that directly. Resolution
 // still fails for Criteria{Service:"kind", Intent:"training",
 // Platform:"kubeflow", Nodes:1}, but for a precise, catalog-stated reason:
 // intent=training and platform=kubeflow both require an accelerator (h100)
@@ -264,10 +329,9 @@ func TestRecommendRejectsEmptyDecisionValues(t *testing.T) {
 // of a cluster with no GPU hardware — which is exactly what the KWOK demo
 // path is (a simulated cluster, no GPU hardware, per the product spec). This
 // is not a bug in criteria derivation; it is a real gap between AICR's
-// catalog coverage and a no-GPU demo cluster. See task-10-report.md, "The
-// KWOK specificity question, round 2" for the full empirical matrix across
-// every (intent, platform) pair Task 11 plans to offer, and what it means
-// for Task 13.
+// catalog coverage and a no-GPU demo cluster. TestRecommendKWOKGPUlessFixtureMatrix
+// below pins the full matrix across every (intent, platform) pair the
+// console offers.
 func TestRecommendResolveAgainstRealFixture(t *testing.T) {
 	client, err := aicrclient.New()
 	if err != nil {
@@ -285,7 +349,7 @@ func TestRecommendResolveAgainstRealFixture(t *testing.T) {
 	runErr := step.Run(context.Background(), run, func(bus.Event) {})
 	if runErr == nil {
 		t.Fatal("Run() succeeded resolving fingerprint-derived criteria against the KWOK fixture — " +
-			"if AICR's catalog or KWOK's fixture changed, update this test and the Task 13 plan")
+			"if AICR's catalog or KWOK's fixture changed, update this test")
 	}
 
 	var se *aicrerrors.StructuredError
@@ -305,8 +369,8 @@ func TestRecommendResolveAgainstRealFixture(t *testing.T) {
 // the literal "any" sentinel (non-blank, so the earlier blank-decision check
 // does not catch it) produces Criteria{Service:"any", Accelerator:"any",
 // Intent:"any", OS:"any", Platform:"any", Nodes:0} -- Specificity()==0.
-// AICR's facade does not reject this itself (see task-10-report.md); this
-// test proves Recommend does, before ever calling the resolver.
+// AICR's facade does not reject this itself (AICR issue #1888); this test
+// proves Recommend does, before ever calling the resolver.
 func TestRecommendFailsOnZeroSpecificityCriteria(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
 	step := steps.NewRecommend(fake)
@@ -376,7 +440,7 @@ func TestRecommendKWOKGPUlessFixtureMatrix(t *testing.T) {
 				runErr := step.Run(context.Background(), run, func(bus.Event) {})
 				if wantErr && runErr == nil {
 					t.Fatalf("intent=%s platform=%s: Run() succeeded against the GPU-less KWOK fixture — "+
-						"AICR's catalog changed; update task-10-report.md and re-evaluate the Task 13 plan",
+						"AICR's catalog changed; re-derive the expected matrix above",
 						intent, platform)
 				}
 				if !wantErr && runErr != nil {
@@ -392,8 +456,8 @@ func TestRecommendKWOKGPUlessFixtureMatrix(t *testing.T) {
 // TestRecommendResolvesAgainstSimulatedH100Fixture is the answer to the
 // question the GPU-less fixture cannot answer: with a real accelerator
 // signal in the snapshot (AICR's own simulated H100 nodes, applied via
-// AICR's own kwok/scripts/apply-nodes.sh -- see loadH100Snapshot and
-// task-10-report.md), does Recommend's fingerprint-derived criteria
+// AICR's own kwok/scripts/apply-nodes.sh -- see loadH100Snapshot), does
+// Recommend's fingerprint-derived criteria
 // actually resolve a real, sensibly-shaped recipe? For five of the twelve
 // (intent, platform) pairs, yes -- pinned here with real client,
 // real fixture, real resolution, and an assertion that every resolved
@@ -432,7 +496,7 @@ func TestRecommendResolvesAgainstSimulatedH100Fixture(t *testing.T) {
 				if wantErr {
 					if runErr == nil {
 						t.Fatalf("intent=%s platform=%s: Run() succeeded against the simulated-H100 fixture — "+
-							"AICR's catalog changed; update task-10-report.md and re-evaluate the Task 13 plan",
+							"AICR's catalog changed; re-derive the expected matrix above",
 							intent, platform)
 					}
 					t.Logf("intent=%s platform=%s: err=%v", intent, platform, runErr)

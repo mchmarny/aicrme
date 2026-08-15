@@ -8,7 +8,8 @@ service:
   port: 8080
 
 auth:
-  username: admin
+  # No username knob: the console is single-user by design and the login name
+  # is fixed to "admin" (see aicrme.authUsername in templates/_helpers.tpl).
   password: ""     # generated when empty, preserved across upgrade
 
 resources:
