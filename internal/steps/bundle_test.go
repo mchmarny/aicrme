@@ -121,6 +121,42 @@ func TestBundleFailsClosedOnVersionDrift(t *testing.T) {
 	}
 }
 
+// TestBundleFailsClosedOnComponentCountLengthMismatch pins a narrower drift
+// shape than the two tests above: a persisted recipe.json (Phase 2b's
+// kubectl-editable ConfigMap store) whose self-reported componentCount
+// agrees with the re-resolved recipe's real component count, but whose
+// components array actually has fewer entries. assertMatchesApproved used
+// to bound its comparison loop by the untrustworthy componentCount field
+// rather than len(summary.Components), so this shape passed the count guard
+// and then panicked indexing summary.Components out of range -- and
+// step.Run executes on engine.Engine's step goroutine, which has no
+// recover, so that panic took down the whole process rather than just
+// failing the run. This must return an error, not panic.
+func TestBundleFailsClosedOnComponentCountLengthMismatch(t *testing.T) {
+	fake := &aicrclient.Fake{Recipe: recipeFixture()} // 2 components
+	step := steps.NewBundle(fake, steps.BundleConfig{WorkDir: t.TempDir()})
+
+	run := newRun()
+	run.Decisions["intent"] = "training"
+	run.Decisions["platform"] = "kubeflow"
+	run.Artifacts["snapshot.yaml"] = []byte(minimalSnapshot)
+	// componentCount (2) matches recipeFixture()'s real component count, but
+	// the components array backing it has only one entry.
+	run.Artifacts["recipe.json"] = []byte(`{"name":"h100-eks-ubuntu-training","version":"0.19.0","componentCount":2,` +
+		`"components":[{"name":"gpu-operator","kind":"Helm","version":"v26.3.3","namespace":"gpu-operator"}]}`)
+
+	err := step.Run(context.Background(), run, func(bus.Event) {})
+	if err == nil {
+		t.Fatal("Run() error = nil, want an error naming the count mismatch, not a panic")
+	}
+	if !strings.Contains(err.Error(), "component count") {
+		t.Errorf("Run() error = %v, want it to name the count mismatch", err)
+	}
+	if fake.BundleCalls != 0 {
+		t.Errorf("MakeBundle called %d times, want 0 -- must not bundle a malformed recipe.json", fake.BundleCalls)
+	}
+}
+
 func TestBundleRequiresRecommendToHaveRun(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
 	step := steps.NewBundle(fake, steps.BundleConfig{WorkDir: t.TempDir()})

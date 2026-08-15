@@ -113,10 +113,17 @@ func assertMatchesApproved(result *aicr.RecipeResult, approved []byte) error {
 	if err := json.Unmarshal(approved, &summary); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "stored recipe.json is unparseable", err)
 	}
-	if len(result.Components) != summary.ComponentCount {
+	// Bounded by len(summary.Components), the slice the loop below actually
+	// indexes -- not the self-reported summary.ComponentCount. recipe.json is
+	// Phase 2b's persisted, kubectl-editable ConfigMap state: a
+	// ComponentCount that disagrees with the real length of Components would
+	// pass this check and then panic on the out-of-range index below, and a
+	// panic here runs on engine.Engine's step goroutine, which has no
+	// recover -- it takes the whole console process down, not just the run.
+	if len(result.Components) != len(summary.Components) {
 		return aicrerrors.New(aicrerrors.ErrCodeInternal, fmt.Sprintf(
 			"re-resolved recipe drifted from the approved one: component count %d, approved %d",
-			len(result.Components), summary.ComponentCount))
+			len(result.Components), len(summary.Components)))
 	}
 	for i, c := range result.Components {
 		a := summary.Components[i]

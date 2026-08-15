@@ -32,10 +32,10 @@ const criteriaAny = "any"
 // silently degrading to a criteria-only resolve. Two reasons: the real
 // aicr.Client already rejects a nil snapshot outright ("snapshot is required
 // (got nil)"), so silently proceeding would only defer this failure past
-// every unit test in this file (aicrclient.Fake does not validate its
-// arguments) to the first real run; and a criteria-only resolve is exactly
-// the zero-specificity, generic-fallback failure mode AICR issue #1888
-// warns about.
+// every Recommend/Bundle unit test that calls this function (aicrclient.Fake
+// does not validate its arguments) to the first real run; and a
+// criteria-only resolve is exactly the zero-specificity, generic-fallback
+// failure mode AICR issue #1888 warns about.
 //
 // The reconstruction itself must go through snapshotter.Snapshot and
 // aicr.WrapSnapshot, not a bare &aicr.Snapshot{Raw: raw} literal: Snapshot's
