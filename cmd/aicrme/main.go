@@ -16,6 +16,7 @@ import (
 
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
+	"github.com/mchmarny/aicrme/internal/applier"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/steps"
@@ -39,6 +40,11 @@ const defaultSnapshotAgentImage = "ghcr.io/nvidia/aicr:v0.19.0"
 // and the helm/kubectl cache variables at subdirectories of it, which is
 // what lets the pod run with readOnlyRootFilesystem: true.
 const defaultWorkDir = "/var/lib/aicrme"
+
+// defaultApplyRetries is deploy.sh's per-component retry budget, matching
+// the script's own default. Its backoff is quadratic and each attempt
+// surfaces as a warn event, so the wait is visible rather than silent.
+const defaultApplyRetries = 5
 
 // workSubdirs are the directories the console and deploy.sh need writable.
 // With readOnlyRootFilesystem: true, the emptyDir at AICRME_WORK_DIR is the
@@ -114,6 +120,14 @@ func main() {
 		steps.NewRecommend(client),
 		steps.NewBundle(client, steps.BundleConfig{
 			WorkDir: workDir,
+		}),
+		steps.NewApply(applier.New(applier.BashExec{}), steps.ApplyConfig{
+			Retries: defaultApplyRetries,
+			// Not exposed in values.yaml, deliberately -- same treatment as
+			// AICRME_SNAPSHOT_NODE_SELECTOR. It exists so the CI end-to-end
+			// test can exercise the real deploy.sh and the real helm binary
+			// against a cluster with no GPUs without installing anything.
+			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
 		}),
 	)
 
