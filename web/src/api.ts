@@ -70,3 +70,18 @@ export async function decide(runId: string, decisions: Record<string, string>): 
   if (!res.ok) throw new ApiError(res.status, 'Failed to submit decision')
   return res.json()
 }
+
+export async function retryRun(runId: string): Promise<Run> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/retry`, { method: 'POST' })
+  if (!res.ok) throw new ApiError(res.status, 'Failed to retry the run')
+  return res.json()
+}
+
+/**
+ * bundleUrl is a plain href rather than a fetch: the browser's own download
+ * handling gets the filename from Content-Disposition, and the session
+ * cookie rides along on the navigation.
+ */
+export function bundleUrl(runId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/bundle`
+}

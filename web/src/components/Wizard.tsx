@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AicrEvent } from '../useEvents'
-import { ApiError, decide as decideApi, fetchOptions, type Options } from '../api'
+import { ApiError, decide as decideApi, fetchOptions, retryRun, type Options } from '../api'
+import { Cockpit } from './Cockpit'
 import { Discover, type CapabilityReport } from './Discover'
 import { Recommend, type RecipeSummary } from './Recommend'
 import { Timeline } from './Timeline'
@@ -25,7 +26,7 @@ import { Timeline } from './Timeline'
  */
 type RunPhase = 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'done'
 
-interface RunState {
+export interface RunState {
   runId?: string
   phase?: string
   state: RunPhase
@@ -185,11 +186,26 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
     return () => { canceled = true; clearTimeout(timer) }
   }, [run.phase, retryToken])
 
-  async function handleDecide(d: { intent: string; platform: string }) {
+  // Record<string, string> rather than the original { intent, platform }
+  // literal: the cockpit's confirm gate sends { apply: 'yes' } through this
+  // same path. Recommend's own call site keeps compiling unchanged --
+  // { intent, platform } is assignable to Record<string, string>, and
+  // function-parameter contravariance holds under strictFunctionTypes.
+  async function handleDecide(d: Record<string, string>) {
     if (!run.runId) return
     setDecideError('')
     try {
       await decideApi(run.runId, d)
+    } catch (err) {
+      setDecideError(err instanceof ApiError ? err.message : (err as Error).message)
+    }
+  }
+
+  async function handleRetry() {
+    if (!run.runId) return
+    setDecideError('')
+    try {
+      await retryRun(run.runId)
     } catch (err) {
       setDecideError(err instanceof ApiError ? err.message : (err as Error).message)
     }
@@ -237,13 +253,22 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
     )
   }
 
+  // The layout expands into the cockpit once the run reaches Bundle/Apply:
+  // the timeline rail narrows from w-96 to w-80, and Cockpit itself (unlike
+  // Discover/Recommend) renders full-width rather than centered under
+  // mx-auto max-w-2xl, so the live component pipeline gets the room a
+  // one-line-per-decision wizard screen never needed.
+  const cockpit = run.phase === 'bundle' || run.phase === 'apply'
+
   return (
     <div className="flex gap-8">
       <div className="min-w-0 flex-1">
         {run.error && <p className="mb-4 text-red-400 text-sm">{run.error}</p>}
         {decideError && <p className="mb-4 text-red-400 text-sm">{decideError}</p>}
 
-        {run.phase === 'recommend' ? (
+        {cockpit ? (
+          <Cockpit events={events} run={run} onDecide={handleDecide} onRetry={handleRetry} />
+        ) : run.phase === 'recommend' ? (
           renderRecommend()
         ) : run.report ? (
           <Discover report={run.report} />
@@ -252,7 +277,7 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
         )}
       </div>
 
-      <aside className="w-96 shrink-0 border-l border-slate-800 pl-8">
+      <aside className={`${cockpit ? 'w-80' : 'w-96'} shrink-0 border-l border-slate-800 pl-8`}>
         <Timeline events={events} />
       </aside>
     </div>

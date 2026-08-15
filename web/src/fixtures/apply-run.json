@@ -1,0 +1,263 @@
+[
+  {
+    "id": 1,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.100000Z",
+    "kind": "phase",
+    "phase": "recommend",
+    "level": "info",
+    "message": "phase started"
+  },
+  {
+    "id": 2,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.140000Z",
+    "kind": "log",
+    "phase": "recommend",
+    "level": "info",
+    "message": "4 components, every version pinned",
+    "data": {
+      "name": "criteria(service=kind, accelerator=h100, intent=training, platform=kubeflow, nodes=7)",
+      "version": "dev",
+      "componentCount": 4,
+      "components": [
+        { "name": "cert-manager", "kind": "Helm", "version": "v1.20.2", "namespace": "cert-manager", "chart": "cert-manager", "source": "https://charts.jetstack.io" },
+        { "name": "gpu-operator", "kind": "Helm", "version": "v26.3.3", "namespace": "gpu-operator", "chart": "gpu-operator", "source": "https://helm.ngc.nvidia.com/nvidia" },
+        { "name": "kai-scheduler", "kind": "Helm", "version": "v0.14.1", "namespace": "kai-scheduler", "chart": "kai-scheduler", "source": "oci://ghcr.io/kai-scheduler/kai-scheduler" },
+        { "name": "kubeflow-trainer", "kind": "Helm", "version": "2.2.0", "namespace": "kubeflow", "chart": "kubeflow-trainer", "source": "oci://ghcr.io/kubeflow/charts" }
+      ]
+    }
+  },
+  {
+    "id": 3,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.180000Z",
+    "kind": "phase",
+    "phase": "recommend",
+    "level": "info",
+    "message": "phase complete"
+  },
+  {
+    "id": 4,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.190000Z",
+    "kind": "phase",
+    "phase": "bundle",
+    "level": "info",
+    "message": "phase started"
+  },
+  {
+    "id": 5,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.240000Z",
+    "kind": "log",
+    "phase": "bundle",
+    "level": "info",
+    "message": "generating bundle for 4 components"
+  },
+  {
+    "id": 6,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.510000Z",
+    "kind": "log",
+    "phase": "bundle",
+    "level": "info",
+    "message": "bundle ready: 42 files, 118392 bytes"
+  },
+  {
+    "id": 7,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.520000Z",
+    "kind": "phase",
+    "phase": "bundle",
+    "level": "info",
+    "message": "phase complete"
+  },
+  {
+    "id": 8,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:02:11.530000Z",
+    "kind": "decision",
+    "phase": "apply",
+    "level": "info",
+    "message": "awaiting decision"
+  },
+  {
+    "id": 9,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:03:47.010000Z",
+    "kind": "phase",
+    "phase": "apply",
+    "level": "info",
+    "message": "phase started"
+  },
+  {
+    "id": 10,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:03:47.020000Z",
+    "kind": "log",
+    "phase": "apply",
+    "level": "info",
+    "message": "applying the bundle"
+  },
+  {
+    "id": 11,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:03:47.500000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "cert-manager",
+    "message": "installing cert-manager",
+    "data": { "name": "cert-manager", "namespace": "cert-manager", "index": 1, "total": 5, "status": "started" }
+  },
+  {
+    "id": 12,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:03:59.870000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "cert-manager",
+    "message": "cert-manager installed",
+    "data": { "name": "cert-manager", "status": "installed" }
+  },
+  {
+    "id": 13,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:03:59.880000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "gpu-operator",
+    "message": "installing gpu-operator",
+    "data": { "name": "gpu-operator", "namespace": "gpu-operator", "index": 2, "total": 5, "status": "started" }
+  },
+  {
+    "id": 14,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:07:12.330000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "gpu-operator",
+    "message": "gpu-operator installed",
+    "data": { "name": "gpu-operator", "status": "installed" }
+  },
+  {
+    "id": 15,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:07:12.340000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "kubeflow-trainer",
+    "message": "installing kubeflow-trainer",
+    "data": { "name": "kubeflow-trainer", "namespace": "kubeflow", "index": 3, "total": 5, "status": "started" }
+  },
+  {
+    "id": 16,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:07:26.910000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "kubeflow-trainer",
+    "message": "kubeflow-trainer installed",
+    "data": { "name": "kubeflow-trainer", "status": "installed" }
+  },
+  {
+    "id": 17,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:07:26.920000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "kubeflow-trainer-post",
+    "message": "installing kubeflow-trainer-post",
+    "data": { "name": "kubeflow-trainer-post", "namespace": "kubeflow", "index": 4, "total": 5, "status": "started" }
+  },
+  {
+    "id": 18,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:07:31.440000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "kubeflow-trainer-post",
+    "message": "kubeflow-trainer-post installed",
+    "data": { "name": "kubeflow-trainer-post", "status": "installed" }
+  },
+  {
+    "id": 19,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:07:31.450000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "info",
+    "component": "kai-scheduler",
+    "message": "installing kai-scheduler",
+    "data": { "name": "kai-scheduler", "namespace": "kai-scheduler", "index": 5, "total": 5, "status": "started" }
+  },
+  {
+    "id": 20,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:07:52.100000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "warn",
+    "component": "kai-scheduler",
+    "message": "kai-scheduler: attempt 1 of 2 failed, retrying in 5s",
+    "data": { "name": "kai-scheduler", "status": "retrying", "attempt": 1, "maxAttempts": 2, "retryInSeconds": 5 }
+  },
+  {
+    "id": 21,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:08:19.760000Z",
+    "kind": "component",
+    "phase": "apply",
+    "level": "error",
+    "component": "kai-scheduler",
+    "message": "kai-scheduler failed after 2 attempts",
+    "data": { "name": "kai-scheduler", "status": "failed", "attempt": 2 }
+  },
+  {
+    "id": 22,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:08:19.770000Z",
+    "kind": "error",
+    "phase": "apply",
+    "level": "error",
+    "component": "kai-scheduler",
+    "message": "deploy.sh failed: exit status 1",
+    "data": {
+      "component": "kai-scheduler",
+      "exitError": "exit status 1",
+      "tail": [
+        "└─ ✗ kai-scheduler FAILED (after 2 attempts)",
+        "Error: INSTALLATION FAILED: failed post-install: timed out waiting for the condition",
+        "podgroupcontroller-6d8f9c7b5-x2n4q   0/1   CrashLoopBackOff   5 (2m ago)   9m",
+        "queuecontroller-7c9b6d4f8-p8k2m      0/1   CrashLoopBackOff   5 (2m ago)   9m",
+        "Events: FailedScheduling: 0/7 nodes are available: 7 Insufficient nvidia.com/gpu",
+        "✗ Deployment failed: kai-scheduler"
+      ]
+    }
+  },
+  {
+    "id": 23,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:08:19.780000Z",
+    "kind": "error",
+    "phase": "apply",
+    "level": "error",
+    "message": "bundle apply failed: exit status 1"
+  },
+  {
+    "id": 24,
+    "runId": "9c1e5a7b3d2f4081",
+    "at": "2026-08-15T09:08:19.790000Z",
+    "kind": "phase",
+    "level": "error",
+    "message": "run failed"
+  }
+]
