@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { ApiError, startRun } from './api'
 import { Login } from './components/Login'
 import { Wizard } from './components/Wizard'
@@ -18,13 +18,20 @@ export default function App() {
   // div its own block formatting context so the margin stays inside it.
   return (
     <div className="min-h-screen flow-root bg-slate-950 text-slate-100">
-      {authed ? <Console /> : <Login onSuccess={() => setAuthed(true)} />}
+      {authed ? <Console onUnauthorized={() => setAuthed(false)} /> : <Login onSuccess={() => setAuthed(true)} />}
     </div>
   )
 }
 
-function Console() {
-  const { events, connected, eventsLost } = useEvents()
+function Console({ onUnauthorized }: { onUnauthorized: () => void }) {
+  // useEvents depends on this callback's identity to decide whether to
+  // re-run its connection effect (see useEvents.ts's doc comment): wrapping
+  // it in useCallback keeps it stable across Console's own re-renders, even
+  // though the onUnauthorized prop itself is currently a fresh closure per
+  // App render. Without this, the SSE stream would tear down and reopen on
+  // every render.
+  const handleUnauthorized = useCallback(() => onUnauthorized(), [onUnauthorized])
+  const { events, connected, eventsLost } = useEvents(handleUnauthorized)
   const [startError, setStartError] = useState('')
   const [retryToken, setRetryToken] = useState(0)
 

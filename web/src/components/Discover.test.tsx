@@ -8,6 +8,7 @@ const report: CapabilityReport = {
   punchline: '0 of 64 GPUs are usable by a workload today.',
   usableGpus: 0,
   totalGpus: 64,
+  analyzed: true,
   gaps: [
     { id: 'gpu-driver', title: 'No GPU driver installed, the kernel does not see the devices', component: 'gpu-operator' },
     { id: 'device-plugin', title: 'No device plugin, Kubernetes cannot schedule nvidia.com/gpu', component: 'gpu-operator' },
@@ -46,6 +47,7 @@ describe('Discover', () => {
       punchline: '8 of 8 GPUs are usable by a workload today.',
       usableGpus: 8,
       totalGpus: 8,
+      analyzed: true,
       gaps: null as unknown as CapabilityReport['gaps'],
     }
     render(<Discover report={fullyCapable} />)
@@ -57,5 +59,23 @@ describe('Discover', () => {
   it('renders a positive statement for an empty (non-null) gaps array too', () => {
     render(<Discover report={{ ...report, gaps: [] }} />)
     expect(screen.getByTestId('no-gaps')).toBeDefined()
+  })
+
+  // gap.Report.Analyzed distinguishes "every capability already present"
+  // from "nothing measured at all" -- both produce zero gaps, but only the
+  // first earns the green already-capable copy.
+  it('renders a caveat, not a congratulation, when no snapshot was ever analyzed', () => {
+    const unmeasured: CapabilityReport = {
+      headline: 'No cluster snapshot available.',
+      punchline: "Run Discover to capture the cluster's current state.",
+      usableGpus: 0,
+      totalGpus: 0,
+      analyzed: false,
+      gaps: null as unknown as CapabilityReport['gaps'],
+    }
+    render(<Discover report={unmeasured} />)
+    expect(screen.getByTestId('no-snapshot').textContent).toMatch(/not.*clean bill of health|nothing has been measured/i)
+    expect(screen.queryByTestId('no-gaps')).toBeNull()
+    expect(screen.queryAllByTestId(/^gap-/)).toHaveLength(0)
   })
 })
