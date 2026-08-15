@@ -21,3 +21,21 @@ jobs:
         with:
           install_only: true
       - run: test/e2e/smoke.sh
+
+  discover-recommend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: go
+        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+      # install_only: discover-recommend.sh creates and tears down its own
+      # Kind cluster (plus the KWOK controller and simulated GPU nodes
+      # inside it); this step only needs to put kind, kubectl, and helm on
+      # the runner.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: test/e2e/discover-recommend.sh

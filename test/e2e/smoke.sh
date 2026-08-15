@@ -3,22 +3,16 @@
 # page and rejects unauthenticated API access.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
 CLUSTER="${CLUSTER:-aicrme-e2e}"
 NS="${NS:-aicrme}"
 IMAGE="${IMAGE:-aicrme:e2e}"
+JAR="$(mktemp -t aicrme-smoke-jar.XXXXXX)"
 PF_PID=""
 ec=0
-
-# On failure, dump what a human needs before the cluster disappears: pod
-# status, recent namespace events, and the console's own logs. Task 13
-# extends this script, so a failing run that leaves nothing behind costs
-# real debugging time later.
-diagnose() {
-  echo "--- FAILURE: diagnostics before teardown ---" >&2
-  kubectl -n "${NS}" get pods -o wide >&2 2>&1 || true
-  kubectl -n "${NS}" get events --sort-by=.lastTimestamp >&2 2>&1 || true
-  kubectl -n "${NS}" logs deploy/aicrme --all-containers --tail=500 >&2 2>&1 || true
-}
 
 cleanup() {
   local exit_code="$1"
@@ -26,8 +20,9 @@ cleanup() {
     kill "${PF_PID}" 2>/dev/null || true
   fi
   if [[ "${exit_code}" -ne 0 ]]; then
-    diagnose
+    e2e_diagnose "${NS}"
   fi
+  rm -f "${JAR}"
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
 # Exit status is captured before cleanup runs anything else, and re-asserted
@@ -37,14 +32,8 @@ cleanup() {
 trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
 
 kind create cluster --name "${CLUSTER}" --wait 120s
-make image IMAGE="${IMAGE}"
-kind load docker-image "${IMAGE}" --name "${CLUSTER}"
-
-helm install aicrme charts/aicrme -n "${NS}" --create-namespace \
-  --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE#*:}" \
-  --set image.pullPolicy=Never --wait --timeout 5m
-
-kubectl -n "${NS}" rollout status deploy/aicrme --timeout=120s
+e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
+e2e_install_chart "${NS}" "${IMAGE}"
 
 kubectl -n "${NS}" port-forward svc/aicrme 18080:8080 >/dev/null 2>&1 &
 PF_PID=$!
@@ -60,10 +49,7 @@ echo "--- GET /api/events is 401 without a session"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/api/events)" == "401" ]]
 
 echo "--- login then POST /api/runs succeeds"
-PASSWORD="$(kubectl -n "${NS}" get secret aicrme-auth -o jsonpath='{.data.password}' | base64 -d)"
-curl -fsS -c /tmp/aicrme.jar -X POST http://localhost:18080/api/login \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"admin\",\"password\":\"${PASSWORD}\"}"
-curl -fsS -b /tmp/aicrme.jar -X POST http://localhost:18080/api/runs | grep -q '"id"'
+e2e_login "localhost:18080" "${JAR}" "${NS}"
+curl -fsS -b "${JAR}" -X POST http://localhost:18080/api/runs | grep -q '"id"'
 
 echo "PASS: smoke test green"

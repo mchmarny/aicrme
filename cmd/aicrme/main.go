@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +25,13 @@ import (
 // replayCapacity bounds the event ring. A full real-hardware run emits a few
 // thousand events; this keeps the whole timeline replayable to a late tab.
 const replayCapacity = 20000
+
+// defaultSnapshotAgentImage is the snapshot agent image used when
+// AICRME_SNAPSHOT_IMAGE is unset. Must track go.mod's github.com/NVIDIA/aicr
+// version (also pinned in .settings.yaml under dependencies.aicr) -- a stale
+// tag here is the first thing that breaks on a fresh customer cluster, since
+// Discover cannot fall back to anything else.
+const defaultSnapshotAgentImage = "ghcr.io/nvidia/aicr:v0.19.0"
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -48,10 +56,28 @@ func main() {
 	b := bus.New(replayCapacity)
 	eng := engine.New(b, engine.NewMemoryStore(),
 		steps.NewDiscover(client, steps.DiscoverConfig{
-			Namespace:  envOr("AICRME_NAMESPACE", "aicrme"),
-			Image:      os.Getenv("AICRME_SNAPSHOT_IMAGE"),
-			Privileged: true,
-			Timeout:    10 * time.Minute,
+			Namespace: envOr("AICRME_NAMESPACE", "aicrme"),
+			// aicr.Client.CollectSnapshot forwards Image verbatim to the Job
+			// spec's container -- unlike the `aicr` CLI, the Go client applies
+			// no fallback of its own (verified against pkg/client/v1 and
+			// pkg/k8s/agent/job.go in the pinned module). An empty string here
+			// reaches the API server as `image: ""`, which container
+			// validation rejects outright, so Discover would fail before the
+			// Job is even scheduled. defaultSnapshotAgentImage reproduces the
+			// same ghcr.io/nvidia/aicr:<version> mapping the CLI's own
+			// defaultAgentImage() uses (pkg/cli/root.go), pinned to this
+			// console's aicr dependency (go.mod / .settings.yaml
+			// dependencies.aicr) rather than derived at runtime.
+			Image: envOr("AICRME_SNAPSHOT_IMAGE", defaultSnapshotAgentImage),
+			// Unset (nil) on every real deployment: aicr.Client.CollectSnapshot
+			// then auto-targets a real GPU node itself (see the NodeSelector
+			// doc on steps.DiscoverConfig). AICRME_SNAPSHOT_NODE_SELECTOR
+			// exists only so a KWOK-simulated cluster (this console's own
+			// e2e test) can pin the agent Job off the tainted, fake-executing
+			// simulated GPU nodes and onto a real one.
+			NodeSelector: parseNodeSelector(os.Getenv("AICRME_SNAPSHOT_NODE_SELECTOR")),
+			Privileged:   true,
+			Timeout:      10 * time.Minute,
 		}),
 		steps.NewRecommend(client),
 	)
@@ -100,4 +126,30 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseNodeSelector turns a "key=value,key2=value2" list into a node
+// selector map, or nil for an empty string -- so an unset
+// AICRME_SNAPSHOT_NODE_SELECTOR leaves DiscoverConfig.NodeSelector nil and
+// the aicr module's own real-cluster GPU auto-targeting applies unchanged.
+// A malformed pair (no "=", or an empty key) is skipped rather than failing
+// startup: one mistyped entry should degrade to "no override", not crash
+// the console.
+func parseNodeSelector(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, pair := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(pair, "=")
+		k = strings.TrimSpace(k)
+		if !ok || k == "" {
+			continue
+		}
+		out[k] = strings.TrimSpace(v)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

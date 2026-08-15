@@ -139,12 +139,15 @@ func TestDiscoverEmitsGapWarnings(t *testing.T) {
 func TestDiscoverPlumbsAgentConfig(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
 	cfg := steps.DiscoverConfig{
-		Namespace:       "aicrme",
-		Image:           "ghcr.io/nvidia/aicr:v0.19.0",
-		Timeout:         3 * time.Minute,
-		Privileged:      true,
-		RequireGPU:      true,
-		DiscoverNetwork: true,
+		Namespace:          "aicrme",
+		Image:              "ghcr.io/nvidia/aicr:v0.19.0",
+		JobName:            "custom-job",
+		ServiceAccountName: "custom-sa",
+		NodeSelector:       map[string]string{"node-role.kubernetes.io/control-plane": ""},
+		Timeout:            3 * time.Minute,
+		Privileged:         true,
+		RequireGPU:         true,
+		DiscoverNetwork:    true,
 	}
 	step := steps.NewDiscover(fake, cfg)
 
@@ -161,6 +164,15 @@ func TestDiscoverPlumbsAgentConfig(t *testing.T) {
 	}
 	if got.Image != cfg.Image {
 		t.Errorf("Image = %q, want %q", got.Image, cfg.Image)
+	}
+	if got.JobName != cfg.JobName {
+		t.Errorf("JobName = %q, want %q", got.JobName, cfg.JobName)
+	}
+	if got.ServiceAccountName != cfg.ServiceAccountName {
+		t.Errorf("ServiceAccountName = %q, want %q", got.ServiceAccountName, cfg.ServiceAccountName)
+	}
+	if got.NodeSelector["node-role.kubernetes.io/control-plane"] != "" || len(got.NodeSelector) != 1 {
+		t.Errorf("NodeSelector = %v, want %v", got.NodeSelector, cfg.NodeSelector)
 	}
 	if got.Timeout != cfg.Timeout {
 		t.Errorf("Timeout = %v, want %v", got.Timeout, cfg.Timeout)
@@ -215,5 +227,32 @@ func TestDiscoverDefaultsTimeout(t *testing.T) {
 	}
 	if fake.LastAgentConfig.Timeout != wantDefault {
 		t.Errorf("Timeout = %v, want default %v", fake.LastAgentConfig.Timeout, wantDefault)
+	}
+}
+
+// TestDiscoverDefaultsAgentName proves JobName and ServiceAccountName are
+// defaulted when left blank rather than reaching CollectSnapshot as "".
+// aicr.Client.CollectSnapshot applies no default of its own for either field
+// (unlike the `aicr` CLI, which defaults both via its own flag layer) — an
+// empty JobName or ServiceAccountName reaches the API server as
+// `metadata.name: ""` and is rejected outright, failing Discover on every
+// cluster. See the identical reasoning on defaultAgentName in discover.go.
+func TestDiscoverDefaultsAgentName(t *testing.T) {
+	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
+	// JobName and ServiceAccountName left zero-valued.
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+
+	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if fake.LastAgentConfig == nil {
+		t.Fatal("CollectSnapshot was called with a nil AgentConfig")
+	}
+	if fake.LastAgentConfig.JobName == "" {
+		t.Error("JobName is empty — CollectSnapshot would reach the API server as metadata.name: \"\"")
+	}
+	if fake.LastAgentConfig.ServiceAccountName == "" {
+		t.Error("ServiceAccountName is empty — CollectSnapshot would reach the API server as metadata.name: \"\"")
 	}
 }
