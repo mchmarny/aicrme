@@ -145,15 +145,39 @@ func TestParseLineToleratesEmptyNamespace(t *testing.T) {
 // The real captured transcript is the regression guard: it is what an AICR
 // bump actually changes.
 func TestParseTranscriptFixtures(t *testing.T) {
+	// noCountCheck marks a count field as unpinned: the failure fixture's
+	// exact inventory hasn't been measured, so only presence/absence is
+	// asserted for it.
+	const noCountCheck = -1
+
 	tests := []struct {
 		file          string
 		wantStarted   bool
 		wantInstalled bool
 		wantFailed    bool
 		wantRetrying  bool
+
+		// Exact counts, checked only when >= 0. deploy-transcript-kwok.txt
+		// is a frozen captured artifact, not a live view of AICR's catalog,
+		// so these numbers are a property of that file and cannot drift on
+		// an AICR bump -- they change only at a deliberate re-capture,
+		// which is exactly when a maintainer should be re-verifying them by
+		// hand. Hardcoding them here does not violate "derive, never
+		// hardcode".
+		wantStartedCount   int
+		wantInstalledCount int
+		wantFailedCount    int
+		wantRetryingCount  int
+		wantPhaseOKCount   int
 	}{
-		{file: "testdata/deploy-transcript-kwok.txt", wantStarted: true, wantInstalled: true},
-		{file: "testdata/deploy-transcript-failure.txt", wantStarted: true, wantInstalled: true, wantFailed: true, wantRetrying: true},
+		{
+			file: "testdata/deploy-transcript-kwok.txt", wantStarted: true, wantInstalled: true,
+			wantStartedCount: 14, wantInstalledCount: 14, wantFailedCount: 0, wantRetryingCount: 0, wantPhaseOKCount: 2,
+		},
+		{
+			file: "testdata/deploy-transcript-failure.txt", wantStarted: true, wantInstalled: true, wantFailed: true, wantRetrying: true,
+			wantStartedCount: noCountCheck, wantInstalledCount: noCountCheck, wantFailedCount: noCountCheck, wantRetryingCount: noCountCheck, wantPhaseOKCount: noCountCheck,
+		},
 	}
 
 	for _, tt := range tests {
@@ -163,20 +187,23 @@ func TestParseTranscriptFixtures(t *testing.T) {
 				t.Fatalf("read fixture error = %v", err)
 			}
 			seen := map[string]bool{}
-			preflight := false
+			counts := map[string]int{}
+			phaseOKCount := 0
 			for _, line := range strings.Split(string(raw), "\n") {
 				e, ok := parseLine(line)
 				if !ok {
 					continue
 				}
 				if e.Kind == bus.KindPhase {
-					preflight = true
+					phaseOKCount++
 				}
 				if e.Kind == bus.KindComponent {
-					seen[componentData(t, e).Status] = true
+					status := componentData(t, e).Status
+					seen[status] = true
+					counts[status]++
 				}
 			}
-			if !preflight {
+			if phaseOKCount == 0 {
 				t.Error("no phase event parsed -- the preflight marker is missing or changed")
 			}
 			if seen[StatusStarted] != tt.wantStarted {
@@ -190,6 +217,22 @@ func TestParseTranscriptFixtures(t *testing.T) {
 			}
 			if seen[StatusRetrying] != tt.wantRetrying {
 				t.Errorf("retrying seen = %v, want %v", seen[StatusRetrying], tt.wantRetrying)
+			}
+
+			if tt.wantStartedCount >= 0 && counts[StatusStarted] != tt.wantStartedCount {
+				t.Errorf("started count = %d, want %d", counts[StatusStarted], tt.wantStartedCount)
+			}
+			if tt.wantInstalledCount >= 0 && counts[StatusInstalled] != tt.wantInstalledCount {
+				t.Errorf("installed count = %d, want %d", counts[StatusInstalled], tt.wantInstalledCount)
+			}
+			if tt.wantFailedCount >= 0 && counts[StatusFailed] != tt.wantFailedCount {
+				t.Errorf("failed count = %d, want %d", counts[StatusFailed], tt.wantFailedCount)
+			}
+			if tt.wantRetryingCount >= 0 && counts[StatusRetrying] != tt.wantRetryingCount {
+				t.Errorf("retrying count = %d, want %d", counts[StatusRetrying], tt.wantRetryingCount)
+			}
+			if tt.wantPhaseOKCount >= 0 && phaseOKCount != tt.wantPhaseOKCount {
+				t.Errorf("phase-ok count = %d, want %d", phaseOKCount, tt.wantPhaseOKCount)
 			}
 		})
 	}
