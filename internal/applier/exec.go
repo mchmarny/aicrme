@@ -43,9 +43,14 @@ type BashExec struct{}
 // sends SIGTERM rather than SIGKILL so deploy.sh's own trap can remove the
 // temp workdir it created, and only escalates after killGrace.
 //
-// Because Stdout and Stderr are the same non-*os.File writer, os/exec
-// copies them on two separate goroutines, so out MUST be safe for
-// concurrent use. lineWriter is.
+// Stdout and Stderr are set to the identical writer value, so os/exec's
+// childStderr (interfaceEqual(c.Stderr, c.Stdout)) reuses Stdout's pipe for
+// Stderr too: in this wiring there is exactly one pipe and one copy
+// goroutine, not two. out must still be safe for concurrent use regardless
+// -- that single-goroutine behavior falls out of Stdout and Stderr pointing
+// at the same comparable value today, not a guarantee this method enforces,
+// so a future split into two distinct writers would silently regain two
+// concurrent copies. lineWriter is safe either way.
 func (BashExec) Run(ctx context.Context, spec Spec, out io.Writer) error {
 	//nolint:gosec // running a caller-supplied argv is this type's entire purpose -- Spec.Argv is built by Applier.Apply, not user input
 	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
@@ -59,9 +64,12 @@ func (BashExec) Run(ctx context.Context, spec Spec, out io.Writer) error {
 }
 
 // lineWriter splits everything written to it into lines and invokes fn once
-// per complete line. fn is called while holding the mutex, which serializes
-// it against the concurrent stdout and stderr copies and lets callers keep
-// unsynchronized state inside fn.
+// per complete line. fn is called while holding the mutex, which lets
+// callers keep unsynchronized state inside fn. Write must tolerate
+// concurrent callers in general -- os/exec runs two copy goroutines
+// whenever Stdout and Stderr are different writers -- so lineWriter does
+// not assume single-writer use even though BashExec happens to wire Stdout
+// and Stderr to the same value today.
 type lineWriter struct {
 	mu  sync.Mutex
 	buf []byte

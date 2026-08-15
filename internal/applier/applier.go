@@ -56,8 +56,10 @@ func (a *Applier) Apply(ctx context.Context, opts Options, emit func(bus.Event))
 
 	// Written and read only from inside the lineWriter callback, which
 	// lineWriter invokes under its own mutex, and read again after
-	// exec.Run returns -- which happens after os/exec has joined both copy
-	// goroutines, so that read is ordered after every write.
+	// exec.Run returns -- Cmd.Wait (called by cmd.Run) joins all of its
+	// internal copy goroutines before returning, so that post-Run read
+	// happens-after every callback write regardless of how many goroutines
+	// copied stdout/stderr.
 	var lastComponent string
 
 	out := newLineWriter(func(line string) {
