@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -212,5 +213,133 @@ func TestPhaseEventsPublished(t *testing.T) {
 	}
 	if phases == 0 {
 		t.Error("no phase events published")
+	}
+}
+
+// A step that fails once and then succeeds -- the exact shape Retry exists
+// for, since a mid-apply component failure is normal on real clusters.
+type flakyStep struct {
+	phase engine.Phase
+	fails int
+	runs  int
+	mu    sync.Mutex
+}
+
+func (f *flakyStep) Phase() engine.Phase { return f.phase }
+func (f *flakyStep) Requires() []string  { return nil }
+func (f *flakyStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs++
+	if f.runs <= f.fails {
+		return errors.New("boom")
+	}
+	return nil
+}
+
+func (f *flakyStep) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runs
+}
+
+func TestRetryResumesFromTheFailedStep(t *testing.T) {
+	b := bus.New(64)
+	first := newFakeStep(engine.PhaseDiscover)
+	flaky := &flakyStep{phase: engine.PhaseApply, fails: 1}
+	e := engine.New(b, engine.NewMemoryStore(), first, flaky)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	if _, err := e.Retry(run.ID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	done := waitState(t, e, run.ID, engine.StateDone)
+
+	if done.Err != "" {
+		t.Errorf("Err = %q, want cleared on a successful retry", done.Err)
+	}
+	// The first step must NOT re-run: the cursor resumes at the step that
+	// failed, so Discover's snapshot Job is not redeployed.
+	if got := len(first.ran); got != 1 {
+		t.Errorf("first step ran %d times, want 1", got)
+	}
+	if got := flaky.count(); got != 2 {
+		t.Errorf("failed step ran %d times, want 2", got)
+	}
+}
+
+func TestRetryRejectsARunThatIsNotFailed(t *testing.T) {
+	b := bus.New(64)
+	e := engine.New(b, engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	if _, err := e.Retry(run.ID); err == nil {
+		t.Error("Retry() error = nil, want a conflict on a completed run")
+	}
+}
+
+func TestRetryRejectsAnUnknownRun(t *testing.T) {
+	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	if _, err := e.Retry("nope"); err == nil {
+		t.Error("Retry() error = nil, want not-found")
+	}
+}
+
+// The epoch guard. Retry is the path that makes a second execute goroutine
+// reachable for the SAME run, which is exactly what Start's isLive check
+// cannot see: isLive answers "is a run live", not "is THIS goroutine still
+// the one driving it". A retried run must therefore reach exactly one
+// terminal state and publish exactly one terminal event -- a superseded
+// goroutine writing state again would produce two.
+func TestRetriedRunReachesExactlyOneTerminalState(t *testing.T) {
+	b := bus.New(256)
+	sub, unsubscribe := b.Subscribe(0)
+	defer unsubscribe()
+
+	flaky := &flakyStep{phase: engine.PhaseApply, fails: 1}
+	e := engine.New(b, engine.NewMemoryStore(), flaky)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	if _, err := e.Retry(run.ID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	done := waitState(t, e, run.ID, engine.StateDone)
+
+	if done.StepIndex != 1 {
+		t.Errorf("StepIndex = %d, want 1 (all steps consumed)", done.StepIndex)
+	}
+
+	// Drain what the bus has so far and count terminal events. A superseded
+	// goroutine calling finish() again is the failure this catches.
+	deadline := time.After(500 * time.Millisecond)
+	terminal := 0
+drain:
+	for {
+		select {
+		case ev := <-sub:
+			if ev.Message == "run done" {
+				terminal++
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+	if terminal != 1 {
+		t.Errorf("published %d 'run done' events, want exactly 1 -- a superseded goroutine wrote state", terminal)
 	}
 }
