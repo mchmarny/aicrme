@@ -343,3 +343,140 @@ drain:
 		t.Errorf("published %d 'run done' events, want exactly 1 -- a superseded goroutine wrote state", terminal)
 	}
 }
+
+// saveFailingStore wraps a Store and can be told to fail every Save call on
+// demand, to exercise Retry's rollback path when persistence fails.
+type saveFailingStore struct {
+	engine.Store
+	mu   sync.Mutex
+	fail bool
+}
+
+func (s *saveFailingStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return errors.New("save failed")
+	}
+	return s.Store.Save(ctx, r)
+}
+
+func (s *saveFailingStore) setFail(v bool) {
+	s.mu.Lock()
+	s.fail = v
+	s.mu.Unlock()
+}
+
+// TestRetryFailedSaveLeavesRunRetryable pins that a Save failure during
+// Retry does not wedge the run. Retry flips State to StateRunning before
+// persisting; if Save then fails and State is left at StateRunning with no
+// goroutine driving it, the run becomes unrecoverable without restarting
+// the process -- Start refuses because isLive(StateRunning) is true, and
+// Retry refuses because it requires StateFailed. This is currently inert
+// (memoryStore.Save never errors) but docs/phase-2-handoff.md's
+// ConfigMap-backed store, landing in Phase 2b, is precisely where Save
+// starts failing for real.
+func TestRetryFailedSaveLeavesRunRetryable(t *testing.T) {
+	b := bus.New(64)
+	boom := errors.New("boom")
+	a := newFakeStep(engine.PhaseDiscover)
+	a.err = boom
+	store := &saveFailingStore{Store: engine.NewMemoryStore()}
+	e := engine.New(b, store, a)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	store.setFail(true)
+	if _, retryErr := e.Retry(run.ID); retryErr == nil {
+		t.Fatal("Retry() error = nil, want the store's Save error")
+	}
+	store.setFail(false)
+
+	// The assertion that matters: State is still StateFailed, so a
+	// subsequent Retry could still succeed. Asserting only the error above
+	// would pass even with the run wedged at StateRunning.
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q -- a failed Save must not wedge the run", got.State, engine.StateFailed)
+	}
+}
+
+// flakyGatedStep requires a decision before it may run, and fails once then
+// succeeds -- it exists to pin that Retry does not re-park a run whose
+// decisions were already supplied before the failing attempt.
+type flakyGatedStep struct {
+	phase    engine.Phase
+	requires []string
+	fails    int
+	runs     int
+	mu       sync.Mutex
+}
+
+func (f *flakyGatedStep) Phase() engine.Phase { return f.phase }
+func (f *flakyGatedStep) Requires() []string  { return f.requires }
+func (f *flakyGatedStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs++
+	if f.runs <= f.fails {
+		return errors.New("boom")
+	}
+	return nil
+}
+
+// TestRetryDoesNotReparkForDecisions pins the path the product depends on:
+// a mid-Apply failure after the user has already answered its decision
+// prompt, followed by Retry, must resume straight into the step rather than
+// asking the question again. Retry never touches Decisions, and
+// awaitDecisions only checks key presence, so this should already hold --
+// but nothing pinned it, and a future change to either would silently
+// re-park a retried run.
+func TestRetryDoesNotReparkForDecisions(t *testing.T) {
+	b := bus.New(64)
+	step := &flakyGatedStep{phase: engine.PhaseApply, requires: []string{"apply"}, fails: 1}
+	e := engine.New(b, engine.NewMemoryStore(), step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	if err := e.Decide(run.ID, map[string]string{"apply": "yes"}); err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	if _, err := e.Retry(run.ID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			got, _ := e.Get(run.ID)
+			t.Fatalf("timed out waiting for state %q, last state %q", engine.StateDone, got.State)
+		default:
+		}
+		got, err := e.Get(run.ID)
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if got.State == engine.StateAwaitingDecision {
+			t.Fatal("Retry re-parked the run for a decision it already had")
+		}
+		if got.State == engine.StateDone {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

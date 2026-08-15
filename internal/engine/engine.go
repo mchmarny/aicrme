@@ -69,6 +69,7 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "a run is already in progress")
 	}
+	previous := e.current
 	now := time.Now().UTC()
 	r := &Run{
 		ID:        e.newID(),
@@ -86,6 +87,17 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 	e.mu.Unlock()
 
 	if err := e.store.Save(ctx, snapshot); err != nil {
+		// Undo the swap so the run is not left wedged: previous is
+		// guaranteed non-live (the isLive check above already ensured
+		// that), and no goroutine was launched for r (that only happens
+		// below, after Save succeeds), so restoring the pointer is a clean
+		// rollback. The epoch stays bumped -- see Retry's identical
+		// rationale.
+		e.mu.Lock()
+		if e.current != nil && e.current.ID == r.ID && e.aliveLocked(epoch) {
+			e.current = previous
+		}
+		e.mu.Unlock()
 		return nil, err
 	}
 	go e.execute(context.WithoutCancel(ctx), epoch)
@@ -348,6 +360,7 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not in a failed state")
 	}
+	prevErr := e.current.Err
 	e.current.State = StateRunning
 	e.current.Err = ""
 	e.current.UpdatedAt = time.Now().UTC()
@@ -358,6 +371,20 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 	e.mu.Unlock()
 
 	if err := e.store.Save(context.Background(), snapshot); err != nil {
+		// Undo the flip to StateRunning so the run is not left wedged: with
+		// no goroutine launched (that only happens below, after Save
+		// succeeds) and State no longer StateFailed, neither Start
+		// (isLive) nor Retry (requires StateFailed) could ever revive it.
+		// The epoch stays bumped regardless -- epochs are monotonic, and a
+		// bumped-but-unused epoch only invalidates goroutines that are
+		// already gone.
+		e.mu.Lock()
+		if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) {
+			e.current.State = StateFailed
+			e.current.Err = prevErr
+			e.current.UpdatedAt = time.Now().UTC()
+		}
+		e.mu.Unlock()
 		return nil, err
 	}
 	e.bus.Publish(bus.Event{
