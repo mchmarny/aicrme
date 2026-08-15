@@ -3,8 +3,18 @@
 # through the real HTTP API: create the cluster, install the KWOK controller
 # and AICR's simulated H100 nodes, install the chart, log in, create a run,
 # answer intent=training/platform=kubeflow once the run parks, and assert it
-# reaches state=done with a resolved, non-empty recipe. This is Phase 1's
-# proof that the whole no-hardware demo arc works on every PR.
+# parks a SECOND time -- pending == ["apply"] -- with a resolved,
+# non-empty recipe. This is Phase 1's proof that the whole no-hardware demo
+# arc works on every PR.
+#
+# Terminal state is the Apply confirm gate, not state=done: Phase 2a wired
+# an Apply step (internal/steps/apply.go) onto the end of this same engine
+# pipeline, requiring an explicit "apply" decision before the run can ever
+# leave awaiting_decision. This script's scope is Discover->Recommend (plus,
+# incidentally, Bundle, which runs to completion before that gate) -- it
+# never supplies that decision, so parking at the gate with a resolved
+# recipe is as far as this script goes and IS its definition of done.
+# test/e2e/apply-dryrun.sh is what drives past this gate.
 #
 # Why simulated GPU nodes are mandatory, not optional: a plain KWOK cluster
 # with no worker nodes has no derivable accelerator in its snapshot, so
@@ -295,15 +305,25 @@ curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
   -H 'Content-Type: application/json' \
   -d '{"intent":"training","platform":"kubeflow"}' >/dev/null
 
-echo "--- poll until done (Recommend complete)"
+echo "--- poll until the run parks a second time (Recommend + Bundle complete, Apply's confirm gate)"
 STATE=""
 for _ in $(seq 1 60); do
   RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
-  [[ "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
+  [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 3
 done
-[[ "${STATE}" == "done" ]] || fail_run "${RUN_JSON}"
+[[ "${STATE}" == "failed" ]] && fail_run "${RUN_JSON}"
+[[ "${STATE}" == "awaiting_decision" ]] || {
+  echo "run did not park at the confirm gate within the deadline (state=${STATE})" >&2
+  fail_run "${RUN_JSON}"
+}
+
+PENDING="$(echo "${RUN_JSON}" | jq -cS '.pending')"
+[[ "${PENDING}" == '["apply"]' ]] || {
+  echo "unexpected pending decisions at the confirm gate: ${PENDING}" >&2
+  exit 1
+}
 
 echo "--- recipe resolved; extracting component count from the SSE stream"
 # A parse failure here is a hard failure, not a warning-and-pass: this is the
