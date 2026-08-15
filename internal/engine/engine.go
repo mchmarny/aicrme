@@ -98,6 +98,17 @@ func isLive(s State) bool {
 
 // aliveLocked reports whether the goroutine holding this epoch is still the
 // one driving the current run. Callers must already hold e.mu.
+//
+// No black-box test can currently force a check here to fail: Retry only
+// launches a second execute goroutine when State == StateFailed, and
+// StateFailed is set exclusively by the first goroutine's own terminal
+// finish() call, so that goroutine has no shared-state work left by the
+// time Retry can even be called -- there is no live second writer for a
+// black-box test to catch. engine_internal_test.go pins the guard anyway by
+// manufacturing the condition directly (bumping epoch mid-step), since a
+// guard no test can break is not a guard. docs/phase-2-handoff.md's
+// "bite when Reset lands" note names the feature that will make this
+// reachable through the public API.
 func (e *Engine) aliveLocked(epoch uint64) bool { return e.epoch == epoch }
 
 // Decide supplies user decisions and unparks a run waiting on them.
