@@ -80,14 +80,28 @@ function relevantTo(events: AicrEvent[]): AicrEvent[] {
  * a generated action subordinate to the most recent real component, not as
  * a peer (OVERRIDE 1).
  *
+ * recipeComponentNames is undefined, not just empty, when the recipe hasn't
+ * loaded yet -- e.g. the SSE replay ring dropped or hasn't yet delivered the
+ * recommend phase's log event (see useEvents.ts's doc comment on
+ * subscriberBuffer), which is reachable on a page reload or simply by
+ * rendering the cockpit before that event arrives. "Unknown" and
+ * "known-empty" are different claims and only the latter licenses calling a
+ * name absent: collapsing them (e.g. via `?? []` at the call site) makes
+ * every step -- including genuinely approved components -- classify as a
+ * generated action, which is a confident claim about the recipe with no
+ * basis. When the recipe is unknown, nothing is classified as generated;
+ * every marker genuinely is a deployment action, and presenting it as an
+ * ordinary component is the fail-safe reading.
+ *
  * `index`/`total` are only present on a step's header ("started") event --
  * internal/applier/parse.go's reInstalled/reFailed/reRetry markers carry
  * neither -- so they are carried forward from the header rather than
  * derived from components.length, which would undercount a component that
  * never started (deploy.sh stopped before reaching it).
  */
-export function deriveComponents(events: AicrEvent[], recipeComponentNames: string[]): ComponentState[] {
-  const recipeSet = new Set(recipeComponentNames)
+export function deriveComponents(events: AicrEvent[], recipeComponentNames: string[] | undefined): ComponentState[] {
+  const recipeKnown = recipeComponentNames !== undefined
+  const recipeSet = new Set(recipeComponentNames ?? [])
   const order: string[] = []
   const byName = new Map<string, ComponentState>()
   let lastRealComponent: string | undefined
@@ -96,7 +110,7 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
     if (e.kind !== 'component' || !isComponentData(e.data)) continue
     const data = e.data
     const existing = byName.get(data.name)
-    const generated = !recipeSet.has(data.name)
+    const generated = recipeKnown && !recipeSet.has(data.name)
 
     const next: ComponentState = {
       ...data,

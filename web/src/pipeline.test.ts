@@ -73,6 +73,22 @@ describe('deriveComponents', () => {
     expect(real).toEqual(['cert-manager', 'gpu-operator', 'kubeflow-trainer', 'kai-scheduler'])
   })
 
+  // Regression guard: when the recipe hasn't loaded yet (e.g. the SSE
+  // replay ring dropped or hasn't yet delivered the recommend phase's log
+  // event -- see useEvents.ts's doc comment on subscriberBuffer), the
+  // caller cannot yet say a name is genuinely absent from the recipe. An
+  // unknown recipe must not be treated the same as a known-empty one:
+  // `?? []` at the call site collapsed that distinction and made every
+  // step -- including cert-manager and gpu-operator -- classify as a
+  // generated action, inverting the exact peer-vs-subordinate distinction
+  // Override 1 exists to establish. undefined (recipe unknown) must
+  // classify nothing as generated; only a known list licenses that call.
+  it('classifies nothing as generated when the recipe is not yet known', () => {
+    const got = deriveComponents(events, undefined)
+    expect(got.every(c => !c.generated)).toBe(true)
+    expect(got.every(c => c.parent === undefined)).toBe(true)
+  })
+
   it('excludes events from an older run id, the same rule deriveRunState applies', () => {
     const staleThenCurrent: AicrEvent[] = [
       {

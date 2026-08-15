@@ -82,6 +82,22 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
   )
 }
 
+/**
+ * RecipeUnknownNote is shown wherever the recipe hasn't loaded yet (see the
+ * doc comment on deriveComponents's recipeComponentNames parameter). Gate
+ * already covers this case with its own "Resolving the bundle…" text;
+ * Running/Failed/Done need the equivalent, since those are reachable with
+ * no recipe too -- e.g. after a page reload whose SSE replay missed the
+ * recommend phase's log event.
+ */
+function RecipeUnknownNote() {
+  return (
+    <p className="text-amber-400 text-xs">
+      The approved recipe hasn't loaded yet — steps below are shown as ordinary components until it does.
+    </p>
+  )
+}
+
 /** ProgressLine states the two counts side by side -- see OVERRIDE 1: a resolved recipe's component count and deploy.sh's own deployment-action total are different things and must never share one label. */
 function ProgressLine({ recipeCount, actionTotal }: { recipeCount?: number; actionTotal?: number }) {
   return (
@@ -99,6 +115,7 @@ function Running({ components, recipeCount }: { components: ComponentState[]; re
   return (
     <section className="space-y-4">
       <h2 className="text-2xl font-semibold text-slate-100">Installing the bundle</h2>
+      {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       {components.length === 0 ? (
         <p className="text-slate-500 text-sm">Generating the bundle…</p>
@@ -124,6 +141,7 @@ function Failed({
   return (
     <section className="space-y-4">
       <h2 className="text-2xl font-semibold text-red-400">Install failed</h2>
+      {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
         {components.map(c => <ComponentRow key={c.name} c={c} />)}
@@ -161,6 +179,7 @@ function Done({ components, recipeCount }: { components: ComponentState[]; recip
       <p data-testid="cockpit-success" className="text-emerald-400">
         Every component in the bundle installed successfully.
       </p>
+      {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
         {components.map(c => <ComponentRow key={c.name} c={c} />)}
@@ -182,7 +201,10 @@ export function Cockpit({ events, run, onDecide, onRetry }: {
   onDecide: (d: Record<string, string>) => void
   onRetry: () => void
 }) {
-  const recipeComponentNames = run.recipe?.components.map(c => c.name) ?? []
+  // undefined, not `?? []`, when run.recipe hasn't loaded yet: deriveComponents
+  // treats "unknown" and "known-empty" as different claims, and only the
+  // latter licenses calling a marker name a generated action.
+  const recipeComponentNames = run.recipe?.components.map(c => c.name)
   const components = deriveComponents(events, recipeComponentNames)
   const failure = deriveFailure(events)
   const recipeCount = run.recipe?.componentCount
