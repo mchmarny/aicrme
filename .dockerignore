@@ -1,0 +1,13 @@
+.git
+.github
+.superpowers
+docs
+approach.md
+bin
+coverage.out
+charts
+test
+README.md
+web/node_modules
+web/dist
+internal/web/dist

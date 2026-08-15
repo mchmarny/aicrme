@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aicrme.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "aicrme.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "aicrme.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aicrme.labels" . | nindent 8 }}
+      annotations:
+        # Forces a rollout when the auth Secret's content actually changes,
+        # and only then. The password is the Secret's only mutable field —
+        # the username is a fixed literal (aicrme.authUsername) — and it is
+        # bound into this pod's env below, so a stale one means the console
+        # authenticates against a credential NOTES.txt no longer prints.
+        # Hashes the memoized aicrme.authPassword helper rather than
+        # re-rendering secret.yaml wholesale: that would call its
+        # randAlphaNum generation path a second, independent time on a fresh
+        # install, producing a different random string than the one actually
+        # written to the Secret and causing the very next upgrade to see a
+        # changed checksum (and roll the pod) despite nothing really changing.
+        checksum/secret: {{ include "aicrme.authPassword" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "aicrme.serviceAccountName" . }}
+      # Must agree with the Dockerfile's `USER 10001` / `adduser -u 10001`.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aicrme
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: AICRME_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aicrme.fullname" . }}-auth
+                  key: username
+            - name: AICRME_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aicrme.fullname" . }}-auth
+                  key: password
+            - name: AICRME_TLS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "aicrme.fullname" . }}
+                  key: AICRME_TLS
+            - name: AICRME_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "aicrme.fullname" . }}
+                  key: AICRME_NAMESPACE
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
