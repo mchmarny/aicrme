@@ -22,12 +22,20 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: sudo apt-get update && sudo apt-get install -y bc
+      - run: sudo apt-get update && sudo apt-get install -y bc shellcheck
       - uses: mikefarah/yq@v4.53.3
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
+      # Every gate below is a make target, so `make qualify` locally runs the
+      # identical commands. They stay listed separately here only so a failure
+      # names the gate that broke rather than the whole target.
       - run: make web
-      - run: cd web && npm test
+      - run: make lint-shell
+      - run: make test-chart
+      - run: make test-web
       - run: make test-coverage
       - run: make check-aicr-pin

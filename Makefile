@@ -72,6 +72,18 @@ check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.
 		echo "check-aicr-pin: OK — snapshot agent image $$image matches pin"; \
 	fi
 
+.PHONY: lint-shell
+lint-shell: ## Lints shell scripts with shellcheck
+	shellcheck -x -P test/e2e -P test/chart test/e2e/*.sh test/chart/*.sh
+
+.PHONY: test-chart
+test-chart: ## Runs helm lint plus the chart contract assertions (offline, no cluster)
+	./test/chart/contract.sh
+
+.PHONY: test-web
+test-web: ## Runs the SPA unit tests
+	cd web && npm test
+
 .PHONY: web
 web: ## Builds the SPA into web/dist and syncs it into internal/web/dist for go:embed
 	cd web && npm ci && npm run build
@@ -90,7 +102,7 @@ image: ## Builds the container image; GO_VERSION comes from .go-version, never h
 	docker build --build-arg GO_VERSION=$(GO_VERSION) -t $(IMAGE) .
 
 .PHONY: qualify
-qualify: web lint test-coverage check-aicr-pin ## Full local gate — must match CI exactly
+qualify: web lint lint-shell test-chart test-web test-coverage check-aicr-pin ## Full local gate — must match CI exactly
 # web comes first: internal/web/dist holds only .gitkeep on a clean
 # checkout, and go test ./internal/web/... (part of test-coverage) needs the
 # real embedded index.html, not just a directory that satisfies go:embed.
