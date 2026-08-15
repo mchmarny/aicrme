@@ -33,6 +33,12 @@ const replayCapacity = 20000
 // Discover cannot fall back to anything else.
 const defaultSnapshotAgentImage = "ghcr.io/nvidia/aicr:v0.19.0"
 
+// defaultWorkDir is the writable scratch root. The chart mounts an emptyDir
+// here (charts/aicrme/templates/deployment.yaml) and points TMPDIR, HOME,
+// and the helm/kubectl cache variables at subdirectories of it, which is
+// what lets the pod run with readOnlyRootFilesystem: true.
+const defaultWorkDir = "/var/lib/aicrme"
+
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
@@ -80,6 +86,9 @@ func main() {
 			Timeout:      10 * time.Minute,
 		}),
 		steps.NewRecommend(client),
+		steps.NewBundle(client, steps.BundleConfig{
+			WorkDir: envOr("AICRME_WORK_DIR", defaultWorkDir),
+		}),
 	)
 
 	srv, err := api.New(api.Config{

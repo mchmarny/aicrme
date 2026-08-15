@@ -2,7 +2,9 @@ package aicrclient
 
 import (
 	"context"
+	"os"
 
+	"github.com/NVIDIA/aicr/pkg/bundler/result"
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 )
 
@@ -23,6 +25,12 @@ type Fake struct {
 	LastCriteria      *aicr.Criteria
 	LastAgentConfig   *aicr.AgentConfig
 	LastCatalogFilter *aicr.Criteria
+
+	Artifact  aicr.BundleArtifact
+	BundleErr error
+
+	BundleCalls   int
+	LastBundleDir string
 }
 
 var _ API = (*Fake)(nil)
@@ -73,3 +81,25 @@ func (f *Fake) ListCatalog(_ context.Context, filter *aicr.Criteria) ([]aicr.Cat
 
 // Close is a no-op; Fake holds no resources to release.
 func (f *Fake) Close() error { return nil }
+
+// MakeBundle records the call and the OutputDir it was given, then returns
+// the configured Artifact. When Artifact is unset it returns a zero-value
+// one so callers can assert on a non-nil result without scripting it, and
+// it creates OutputDir so a caller that then stats the directory sees what
+// a real bundle run would have left behind.
+func (f *Fake) MakeBundle(_ context.Context, _ *aicr.RecipeResult, opts aicr.BundleOptions) (aicr.BundleArtifact, error) {
+	f.BundleCalls++
+	f.LastBundleDir = opts.OutputDir
+	if f.BundleErr != nil {
+		return nil, f.BundleErr
+	}
+	if opts.OutputDir != "" {
+		if err := os.MkdirAll(opts.OutputDir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	if f.Artifact == nil {
+		return &result.Output{OutputDir: opts.OutputDir}, nil
+	}
+	return f.Artifact, nil
+}
