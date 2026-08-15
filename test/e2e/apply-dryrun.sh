@@ -129,9 +129,14 @@ DOCKERFILE_HELM_VERSION="$(sed -n 's/^ARG HELM_VERSION=\(.*\)$/\1/p' "${REPO_ROO
 }
 DOCKERFILE_HELM_MAJOR="${DOCKERFILE_HELM_VERSION%%.*}"
 IMAGE_HELM_VERSION="$(kubectl -n "${NS}" exec deploy/aicrme -- helm version --template '{{.Version}}')"
+# IMAGE_KUBECTL_VERSION is captured and logged for the record (it is
+# version-sensitive context for anyone reading a CI log later) but, unlike
+# helm, is not asserted against the Dockerfile's KUBECTL_VERSION pin --
+# only the helm major is required, since that is the one install.sh
+# branches its apply semantics on.
 IMAGE_KUBECTL_VERSION="$(kubectl -n "${NS}" exec deploy/aicrme -- kubectl version --client=true -o json | jq -r '.clientVersion.gitVersion')"
 IMAGE_HELM_MAJOR="$(echo "${IMAGE_HELM_VERSION}" | sed -nE 's/^v?([0-9]+)\..*/\1/p')"
-echo "Dockerfile pins helm ${DOCKERFILE_HELM_VERSION} (major ${DOCKERFILE_HELM_MAJOR}); in-image helm reports ${IMAGE_HELM_VERSION}; in-image kubectl reports ${IMAGE_KUBECTL_VERSION}"
+echo "Dockerfile pins helm ${DOCKERFILE_HELM_VERSION} (major ${DOCKERFILE_HELM_MAJOR}); in-image helm reports ${IMAGE_HELM_VERSION}; in-image kubectl reports ${IMAGE_KUBECTL_VERSION} (informational only, not asserted)"
 [[ -n "${IMAGE_HELM_MAJOR}" ]] || {
   echo "could not parse a major version out of in-image helm's own version string: ${IMAGE_HELM_VERSION}" >&2
   exit 1
@@ -253,15 +258,23 @@ echo "--- extracting the SSE stream (component statuses, the failing component, 
 # above: /api/events is a long-lived stream, so --max-time force-closes it
 # mid-read, and curl's own exit status for that (28, CURLE_OPERATION_TIMEDOUT)
 # would otherwise abort the whole script under pipefail before the STATE
-# checks below ever run. EVENTS is read once and queried with jq multiple
-# times below rather than re-fetched, since the stream is replayed from
-# the start (since=0) and would return the same content again anyway.
+# checks below ever run. The same force-close can also truncate the FINAL
+# line mid-object -- `jq -R -c 'fromjson? // empty'` re-parses each line on
+# its own and drops (rather than errors on) any that don't parse, so a
+# truncated tail is silently discarded here, once, at the source, instead
+# of resurfacing as a `jq` parse failure (and a script abort, under
+# pipefail, hiding which downstream assertion never got to run) in every
+# one of the several jq calls below that read EVENTS. EVENTS is read once
+# and queried multiple times rather than re-fetched, since the stream is
+# replayed from the start (since=0) and would return the same content
+# again anyway.
 set +e
 EVENTS="$(curl -fsS -b "${JAR}" --max-time 10 "http://${ADDR}/api/events?since=0" 2>/dev/null \
-  | sed -n 's/^data: //p')"
+  | sed -n 's/^data: //p' \
+  | jq -R -c 'fromjson? // empty')"
 set -e
 
-COMPONENT_STATUSES="$(echo "${EVENTS}" | jq -r 'select(.kind=="component") | .data.status' 2>/dev/null | sort -u)"
+COMPONENT_STATUSES="$(echo "${EVENTS}" | jq -r 'select(.kind=="component") | .data.status' | sort -u)"
 echo "component statuses observed: $(echo "${COMPONENT_STATUSES}" | tr '\n' ' ')"
 
 # This is the assertion that proves Apply actually drove deploy.sh through
@@ -303,6 +316,17 @@ echo "${COMPONENT_STATUSES}" | grep -qx 'installed' || {
 # real changed (upstream chart, recipe shape, or deploy.sh itself) and
 # this assertion must break so a human re-verifies the ceiling, rather
 # than silently keep passing (or silently keep failing) through it.
+#
+# Pinning EXPECTED_FAILING_INDEX in addition to the component name is
+# stricter than strictly required (the name alone already identifies the
+# component), and it is a second, independent thing that can legitimately
+# drift on an AICR recipe-catalog bump even when network-operator itself
+# is unaffected -- e.g. a new component inserted earlier in the recipe
+# would shift network-operator's position without changing anything
+# about the CRD-ordering limitation itself. That is an acceptable,
+# expected reason for this specific check to need updating; it is called
+# out here so a future reader isn't surprised that a routine AICR bump
+# can legitimately break this one line without indicating a real bug.
 EXPECTED_FAILING_COMPONENT="network-operator"
 EXPECTED_FAILING_INDEX="3"
 
@@ -311,20 +335,20 @@ EXPECTED_FAILING_INDEX="3"
   fail_run "${RUN_JSON}"
 }
 
-FAILED_COMPONENT="$(echo "${EVENTS}" | jq -r 'select(.kind=="component" and .data.status=="failed") | .data.name' 2>/dev/null | tail -n 1)"
+FAILED_COMPONENT="$(echo "${EVENTS}" | jq -r 'select(.kind=="component" and .data.status=="failed") | .data.name' | tail -n 1)"
 [[ "${FAILED_COMPONENT}" == "${EXPECTED_FAILING_COMPONENT}" ]] || {
   echo "run failed at an unexpected component: got '${FAILED_COMPONENT}', expected '${EXPECTED_FAILING_COMPONENT}' -- this is a real regression (or a real fix, if the previously-failing component now succeeds), not the known dry-run ceiling; investigate before touching this assertion" >&2
   fail_run "${RUN_JSON}"
 }
 
 FAILED_INDEX="$(echo "${EVENTS}" | jq -r --arg c "${EXPECTED_FAILING_COMPONENT}" \
-  'select(.kind=="component" and .data.name==$c and .data.status=="started") | .data.index' 2>/dev/null | tail -n 1)"
+  'select(.kind=="component" and .data.name==$c and .data.status=="started") | .data.index' | tail -n 1)"
 [[ "${FAILED_INDEX}" == "${EXPECTED_FAILING_INDEX}" ]] || {
   echo "${EXPECTED_FAILING_COMPONENT} failed at recipe position ${FAILED_INDEX}, expected ${EXPECTED_FAILING_INDEX} -- the recipe shape changed; re-verify the dry-run ceiling still applies" >&2
   fail_run "${RUN_JSON}"
 }
 
-ERROR_TAIL="$(echo "${EVENTS}" | jq -r 'select(.kind=="error" and .data.tail != null) | .data.tail[]' 2>/dev/null)"
+ERROR_TAIL="$(echo "${EVENTS}" | jq -r 'select(.kind=="error" and .data.tail != null) | .data.tail[]')"
 echo "${ERROR_TAIL}" | grep -q 'no matches for kind "NodeFeatureRule"' || {
   echo "${EXPECTED_FAILING_COMPONENT} failed, but not with the known nfd CRD-ordering error -- a different, unverified failure mode; investigate before touching this assertion" >&2
   fail_run "${RUN_JSON}"
