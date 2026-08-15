@@ -156,6 +156,55 @@ func TestBundleDownloadStreamsATarball(t *testing.T) {
 	}
 }
 
+// A symlink planted inside an otherwise-legitimate (in-bounds) bundle
+// directory must not be followed: the containment check validates the
+// bundle directory's own path, but says nothing about what an entry nested
+// inside it points at. os.Open follows symlinks, so without a type check a
+// bundle download can be turned into an arbitrary-file read of anything the
+// process can see -- and even setting content aside, tar.FileInfoHeader
+// reports a symlink entry as Typeflag=TypeSymlink, Size=0, so writing the
+// target's bytes under that header corrupts the archive regardless of
+// intent.
+func TestBundleDownloadRejectsSymlinkedContent(t *testing.T) {
+	secretDir := t.TempDir()
+	const secret = "TOP-SECRET-CONTENTS-not-part-of-any-bundle"
+	secretPath := filepath.Join(secretDir, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	workDir := t.TempDir()
+	runID := "run-under-test"
+	bundleDir := filepath.Join(workDir, "runs", runID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "deploy.sh"), []byte("#!/bin/bash\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if err := os.Symlink(secretPath, filepath.Join(bundleDir, "sneaky-link")); err != nil {
+		t.Fatalf("Symlink error = %v", err)
+	}
+
+	ts, client, id := newBundleTestServer(t, workDir, rawBundlePathStep{path: bundleDir})
+
+	resp, err := client.Get(ts.URL + "/api/runs/" + id + "/bundle")
+	if err != nil {
+		t.Fatalf("GET bundle error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body error = %v", err)
+	}
+	if strings.Contains(string(body), secret) {
+		t.Errorf("response leaked symlink target content: %q", body)
+	}
+}
+
 func TestBundleDownloadIsNotFoundBeforeBundleRuns(t *testing.T) {
 	workDir := t.TempDir()
 	ts, client, runID := newBundleTestServer(t, workDir, rawBundlePathStep{})

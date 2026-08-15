@@ -25,11 +25,9 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
-	// engine.Retry takes no context parameter by design (Task 7, internal/engine
-	// is locked): it only reaches context.Background() to persist the resumed
-	// run's state, not to call out to anything that needs this request's
-	// cancellation or deadline.
-	run, err := s.engine.Retry(r.PathValue("id")) //nolint:contextcheck
+	// engine.Retry takes no context parameter for the same reason as
+	// engine.Get -- see handleGetRun.
+	run, err := s.engine.Retry(r.PathValue("id")) //nolint:contextcheck // see handleGetRun
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -41,8 +39,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// engine.Get takes no context parameter by design (internal/engine is
 	// locked): it only reaches context.Background() on its store.Load
 	// fallback for a run this process didn't start, not a call this
-	// request's cancellation should govern.
-	run, err := s.engine.Get(r.PathValue("id")) //nolint:contextcheck
+	// request's cancellation should govern today. That stops being true once
+	// Phase 2b's store rewrite makes Load/Save real ConfigMap API calls --
+	// at that point context.Background() here starts ignoring genuine
+	// caller cancellation instead of hitting an in-memory map, and
+	// Engine.Get/Retry will need a context.Context parameter threaded
+	// through from these handlers. grep for contextcheck in internal/api to
+	// find every site this affects.
+	run, err := s.engine.Get(r.PathValue("id")) //nolint:contextcheck // engine.Get takes no context parameter by design; internal/engine is locked.
 	if err != nil {
 		writeErr(w, err)
 		return

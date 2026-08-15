@@ -20,9 +20,9 @@ import (
 // can inspect exactly what they are about to approve.
 func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
-	// engine.Get takes no context parameter by design (internal/engine is
-	// locked); see the identical justification on handleGetRun in runs.go.
-	run, err := s.engine.Get(runID) //nolint:contextcheck
+	// engine.Get takes no context parameter for the same reason as
+	// handleGetRun in runs.go.
+	run, err := s.engine.Get(runID) //nolint:contextcheck // see handleGetRun in runs.go
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -51,6 +51,25 @@ func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The directory being inside workDir does not make everything under it
+	// safe to stream: a symlink nested in the tree can still point anywhere
+	// the process can read, and os.Open follows it. The same "no caller
+	// does that yet is not a boundary" reasoning above applies here --
+	// nothing plants such a symlink today, but that is not a guarantee.
+	// Validated before any header is written, so a bundle that fails this
+	// check gets a clean 500 instead of a truncated, silently-malformed
+	// archive: headers sent so far cannot un-send a 200, and
+	// tar.FileInfoHeader reports Typeflag=TypeSymlink with Size=0 for an
+	// unfollowed link, so writing that entry's target bytes under a
+	// zero-length header would corrupt the stream from that point on
+	// regardless. The tree is small (bundles run tens to low hundreds of KB
+	// in practice), so a full pre-walk here is cheap.
+	if err := validateBundleTree(dir); err != nil {
+		slog.Error("bundle contains an unsupported entry", "run", runID, "error", err)
+		writeErr(w, aicrerrors.New(aicrerrors.ErrCodeInternal, "bundle contains an unsupported file type"))
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="aicrme-bundle-%s.tar.gz"`, runID))
 	w.WriteHeader(http.StatusOK)
@@ -71,8 +90,37 @@ func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// bundleEntryAllowed reports whether d is a type handleBundle will stream.
+// Only regular files and directories qualify -- symlinks, devices, sockets,
+// and FIFOs are all rejected. d.Type() reflects the entry's own Lstat-style
+// mode (WalkDir never follows a symlink to classify it), so this check is
+// itself immune to the exact bug it exists to catch.
+func bundleEntryAllowed(d fs.DirEntry) bool {
+	return d.Type().IsRegular() || d.IsDir()
+}
+
+// validateBundleTree walks dir and fails on the first entry that is not a
+// regular file or a directory, without opening or reading any file content.
+// Run before any response bytes are written -- see the comment at its call
+// site in handleBundle for why this has to be a separate pass rather than
+// folded into writeBundleTar's own walk.
+func validateBundleTree(dir string) error {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !bundleEntryAllowed(d) {
+			return fmt.Errorf("%s: unsupported file type %s", p, d.Type())
+		}
+		return nil
+	})
+}
+
 // writeBundleTar walks dir and writes each entry into tw with paths relative
-// to dir, preserving each file's mode so deploy.sh stays executable.
+// to dir, preserving each file's mode so deploy.sh stays executable. dir is
+// assumed already validated by validateBundleTree; the type check here is
+// defense in depth against a TOCTOU change between the two walks, not the
+// primary guard.
 func writeBundleTar(tw *tar.Writer, dir string) error {
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -84,6 +132,9 @@ func writeBundleTar(tw *tar.Writer, dir string) error {
 		}
 		if rel == "." {
 			return nil
+		}
+		if !bundleEntryAllowed(d) {
+			return fmt.Errorf("%s: unsupported file type %s", p, d.Type())
 		}
 
 		info, err := d.Info()
