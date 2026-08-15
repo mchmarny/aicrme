@@ -39,9 +39,13 @@ type Exec interface {
 // BashExec runs the real process.
 type BashExec struct{}
 
-// Run streams merged stdout and stderr to out. On context cancellation it
-// sends SIGTERM rather than SIGKILL so deploy.sh's own trap can remove the
-// temp workdir it created, and only escalates after killGrace.
+// Run streams merged stdout and stderr to out. deploy.sh spawns install.sh,
+// which spawns `helm upgrade --wait`, which spawns kubectl -- so on context
+// cancellation Run signals that whole process group, not just the bash
+// process os/exec started directly. It sends SIGTERM rather than SIGKILL so
+// deploy.sh's own trap (and helm's own cleanup) can run before anything is
+// force-killed, and only escalates to a group SIGKILL after killGrace, and
+// only if the tree is still alive.
 //
 // Stdout and Stderr are set to the identical writer value, so os/exec's
 // childStderr (interfaceEqual(c.Stderr, c.Stdout)) reuses Stdout's pipe for
@@ -58,8 +62,47 @@ func (BashExec) Run(ctx context.Context, spec Spec, out io.Writer) error {
 	cmd.Env = append(os.Environ(), spec.Env...)
 	cmd.Stdout = out
 	cmd.Stderr = out
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+
+	// Setpgid makes the child the leader of a new process group whose pgid
+	// equals its own pid, so signaling -pid below reaches deploy.sh's
+	// entire descendant tree instead of just the bash process os/exec
+	// started. Unix-only -- this project ships a Linux container and CI is
+	// Linux; local development is macOS, which has the same field, so no
+	// build-tag split is needed to keep `go build ./...` honest.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// reaped closes once cmd.Run has returned, i.e. once the group leader
+	// has been reaped and its pgid is free for the kernel to reuse.
+	reaped := make(chan struct{})
+	defer close(reaped)
+
+	cmd.Cancel = func() error {
+		pid := cmd.Process.Pid
+
+		// cmd.WaitDelay escalates against cmd.Process alone, which by the
+		// time it fires has already exited -- it cannot reach the group. So
+		// Run runs its own escalation, racing killGrace against reaped
+		// rather than issuing the kill after cmd.Run has already returned.
+		// The alternative -- killing -pid only after Wait reaps the leader
+		// -- is simpler but leaves a real window in which the pgid has
+		// already been recycled by an unrelated process group; racing the
+		// timer against reaped instead means the escalation only fires
+		// while the leader is (as far as this goroutine can tell) still
+		// unreaped, which shrinks that hazard to the scheduling gap between
+		// the kernel's reap and this goroutine observing it -- about as
+		// tight as it gets without a pidfd.
+		go func() {
+			select {
+			case <-time.After(killGrace):
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			case <-reaped:
+			}
+		}()
+
+		return syscall.Kill(-pid, syscall.SIGTERM)
+	}
 	cmd.WaitDelay = killGrace
+
 	return cmd.Run()
 }
 

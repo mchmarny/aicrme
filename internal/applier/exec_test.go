@@ -3,10 +3,13 @@ package applier
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -139,6 +142,92 @@ func TestBashExecRunCancelReturnsPromptly(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("Run() did not return within 20s of cancellation, want well under the 30s sleep")
+	}
+}
+
+// TestBashExecRunCancelKillsGrandchild proves cancellation reaches the whole
+// process tree, not just the direct child. TestBashExecRunCancelReturnsPromptly
+// above uses a leaf process (sh -c 'sleep 30') and would pass even if the
+// signal only reached bash while a descendant survived -- it structurally
+// cannot observe that class of bug. This test spawns a child that itself
+// backgrounds a grandchild and prints the grandchild's PID, then asserts
+// the grandchild is gone after cancellation, not merely that Run returned.
+//
+// The grandchild sleeps far longer than any deadline below it deliberately:
+// an orphaned grandchild inherits the same stdout/stderr pipe as its
+// parent, so an unsignaled grandchild can also stall Run's own return
+// (os/exec's copy goroutines block until the pipe's last writer closes it).
+// If the grandchild's own sleep were short enough to land inside the
+// waitForProcessExit deadline by coincidence, a still-broken build could
+// pass this test by dumb luck -- it did, once, during development, against
+// the very single-process form this test exists to catch. A lifetime far
+// past killGrace plus polling slack makes the natural-death race
+// impossible rather than merely unlikely.
+func TestBashExecRunCancelKillsGrandchild(t *testing.T) {
+	out := &safeBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	spec := Spec{Argv: []string{"sh", "-c", `sh -c 'sleep 120' & echo $!; wait`}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		var e BashExec
+		errCh <- e.Run(ctx, spec, out)
+	}()
+
+	pid := waitForGrandchildPID(t, out)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Run() error = nil, want an error after cancellation")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run() did not return within 20s of cancellation")
+	}
+
+	waitForProcessExit(t, pid)
+}
+
+// waitForGrandchildPID polls out for the PID the spec's shell script prints
+// before it blocks in `wait`, so the caller can cancel only once the
+// grandchild actually exists to be killed.
+func waitForGrandchildPID(t *testing.T, out *safeBuffer) int {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if line := strings.TrimSpace(out.String()); line != "" {
+			pid, err := strconv.Atoi(strings.SplitN(line, "\n", 2)[0])
+			if err == nil {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("did not observe grandchild PID within 5s, output so far = %q", out.String())
+	return 0
+}
+
+// waitForProcessExit polls pid with the standard existence probe --
+// syscall.Kill(pid, 0) delivers no signal, it only reports whether pid is
+// still addressable -- until it reports ESRCH (gone) or a deadline elapses.
+// The deadline is generous relative to killGrace so a loaded CI box cannot
+// flake this into a false failure; the assertion is eventual disappearance,
+// not exact timing.
+func waitForProcessExit(t *testing.T, pid int) {
+	t.Helper()
+
+	deadline := time.Now().Add(killGrace + 10*time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grandchild pid %d still alive %s after cancellation", pid, killGrace+10*time.Second)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
