@@ -248,48 +248,86 @@ for _ in $(seq 1 240); do
   sleep 10
 done
 
-echo "--- extracting component statuses from the SSE stream"
-# set +e/-e around this pipeline for the same reason as dump_recent_events
+echo "--- extracting the SSE stream (component statuses, the failing component, and its error)"
+# set +e/-e around this fetch for the same reason as dump_recent_events
 # above: /api/events is a long-lived stream, so --max-time force-closes it
 # mid-read, and curl's own exit status for that (28, CURLE_OPERATION_TIMEDOUT)
 # would otherwise abort the whole script under pipefail before the STATE
-# checks below ever run.
+# checks below ever run. EVENTS is read once and queried with jq multiple
+# times below rather than re-fetched, since the stream is replayed from
+# the start (since=0) and would return the same content again anyway.
 set +e
-COMPONENT_STATUSES="$(curl -fsS -b "${JAR}" --max-time 10 "http://${ADDR}/api/events?since=0" 2>/dev/null \
-  | sed -n 's/^data: //p' \
-  | jq -r 'select(.kind=="component") | .data.status' 2>/dev/null | sort -u)"
+EVENTS="$(curl -fsS -b "${JAR}" --max-time 10 "http://${ADDR}/api/events?since=0" 2>/dev/null \
+  | sed -n 's/^data: //p')"
 set -e
+
+COMPONENT_STATUSES="$(echo "${EVENTS}" | jq -r 'select(.kind=="component") | .data.status' 2>/dev/null | sort -u)"
 echo "component statuses observed: $(echo "${COMPONENT_STATUSES}" | tr '\n' ' ')"
 
-# state=="failed" is a hard failure here, not a soft "progress reached"
-# floor: the host probe this repo's plan leaned on (deploy.sh --dry-run
-# via helm v4.2.4, docs/phase-2a-task-1-findings.md) reached gate outcome
-# 1 -- exit 0, all 14 components installed -- but that probe never ran
-# through the shipped image's helm 3.19.0. Run against the real image,
-# component 3/14 (network-operator) fails deterministically: its chart
-# renders a NodeFeatureRule CR owned by nfd's CRD, but nfd (component
-# 2/14) was itself only ever dry-run, so that CRD was never actually
-# registered with the API server. helm 3's --dry-run builds typed k8s
-# objects client-side against live discovery and fails hard ("no matches
-# for kind NodeFeatureRule ... ensure CRDs are installed first"); the host
-# probe's helm 4 -- whose own --dry-run is deprecated in favor of
-# --dry-run=client, implying its default already round-trips the server --
-# tolerated the same missing CRD. This is a genuine, reproducible defect
-# in the shipped toolchain path, not a flake: asserting through it here
-# instead of softening the check is deliberate, so it stays visible in CI
-# until it's actually fixed rather than silently downgrading this gate.
-[[ "${STATE}" == "failed" ]] && fail_run "${RUN_JSON}"
-[[ "${STATE}" == "done" ]] || {
-  echo "run did not reach done or failed within the deadline (state=${STATE})" >&2
-  fail_run "${RUN_JSON}"
-}
-
 # This is the assertion that proves Apply actually drove deploy.sh through
-# the marker parser end to end, not just that the run reached done with no
-# error -- same reasoning as discover-recommend.sh's componentCount check.
+# the marker parser end to end, not just that the run reached some
+# terminal state with no error -- same reasoning as discover-recommend.sh's
+# componentCount check.
 echo "${COMPONENT_STATUSES}" | grep -qx 'installed' || {
   echo "no component reached status=installed in the SSE stream" >&2
   fail_run "${RUN_JSON}"
 }
 
-echo "PASS: apply-dryrun e2e green (run ${RUN_ID}, helm ${IMAGE_HELM_VERSION} in-image, state=done)"
+# ---- The dry-run ceiling: pinned, not asserted away ----
+#
+# state=="done" is NOT reachable here, and this is not a toolchain defect
+# to chase: on a REAL install, deploy.sh runs components in numbered
+# order, so nfd (2/14) actually installs and registers its
+# NodeFeatureRule CRD before network-operator (3/14) -- which renders one
+# -- ever runs. The chain works. But under --dry-run nothing is ever
+# really installed, so a later component's dependency on an earlier
+# component's CRD can never be satisfied, by helm 3, helm 4, or anything
+# else. helm 3's --dry-run builds typed k8s objects client-side against
+# live discovery and fails hard when the kind isn't there ("no matches
+# for kind NodeFeatureRule ... ensure CRDs are installed first"); the
+# earlier host probe (docs/phase-2a-task-1-findings.md, helm v4.2.4)
+# happened to tolerate the same missing CRD and reached exit 0 on all 14
+# components -- arguably the LESS correct behavior, and evidence that
+# probe validated a code path (install.sh branches on helm major)
+# production doesn't take, not evidence this console is broken.
+#
+# So this is the genuine ceiling of dry-run verification for an ordered
+# bundle with cross-component CRD dependencies, not a bug awaiting a fix:
+# full-chain validation needs a real install, which is Phase 4's job.
+# Asserting state=="done" would therefore never pass; asserting nothing
+# more than "it failed somewhere" would never catch a real regression
+# either. So the expected outcome is pinned by name: THIS component, AT
+# THIS position, failing with THIS reason. If any of the three drifts --
+# a different component fails, network-operator moves to a different
+# recipe position, or the error stops mentioning NodeFeatureRule -- something
+# real changed (upstream chart, recipe shape, or deploy.sh itself) and
+# this assertion must break so a human re-verifies the ceiling, rather
+# than silently keep passing (or silently keep failing) through it.
+EXPECTED_FAILING_COMPONENT="network-operator"
+EXPECTED_FAILING_INDEX="3"
+
+[[ "${STATE}" == "failed" ]] || {
+  echo "run did not fail as the known dry-run ceiling predicts (state=${STATE}) -- if this now reaches done, the network-operator/nfd CRD-ordering limitation may have been resolved upstream; a human needs to re-verify and update this pinned assertion, not just let it pass" >&2
+  fail_run "${RUN_JSON}"
+}
+
+FAILED_COMPONENT="$(echo "${EVENTS}" | jq -r 'select(.kind=="component" and .data.status=="failed") | .data.name' 2>/dev/null | tail -n 1)"
+[[ "${FAILED_COMPONENT}" == "${EXPECTED_FAILING_COMPONENT}" ]] || {
+  echo "run failed at an unexpected component: got '${FAILED_COMPONENT}', expected '${EXPECTED_FAILING_COMPONENT}' -- this is a real regression (or a real fix, if the previously-failing component now succeeds), not the known dry-run ceiling; investigate before touching this assertion" >&2
+  fail_run "${RUN_JSON}"
+}
+
+FAILED_INDEX="$(echo "${EVENTS}" | jq -r --arg c "${EXPECTED_FAILING_COMPONENT}" \
+  'select(.kind=="component" and .data.name==$c and .data.status=="started") | .data.index' 2>/dev/null | tail -n 1)"
+[[ "${FAILED_INDEX}" == "${EXPECTED_FAILING_INDEX}" ]] || {
+  echo "${EXPECTED_FAILING_COMPONENT} failed at recipe position ${FAILED_INDEX}, expected ${EXPECTED_FAILING_INDEX} -- the recipe shape changed; re-verify the dry-run ceiling still applies" >&2
+  fail_run "${RUN_JSON}"
+}
+
+ERROR_TAIL="$(echo "${EVENTS}" | jq -r 'select(.kind=="error" and .data.tail != null) | .data.tail[]' 2>/dev/null)"
+echo "${ERROR_TAIL}" | grep -q 'no matches for kind "NodeFeatureRule"' || {
+  echo "${EXPECTED_FAILING_COMPONENT} failed, but not with the known nfd CRD-ordering error -- a different, unverified failure mode; investigate before touching this assertion" >&2
+  fail_run "${RUN_JSON}"
+}
+
+echo "PASS: apply-dryrun e2e green (run ${RUN_ID}, helm ${IMAGE_HELM_VERSION} in-image; confirm gate fired, bundle downloaded, >=1 component installed, and the known dry-run ceiling confirmed: fails at ${EXPECTED_FAILING_COMPONENT} (${EXPECTED_FAILING_INDEX}/14) on the nfd CRD-ordering limitation, exactly as pinned)"
