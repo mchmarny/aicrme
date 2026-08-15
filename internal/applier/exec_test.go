@@ -34,14 +34,29 @@ func (b *safeBuffer) String() string {
 }
 
 // TestBashExecRunHonorsDirAndMergesEnv proves cmd.Dir is honored and that
-// Spec.Env is appended to (not replacing) the inherited environment -- the
-// property applier.env and Spec's doc comment depend on.
+// Spec.Env is APPENDED to the inherited environment rather than replacing
+// it. That distinction is the whole point of the test: deploy.sh and every
+// install.sh it invokes depend on inherited variables -- PATH to find helm
+// and kubectl, plus the six work-dir variables the chart sets (TMPDIR,
+// HOME, HELM_CACHE_HOME, HELM_CONFIG_HOME, HELM_DATA_HOME, KUBECACHEDIR).
+// If cmd.Env ever regressed from append to replace, every one of those
+// would vanish and the failure would show up on a real cluster as a
+// baffling helm error, not as a test failure -- so this test plants a
+// variable in the parent (t.Setenv) that Spec.Env never mentions, and
+// requires the child to see BOTH it and the injected one. Asserting only
+// the injected variable would pass under a replace just as well as an
+// append, since Spec.Env always contains it either way.
+//
+// t.Setenv forbids t.Parallel(), which is fine: nothing in this file uses
+// it.
 func TestBashExecRunHonorsDirAndMergesEnv(t *testing.T) {
+	t.Setenv("AICRME_INHERITED_MARKER", "from-parent")
+
 	dir := t.TempDir()
 	out := &safeBuffer{}
 	spec := Spec{
 		Dir:  dir,
-		Argv: []string{"sh", "-c", "pwd; echo $AICRME_TEST_VAR"},
+		Argv: []string{"sh", "-c", `pwd; echo "$AICRME_TEST_VAR"; echo "$AICRME_INHERITED_MARKER"`},
 		Env:  []string{"AICRME_TEST_VAR=merged"},
 	}
 
@@ -51,8 +66,8 @@ func TestBashExecRunHonorsDirAndMergesEnv(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("output = %q, want 2 lines (pwd, env var)", out.String())
+	if len(lines) != 3 {
+		t.Fatalf("output = %q, want 3 lines (pwd, injected var, inherited var)", out.String())
 	}
 
 	// Compare via EvalSymlinks: t.TempDir() can return a path through a
@@ -70,7 +85,10 @@ func TestBashExecRunHonorsDirAndMergesEnv(t *testing.T) {
 		t.Errorf("pwd = %q, want %q -- Spec.Dir not honored", lines[0], dir)
 	}
 	if lines[1] != "merged" {
-		t.Errorf("$AICRME_TEST_VAR = %q, want %q -- Spec.Env not appended to the inherited environment", lines[1], "merged")
+		t.Errorf("$AICRME_TEST_VAR = %q, want %q -- Spec.Env was not passed to the child", lines[1], "merged")
+	}
+	if lines[2] != "from-parent" {
+		t.Errorf("$AICRME_INHERITED_MARKER = %q, want %q -- the parent's environment was not inherited (cmd.Env replaced os.Environ() instead of appending to it)", lines[2], "from-parent")
 	}
 }
 
