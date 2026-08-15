@@ -189,16 +189,78 @@ func TestBashExecRunCancelKillsGrandchild(t *testing.T) {
 	waitForProcessExit(t, pid)
 }
 
+// TestBashExecRunCancelEscalatesToSigkill proves the group-SIGKILL
+// escalation in cmd.Cancel's watchdog goroutine is reachable and actually
+// terminates a group member that ignores SIGTERM. TestBashExecRunCancelKillsGrandchild
+// above cannot exercise this: its grandchild is a plain sh/sleep with no
+// trap, so the group SIGTERM alone kills it every time and the watchdog's
+// <-reaped case always wins the race -- <-time.After(killGrace) never does.
+//
+// killGrace is temporarily lowered so this doesn't cost its normal 10s on
+// every run; that's the whole reason killGrace is a package var and not a
+// const (see its doc comment). t.Cleanup restores it unconditionally.
+// internal/applier has no t.Parallel() anywhere, so mutating a package var
+// here cannot race a sibling test.
+func TestBashExecRunCancelEscalatesToSigkill(t *testing.T) {
+	orig := killGrace
+	killGrace = 250 * time.Millisecond
+	t.Cleanup(func() { killGrace = orig })
+
+	out := &safeBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	spec := Spec{Argv: []string{"sh", "-c", `sh -c 'trap "" TERM; sleep 120' & echo $!; wait`}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		var e BashExec
+		errCh <- e.Run(ctx, spec, out)
+	}()
+
+	pid := waitForGrandchildPID(t, out)
+
+	// Give the grandchild time to actually execute its trap builtin before
+	// signaling it: echo $! fires the instant fork() returns in the parent,
+	// before the grandchild has run any of its own script. Signaling too
+	// early would hit the still-default TERM disposition rather than the
+	// ignore trap, and the test would prove nothing about escalation.
+	time.Sleep(300 * time.Millisecond)
+
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Run() error = nil, want an error after cancellation")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run() did not return within 20s of cancellation")
+	}
+
+	if elapsed := time.Since(start); elapsed < killGrace {
+		t.Errorf("Run() returned in %s, want >= killGrace (%s) -- a SIGTERM-ignoring grandchild should force the escalation wait", elapsed, killGrace)
+	}
+
+	// The assertion that actually pins the regression this test exists to
+	// catch: the grandchild ignores SIGTERM, so only a correctly-scoped
+	// group SIGKILL can end it.
+	waitForProcessExit(t, pid)
+}
+
 // waitForGrandchildPID polls out for the PID the spec's shell script prints
 // before it blocks in `wait`, so the caller can cancel only once the
-// grandchild actually exists to be killed.
+// grandchild actually exists to be killed. It requires a full line (a "\n"
+// present in the buffer) before parsing -- reading mid-write would otherwise
+// let strconv.Atoi succeed on a truncated digit-prefix of the real PID, a
+// plausible-but-wrong value that the caller would then poll forever.
 func waitForGrandchildPID(t *testing.T, out *safeBuffer) int {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if line := strings.TrimSpace(out.String()); line != "" {
-			pid, err := strconv.Atoi(strings.SplitN(line, "\n", 2)[0])
+		if buf := out.String(); strings.Contains(buf, "\n") {
+			line := strings.TrimSpace(strings.SplitN(buf, "\n", 2)[0])
+			pid, err := strconv.Atoi(line)
 			if err == nil {
 				return pid
 			}

@@ -17,7 +17,12 @@ const maxLineBytes = 64 << 10
 
 // killGrace is how long a canceled deploy.sh has to run its own INT/TERM
 // trap (which removes the helm temp workdir) before the process is killed.
-const killGrace = 10 * time.Second
+// It is a var, not a const, solely so tests can shrink it to exercise the
+// SIGKILL escalation path without paying its full cost on every run; no
+// non-test code ever assigns to it, and internal/applier has no
+// t.Parallel() anywhere, so a test that lowers it and restores it via
+// t.Cleanup cannot race a sibling test.
+var killGrace = 10 * time.Second
 
 // Spec is one process invocation. Env carries only the variables to ADD to
 // the inherited environment, which keeps the golden assertions in
@@ -71,6 +76,17 @@ func (BashExec) Run(ctx context.Context, spec Spec, out io.Writer) error {
 	// build-tag split is needed to keep `go build ./...` honest.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	// grace is read from the package var exactly once, synchronously, here
+	// -- before cmd.Cancel exists for the ctx-watching goroutine to invoke
+	// and before any watchdog goroutine below can exist to read it. Every
+	// later use in this call (the watchdog's timer, WaitDelay) reads this
+	// local copy instead of re-reading killGrace. killGrace is mutable
+	// (tests shrink it to exercise escalation cheaply) and this is what
+	// keeps that mutation race-free: nothing spawned by this call ever
+	// touches the package var itself, only a value that was already fixed
+	// before any of them existed.
+	grace := killGrace
+
 	// reaped closes once cmd.Run has returned, i.e. once the group leader
 	// has been reaped and its pgid is free for the kernel to reuse.
 	reaped := make(chan struct{})
@@ -81,19 +97,19 @@ func (BashExec) Run(ctx context.Context, spec Spec, out io.Writer) error {
 
 		// cmd.WaitDelay escalates against cmd.Process alone, which by the
 		// time it fires has already exited -- it cannot reach the group. So
-		// Run runs its own escalation, racing killGrace against reaped
-		// rather than issuing the kill after cmd.Run has already returned.
-		// The alternative -- killing -pid only after Wait reaps the leader
-		// -- is simpler but leaves a real window in which the pgid has
-		// already been recycled by an unrelated process group; racing the
-		// timer against reaped instead means the escalation only fires
-		// while the leader is (as far as this goroutine can tell) still
-		// unreaped, which shrinks that hazard to the scheduling gap between
-		// the kernel's reap and this goroutine observing it -- about as
-		// tight as it gets without a pidfd.
+		// Run runs its own escalation, racing grace against reaped rather
+		// than issuing the kill after cmd.Run has already returned. The
+		// alternative -- killing -pid only after Wait reaps the leader --
+		// is simpler but leaves a real window in which the pgid has already
+		// been recycled by an unrelated process group; racing the timer
+		// against reaped instead means the escalation only fires while the
+		// leader is (as far as this goroutine can tell) still unreaped,
+		// which shrinks that hazard to the scheduling gap between the
+		// kernel's reap and this goroutine observing it -- about as tight
+		// as it gets without a pidfd.
 		go func() {
 			select {
-			case <-time.After(killGrace):
+			case <-time.After(grace):
 				_ = syscall.Kill(-pid, syscall.SIGKILL)
 			case <-reaped:
 			}
@@ -101,7 +117,7 @@ func (BashExec) Run(ctx context.Context, spec Spec, out io.Writer) error {
 
 		return syscall.Kill(-pid, syscall.SIGTERM)
 	}
-	cmd.WaitDelay = killGrace
+	cmd.WaitDelay = grace
 
 	return cmd.Run()
 }
