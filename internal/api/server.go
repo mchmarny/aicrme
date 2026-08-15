@@ -30,6 +30,10 @@ type Config struct {
 	// intents and platforms actually have an overlay for this cluster,
 	// rather than the console offering a static list that can dead-end.
 	AICR aicrclient.API
+	// WorkDir is the containment boundary for GET /api/runs/{id}/bundle: a
+	// run's bundle.path artifact must resolve inside this directory before
+	// handleBundle will open anything under it.
+	WorkDir string
 }
 
 // Server wires the HTTP routes.
@@ -40,6 +44,7 @@ type Server struct {
 	static  fs.FS
 	aicr    aicrclient.API
 	options aicrclient.OptionsCache
+	workDir string
 }
 
 // New validates cfg and returns a Server.
@@ -59,7 +64,12 @@ func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error
 	if cfg.AICR == nil {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "aicr client must not be nil")
 	}
-	return &Server{auth: newAuthenticator(cfg), bus: b, engine: e, static: static, aicr: cfg.AICR}, nil
+	if cfg.WorkDir == "" {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "work dir must not be empty")
+	}
+	return &Server{
+		auth: newAuthenticator(cfg), bus: b, engine: e, static: static, aicr: cfg.AICR, workDir: cfg.WorkDir,
+	}, nil
 }
 
 // Handler returns the fully routed http.Handler.
@@ -79,6 +89,16 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("POST /api/runs", s.handleCreateRun)
 	protected.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
 	protected.HandleFunc("POST /api/runs/{id}/decide", s.handleDecide)
+	// GET /api/session exists so the SPA can tell an expired session from a
+	// network blip: EventSource surfaces no HTTP status on error, so without
+	// this probe the console had no way to learn its 8-hour session expired
+	// and stuck on "reconnecting..." forever. The auth middleware wrapping
+	// protected already supplies the 401; a live session just needs a 204.
+	protected.HandleFunc("GET /api/session", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	protected.HandleFunc("POST /api/runs/{id}/retry", s.handleRetry)
+	protected.HandleFunc("GET /api/runs/{id}/bundle", s.handleBundle)
 	mux.Handle("/api/", s.auth.require(protected))
 
 	// Unrestricted method, not "GET /": http.ServeMux (Go 1.22+) treats "GET /"

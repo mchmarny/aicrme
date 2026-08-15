@@ -138,6 +138,7 @@ func main() {
 		LoginRate:  10,
 		TLS:        os.Getenv("AICRME_TLS") == "true",
 		AICR:       client,
+		WorkDir:    workDir,
 	}, b, eng, static)
 	if err != nil {
 		slog.Error("server configuration invalid", "error", err)

@@ -54,7 +54,7 @@ func TestOptionsEndpointFiltersThroughTheCatalog(t *testing.T) {
 	b := bus.New(8)
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: fake,
+		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -151,7 +151,7 @@ func TestOptionsUsesCurrentRunSnapshotWhenAvailable(t *testing.T) {
 	step := rawSnapshotStep{raw: []byte("apiVersion: aicr.nvidia.com/v1\nkind: Snapshot\n")}
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: fake,
+		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -183,7 +183,7 @@ func TestOptionsProvisionalClearsOnceASnapshotYieldsARealService(t *testing.T) {
 	step := rawSnapshotStep{raw: raw}
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: fake,
+		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -213,7 +213,7 @@ func TestOptionsDegradesToProvisionalOnCorruptSnapshot(t *testing.T) {
 	step := rawSnapshotStep{raw: []byte("- this\n- is\n- a list, not a Snapshot\n")}
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: fake,
+		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -234,7 +234,7 @@ func TestOptionsDegradesToProvisionalOnCorruptSnapshot(t *testing.T) {
 // client would panic the first time handleOptions runs, so api.New must
 // reject it at construction like every other required Config field.
 func TestNewRequiresAICRClient(t *testing.T) {
-	_, err := api.New(api.Config{Username: "admin", Password: "pw", SessionTTL: time.Hour, LoginRate: 10},
+	_, err := api.New(api.Config{Username: "admin", Password: "pw", SessionTTL: time.Hour, LoginRate: 10, WorkDir: t.TempDir()},
 		bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
 	if err == nil {
 		t.Error("api.New() accepted a nil AICR client")
