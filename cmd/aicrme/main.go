@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -39,6 +40,25 @@ const defaultSnapshotAgentImage = "ghcr.io/nvidia/aicr:v0.19.0"
 // what lets the pod run with readOnlyRootFilesystem: true.
 const defaultWorkDir = "/var/lib/aicrme"
 
+// workSubdirs are the directories the console and deploy.sh need writable.
+// With readOnlyRootFilesystem: true, the emptyDir at AICRME_WORK_DIR is the
+// only writable path in the container, so every tool that wants scratch
+// space is pointed at a subdirectory of it by the chart's env block --
+// bash's mktemp -d at TMPDIR, helm's three XDG-style caches, kubectl's
+// discovery cache, and $HOME for anything that ignores all of the above.
+// They are created here rather than by the chart because an emptyDir is
+// mounted empty on every pod start.
+var workSubdirs = []string{"tmp", "home", "helm/cache", "helm/config", "helm/data", "kube/cache", "runs"}
+
+func ensureWorkDirs(root string) error {
+	for _, sub := range workSubdirs {
+		if err := os.MkdirAll(filepath.Join(root, sub), 0o700); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
@@ -46,6 +66,12 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 	slog.Info("starting aicrme", "version", version.String())
+
+	workDir := envOr("AICRME_WORK_DIR", defaultWorkDir)
+	if err := ensureWorkDirs(workDir); err != nil {
+		slog.Error("work directory unusable", "dir", workDir, "error", err)
+		os.Exit(1)
+	}
 
 	static, err := web.Static()
 	if err != nil {
@@ -87,7 +113,7 @@ func main() {
 		}),
 		steps.NewRecommend(client),
 		steps.NewBundle(client, steps.BundleConfig{
-			WorkDir: envOr("AICRME_WORK_DIR", defaultWorkDir),
+			WorkDir: workDir,
 		}),
 	)
 

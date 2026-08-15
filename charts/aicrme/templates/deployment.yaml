@@ -40,6 +40,10 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: [ALL]
+            # Every writable path the console and deploy.sh need is a
+            # subdirectory of the work-dir emptyDir below, so nothing needs
+            # to write to the image's own filesystem.
+            readOnlyRootFilesystem: true
           ports:
             - name: http
               containerPort: 8080
@@ -64,6 +68,24 @@ spec:
                 configMapKeyRef:
                   name: {{ include "aicrme.fullname" . }}
                   key: AICRME_NAMESPACE
+            - name: AICRME_WORK_DIR
+              value: /var/lib/aicrme
+            # deploy.sh runs `mktemp -d`; helm and kubectl keep caches. With
+            # readOnlyRootFilesystem the emptyDir is the only writable path,
+            # so each tool is pointed into it explicitly. cmd/aicrme creates
+            # these subdirectories at startup (an emptyDir mounts empty).
+            - name: TMPDIR
+              value: /var/lib/aicrme/tmp
+            - name: HOME
+              value: /var/lib/aicrme/home
+            - name: HELM_CACHE_HOME
+              value: /var/lib/aicrme/helm/cache
+            - name: HELM_CONFIG_HOME
+              value: /var/lib/aicrme/helm/config
+            - name: HELM_DATA_HOME
+              value: /var/lib/aicrme/helm/data
+            - name: KUBECACHEDIR
+              value: /var/lib/aicrme/kube/cache
           readinessProbe:
             httpGet:
               path: /healthz
@@ -77,3 +99,10 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /var/lib/aicrme
+      volumes:
+        - name: work
+          emptyDir:
+            sizeLimit: {{ .Values.workDir.sizeLimit }}

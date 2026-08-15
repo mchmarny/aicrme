@@ -15,3 +15,11 @@ auth:
 resources:
   requests: { cpu: 100m, memory: 128Mi }
   limits:   { memory: 512Mi }
+
+# Scratch space for generated bundles plus the helm, kubectl, and bash temp
+# directories deploy.sh needs. emptyDir, not a PVC: a bundle is regenerated
+# deterministically from the pinned, embedded recipe catalog on every run,
+# so nothing here needs to outlive the pod. sizeLimit is measured against a
+# real bundle -- see docs/phase-2a-task-1-findings.md.
+workDir:
+  sizeLimit: 1Gi
