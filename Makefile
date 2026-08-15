@@ -39,8 +39,14 @@ test-coverage: test ## Runs tests and enforces the coverage floor
 		echo "ERROR: coverage $$coverage% below threshold $(COVERAGE_THRESHOLD)%"; exit 1; \
 	fi
 
+# Source file holding the snapshot agent image constant. The image tag is a
+# second copy of the AICR version literal that go.mod and .settings.yaml also
+# carry, and neither Go's module graph nor yq can see it — check-aicr-pin
+# below greps it so all three stay equal or the build fails.
+AICR_IMAGE_SRC := cmd/aicrme/main.go
+
 .PHONY: check-aicr-pin
-check-aicr-pin: ## Verifies go.mod pins github.com/NVIDIA/aicr to the version recorded in .settings.yaml
+check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.com/NVIDIA/aicr to the version in .settings.yaml
 	@expected=$$(yq -r '.dependencies.aicr' .settings.yaml); \
 	case "$$expected" in \
 		''|null) echo "ERROR: dependencies.aicr is not set in .settings.yaml (is yq installed?)"; exit 1 ;; \
@@ -52,6 +58,18 @@ check-aicr-pin: ## Verifies go.mod pins github.com/NVIDIA/aicr to the version re
 		echo "ERROR: go.mod requires github.com/NVIDIA/aicr@$$actual, expected $$expected (see .settings.yaml dependencies.aicr)"; exit 1; \
 	else \
 		echo "check-aicr-pin: OK — github.com/NVIDIA/aicr@$$actual matches pin"; \
+	fi; \
+	image=$$(sed -n 's/^const defaultSnapshotAgentImage = "\(.*\)"$$/\1/p' $(AICR_IMAGE_SRC)); \
+	if [ -z "$$image" ]; then \
+		echo "ERROR: no non-empty defaultSnapshotAgentImage constant in $(AICR_IMAGE_SRC) — Discover would deploy the snapshot agent with an empty image, which the API server rejects"; exit 1; \
+	fi; \
+	tag=$${image##*:}; \
+	if [ "$$tag" = "$$image" ]; then \
+		echo "ERROR: $(AICR_IMAGE_SRC) pins $$image with no tag, expected :$$expected (see .settings.yaml dependencies.aicr)"; exit 1; \
+	elif [ "$$tag" != "$$expected" ]; then \
+		echo "ERROR: $(AICR_IMAGE_SRC) pins snapshot agent image $$image, expected tag $$expected (see .settings.yaml dependencies.aicr)"; exit 1; \
+	else \
+		echo "check-aicr-pin: OK — snapshot agent image $$image matches pin"; \
 	fi
 
 .PHONY: web

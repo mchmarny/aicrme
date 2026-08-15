@@ -35,14 +35,20 @@ type DiscoverConfig struct {
 	// read, which is exactly right there. It exists as a knob for simulated
 	// clusters (KWOK), where every node advertising
 	// nvidia.com/gpu.present=true is a fake node carrying the
-	// kwok.x-k8s.io/node=fake:NoSchedule taint -- KWOK's controller fakes
-	// Running/Succeeded status for anything scheduled onto such a node with
-	// no real execution ever happening (verified against the kwok-controller
-	// v0.8.0 stage-fast.yaml pod-complete Stage), so tolerating that taint
-	// to let the agent land there would make Discover report success
-	// without ever running the real collector. Setting NodeSelector here
-	// bypasses the module's auto-targeting (it only fires when the caller
-	// leaves NodeSelector unset) and pins the Job onto a real node instead.
+	// kwok.x-k8s.io/node=fake:NoSchedule taint. The agent pod deliberately
+	// carries no toleration for that taint, so left unpinned it stays
+	// Pending on every auto-targeted fake node and Discover times out
+	// loudly rather than completing -- Discover can never succeed on such a
+	// cluster without this. (Tolerating the taint instead, so the agent
+	// could land there, would be worse than a timeout: KWOK's controller
+	// fakes Running/Succeeded status for anything scheduled onto such a
+	// node with no real execution ever happening -- verified against the
+	// kwok-controller v0.8.0 stage-fast.yaml pod-complete Stage -- so
+	// Discover would falsely report success without the collector ever
+	// having run. That path is deliberately not taken.) Setting
+	// NodeSelector here bypasses the module's auto-targeting (it only
+	// fires when the caller leaves NodeSelector unset) and pins the Job
+	// onto a real node instead.
 	NodeSelector map[string]string
 
 	// DiscoverNetwork enables live l8k network-fabric discovery, populating

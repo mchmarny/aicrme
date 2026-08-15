@@ -139,8 +139,13 @@ func TestDiscoverEmitsGapWarnings(t *testing.T) {
 func TestDiscoverPlumbsAgentConfig(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
 	cfg := steps.DiscoverConfig{
-		Namespace:          "aicrme",
-		Image:              "ghcr.io/nvidia/aicr:v0.19.0",
+		Namespace: "aicrme",
+		// Deliberately not the real pinned agent image: a value that cannot
+		// coincide with any default proves Run() forwards what it was given
+		// rather than happening to agree with it. The real pin is asserted in
+		// cmd/aicrme's TestDefaultSnapshotAgentImageTracksLinkedAICRVersion
+		// and by `make check-aicr-pin`.
+		Image:              "ghcr.io/example/snapshot-agent:plumbing-test",
 		JobName:            "custom-job",
 		ServiceAccountName: "custom-sa",
 		NodeSelector:       map[string]string{"node-role.kubernetes.io/control-plane": ""},

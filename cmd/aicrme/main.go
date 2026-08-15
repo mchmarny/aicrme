@@ -134,7 +134,15 @@ func envOr(key, fallback string) string {
 // the aicr module's own real-cluster GPU auto-targeting applies unchanged.
 // A malformed pair (no "=", or an empty key) is skipped rather than failing
 // startup: one mistyped entry should degrade to "no override", not crash
-// the console.
+// the console. But skipping is not the same as staying silent about it: a
+// value that is present yet unparseable silently re-enables the very
+// auto-targeting this knob exists to disable (see the NodeSelector doc on
+// steps.DiscoverConfig -- on a KWOK cluster that means Discover pends on a
+// tainted, non-tolerated fake node and times out loudly rather than ever
+// completing, not a silent success, but it is still a confusing failure an
+// operator should be able to trace back to a typo), so every dropped pair,
+// and a fully malformed value that resolves to no selector at all, is
+// logged at Warn.
 func parseNodeSelector(s string) map[string]string {
 	if s == "" {
 		return nil
@@ -144,11 +152,16 @@ func parseNodeSelector(s string) map[string]string {
 		k, v, ok := strings.Cut(pair, "=")
 		k = strings.TrimSpace(k)
 		if !ok || k == "" {
+			slog.Warn("AICRME_SNAPSHOT_NODE_SELECTOR: skipping unparseable pair",
+				"pair", pair, "value", s)
 			continue
 		}
 		out[k] = strings.TrimSpace(v)
 	}
 	if len(out) == 0 {
+		slog.Warn("AICRME_SNAPSHOT_NODE_SELECTOR set but produced no usable selector; "+
+			"Discover falls back to the module's own GPU auto-targeting",
+			"value", s)
 		return nil
 	}
 	return out

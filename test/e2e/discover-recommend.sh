@@ -68,12 +68,13 @@ dump_recent_events() {
   set -e
 }
 
-# fail_run prints the run's error and recent SSE events, then exits 1.
+# fail_run prints the run's error, then exits 1. The SSE dump itself happens
+# once, in cleanup, while the port-forward is still alive -- see cleanup's
+# ordering below.
 fail_run() {
   local run_json="$1"
   echo "run failed: $(echo "${run_json}" | jq -r '.error // "unknown error"')" >&2
   echo "full run: ${run_json}" >&2
-  dump_recent_events
   exit 1
 }
 
@@ -184,12 +185,16 @@ apply_kwok_nodes() {
 
 cleanup() {
   local exit_code="$1"
-  if [[ -n "${PF_PID}" ]]; then
-    kill "${PF_PID}" 2>/dev/null || true
-  fi
+  # Diagnostics run BEFORE killing the port-forward, and exactly once here
+  # (fail_run no longer dumps its own copy): dump_recent_events curls the
+  # console through PF_PID, so dumping after the kill -- or twice, once from
+  # fail_run and again here -- was the previous, empty-on-failure bug.
   if [[ "${exit_code}" -ne 0 ]]; then
     e2e_diagnose "${NS}"
     dump_recent_events
+  fi
+  if [[ -n "${PF_PID}" ]]; then
+    kill "${PF_PID}" 2>/dev/null || true
   fi
   rm -f "${JAR}"
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
@@ -222,14 +227,17 @@ echo "--- install chart"
 e2e_install_chart "${NS}" "${IMAGE}"
 
 # Every simulated GPU node carries the kwok.x-k8s.io/node=fake:NoSchedule
-# taint (see node_yaml above) and no real kubelet: the kwok-controller fakes
-# Running/Succeeded status for anything scheduled there without ever really
-# executing it (confirmed against kwok-controller v0.8.0's stage-fast.yaml
-# pod-complete Stage). AICR's Go client auto-targets a node advertising
-# nvidia.com/gpu.present=true when no NodeSelector is set -- exactly right on
-# real hardware, but on this cluster that is only the fake GPU nodes. Pin the
-# agent Job onto the real node instead, or Discover would falsely report
-# success on a snapshot the agent never actually produced.
+# taint (see node_yaml above) and no real kubelet. AICR's Go client
+# auto-targets a node advertising nvidia.com/gpu.present=true when no
+# NodeSelector is set -- exactly right on real hardware, but on this cluster
+# that selector matches only the tainted fake GPU nodes. Left unpinned, the
+# agent pod carries no toleration for that taint (deliberately -- tolerating
+# it would let the pod land there, and kwok-controller fakes Running/
+# Succeeded status for anything scheduled onto a kwok node with no real
+# execution ever happening, confirmed against kwok-controller v0.8.0's
+# stage-fast.yaml pod-complete Stage), so it would stay Pending on every
+# fake GPU node and Discover would time out loudly rather than ever
+# completing. Pin the agent Job onto the real node instead.
 echo "--- pin the snapshot agent off the simulated GPU nodes onto the real one"
 kubectl -n "${NS}" set env deploy/aicrme 'AICRME_SNAPSHOT_NODE_SELECTOR=node-role.kubernetes.io/control-plane='
 kubectl -n "${NS}" rollout status deploy/aicrme --timeout=120s
@@ -296,7 +304,16 @@ for _ in $(seq 1 60); do
 done
 [[ "${STATE}" == "done" ]] || fail_run "${RUN_JSON}"
 
-echo "--- recipe resolved; extracting component count from the SSE stream (best effort)"
+echo "--- recipe resolved; extracting component count from the SSE stream"
+# A parse failure here is a hard failure, not a warning-and-pass: this is the
+# assertion that proves Recommend actually pinned components, not just that
+# the run reached done with no error. Silently falling back to the weaker
+# state=done floor would let an SSE event-shape change (e.g. a Data field
+# rename) quietly downgrade this test to a much weaker one while it kept
+# reporting green -- exactly the failure mode this whole task exists to
+# catch. Empirically reliable in practice (verified against a real run
+# resolving 13 components), so a genuine miss here means something is wrong
+# and the test should say so loudly.
 COMPONENT_COUNT=""
 set +e
 COMPONENT_COUNT="$(curl -fsS -b "${JAR}" --max-time 5 "http://${ADDR}/api/events?since=0" 2>/dev/null \
@@ -304,15 +321,14 @@ COMPONENT_COUNT="$(curl -fsS -b "${JAR}" --max-time 5 "http://${ADDR}/api/events
   | jq -r 'select(.data.componentCount != null) | .data.componentCount' 2>/dev/null \
   | tail -n 1)"
 set -e
-if [[ -n "${COMPONENT_COUNT}" ]]; then
-  echo "resolved recipe: ${COMPONENT_COUNT} components"
-  [[ "${COMPONENT_COUNT}" -gt 0 ]] || {
-    echo "resolved recipe reports zero components" >&2
-    exit 1
-  }
-else
-  echo "WARNING: could not parse component count from the SSE stream." >&2
-  echo "WARNING: falling back to the floor assertion -- state=done with no error." >&2
-fi
+[[ -n "${COMPONENT_COUNT}" ]] || {
+  echo "could not parse a component count from the SSE stream -- the KindLog/Data event shape probably changed" >&2
+  exit 1
+}
+echo "resolved recipe: ${COMPONENT_COUNT} components"
+[[ "${COMPONENT_COUNT}" -gt 0 ]] || {
+  echo "resolved recipe reports zero components" >&2
+  exit 1
+}
 
 echo "PASS: discover-recommend e2e green (run ${RUN_ID}, training/kubeflow resolved)"
