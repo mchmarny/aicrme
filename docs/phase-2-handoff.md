@@ -1,75 +1,232 @@
 # Phase 2 handoff
 
-**Status:** Phases 0 and 1 are complete and merged to `main`. Phase 2 has not started.
-**Spec:** `approach.md`. **Phase 0-1 plan:** `docs/superpowers/plans/2026-08-13-aicrme-phase-0-1.md` — its "Roadmap for Phases 2-5" section carries the `deploy.sh` marker grammar and the applier decision, which are the main technical inputs to Phase 2.
+**Status:** Phases 0, 1, and 2a are complete and merged to `main`. Phase 2b has not started.
+**Spec:** `approach.md`. **Phase 2a plan:** `docs/superpowers/plans/2026-08-15-aicrme-phase-2a.md`. **Phase 2a design:** `docs/superpowers/specs/2026-08-15-aicrme-phase-2a-design.md` — its "Roadmap" and "Open questions" sections carry inputs 2b needs. **Phase 0-1 plan:** `docs/superpowers/plans/2026-08-13-aicrme-phase-0-1.md`.
 
-This document records what the Phase 0-1 build learned that the code and the plan do not already state. It exists because the working ledger those findings lived in was scratch and has been deleted.
+This document records what the Phase 2a build learned that the code and the plan do not already state. It exists because the working ledger those findings lived in (`.superpowers/sdd/2026-08-15-aicrme-phase-2a/progress.md`) was scratch and is deleted at the end of the run. `docs/phase-2a-task-1-findings.md` was a second scratch document created mid-phase for the same reason this one exists; its durable content is folded in below and the file itself has been deleted — git is the record, not a second markdown file.
 
 ---
 
 ## What works today
 
-`helm install` on Kind/KWOK gives a console that runs the full **Discover → Recommend** arc: login, live SSE timeline, real cluster snapshot via the AICR agent Job, capability statement and gap list, two questions, resolved and version-pinned recipe. Verified live end to end by `test/e2e/discover-recommend.sh`.
+`helm install` on Kind/KWOK gives a console that runs the full **Discover → Recommend → Bundle → Apply** arc: login, live SSE timeline, real cluster snapshot via the AICR agent Job, capability statement and gap list, two questions, resolved and version-pinned recipe, a downloadable bundle, and a confirm-gated Apply that runs `deploy.sh` for real inside the production image. Verified live end to end by two scripts: `test/e2e/discover-recommend.sh` proves Discover through the Apply confirm gate, and **`test/e2e/apply-dryrun.sh` is the proof for Apply itself** — it builds and loads the real container image, drives the whole arc through the HTTP API, clicks through to Apply, and asserts against `deploy.sh --dry-run` running inside that image with the pinned toolchain (helm 3.19.0, kubectl 1.34.1). Both scripts share cluster setup via `test/e2e/lib.sh`.
 
-Apply, Validate, Prove, Reset, GitOps export, AKS, and real hardware are Phases 2-5 and not built.
+Validate, Prove, Reset, GitOps export, AKS, and real hardware are Phase 3+ and not built. Real-cluster (non-dry-run) Apply is not validated by anything in 2a — see "Phase 2a's exit criterion" below.
 
-### Demoing it — the non-obvious prerequisite
+### Demoing it — the non-obvious prerequisite (carried from Phase 0-1)
 
-**A plain KWOK cluster cannot resolve a recipe.** With no worker nodes the snapshot has no derivable `accelerator`, so every intent/platform pair fails AICR's coverage post-condition. This cost a full fix round to diagnose and an implementer proposed three scope reductions before the real cause was found.
+**A plain KWOK cluster cannot resolve a recipe.** With no worker nodes the snapshot has no derivable `accelerator`, so every intent/platform pair fails AICR's coverage post-condition. The cluster must carry AICR's simulated GPU nodes (`kwok/profiles/eks/p5-h100.yaml` via `kwok/scripts/apply-nodes.sh` in the AICR repo; see `kwok/README.md`). `test/e2e/lib.sh` does this correctly — copy its approach.
 
-The cluster must carry AICR's simulated GPU nodes. Use the tooling in the AICR repo: `kwok/profiles/eks/p5-h100.yaml` presents fake nodes as EKS `p5.48xlarge` H100s, applied via `kwok/scripts/apply-nodes.sh`; see `kwok/README.md`. `test/e2e/discover-recommend.sh` does this correctly — copy its approach.
+Against a simulated-H100 KWOK cluster, `training/kubeflow` resolves to **13 components** (`internal/steps/recommend_test.go` pins the resolvable matrix against real fixtures). Two snapshot fixtures are committed and both matter: `snapshot-kwok.yaml` (no GPUs, pins the degenerate case) and `snapshot-kwok-h100.yaml` (simulated GPUs, pins the demo path, and is what Task 1's probe and Bundle both used). Do not delete either.
 
-Against a simulated-H100 KWOK cluster, **5 of 12 pairs resolve**: `training/kubeflow` (13 components), `training/slurm` (16), `training/any` (12), `inference/dynamo` (16), `inference/any` (14). The other 7 fail because AICR's catalog has no `service=kind` overlay for them — not an accelerator problem. `internal/steps/recommend_test.go` pins both matrices against real fixtures.
+### The Task 1 probe, folded in from the deleted findings file
 
-Two snapshot fixtures are committed and both matter: `snapshot-kwok.yaml` (no GPUs, pins the degenerate case and the gap package's degraded-collector guard) and `snapshot-kwok-h100.yaml` (simulated GPUs, pins the demo path). Do not delete either.
+Before any of the applier code existed, Task 1 answered the phase's two load-bearing questions empirically rather than by assumption: does `deploy.sh --dry-run` survive against Kind+KWOK at all, and does its stdout marker grammar match what the plan transcribed. Both held, on the host toolchain available at the time:
+
+- **Bundle:** 13 logical `result.Components`, 61 files on disk, 159,731 bytes reported by `MakeBundle`, **352K measured by `du -sh`**. This is the number `charts/aicrme/values.yaml`'s `workDir.sizeLimit: 1Gi` default is sized generously against — helm's own chart cache, not the bundle, is expected to dominate the emptyDir in practice.
+- **Deploy steps vs. components:** the bundle has 13 logical components but `deploy.sh` numbers **14** steps — `kubeflow-trainer-post` is a `local-helm` post-install step parented to `kubeflow-trainer`, numbered separately. Nothing may assume 13 == 14; Feedback 2 below is why the UI now models these as two distinct, correctly-related numbers rather than picking one.
+- **Dry-run outcome on that run:** exit 0, all 14 numbered steps printed `└─ ✓ <name> installed`, marker grammar (`┌─ [N/M] <name>  →  <namespace>`, `└─ ✓ <name> installed`, `✓ Pre-flight checks passed`) matched the plan's regexes byte for byte, verified with `repr()` to rule out terminal artifacts.
+- **Tool versions on that run — the fact that later mattered most:** `helm version` reported **v4.2.4**, `kubectl version` reported **v1.36.3** (`kind v0.32.0`, `kindest/node:v1.36.1`, KWOK `v0.8.0`). The shipped image pins **helm 3.19.0 / kubectl 1.34.1** (`Dockerfile`). This gap is what "the dry-run ceiling" below is about — the host probe's green result does not generalize to the production toolchain, and it took a later dedicated finding to discover why.
 
 ---
 
-## Constraints Phase 2 inherits
+## The dry-run ceiling — the single most important finding of this phase
 
-**The applier drives `deploy.sh`, not per-component `install.sh`.** The plan's Decisions table originally said the opposite. `deploy.sh` is ~480 generated lines carrying correctness logic a per-component loop silently drops: preflight for terminating namespaces / stale webhooks / orphaned CRD groups, per-component wait derivation (`kai-scheduler` 20m/1 retry, `*-readiness` gates 1h35m, `ASYNC_COMPONENTS` skipping `--wait`), quadratic-backoff retry with helm hook-Job cleanup, and a post-install block that waits for `nvidia.com/gpu-driver-upgrade-state=upgrade-done` on every managed node before restarting the DRA kubelet plugin. Skipping that last one strands DRA pods in `ContainerCreating` (AICR issue #973). The marker-to-event grammar is in the plan's roadmap.
+**`deploy.sh --dry-run` cannot validate this bundle past component 3/14, running the real, shipped toolchain.** This is empirically established, not inferred, and it is load-bearing for how `test/e2e/apply-dryrun.sh` is written. Read this before touching that script or `internal/applier`.
 
-Guard it: pin the sha256 of `pkg/bundler/deployer/helm/templates/deploy.sh.tmpl` from the pinned aicr module so an upstream edit forces a parser review. The freed upstream-PR budget (Risk 1 turned out already resolved) should go to adding an opt-in machine-readable event stream to that template, retiring the parser.
+Task 11 built and loaded the actual production image and ran the full arc against it (not a host probe). In-image `helm version` and `kubectl version` were confirmed to match the Dockerfile pin exactly: helm v3.19.0, kubectl v1.34.1. Under that toolchain, component 3/14 (`network-operator`) fails deterministically:
 
-**`StateActive` is declared but unreachable.** `engine.execute()` unconditionally finishes at `StateDone`, and no `Step`/engine hook lets a Prove step park in the terminal-but-active state the spec's §6 requires. Nothing in Phase 0-1 revisits `engine.go`, so Phase 3 must add the hook. Related: nothing in `execute`/`runStep`/`awaitDecisions` re-checks that `e.current` is still the run its goroutine started for — `Start`'s `isLive` guard is the only protection and it does not cover `StateActive`. Both bite when Reset lands.
+```
+no matches for kind "NodeFeatureRule" ... ensure CRDs are installed first
+```
 
-**The ConfigMap-backed `engine.Store` is still unimplemented.** The interface exists (`internal/engine/store.go`) with only `NewMemoryStore`. Apply takes 10-20 minutes on real hardware, which is when restart survival starts to matter. Two latent issues activate with it: `handleCreateRun` passes the cancellable request context to `engine.Start`, so a `store.Save` failure would leave `e.current` live and permanently 409 new runs; and a server restart resets `bus.nextID` to 1 while the browser keeps a high `lastId`, so `?since=` filters out the entire new run. The bus needs an epoch or a run-scoped cursor, designed together with the store.
+`network-operator` renders a `NodeFeatureRule` custom resource. That CRD is registered by `nfd`, component 2/14 — but under `--dry-run` nothing is ever actually installed, so by the time component 3 renders, the CRD `nfd` would have registered on a real install simply does not exist. Both `--dry-run=client` and `--dry-run=server` were tried against the in-image toolchain and produced the **byte-identical error** — this is not a flag choice, it is inherent to dry-running an ordered bundle whose later components depend on earlier components' CRDs.
+
+**State this plainly: this is a ceiling on dry-run as a verification technique for ordered bundles with cross-component CRD dependencies. It is not a product defect, and it is not a bug in `network-operator`, `nfd`, or `deploy.sh`.** On a real install, `deploy.sh` runs its 14 steps in numbered order, `nfd` genuinely installs and its CRD genuinely registers with the API server, and `network-operator` renders successfully against a real cluster with real discovery. helm 3 is, if anything, more correct here than helm 4 — it builds typed objects against live API discovery and fails hard on a CRD that provably does not exist, where helm 4's dry-run tolerated the same gap. Neither toolchain is buggy; they disagree only on how strict a dry-run's discovery check should be.
+
+**The earlier host probe's green result (Task 1, above) was a false green.** It was produced by helm v4.2.4 taking a different code path than the shipped helm 3.19.0 — not a version-number footnote, but a materially different command line. `install-upstream-helm.sh.tmpl` (in the pinned aicr module) branches on the detected helm major: `HELM_MAJOR=$(helm version ...); if >= 4 then FORCE_CONFLICTS_FLAG="--force-conflicts"`. The host probe therefore ran with `--force-conflicts` and server-side apply; production runs helm 3 with neither. Task 1's green dry run never established that the production image's helm 3 renders these 13 charts — only that some helm does. Task 11's in-image run is the first (and only) evidence about the toolchain that actually ships.
+
+`test/e2e/apply-dryrun.sh` therefore does **not** assert `state == done`. That state is not merely unmet under dry-run, it is **unreachable, forever** — a test asserting it can never pass, which trains people to ignore CI exactly as reliably as a test that can never fail. Instead it asserts everything dry-run *can* prove and pins the *known* failure precisely: the confirm gate fired, the bundle downloaded, in-image helm's major matches the Dockerfile pin, at least one component reached `installed`, and the run failed at exactly `network-operator` (recipe position 3/14) with an error containing `no matches for kind "NodeFeatureRule"`. Pinning the known failure this specifically means a *different* failure — a real regression — still breaks the build; the script's own failure messages say as much (e.g. "if this now reaches done, the network-operator/nfd CRD-ordering limitation may have been resolved upstream; a human needs to re-verify and update this pinned assertion, not just let it pass").
+
+**If you are reading this because CI is red on `apply-dryrun.sh` and you are about to change the assertion to make it green: stop.** Read the failure message the script prints — if it names `network-operator` failing on the exact `NodeFeatureRule` error, at position 3/14, that is the known ceiling firing correctly and nothing is wrong. If it names a *different* component, a *different* error, or reaches `done`, that is real signal (a regression or an upstream fix) and needs investigation, not a widened assertion. "Fixing" `apply-dryrun.sh` to assert `state == done` would not be a fix; it would delete the only exit gate 2a has, because state == done cannot happen under dry-run regardless of code correctness.
+
+---
+
+## Phase 2a's exit criterion, stated explicitly
+
+**2a is a dry-run / demo milestone.** It proves: the console builds and downloads a real, version-pinned bundle for a resolved recipe; the confirm-gated Apply step genuinely invokes `deploy.sh` inside the production image with the production toolchain; the pipeline UI correctly renders that run's markers as they stream in; and the run fails, deterministically and for a well-understood reason, at the point dry-run structurally cannot go further.
+
+**2a is explicitly not validated for real-cluster Apply**, and it should not be presented or treated as such. Nothing in this phase runs `deploy.sh` without `--dry-run` against real hardware; nothing exercises real driver installs, real GPU scheduling, or a real multi-minute Apply. Full-chain validation — a real Apply reaching `StateDone` against real GPU nodes — requires Phase 4's real hardware, and that dependency now has empirical backing rather than being a stated preference: the dry-run ceiling above is a structural proof that dry-run *cannot* stand in for it, not merely a caution that it doesn't yet.
+
+This closes Feedback 1 below on the "should 2a claim more than a demo milestone" question: no, and now there is a reason stronger than caution to say so.
+
+---
+
+## USER REVIEW FEEDBACK — four external findings and their disposition
+
+Mid-run, an external reviewer raised four findings against the in-progress build. All four were verified rather than accepted at face value, and each was triaged on "does acting now beat acting later," not by severity alone (Ruling 10 in the deleted ledger). This is their durable record.
+
+### Finding 1 — restart recovery is not fully designed; 2a should stay a dry-run/demo milestone
+
+Accurate. `approach.md` promises ConfigMap checkpointing; only `NewMemoryStore` exists (see "Constraints 2b inherits" below). Nothing was built against this finding in 2a — what was missing was the *written* exit criterion, which is now stated explicitly above, backed by the dry-run ceiling.
+
+**Disposition: deferred to 2b.** The reviewer's own required-contract list is more complete than anything previously written down and is carried verbatim so 2b does not have to reconstruct it. A restart-recovery implementation must provide:
+
+- Run discovery after restart — the console must be able to find in-flight or interrupted runs from persisted state, not just from memory.
+- Fail-closed plus explicit Retry rather than auto-resume on an interrupted Apply — an Apply that was cut off mid-`deploy.sh` must not silently resume; it must land in a state that requires an operator's explicit `Retry`.
+- Bundle regeneration — the bundle directory lives in an emptyDir that does not survive a restart, so recovery must be able to reconstruct or re-request it, not assume it is still on disk.
+- Persisting component/deploy-step state — an in-memory SSE ring cannot replay across a restart, so the store must carry enough state (not just the terminal Run state) to redraw the pipeline UI faithfully after reconnecting.
+- Failed checkpoint writes — a `store.Save` failure must not silently wedge the run (see Ruling 13 below, which fixed exactly this class of bug for the in-memory store's callers, but the ConfigMap store introduces a store that can genuinely fail to write).
+- ConfigMap size limits — Kubernetes ConfigMaps cap at ~1MiB; a long-running Apply's accumulated event/state history must be bounded or externalized before it can hit that ceiling.
+
+### Finding 2 — 13/14 needs a real data model, not just careful wording
+
+Accurate, and stronger than the plan's original approach (which had proposed set-difference classification with careful wording alone). The reviewer wanted components and deployment actions modeled as two distinct, related things: generated steps grouped under their parent component, displayed as "N components, M deployment actions" rather than picked as a single ambiguous number.
+
+**Disposition: implemented in Task 9.** `web/src/pipeline.ts`'s `deriveComponents` classifies each marker by genuine set difference against the approved recipe (`const generated = !recipeSet.has(data.name)` — verified to contain zero `endsWith`/`-post`/`-readiness` suffix-rule shortcuts). Generated actions carry `generated: true` and a `parent` attributed to the most recent real component, render indented/de-emphasized in the Cockpit, and `deploymentActionsTotal` reads `deploy.sh`'s own header total rather than an invented count. `web/src/components/Cockpit.tsx` renders both numbers side by side (`{recipe.componentCount} components`, `{actionTotal} deployment actions`). A real defect was caught and fixed in this area before it shipped: `Cockpit.tsx` passing `run.recipe?.components.map(...) ?? []` made every marker classify as `generated` whenever the recipe hadn't arrived yet or was unknown — the classification was not merely lost in that state, it was inverted. Fixed to distinguish "recipe not yet known" (nothing classified as generated, fail-safe direction) from "recipe known and this name is absent" (genuinely generated); see `web/src/pipeline.test.ts`.
+
+### Finding 3 — the probe did not use the shipped toolchain
+
+Verified, and worse than first stated. This is the finding that produced the dry-run ceiling above.
+
+**Disposition: implemented as a hard exit gate in Task 11.** No separate remediation task was needed — Task 11 already builds and loads the real production image for its e2e, so it runs in-image by construction. What was added was an explicit assertion that in-image helm's major version matches the Dockerfile pin, so this class of drift (probe toolchain silently diverging from shipped toolchain) can never again pass unnoticed. The Dockerfile's own pin was correct throughout; the *probe* was the outlier, so there was nothing to change in production code — only in what the e2e proves.
+
+### Finding 4 — cancellation must kill the process tree
+
+Verified, and was a live bug in already-committed code at the time it was raised: `internal/applier/exec.go`'s `cmd.Cancel` sent `SIGTERM` to `cmd.Process` alone. `deploy.sh` traps `TERM` and exits, but its descendants — `install.sh` → `helm upgrade --install --wait --timeout 10m` → `kubectl` — are separate processes in no process group relationship that were never signaled. `cmd.WaitDelay` then `SIGKILL`s only the already-gone `bash`. Net effect: the console would report a run cancelled while `helm` kept installing and kept mutating the cluster underneath it. Neither Task 5's review nor its two fix rounds had caught this, because every test used a fake `Exec`, and the one real-process test spawned a leaf (`sh -c 'sleep 30'`) with no children to orphan — the test could not observe the bug class it needed to observe.
+
+**Disposition: fixed in Task 5b**, inserted as a new task before Task 7 specifically because it was a live bug, the applier was still fresh, and Task 11 was going to be the first task with real child processes (a cancelled e2e run would otherwise have leaked live `helm` processes into CI). The fix: `cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}` makes the spawned process the leader of its own process group; `cmd.Cancel` sends `SIGTERM` to the negative pid (the whole group) rather than the single process; and an escalation goroutine races a `killGrace` timer against a `reaped` channel to send a group `SIGKILL` if the tree is still alive after grace, rather than relying on `WaitDelay` (which only ever targets the single leader process, not the group). This was proven with a real grandchild process (`sh -c 'sh -c "sleep 30" & wait'`), asserting the grandchild is actually gone after cancellation — the class of test the original code lacked. The SIGKILL escalation branch was itself initially untested (Ruling 11) — `killGrace` was changed from a `const` to a package `var` specifically so a test could shrink it and force the escalation branch to fire in well under a second, and an asymmetric bite-proof (mutating only the SIGKILL line, not the SIGTERM line) confirmed exactly one test — `TestBashExecRunCancelEscalatesToSigkill` — catches that specific regression while the other cancellation tests stay green, proving it covers ground the others structurally cannot.
+
+---
+
+## Constraints 2b inherits
+
+**The ConfigMap-backed `engine.Store` is still unimplemented.** The interface exists (`internal/engine/store.go`) with only `NewMemoryStore`. Apply takes 10-20 minutes on real hardware, which is when restart survival starts to matter. This is Feedback 1's whole subject above — read its required-contract list before starting the store.
+
+**The bus's `nextID` epoch problem is still open.** A server restart resets `bus.nextID` to 1 while a connected browser keeps a high `lastId`, so `?since=` would filter out an entire new run's events after a restart. This is unrelated to `internal/engine`'s epoch guard (below, closed in 2a) despite the shared name — the engine's epoch detects a superseded goroutine within one process's lifetime; the bus's epoch problem is about `nextID` surviving (or not) a process restart. Needs an epoch or a run-scoped cursor, designed together with the ConfigMap store, since both activate together.
+
+**`StateActive` is declared but unreachable.** `engine.execute()` unconditionally finishes at `StateDone`; no `Step`/engine hook lets a Prove step park in the terminal-but-active state the spec's §6 requires. Nothing in 2a revisits this. Phase 3 must add the hook.
 
 **The training workload does not exist.** `demos/workloads/training/` in the AICR repo holds only `gke-nccl-test-tcpxo.yaml`. The spec's "Training + Kubeflow → TrainJob NCCL all-reduce" finale has no source material and must be authored in Phase 3. Inference is well covered (`vllm-agg.yaml`, `nimservice-llama-3-2-1b.yaml`, `chat-server.sh`, `chat.html`).
 
-**`aicrclient` has headroom.** `MakeBundle`, `BundleComponents`, and `ValidateState` all exist on `*aicr.Client` and are deliberately not exposed yet. The single-method interface decomposition accommodates a `Bundler`/`Validator` additively with no restructuring.
+**The observer is unstarted.** `internal/observer` (shared informers over Pods, Events, Nodes, DaemonSets, Deployments feeding typed events into `bus`, per `approach.md`) does not exist as a directory. Whatever live per-component sub-status the cockpit eventually wants beyond `deploy.sh`'s own marker stream depends on this being built.
+
+**`aicrclient` has headroom.** `MakeBundle`, `BundleComponents`, and `ValidateState` all exist on `*aicr.Client`; `MakeBundle` is now consumed (Task 2), `ValidateState` is not yet. The single-method interface decomposition accommodates a `Validator` additively with no restructuring, same as it did for the `Bundler` Phase 2a added.
+
+---
+
+## Resolved in 2a — removed from the inherited deferred list
+
+The following five items, carried forward from the Phase 0-1 handoff as things Phase 2 would inherit, are closed. Do not re-open them without a new finding.
+
+- **`readOnlyRootFilesystem`** is now set (`charts/aicrme/templates/deployment.yaml:46`). Task 3 built the writable emptyDir (`workDir`, `sizeLimit: 1Gi`, sized against Task 1's measured 352K bundle), the six tool-cache env vars pointing helm/kubectl/bash scratch space at subdirectories of it, and `ensureWorkDirs` to create them at startup (an emptyDir mounts empty). Verified: the only production filesystem write outside it is `internal/steps/bundle.go`'s bundle generation, which is inside the emptyDir.
+- **The `engine.Start` context / 409 latch.** `handleCreateRun` passing the cancellable request context into `Start`, such that a `store.Save` failure would leave `e.current` live with no goroutine and permanently 409 new run creation, is fixed. `Start` (like the new `Retry`, below) now rolls back `State`/`Err` on a `store.Save` failure, guarded by an identity check (`e.current.ID == r.ID`) and an epoch-aliveness check so the rollback cannot stomp a legitimately newer run that took over in the interim (Ruling 13). Inert today (`memoryStore.Save` never errors) but no longer a landmine for 2b's ConfigMap store, whose whole point is a `Save` that can fail.
+- **The epoch guard.** `internal/engine/engine.go` now carries an `epoch uint64` field, bumped on every `Start` and `Retry`, checked via `aliveLocked(epoch)` at six checkpoints: `execute` (twice — on entry and again just before it calls `finish`), `awaitDecisions` (once), `runStep` (twice — on entry and again at the merge-back after the step returns), and `finish` (once). This is what stops a superseded run's stale goroutine from writing state after a `Retry` has launched a new one for the same run ID. It is currently **unreachable by any black-box test** — `Retry` only launches when `State == Failed`, which is set exclusively by the prior goroutine's own terminal `finish()`, so by the time any external caller can observe `Failed` and call `Retry`, the prior goroutine has no shared-state work left to race on. The guard is proven correct by a white-box test in `internal/engine` (package-internal, since `engine_test.go` is `package engine_test` and cannot reach the unexported field) that manufactures supersession directly. This is documented at the code site and here so the next phase does not read "0% naturally reachable" as "delete it" — Reset (Phase 3) is exactly the feature that will make it naturally reachable, and re-adding a concurrency guard correctly under time pressure later is a worse position than carrying an artificially-tested one now.
+- **The 401 `authed` reset.** Fixed in Task 10 — `GET /api/session` backs an unmount-safe probe from `EventSource`'s error handler; on a real 401 the console now returns to the login screen instead of sticking on "reconnecting…" forever after the 8-hour session expiry.
+- **`Discover.tsx`'s capable-vs-no-snapshot conflation.** Fixed in Task 10 — the component now checks `!report.analyzed` before `gaps.length === 0`, so a payload missing or with a degraded `analyzed` field (including a stale fixture that predates the field) degrades to an explicit caveat rather than a false "already capable" claim. Same fail-safe direction as the recipe-classification fix in Finding 2 above.
+
+---
+
+## New for 2b
+
+**The applier's marker parser (`internal/applier/parse.go`) is a maintenance liability, pinned only by `TestDeployTemplateUnchanged`.** It transcribes `deploy.sh.tmpl`'s `printf` output formats into seven hand-written regexes; nothing in the Go type system connects the two. `TestDeployTemplateUnchanged` (`internal/applier/template_test.go`) pins the upstream template's sha256 (`df919af7e46d565d38fbf12927881ebeec1172227efac8962e4c00f035a8b519`) via `go list -m -f '{{.Dir}}' github.com/NVIDIA/aicr` against the local module cache, so any upstream edit to that template fails this test loudly instead of silently drifting. The freed-up upstream-PR budget from an earlier resolved risk should go toward adding an opt-in machine-readable event stream (`AICR_DEPLOY_EVENTS=jsonl` or similar) to that template — that is what retires the parser and this whole maintenance surface, rather than deepening it. See the AICR bump checklist below for what to actually do when this test fires.
+
+**Image size: unchanged, still ~55 MB compressed.** `Dockerfile` was not touched anywhere in Phase 2a (verified: `git diff 460f7b4..cfe5daf -- Dockerfile` is empty) — 2a added no new binaries or base-image layers to the shipped image; Task 1's `cmd/probe` that pulled in AICR's Go module graph was a throwaway, deleted before its own commit. The image remains the first thing a cluster pulls; watch it in 2b, since the ConfigMap store, the observer, and any Prove/Reset tooling are all candidates to grow it.
+
+**`workDir.sizeLimit` is `1Gi`** (`charts/aicrme/values.yaml:24-25`), chosen deliberately generous against Task 1's measured 352K real bundle — the reasoning documented at the site is that helm's own chart cache for 14 charts, not the bundle itself, is expected to be the larger consumer of that emptyDir in practice. Override via `--set workDir.sizeLimit=<value>`; verified to flow through to the rendered emptyDir.
+
+---
+
+## AICR bump checklist
+
+`aicr` is pinned to `v0.19.0` in `go.mod` and `.settings.yaml`. An AICR bump is expected and acceptable — the phase deliberately keeps the production code free of catalog-count literals (verified: zero component-count literals across `internal/**` and `cmd/**` at the end of 2a) — **provided the response to each signal below is the right one.** This table exists because the detectors already exist; what was missing before this phase is the documented response.
+
+| Signal that fires on a bump | What it means | Correct action |
+|---|---|---|
+| `make check-aicr-pin` fails | `go.mod`'s `github.com/NVIDIA/aicr` version, or the snapshot agent image tag (`defaultSnapshotAgentImage` in `cmd/aicrme/main.go`), disagrees with `.settings.yaml`'s `dependencies.aicr` | Bump both together, deliberately. This is the pin-consistency check, not a functional test — it is telling you the two places that must agree, have not been updated together. |
+| The `succeeds` (intent, platform) matrix in `internal/steps/recommend_test.go` fails | The catalog's coverage — which intent/platform pairs actually resolve on KWOK — changed | Re-verify which pairs resolve against the new catalog and update the matrix to match reality. This test exists to catch catalog coverage *drifting silently*, not to gate the bump — a shrinking or growing resolvable set is real information to record, not a regression to suppress. |
+| `TestDeployTemplateUnchanged` fails (`internal/applier/template_test.go`) | The upstream `deploy.sh.tmpl` this phase's marker parser transcribes has changed | **Re-read the upstream template's output helpers against `internal/applier/parse.go`'s regexes and think.** This is the one pin whose correct response is *not* "update the number." Updating the sha256 reflexively to turn CI green would silently empty the Apply timeline in production — every marker line the new template emits differently would simply stop matching, and every existing test would still pass, because the fixtures pinning today's grammar would need to be re-captured too. If the template only added something the parser can safely ignore, update the sha256, confirm the regexes still match by hand, and move on. If it changed a format the parser depends on, update the regexes *and* re-capture `internal/applier/testdata/deploy-transcript-kwok.txt` against the new template before updating the constant. |
+| `assertMatchesApproved` (`internal/steps/bundle.go`) fails at runtime | The catalog's actual component composition for an already-approved recipe changed between Recommend-time and Bundle-time re-resolve | This is the fail-closed guard working as designed — it exists precisely to catch a bump changing what a stored `recipe.json` resolves to. It should not be silenced; if it fires in production against a real bump, the run correctly refuses to install a component set the user never saw and reviewed. |
+| The e2e's pinned ceiling (`test/e2e/apply-dryrun.sh`'s `EXPECTED_FAILING_COMPONENT="network-operator"`, `EXPECTED_FAILING_INDEX="3"`) fails | Either the recipe's component ordering shifted (a bump moved `network-operator`'s position without changing the underlying CRD-ordering issue) or the underlying nfd/network-operator CRD-ordering limitation was actually resolved upstream | Read the script's own failure message before touching the assertion — it names exactly which of these happened. A position shift with the same underlying error is a benign catalog reshuffle; update the pinned index. A run that now reaches `done` under dry-run is a genuine upstream fix and needs a human to re-verify and rewrite this section of the handoff, not just widen the assertion. |
+
+**Explicit 2b non-goal:** `approach.md` Risk 5 asks for "a deliberate bump cadence, and probably a CI job that opens a bump PR when aicr releases." Phase 2a builds none of that — the checklist above is manual, human-triggered process, not automation. Keeping this as an explicit non-goal (rather than a silently-dropped idea) is deliberate, so it stays visible for 2b or later to pick up rather than being rediscovered from scratch.
 
 ---
 
 ## Deferred findings
 
-Every per-task review's minors, triaged by the final whole-branch review as acceptable to defer. Grouped by where they bite.
+Every per-task review's minors, triaged as acceptable to defer past 2a. Grouped by where they bite.
 
-### Activated by Phase 2 work
-- ConfigMap store: the `engine.Start` context / 409-latch and the `bus.nextID` epoch reset, above.
-- `readOnlyRootFilesystem` is omitted from the pod security context — correctly deferred until the `deploy.sh` wiring shows which helm/kubectl cache dirs need to be writable.
-- The image is 55 MB compressed (was 38 MB before `cmd/aicrme` imported AICR, which pulls its full transitive graph). It is the first thing a cluster pulls. Watch it.
+### Pre-existing, predates this branch
+- `go.mod:194` marks `gopkg.in/yaml.v3 v3.0.1 // indirect`, but `internal/steps/recommend.go` imports it directly, so a real `go mod tidy` would rewrite `go.mod`. Verified identical on `main` before this branch (`git show main:go.mod`). `make qualify` does not run `go mod tidy`, which is why CI has never caught it. Out of any single task's scope to fix opportunistically; a controller-side fix mid-run would have skipped review and raced a running implementer.
 
-### Raised to the top of the Phase 2 list by the final review
-- **Nothing resets `authed` on a 401.** After the 8-hour session expiry the console sticks on "reconnecting…" forever with no path back to the login screen.
-- `Discover.tsx` shows the green "already capable" copy for `gap.Analyze`'s degraded early return too — "No cluster snapshot available" also yields nil gaps. Should distinguish capable from no-snapshot.
+### Activated by 2b's ConfigMap store / restart-recovery work
+- The `bus.nextID` epoch reset on restart (above, "Constraints 2b inherits").
+- `StateActive` unreachability (above).
+- Everything in Finding 1's required-contract list above.
 
-### Cosmetic / low risk
+### Applier / process execution
+- `internal/applier`'s `Applier.env` method does not use its receiver; could be a plain function.
+- `parse.go`'s `atoi` comment calls a parse failure "unreachable"; strictly, RE2's `\d+` has no length cap, so a pathological digit run could overflow `int`. Overstatement, not a defect.
+- `TestParseTranscriptFixtures` asserts only presence/absence of each marker Status across a transcript, never counts — it catches a regex regressing to match nothing, but not a partial regression (13 of 14 headers still leaves `seen[StatusStarted] == true`). The captured kwok fixture's marker counts (14 headers, 14 installed, 0 failed, 0 retrying, 2 phase-ok, 1 async) are pinned as an exact-count assertion specifically because that fixture is a frozen file — 14 is a property of the artifact, not of AICR's catalog, so pinning it cannot break on a bump.
+- Two `internal/applier` branches were left deliberately covered only by artificial (not naturally-reachable) tests, both documented at their code sites and both intentional, not oversights: the SIGKILL escalation branch in `exec.go` (needs `killGrace` shrunk via the test-only package var to exercise sub-second) and the engine's epoch guard (above).
+- `internal/engine`'s `Start` Save-failure rollback path had zero test coverage as of Task 7's initial pass (caught by a coverage-percentage *drop* rather than by reading, since the new branch was entirely uncovered); it was fixed alongside `Retry`'s identical rollback in the same fix round (Ruling 13), so this is resolved, not deferred — listed here only so its discovery method (coverage signature, not inspection) is on record as a technique worth repeating.
+
+### API / bundle download
+- If the bundle root directory itself became a symlink between `validateBundleTree`'s pre-validation pass and `writeBundleTar`'s streaming pass, the inline second-pass check in `writeBundleTar` would miss it (it short-circuits at `rel == "."` before the type check); `validateBundleTree` does check the root. An unrealistic TOCTOU window given the bundle directory's single-writer ownership (the in-process bundler, one run at a time), and not a regression — pre-fix code never checked it either.
+- The defense-in-depth comments around the symlink-rejection logic do not spell out *why* the TOCTOU race is considered unrealistic (single-writer bundle directory); worth one added line next time that file is touched.
+
+### Cockpit / frontend
+- `currentRunIdOf`/`relevantTo` run-id filtering logic is duplicated between `Wizard.tsx:59-64` and `pipeline.ts:58-68` — five lines that can drift out of sync. Justified for now by not relocating `deriveRunState`/`RunState` out of `Wizard.tsx` (a deliberate scope decision, referenced in the code as `OVERRIDE 2`), but a future task consolidating shared run-state helpers should fold these together.
+- `ComponentRow` does not surface a per-row index; only the aggregate progress line shows the running total.
+- The session probe (`useEvents.ts`, wired to `GET /api/session`) has no in-flight dedup — the intent is "probe once per connection drop, not once per `EventSource` retry tick," and today that holds only incidentally (bounded by `EventSource`'s own ~3s retry cadence against an O(1), no-I/O endpoint), not because anything enforces it explicitly.
+- `TestAnalyzeBareSnapshotIsSafe` does not assert `Analyzed == false` on the inner-`nil` degraded branch; the property is structurally guaranteed by the code shape but left uncovered by an explicit assertion.
+- No App/Console render-level test asserts the `EventSource` instance count stays at 1 across a `Console` re-render. Correct today, but a latent trap: any future App-level state added while authenticated could silently break the stable-reference invariant the whole live-timeline UX depends on, and the failure mode would present as an intermittent, hard-to-explain "flaky backend" rather than a clear test failure.
+
+### Chart / contract test cosmetics
+- `test/chart/contract.sh`'s Invariant 6 banner wraps to two lines, unlike every other single-line banner in the file.
+- `contract.sh`'s `has("emptyDir")` assertion is redundant with the separate `sizeLimit` assertion — no independent failure mode between the two.
+- `readOnlyRootFilesystem` landed in its own new Invariant 6 rather than folded into the existing "Invariant 5: pod hardening" block; defensible either way, not revisited.
+
+### E2E scripts
+- Two idioms for the same SSE-truncation problem now coexist across the file family: `discover-recommend.sh` bundles the events fetch and its parse in one `set +e` block, while `apply-dryrun.sh` pre-filters with `fromjson? // empty` and then runs under plain `set -e`. Both are correct and the divergence was an explicit, reasoned choice (Ruling 17), but a future task may want to converge on one idiom across both scripts.
+- `apply-dryrun.sh`'s `ERROR_TAIL` handling (`.data.tail[]`) would abort under `set -e` if `.tail` were ever a non-array truthy value. A pre-existing shape assumption inherited from the SSE event schema, not introduced by this phase.
+- The in-image kubectl version is captured and printed by `apply-dryrun.sh` but deliberately not asserted (only the helm major is), which reads as if it were an assertion; worth a comment labeling it informational.
+
+### Cosmetic / low risk, carried unchanged from Phase 0-1 (still true, still low priority)
 - `.golangci.yaml` carries orphaned `gocognit`/`gocyclo` settings for linters not enabled.
-- `/` answers all methods, so `POST /` and `POST /healthz` return index.html 200.
+- `/` answers all methods, so `POST /` and `POST /healthz` return `index.html` 200.
 - `isAssetPath` heuristic: false-positive on a client route containing a dot, false-negative on an extensionless asset.
 - CSP lacks `base-uri`, `form-action`, `object-src`. `index.html` is not content-hashed and gets no `Cache-Control`.
 - `useEvents.ts` comment claims an O(1) fast path but the append is an O(n) copy; it closes the closure `source` rather than `msg.target`.
 - `gap` rules: `gpu-scheduler` covers KAI images only (`kueue`/`grove` are also gang-scheduling adjacent); a comment cites the chart name `aws-efa-k8s-device-plugin` where the component is `aws-efa`; `usableGPUs` is all-or-nothing.
 - `ServiceFromSnapshot` is production-dead (test-only callers). `pairResolves` sits at 81.8% — the gap is two registry parse-failure returns unreachable from real catalog candidates, left honestly uncovered.
-- No dedicated failure-state screen; errors render as a text line.
+- No dedicated failure-state screen for errors outside the Apply pipeline; they render as a text line.
 - Chart: helm/kubectl downloads are TLS-only with no checksum; `alpine` pinned by tag not digest; the ClusterRoleBinding uses the cluster-scoped name `aicrme`, so a second install in another namespace fails closed; an operator-supplied `--set auth.password=` is persisted in helm release values and shell history.
 - `e2e.yaml` runs on `pull_request` only, with no `concurrency` or `timeout-minutes`.
+- Only 4 of the spec's 5 gap rules ship: `gpu-driver`, `device-plugin`, `gpu-metrics`, `gpu-scheduler`. EFA is deferred because `TypeNetworkTopology` is gated behind the agent's `--discover-network` flag (plumbed through `DiscoverConfig` but off by default) and no fixture exercises it. Two residual false-positive paths exist on `gpuOperatorAbsent`: a policy-specific collector failure defeats the degraded guard, and a standalone helm install of `nvidia-device-plugin`/`dcgm-exporter` with no ClusterPolicy makes both gaps fire falsely. Both are outside the "vanilla cluster" premise.
+- The demo's headline number — "N of M GPUs usable" — is unit-tested but no fixture exercises it, because even the simulated-H100 KWOK snapshot reports `gpu-present: false` (the agent finds no real device). It first runs for real on EKS in Phase 4.
 
-### Known gaps in the gap list
-Only 4 of the spec's 5 gap rules ship: `gpu-driver`, `device-plugin`, `gpu-metrics`, `gpu-scheduler`. EFA is deferred because `TypeNetworkTopology` is gated behind the agent's `--discover-network` flag (now plumbed through `DiscoverConfig` but off by default) and no fixture exercises it. Two residual false-positive paths exist on `gpuOperatorAbsent`: a policy-specific collector failure defeats the degraded guard, and a standalone helm install of `nvidia-device-plugin`/`dcgm-exporter` with no ClusterPolicy makes both gaps fire falsely. Both are outside the "vanilla cluster" premise.
+### Deliberately not carried forward from the raw ledger
+The 5.88 MB captured transcript fixture (`internal/applier/testdata/deploy-transcript-kwok.txt`) and the `kind v0.32.0` vs. `.settings.yaml`'s pinned `v0.31.0` mismatch were both raised and reviewed mid-phase, then judged genuinely low-priority and not worth a line here beyond this note: the transcript is large (596 KB compressed) but was independently judged the deliberately-correct artifact by review (it guards the marker parser against false-positives on real helm noise that a hand-authored fixture cannot reproduce), and the kind version mismatch has no enforced consequence anywhere in `Makefile` or `.github/workflows`. Both are cheap to revisit if they ever start actually costing something; neither warrants tracking as an open deferred item.
 
-The demo's headline number — "N of M GPUs usable" — is unit-tested but no fixture exercises it, because even the simulated-H100 KWOK snapshot reports `gpu-present: false` (the agent finds no real device). It first runs for real on EKS in Phase 4.
+---
+
+## The phase's dominant defect mode: tests that could not detect the thing they were written for
+
+Worth its own heading because it recurred across nearly every task in this phase, in the same shape each time. Carry the practice into 2b, not just the list above.
+
+The pattern: a test existed, exercised real code, and passed — but its passing proved less than it appeared to, because the specific failure mode it was meant to catch could not actually manifest through it. Instances, in order encountered:
+
+- A golden transcript test (`TestParseTranscriptFixtures`) that could catch a regex regressing to match *nothing at all*, but not a *partial* regression — 13-of-14 headers matching still satisfies "started == true."
+- An environment-merge test (`TestBashExecRunHonorsDirAndMergesEnv`) that asserted an injected variable was visible in the child process — a property true under both "append to the inherited environment" and "replace it entirely." It could not distinguish the two, even though the difference is exactly the one that matters: `deploy.sh` and every `install.sh` it calls depend on the *inherited* environment for `PATH` (to find `helm`/`kubectl`) plus the work-dir variables Task 3 added. A silent regression to replace-semantics would have erased all of them and surfaced in production as a baffling helm error, never as a test failure. The fix required planting a second, *inherited* marker via `t.Setenv` and asserting it survives alongside the injected one.
+- A cancellation test (`TestBashExecRunCancelKillsGrandchild`, pre-Task-5b) built against a leaf process (`sh -c 'sleep 30'`) with no children — structurally unable to observe an orphaned grandchild, which is exactly the class of bug Finding 4 above turned out to be.
+- An epoch/supersession guard (`internal/engine`'s epoch check) that no black-box test can reach at all, because the precondition for triggering `Retry` (`State == Failed`) is set exclusively by the very goroutine whose supersession the guard exists to prevent — by the time any external caller could race it, there is nothing left to race. Proven correct only by a white-box test that manufactures the condition directly.
+- A recipe-classification test (Finding 2's `deriveComponents`) that would have passed with **no classification logic at all**, if its fixture had used only marker names present in both the recipe and the transcript — the reviewer required it to include a name (`kubeflow-trainer-post`) genuinely absent from `recipe.json`, taken from the real captured transcript rather than invented, specifically so the test could fail if the classification logic were deleted.
+
+The controller's own verification methods failed the same way, three separate times, worth naming so the next phase doesn't repeat them: a targeted mutation for a bite-proof that didn't compile (an unused import left behind after the mutation, so the "failing" test never actually ran); a `go test` run without `-v` that showed only a failure, proving nothing about which *other* tests still passed (an asymmetric bite-proof requires knowing that, not just that the target test failed); and a `perl` one-liner mutation that silently matched nothing and left the file byte-identical, which would have "proven" a guard untestable purely because the tool used to attack it never actually touched it.
+
+**The practice that caught every one of these before it shipped: bite-proofing.** Reintroduce the bug (by direct mutation, not by argument), confirm the specific test fails with the expected message, restore the code, confirm the suite is green again — and, critically, confirm that the *right* test failed while every other test in the suite stayed green. That last clause is what an asymmetric bite-proof buys over a simple pass/fail check: proof that the new test covers ground the *other* tests structurally cannot, not just that it can fail somehow. Every fix round in this phase that mattered was verified this way, and in several cases (the SIGKILL escalation branch, the epoch guard, the env-merge test) the first bite-proof attempt was itself flawed and had to be redone before it was trustworthy. Treat a bite-proof's own result with the same skepticism as the code it is testing — verify it was set up correctly before trusting what it reports.
 
 ---
 
@@ -79,8 +236,8 @@ Air-gapped operation, private registries, and registry mirroring are spec non-go
 
 ---
 
-## How to start Phase 2
+## How to start Phase 2b
 
-Write a plan first — `superpowers:writing-plans`, informed by this document and the roadmap section of the Phase 0-1 plan. Then execute it; `superpowers:subagent-driven-development` was used for Phase 0-1 and worked well.
+Write a plan first — `superpowers:writing-plans`, informed by this document and the "Roadmap" section of the Phase 2a design spec. Then execute it; `superpowers:subagent-driven-development` was used for both Phase 0-1 and Phase 2a and worked well both times. Phase 2a stayed serial from Task 7 onward rather than parallelizing the one genuinely-parallel pair (Tasks 9 and 10) because per-task review packages are `BASE..HEAD` diffs — two implementers on one branch interleave commits, and each review would then see the other task's changes and be unable to attribute findings to the right task. Worktree isolation fixes that but costs a second `npm ci` and a merge with likely frontend conflicts; weigh that trade-off explicitly rather than defaulting either way.
 
-Two process notes from the Phase 0-1 run worth carrying forward. Verify the plan's own code before trusting it — four real defects shipped in the plan text and were caught only by implementers (a send-on-closed-channel race, a `ServeMux` routing panic, a Dockerfile that would have embedded an empty SPA, and a false premise about AICR deriving criteria from the snapshot). And demand bite-proofs: every fix round that mattered was verified by reintroducing the bug and watching the test fail.
+Three process notes carried forward, one from each phase so far. From Phase 0-1: verify a plan's own code before trusting it — four real defects shipped in that phase's plan text and were caught only by implementers. From Phase 2a's own plan: the same thing happened again, smaller — an early draft of Task 7 reached for an `Engine.Abandon` method the phase had no reason to add, caught before dispatch. And from across all of Phase 2a: demand bite-proofs, and read the bite-proofing section above before assuming a green test suite means what it appears to mean — the single most common real defect in this phase was not incorrect code, it was a test that could not have caught the incorrect code if it had shipped.
