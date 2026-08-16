@@ -3,7 +3,15 @@ package api_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/mchmarny/aicrme/internal/aicrclient"
+	"github.com/mchmarny/aicrme/internal/api"
+	"github.com/mchmarny/aicrme/internal/bus"
+	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/testfs"
 )
 
 // TestHandlerRoutesDoNotConflict guards against a regression to
@@ -31,5 +39,79 @@ func TestSPAMissingAssetIs404EndToEnd(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func newDrainableTestServer(t *testing.T) *api.Server {
+	t.Helper()
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+	}, bus.New(64), engine.New(bus.New(64), engine.NewMemoryStore()), testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	return srv
+}
+
+// TestDrainRejectsMutations pins the hole Drain closes: canceling the
+// in-flight run lands it in StateFailed, which isLive does not treat as
+// live, so an unguarded POST /api/runs during the shutdown wait would start
+// a fresh run that shutdown then kills mid-flight.
+func TestDrainRejectsMutations(t *testing.T) {
+	srv := newDrainableTestServer(t)
+	srv.Drain()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/runs", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// TestDrainKeepsSafeMethodsServing confirms a connected browser keeps
+// watching its timeline through shutdown: safe methods (here, the public
+// /healthz probe and an already-open /api/events stream) must not be
+// rejected once draining begins.
+func TestDrainKeepsSafeMethodsServing(t *testing.T) {
+	srv := newDrainableTestServer(t)
+	ts, client := loggedInClient(t, srv.Handler())
+	srv.Drain()
+
+	healthzResp, err := client.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz error = %v", err)
+	}
+	defer healthzResp.Body.Close()
+	if healthzResp.StatusCode != http.StatusOK {
+		t.Errorf("healthz status = %d, want %d", healthzResp.StatusCode, http.StatusOK)
+	}
+
+	eventsResp, err := client.Get(ts.URL + "/api/events")
+	if err != nil {
+		t.Fatalf("GET /api/events error = %v", err)
+	}
+	defer eventsResp.Body.Close()
+	if eventsResp.StatusCode != http.StatusOK {
+		t.Errorf("events status = %d, want %d", eventsResp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestNotDrainingByDefault guards against a middleware that trivially
+// passes by rejecting everything: a fresh server that never called Drain
+// must still accept a normal same-origin POST /api/runs.
+func TestNotDrainingByDefault(t *testing.T) {
+	h := newTestServer(t)
+	ts, client := loggedInClient(t, h)
+
+	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /api/runs error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
 	}
 }

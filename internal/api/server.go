@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
@@ -38,13 +39,14 @@ type Config struct {
 
 // Server wires the HTTP routes.
 type Server struct {
-	auth    *authenticator
-	bus     *bus.Bus
-	engine  *engine.Engine
-	static  fs.FS
-	aicr    aicrclient.API
-	options aicrclient.OptionsCache
-	workDir string
+	auth     *authenticator
+	bus      *bus.Bus
+	engine   *engine.Engine
+	static   fs.FS
+	aicr     aicrclient.API
+	options  aicrclient.OptionsCache
+	workDir  string
+	draining atomic.Bool
 }
 
 // New validates cfg and returns a Server.
@@ -70,6 +72,39 @@ func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error
 	return &Server{
 		auth: newAuthenticator(cfg), bus: b, engine: e, static: static, aicr: cfg.AICR, workDir: cfg.WorkDir,
 	}, nil
+}
+
+// Drain marks the server as shutting down: mutating routes start returning
+// 503 immediately. It must be called before the shutdown wait begins, not
+// after -- canceling the in-flight run lands it in StateFailed, which
+// isLive does not treat as live, so an HTTP surface left fully open during
+// that wait would happily accept a POST /api/runs that shutdown then kills
+// mid-flight. Idempotent and safe to call from the shutdown goroutine with
+// requests still arriving concurrently.
+func (s *Server) Drain() {
+	s.draining.Store(true)
+}
+
+// requireNotDraining rejects state-changing requests once shutdown has
+// begun. Canceling the in-flight run leaves it StateFailed, which isLive
+// does not treat as live -- so without this, a POST /api/runs arriving
+// during the shutdown wait would start a fresh run that shutdown then kills
+// mid-flight. Safe methods keep serving so a connected browser watches the
+// timeline through shutdown.
+func (s *Server) requireNotDraining(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			h.ServeHTTP(w, r)
+			return
+		}
+		if s.draining.Load() {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // Handler returns the fully routed http.Handler.
@@ -107,7 +142,7 @@ func (s *Server) Handler() http.Handler {
 	// — and panics at registration time. "/" with no method matches strictly
 	// more than "/api/" does, so it can only ever apply as the fallback.
 	mux.Handle("/", spaHandler(s.static))
-	return securityHeaders(requireSameOrigin(mux))
+	return securityHeaders(requireSameOrigin(s.requireNotDraining(mux)))
 }
 
 // requireSameOrigin rejects state-changing requests that did not originate

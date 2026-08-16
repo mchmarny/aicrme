@@ -214,6 +214,28 @@ else
   fail "work volume sizeLimit override" "got '${size_override}', want '2Gi'"
 fi
 
+# --- Invariant 7: the shutdown budget is explicit, not inherited ----------
+# cmd/aicrme drains HTTP and cancels any in-flight run concurrently, bounded
+# by runShutdownTimeout (15s), before it can return from main -- returning
+# early would tear down the PID namespace and SIGKILL helm mid-deploy,
+# stranding a release in pending-install. That only fits inside Kubernetes'
+# default terminationGracePeriodSeconds (30s) by luck; pinning it here makes
+# the budget survive an unrelated edit to the Deployment.
+echo "== shutdown budget =="
+grace_default=$(render | doc Deployment | yq -r '.spec.template.spec.terminationGracePeriodSeconds' | val)
+if [[ "${grace_default}" == "45" ]]; then
+  pass "terminationGracePeriodSeconds defaults to 45"
+else
+  fail "terminationGracePeriodSeconds default" "got '${grace_default}', want '45'"
+fi
+
+grace_override=$(render --set terminationGracePeriodSeconds=60 | doc Deployment | yq -r '.spec.template.spec.terminationGracePeriodSeconds' | val)
+if [[ "${grace_override}" == "60" ]]; then
+  pass "--set terminationGracePeriodSeconds=60 flows through"
+else
+  fail "terminationGracePeriodSeconds override" "got '${grace_override}', want '60'"
+fi
+
 echo
 if [[ "${FAILURES}" -gt 0 ]]; then
   printf '\033[0;31mFAIL\033[0m: %s chart contract assertion(s) failed\n' "${FAILURES}"

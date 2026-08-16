@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,6 +46,17 @@ const defaultWorkDir = "/var/lib/aicrme"
 // the script's own default. Its backoff is quadratic and each attempt
 // surfaces as a warn event, so the wait is visible rather than silent.
 const defaultApplyRetries = 5
+
+// runShutdownTimeout bounds how long shutdown waits for an in-flight run to
+// stop. It must exceed the applier's own killGrace (10s) so the process-group
+// SIGTERM -> SIGKILL escalation can complete; see internal/applier/exec.go.
+const runShutdownTimeout = 15 * time.Second
+
+// httpShutdownTimeout bounds the HTTP drain. Runs concurrently with the
+// above, so the pod's total shutdown budget is the larger of the two, not
+// their sum -- which is what lets both fit inside
+// terminationGracePeriodSeconds.
+const httpShutdownTimeout = 10 * time.Second
 
 // workSubdirs are the directories the console and deploy.sh need writable.
 // With readOnlyRootFilesystem: true, the emptyDir at AICRME_WORK_DIR is the
@@ -166,9 +178,38 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+
+	// Drain first: canceling the run lands it in StateFailed, which isLive
+	// does not consider live, so an unguarded POST /api/runs during the wait
+	// below would start a run that shutdown then kills mid-flight.
+	srv.Drain()
+
+	// HTTP drain and engine cleanup run concurrently. The invariant is "do
+	// not return before the deploy.sh process tree is reaped" -- not "do not
+	// begin HTTP shutdown first". aicrme is PID 1 under the image's
+	// ENTRYPOINT with no init, so returning from main tears down the whole
+	// PID namespace and SIGKILLs helm before deploy.sh's INT/TERM trap can
+	// run, which is what strands a release in pending-install.
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		httpCtx, cancelHTTP := context.WithTimeout(context.Background(), httpShutdownTimeout)
+		defer cancelHTTP()
+		_ = httpSrv.Shutdown(httpCtx)
+	}()
+
+	go func() {
+		defer wg.Done()
+		engCtx, cancelEng := context.WithTimeout(context.Background(), runShutdownTimeout)
+		defer cancelEng()
+		if err := eng.CancelAndWait(engCtx); err != nil {
+			slog.Error("in-flight run did not stop cleanly", "error", err)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func envOr(key, fallback string) string {
