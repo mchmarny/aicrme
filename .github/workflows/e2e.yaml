@@ -52,7 +52,14 @@ jobs:
 
   apply-dryrun:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # apply-dryrun.sh's own polling budget (Discover 7.5m + Recommend/Bundle
+    # 3m + Apply 40m = 50.5m) plus 10-15m of cluster/image/chart setup can
+    # total roughly an hour in the worst case the script's loops permit, even
+    # though the dry-run ceiling means today's real run finishes in minutes.
+    # 45m was silently narrower than that budget; 75m gives it room without
+    # masking a genuinely wedged run behind an hours-long CI timeout. See the
+    # comment above apply-dryrun.sh's Apply poll loop for the budget math.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
       - id: go

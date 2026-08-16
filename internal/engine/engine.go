@@ -134,6 +134,25 @@ func (e *Engine) Decide(runID string, decisions map[string]string) error {
 	if e.current.State != StateAwaitingDecision {
 		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not awaiting a decision")
 	}
+	// Reject any key the client sends that this gate did not ask for.
+	// Without this, a single call supplying every key a later step will ever
+	// require (e.g. {"intent":..., "platform":..., "apply":"yes"}) satisfies
+	// steps.Apply.Requires() before Apply's confirm gate is ever reached --
+	// awaitDecisions only checks presence in e.current.Decisions, not that
+	// the value arrived at the gate that asked for it. That contradicts the
+	// contract steps/apply.go states (a confirm gate the console must not
+	// mutate a cluster without) and, as a side effect, would let a later
+	// Decide call silently overwrite intent/platform after Recommend has
+	// already consumed them.
+	pending := make(map[string]bool, len(e.current.Pending))
+	for _, key := range e.current.Pending {
+		pending[key] = true
+	}
+	for key := range decisions {
+		if !pending[key] {
+			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "decision not currently requested: "+key)
+		}
+	}
 	for _, key := range e.current.Pending {
 		if _, ok := decisions[key]; !ok {
 			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "missing required decision: "+key)

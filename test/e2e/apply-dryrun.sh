@@ -244,6 +244,18 @@ curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
 # retries it with quadratic backoff (5s, 20s, 45s, 80s, 120s cap) before
 # giving up, since it runs WITHOUT --best-effort. 40 minutes covers 14
 # real chart fetches plus one full retry storm on the slowest CI runner.
+#
+# This loop's ceiling never bites today -- the dry-run ceiling below fails
+# the run at component 3/14 within minutes -- but it is sized for a world
+# where that ceiling has moved or been resolved and the run genuinely goes
+# the distance. Budget check: this loop's 40m + the Discover poll's 7.5m +
+# the Recommend/Bundle poll's 3m + 10-15m of cluster/image/chart setup can
+# total roughly an hour in the worst case these loops permit.
+# .github/workflows/e2e.yaml's apply-dryrun job sets timeout-minutes: 75 to
+# actually cover that worst case -- if either number changes, change both
+# together so the job's ceiling and this script's own budget keep agreeing;
+# a job that times out before the script's own diagnostics ever print loses
+# exactly the failure detail cleanup()/fail_run() exist to capture.
 echo "--- poll until done or failed (Apply)"
 STATE=""
 for _ in $(seq 1 240); do

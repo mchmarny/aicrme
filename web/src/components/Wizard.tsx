@@ -84,6 +84,14 @@ export function deriveRunState(events: AicrEvent[]): RunState {
         if (e.message === 'run done') out.state = 'done'
         else if (e.message === 'run failed') out.state = 'failed'
         else out.state = 'running'
+        // engine.Retry (internal/engine/engine.go) publishes this exact
+        // message before relaunching execute for the same run ID. Replaying
+        // it here is the signal that a fresh attempt has started, so the
+        // previous attempt's error must not keep rendering above a
+        // subsequently successful run -- out.error is otherwise sticky
+        // because deriving replays every event this run has ever emitted,
+        // including a 'kind === error' from an attempt that later succeeded.
+        if (e.message === 'run retrying') out.error = undefined
         break
       case 'decision':
         out.state = 'awaiting_decision'

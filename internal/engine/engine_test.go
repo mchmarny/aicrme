@@ -99,6 +99,73 @@ func TestRunParksForDecisions(t *testing.T) {
 	}
 }
 
+// TestDecideRejectsKeysNotCurrentlyPending closes the gap the pre-fix Decide
+// left open: a single call supplying every key a later gate will ever
+// require -- sent at the FIRST gate the run parks on -- must not pre-satisfy
+// a downstream Requires() before that step's own gate is ever reached. The
+// pre-fix Decide merged every key the client sent, checking only that the
+// currently-pending keys were present, so
+// {"intent":"training","platform":"kubeflow","apply":"yes"} answered at the
+// Recommend gate would have satisfied steps.Apply.Requires() (steps/apply.go)
+// without the confirm gate it names ever firing.
+func TestDecideRejectsKeysNotCurrentlyPending(t *testing.T) {
+	b := bus.New(64)
+	a := newFakeStep(engine.PhaseDiscover)
+	c := newFakeStep(engine.PhaseRecommend, "intent", "platform")
+	d := newFakeStep(engine.PhaseApply, "apply")
+	e := engine.New(b, engine.NewMemoryStore(), a, c, d)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	if decideErr := e.Decide(run.ID, map[string]string{
+		"intent": "training", "platform": "kubeflow", "apply": "yes",
+	}); decideErr == nil {
+		t.Fatal("Decide() with a key not currently pending ('apply') should error")
+	}
+
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if _, ok := got.Decisions["apply"]; ok {
+		t.Error("apply decision was recorded even though the rejected call must not merge anything")
+	}
+	if len(d.ran) != 0 {
+		t.Fatal("Apply ran before its own confirm gate was ever satisfied")
+	}
+
+	// The legitimate two-key answer at this gate still works.
+	if decideErr := e.Decide(run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); decideErr != nil {
+		t.Fatalf("Decide() with only the pending keys error = %v", decideErr)
+	}
+
+	// The run now parks on Apply's own gate, proving "apply" is still
+	// genuinely pending rather than having been silently pre-satisfied.
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+	got, err = e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if len(got.Pending) != 1 || got.Pending[0] != "apply" {
+		t.Fatalf("Pending = %v, want [apply]", got.Pending)
+	}
+	if len(d.ran) != 0 {
+		t.Fatal("Apply ran before its confirm gate was answered")
+	}
+
+	if decideErr := e.Decide(run.ID, map[string]string{"apply": "yes"}); decideErr != nil {
+		t.Fatalf("Decide() error = %v", decideErr)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+	if len(d.ran) != 1 {
+		t.Errorf("Apply ran %d times, want 1", len(d.ran))
+	}
+}
+
 func TestStepFailureStopsRun(t *testing.T) {
 	b := bus.New(64)
 	boom := errors.New("boom")

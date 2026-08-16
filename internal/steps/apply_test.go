@@ -24,8 +24,9 @@ func (r *recordingExec) Run(_ context.Context, spec applier.Spec, out io.Writer)
 	return r.err
 }
 
-// The confirm gate: the console installs sixteen charts with cluster-admin,
-// so the run must park for an explicit click first.
+// The confirm gate: the console's demo path installs 13 components across
+// 14 deploy.sh steps with cluster-admin, so the run must park for an
+// explicit click first.
 func TestApplyGatesOnTheApplyDecision(t *testing.T) {
 	step := steps.NewApply(applier.New(&recordingExec{}), steps.ApplyConfig{})
 	got := step.Requires()
