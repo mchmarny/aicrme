@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -545,5 +546,168 @@ func TestRetryDoesNotReparkForDecisions(t *testing.T) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ctxBlockingStep blocks until its context is canceled, which is what a
+// canceled deploy.sh does: SIGTERM propagates through the process group,
+// deploy.sh's trap runs, and Wait() returns once the tree is reaped -- here
+// represented by <-ctx.Done(). Named distinctly from the existing
+// blockingStep above (which blocks on a release channel, not ctx) since the
+// two are unrelated fixtures that happen to share a shape.
+type ctxBlockingStep struct {
+	phase   engine.Phase
+	entered chan struct{}
+}
+
+func (b *ctxBlockingStep) Phase() engine.Phase { return b.phase }
+func (b *ctxBlockingStep) Requires() []string  { return nil }
+func (b *ctxBlockingStep) Run(ctx context.Context, _ *engine.Run, _ engine.Emit) error {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestCancelAndWaitStopsAnInFlightRun(t *testing.T) {
+	b := bus.New(64)
+	step := &ctxBlockingStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1)}
+	e := engine.New(b, engine.NewMemoryStore(), step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-step.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step never entered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("CancelAndWait() error = %v", cancelErr)
+	}
+
+	// CancelAndWait must not return until the terminal state is persisted --
+	// a caller that returns early would let main exit before the run is done.
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
+	}
+	if !strings.Contains(got.Err, "canceled") {
+		t.Errorf("Err = %q, want it to say the run was canceled", got.Err)
+	}
+}
+
+func TestCancelAndWaitIsIdempotentAndSafeWithNoRun(t *testing.T) {
+	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	ctx := context.Background()
+
+	// No run has ever started.
+	if err := e.CancelAndWait(ctx); err != nil {
+		t.Fatalf("CancelAndWait() with no run error = %v", err)
+	}
+
+	run, err := e.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	// Run already finished on its own; canceling is a no-op, twice.
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("first CancelAndWait() error = %v", cancelErr)
+	}
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("second CancelAndWait() error = %v", cancelErr)
+	}
+}
+
+// stuckStep ignores its context entirely -- the pathological case
+// CancelAndWait's deadline exists for.
+type stuckStep struct {
+	phase   engine.Phase
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *stuckStep) Phase() engine.Phase { return s.phase }
+func (s *stuckStep) Requires() []string  { return nil }
+func (s *stuckStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return nil
+}
+
+func TestCancelAndWaitTimesOutRatherThanBlockingForever(t *testing.T) {
+	b := bus.New(64)
+	stuck := &stuckStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	e := engine.New(b, engine.NewMemoryStore(), stuck)
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-stuck.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step never entered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := e.CancelAndWait(ctx); err == nil {
+		t.Error("CancelAndWait() error = nil, want a timeout error")
+	}
+	close(stuck.release)
+}
+
+func TestCancelWhileParkedForDecisionsFinishesTheRun(t *testing.T) {
+	b := bus.New(64)
+	e := engine.New(b, engine.NewMemoryStore(), newFakeStep(engine.PhaseRecommend, "intent"))
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("CancelAndWait() error = %v", cancelErr)
+	}
+
+	// A run frozen at a gate with no goroutine is the wedge class Ruling 13
+	// fixed for Save failures; cancellation must not reintroduce it.
+	got, _ := e.Get(run.ID)
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
+	}
+}
+
+func TestCurrentIDDoesNotRequireAClone(t *testing.T) {
+	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+
+	if _, ok := e.CurrentID(); ok {
+		t.Error("CurrentID() ok = true before any run, want false")
+	}
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	id, ok := e.CurrentID()
+	if !ok || id != run.ID {
+		t.Errorf("CurrentID() = %q, %v, want %q, true", id, ok, run.ID)
 	}
 }
