@@ -121,6 +121,39 @@ func TestBundleFailsClosedOnVersionDrift(t *testing.T) {
 	}
 }
 
+// TestBundleFailsClosedOnNamespaceDrift proves the guard compares more than
+// name/version. Before this fix, assertMatchesApproved only checked
+// c.Name and c.Version -- a catalog change repointing a component at a
+// different namespace (e.g. gpu-operator moving from "gpu-operator" to
+// "nvidia-gpu-operator") held the version string and would have passed
+// silently, even though the console shows the user the namespace on both
+// the Recommend and Apply screens (Cockpit.tsx, Wizard.tsx).
+func TestBundleFailsClosedOnNamespaceDrift(t *testing.T) {
+	approved := recipeFixture()
+	drifted := recipeFixture()
+	drifted.Components[0].Namespace = "nvidia-gpu-operator"
+
+	fake := &aicrclient.Fake{Recipe: drifted}
+	step := steps.NewBundle(fake, steps.BundleConfig{WorkDir: t.TempDir()})
+
+	run := newRun()
+	run.Decisions["intent"] = "training"
+	run.Decisions["platform"] = "kubeflow"
+	run.Artifacts["snapshot.yaml"] = []byte(minimalSnapshot)
+	run.Artifacts["recipe.json"] = approvedFrom(t, approved)
+
+	err := step.Run(context.Background(), run, func(bus.Event) {})
+	if err == nil {
+		t.Fatal("Run() error = nil, want a drift error")
+	}
+	if !strings.Contains(err.Error(), "namespace") || !strings.Contains(err.Error(), "gpu-operator") {
+		t.Errorf("Run() error = %v, want it to name the namespace drift on gpu-operator", err)
+	}
+	if fake.BundleCalls != 0 {
+		t.Errorf("MakeBundle called %d times, want 0 -- must not bundle a namespace-drifted recipe", fake.BundleCalls)
+	}
+}
+
 // TestBundleFailsClosedOnComponentCountLengthMismatch pins a narrower drift
 // shape than the two tests above: a persisted recipe.json (Phase 2b's
 // kubectl-editable ConfigMap store) whose self-reported componentCount

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
@@ -108,10 +109,27 @@ func (b *bundle) Run(ctx context.Context, run *engine.Run, emit engine.Emit) err
 // choice safe rather than merely convenient: without it, a catalog or
 // derivation change between the two resolves would silently install a
 // component set the user never saw.
+//
+// Every field ComponentSummary carries is compared, not just Name/Version:
+// the console shows the user Name, Version, and Namespace
+// (Cockpit.tsx/Wizard.tsx render "{name} {version} -> {namespace}"), and
+// Chart/Source are supply-chain-relevant even though the UI does not render
+// them today. A catalog change that moves a component to a different
+// namespace, or repoints its Chart/Source at a different registry while
+// holding the version string, must not slip past this guard. The recipe's
+// own identity (Name/Version) is compared too -- Recommend writes all of
+// these fields from the same result Bundle re-resolves, so there is no old-
+// record compatibility gap yet (see the AICR bump checklist in
+// docs/phase-2-handoff.md for what changes once recipe.json is persisted).
 func assertMatchesApproved(result *aicr.RecipeResult, approved []byte) error {
 	var summary RecipeSummary
 	if err := json.Unmarshal(approved, &summary); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "stored recipe.json is unparseable", err)
+	}
+	if result.Name != summary.Name || result.Version != summary.Version {
+		return aicrerrors.New(aicrerrors.ErrCodeInternal, fmt.Sprintf(
+			"re-resolved recipe drifted from the approved one: recipe %s %s, approved %s %s",
+			result.Name, result.Version, summary.Name, summary.Version))
 	}
 	// Bounded by len(summary.Components), the slice the loop below actually
 	// indexes -- not the self-reported summary.ComponentCount. recipe.json is
@@ -127,11 +145,31 @@ func assertMatchesApproved(result *aicr.RecipeResult, approved []byte) error {
 	}
 	for i, c := range result.Components {
 		a := summary.Components[i]
-		if c.Name != a.Name || c.Version != a.Version {
+		if diff := componentDrift(c, a); diff != "" {
 			return aicrerrors.New(aicrerrors.ErrCodeInternal, fmt.Sprintf(
-				"re-resolved recipe drifted from the approved one at position %d: %s %s, approved %s %s",
-				i, c.Name, c.Version, a.Name, a.Version))
+				"re-resolved recipe drifted from the approved one at position %d (%s): %s",
+				i, c.Name, diff))
 		}
 	}
 	return nil
+}
+
+// componentDrift names every field that differs between the re-resolved
+// component c and the approved summary a, or "" if none do. Named per-field
+// rather than a single bool so a log reader learns what changed (e.g. a
+// namespace move or a Source repoint) without going back to the code.
+func componentDrift(c aicr.ComponentRef, a ComponentSummary) string {
+	var diffs []string
+	add := func(field, got, want string) {
+		if got != want {
+			diffs = append(diffs, fmt.Sprintf("%s %q != approved %q", field, got, want))
+		}
+	}
+	add("name", c.Name, a.Name)
+	add("kind", c.Kind, a.Kind)
+	add("version", c.Version, a.Version)
+	add("namespace", c.Namespace, a.Namespace)
+	add("chart", c.Chart, a.Chart)
+	add("source", c.Source, a.Source)
+	return strings.Join(diffs, "; ")
 }
