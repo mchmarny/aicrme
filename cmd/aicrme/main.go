@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
+	"github.com/mchmarny/aicrme/internal/applier"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/steps"
@@ -33,6 +35,36 @@ const replayCapacity = 20000
 // Discover cannot fall back to anything else.
 const defaultSnapshotAgentImage = "ghcr.io/nvidia/aicr:v0.19.0"
 
+// defaultWorkDir is the writable scratch root. The chart mounts an emptyDir
+// here (charts/aicrme/templates/deployment.yaml) and points TMPDIR, HOME,
+// and the helm/kubectl cache variables at subdirectories of it, which is
+// what lets the pod run with readOnlyRootFilesystem: true.
+const defaultWorkDir = "/var/lib/aicrme"
+
+// defaultApplyRetries is deploy.sh's per-component retry budget, matching
+// the script's own default. Its backoff is quadratic and each attempt
+// surfaces as a warn event, so the wait is visible rather than silent.
+const defaultApplyRetries = 5
+
+// workSubdirs are the directories the console and deploy.sh need writable.
+// With readOnlyRootFilesystem: true, the emptyDir at AICRME_WORK_DIR is the
+// only writable path in the container, so every tool that wants scratch
+// space is pointed at a subdirectory of it by the chart's env block --
+// bash's mktemp -d at TMPDIR, helm's three XDG-style caches, kubectl's
+// discovery cache, and $HOME for anything that ignores all of the above.
+// They are created here rather than by the chart because an emptyDir is
+// mounted empty on every pod start.
+var workSubdirs = []string{"tmp", "home", "helm/cache", "helm/config", "helm/data", "kube/cache", "runs"}
+
+func ensureWorkDirs(root string) error {
+	for _, sub := range workSubdirs {
+		if err := os.MkdirAll(filepath.Join(root, sub), 0o700); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
@@ -40,6 +72,12 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 	slog.Info("starting aicrme", "version", version.String())
+
+	workDir := envOr("AICRME_WORK_DIR", defaultWorkDir)
+	if err := ensureWorkDirs(workDir); err != nil {
+		slog.Error("work directory unusable", "dir", workDir, "error", err)
+		os.Exit(1)
+	}
 
 	static, err := web.Static()
 	if err != nil {
@@ -80,6 +118,17 @@ func main() {
 			Timeout:      10 * time.Minute,
 		}),
 		steps.NewRecommend(client),
+		steps.NewBundle(client, steps.BundleConfig{
+			WorkDir: workDir,
+		}),
+		steps.NewApply(applier.New(applier.BashExec{}), steps.ApplyConfig{
+			Retries: defaultApplyRetries,
+			// Not exposed in values.yaml, deliberately -- same treatment as
+			// AICRME_SNAPSHOT_NODE_SELECTOR. It exists so the CI end-to-end
+			// test can exercise the real deploy.sh and the real helm binary
+			// against a cluster with no GPUs without installing anything.
+			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
+		}),
 	)
 
 	srv, err := api.New(api.Config{
@@ -89,6 +138,7 @@ func main() {
 		LoginRate:  10,
 		TLS:        os.Getenv("AICRME_TLS") == "true",
 		AICR:       client,
+		WorkDir:    workDir,
 	}, b, eng, static)
 	if err != nil {
 		slog.Error("server configuration invalid", "error", err)

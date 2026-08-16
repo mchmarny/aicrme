@@ -159,6 +159,61 @@ else
   fail "allowPrivilegeEscalation" "got '${esc}', want 'false'"
 fi
 
+# --- Invariant 6: the work-dir emptyDir is what makes the root filesystem
+# read-only safe ---------------------------------------------------------
+# approach.md / Phase 0-1 review: readOnlyRootFilesystem was deferred until
+# the deploy.sh wiring showed which helm/kubectl cache dirs need to be
+# writable. cmd/aicrme now creates those dirs under one emptyDir, and every
+# tool is pointed into it by env -- assert all of that actually renders.
+echo "== work dir =="
+root_fs=$(render | doc Deployment |
+          yq -r '.spec.template.spec.containers[].securityContext.readOnlyRootFilesystem' | val)
+if [[ "${root_fs}" == "true" ]]; then
+  pass "readOnlyRootFilesystem is true"
+else
+  fail "readOnlyRootFilesystem" "got '${root_fs}', want 'true'"
+fi
+
+work_vol_type=$(render | doc Deployment |
+                yq -r '.spec.template.spec.volumes[] | select(.name == "work") | has("emptyDir")' | val)
+if [[ "${work_vol_type}" == "true" ]]; then
+  pass "work volume is an emptyDir"
+else
+  fail "work volume" "got '${work_vol_type}', want an emptyDir volume named work"
+fi
+
+work_mount=$(render | doc Deployment |
+             yq -r '.spec.template.spec.containers[].volumeMounts[] | select(.name == "work") | .mountPath' | val)
+if [[ "${work_mount}" == "/var/lib/aicrme" ]]; then
+  pass "work volume mounted at /var/lib/aicrme"
+else
+  fail "work volumeMount path" "got '${work_mount}', want '/var/lib/aicrme'"
+fi
+
+for var in AICRME_WORK_DIR TMPDIR HOME HELM_CACHE_HOME HELM_CONFIG_HOME HELM_DATA_HOME KUBECACHEDIR; do
+  got=$(render | doc Deployment |
+        yq -r ".spec.template.spec.containers[].env[] | select(.name == \"${var}\") | .value" | val)
+  if [[ -n "${got}" ]]; then
+    pass "env ${var} set (${got})"
+  else
+    fail "env ${var}" "missing -- deploy.sh's tools would fall back to the read-only root filesystem"
+  fi
+done
+
+size_default=$(render | doc Deployment | yq -r '.spec.template.spec.volumes[] | select(.name == "work") | .emptyDir.sizeLimit' | val)
+if [[ "${size_default}" == "1Gi" ]]; then
+  pass "work volume sizeLimit defaults to 1Gi"
+else
+  fail "work volume sizeLimit default" "got '${size_default}', want '1Gi'"
+fi
+
+size_override=$(render --set workDir.sizeLimit=2Gi | doc Deployment | yq -r '.spec.template.spec.volumes[] | select(.name == "work") | .emptyDir.sizeLimit' | val)
+if [[ "${size_override}" == "2Gi" ]]; then
+  pass "--set workDir.sizeLimit=2Gi flows through to the emptyDir"
+else
+  fail "work volume sizeLimit override" "got '${size_override}', want '2Gi'"
+fi
+
 echo
 if [[ "${FAILURES}" -gt 0 ]]; then
   printf '\033[0;31mFAIL\033[0m: %s chart contract assertion(s) failed\n' "${FAILURES}"

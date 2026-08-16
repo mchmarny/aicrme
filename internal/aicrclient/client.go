@@ -36,12 +36,20 @@ type CatalogLister interface {
 	ListCatalog(ctx context.Context, filter *aicr.Criteria) ([]aicr.CatalogEntry, error)
 }
 
+// Bundler generates the on-disk deployer bundle for a resolved recipe. Kept
+// as its own single-method interface for the same reason as the others: a
+// step that only bundles should not be able to collect a snapshot.
+type Bundler interface {
+	MakeBundle(ctx context.Context, r *aicr.RecipeResult, opts aicr.BundleOptions) (aicr.BundleArtifact, error)
+}
+
 // API is the whole console-facing AICR surface.
 type API interface {
 	Snapshotter
 	Resolver
 	CriteriaRegistrar
 	CatalogLister
+	Bundler
 	Close() error
 }
 

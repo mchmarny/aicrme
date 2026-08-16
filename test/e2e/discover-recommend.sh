@@ -3,8 +3,18 @@
 # through the real HTTP API: create the cluster, install the KWOK controller
 # and AICR's simulated H100 nodes, install the chart, log in, create a run,
 # answer intent=training/platform=kubeflow once the run parks, and assert it
-# reaches state=done with a resolved, non-empty recipe. This is Phase 1's
-# proof that the whole no-hardware demo arc works on every PR.
+# parks a SECOND time -- pending == ["apply"] -- with a resolved,
+# non-empty recipe. This is Phase 1's proof that the whole no-hardware demo
+# arc works on every PR.
+#
+# Terminal state is the Apply confirm gate, not state=done: Phase 2a wired
+# an Apply step (internal/steps/apply.go) onto the end of this same engine
+# pipeline, requiring an explicit "apply" decision before the run can ever
+# leave awaiting_decision. This script's scope is Discover->Recommend (plus,
+# incidentally, Bundle, which runs to completion before that gate) -- it
+# never supplies that decision, so parking at the gate with a resolved
+# recipe is as far as this script goes and IS its definition of done.
+# test/e2e/apply-dryrun.sh is what drives past this gate.
 #
 # Why simulated GPU nodes are mandatory, not optional: a plain KWOK cluster
 # with no worker nodes has no derivable accelerator in its snapshot, so
@@ -45,14 +55,6 @@ NS="${NS:-aicrme}"
 IMAGE="${IMAGE:-aicrme:e2e-kwok}"
 PORT="${PORT:-18081}"
 ADDR="localhost:${PORT}"
-# Must track .settings.yaml's test_tools.kwok. Not read from that file at
-# run time: this script has no yq dependency, and the tool list this task
-# was scoped against (helm, kubectl, Docker, kind) does not include one.
-KWOK_VERSION="${KWOK_VERSION:-0.8.0}"
-
-KWOK_K8S_VERSION="v1.33.5"
-KWOK_REGION="us-east-1"
-KWOK_ZONES=(us-east-1a us-east-1b)
 
 JAR="$(mktemp -t aicrme-kwok-jar.XXXXXX)"
 PF_PID=""
@@ -77,111 +79,6 @@ fail_run() {
   echo "run failed: $(echo "${run_json}" | jq -r '.error // "unknown error"')" >&2
   echo "full run: ${run_json}" >&2
   exit 1
-}
-
-# node_yaml emits one fake KWOK Node object to stdout. Field values
-# reproduce AICR's kwok/profiles/eks/{system-m7i,p5-h100}.yaml node
-# profiles and kwok/templates/nodes/node.yaml.tmpl's structure -- see the
-# header comment for why they are inlined rather than sourced from there.
-node_yaml() {
-  local name="$1" node_type="$2" instance_type="$3" zone="$4" \
-    cpu="$5" memory="$6" storage="$7" max_pods="$8"
-  local extra_label="" gpu_label_block="" gpu_annotation_block=""
-  local gpu_capacity_block="" gpu_allocatable_block=""
-
-  if [[ "${node_type}" == "system" ]]; then
-    extra_label='    node-role.kubernetes.io/control-plane: ""'
-  fi
-  if [[ "${node_type}" == "accelerated" ]]; then
-    gpu_label_block='    nvidia.com/gpu.present: "true"
-    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
-    nvidia.com/gpu.count: "8"
-    nvidia.com/gpu.memory: "81920"
-    nvidia.com/cuda.driver.major: "570"
-    nvidia.com/cuda.driver.minor: "86"'
-    gpu_annotation_block='    nvidia.com/gpu.driver.version: "570.86.16"'
-    gpu_capacity_block='    nvidia.com/gpu: "8"'
-    gpu_allocatable_block='    nvidia.com/gpu: "8"'
-  fi
-
-  cat <<EOF
-apiVersion: v1
-kind: Node
-metadata:
-  name: ${name}
-  labels:
-    type: kwok
-    kubernetes.io/hostname: ${name}
-    kubernetes.io/os: linux
-    kubernetes.io/arch: amd64
-    node.kubernetes.io/instance-type: ${instance_type}
-    topology.kubernetes.io/region: ${KWOK_REGION}
-    topology.kubernetes.io/zone: ${zone}
-    aicr.run/node-type: ${node_type}
-${extra_label}
-${gpu_label_block}
-  annotations:
-    kwok.x-k8s.io/node: "fake"
-${gpu_annotation_block}
-spec:
-  taints:
-    - key: kwok.x-k8s.io/node
-      value: fake
-      effect: NoSchedule
-status:
-  nodeInfo:
-    architecture: amd64
-    containerRuntimeVersion: containerd://1.7.0
-    kernelVersion: 6.1.0-fake
-    kubeletVersion: ${KWOK_K8S_VERSION}
-    operatingSystem: linux
-    osImage: Amazon Linux 2023
-  capacity:
-    cpu: "${cpu}"
-    memory: ${memory}
-    ephemeral-storage: ${storage}
-    pods: "${max_pods}"
-${gpu_capacity_block}
-  allocatable:
-    cpu: "${cpu}"
-    memory: ${memory}
-    ephemeral-storage: ${storage}
-    pods: "${max_pods}"
-${gpu_allocatable_block}
-  conditions:
-    - type: Ready
-      status: "True"
-      reason: KubeletReady
-      message: kubelet is posting ready status
-    - type: MemoryPressure
-      status: "False"
-      reason: KubeletHasSufficientMemory
-    - type: DiskPressure
-      status: "False"
-      reason: KubeletHasNoDiskPressure
-    - type: PIDPressure
-      status: "False"
-      reason: KubeletHasSufficientPID
-  addresses:
-    - type: Hostname
-      address: ${name}
-EOF
-}
-
-# apply_kwok_nodes creates 2 system + 4 GPU (H100) fake nodes and waits for
-# the KWOK controller (installed by the caller) to bring them Ready.
-apply_kwok_nodes() {
-  local tmp i zone
-  tmp="$(mktemp -d)"
-  node_yaml system-0 system m7i.4xlarge "${KWOK_ZONES[0]}" 16 64Gi 100Gi 110 >"${tmp}/system-0.yaml"
-  node_yaml system-1 system m7i.4xlarge "${KWOK_ZONES[1]}" 16 64Gi 100Gi 110 >"${tmp}/system-1.yaml"
-  for i in 0 1 2 3; do
-    zone="${KWOK_ZONES[$((i % 2))]}"
-    node_yaml "gpu-${i}" accelerated p5.48xlarge "${zone}" 192 2048Gi 3800Gi 250 >"${tmp}/gpu-${i}.yaml"
-  done
-  kubectl apply -f "${tmp}/"
-  kubectl wait --for=condition=Ready nodes -l type=kwok --timeout=60s
-  rm -rf "${tmp}"
 }
 
 cleanup() {
@@ -209,17 +106,10 @@ trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
 echo "--- create Kind cluster"
 kind create cluster --name "${CLUSTER}" --wait 120s
 
-echo "--- install KWOK controller (v${KWOK_VERSION})"
-curl -fsSL --connect-timeout 10 --max-time 60 \
-  "https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/kwok.yaml" \
-  | kubectl apply --request-timeout=30s -f -
-curl -fsSL --connect-timeout 10 --max-time 60 \
-  "https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/stage-fast.yaml" \
-  | kubectl apply --request-timeout=30s -f -
-kubectl -n kube-system rollout status deploy/kwok-controller --timeout=120s
+e2e_install_kwok
 
 echo "--- apply simulated H100 nodes (2 system + 4x p5.48xlarge)"
-apply_kwok_nodes
+e2e_apply_kwok_nodes
 
 echo "--- build and load console image"
 e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
@@ -295,15 +185,25 @@ curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
   -H 'Content-Type: application/json' \
   -d '{"intent":"training","platform":"kubeflow"}' >/dev/null
 
-echo "--- poll until done (Recommend complete)"
+echo "--- poll until the run parks a second time (Recommend + Bundle complete, Apply's confirm gate)"
 STATE=""
 for _ in $(seq 1 60); do
   RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
-  [[ "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
+  [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 3
 done
-[[ "${STATE}" == "done" ]] || fail_run "${RUN_JSON}"
+[[ "${STATE}" == "failed" ]] && fail_run "${RUN_JSON}"
+[[ "${STATE}" == "awaiting_decision" ]] || {
+  echo "run did not park at the confirm gate within the deadline (state=${STATE})" >&2
+  fail_run "${RUN_JSON}"
+}
+
+PENDING="$(echo "${RUN_JSON}" | jq -cS '.pending')"
+[[ "${PENDING}" == '["apply"]' ]] || {
+  echo "unexpected pending decisions at the confirm gate: ${PENDING}" >&2
+  exit 1
+}
 
 echo "--- recipe resolved; extracting component count from the SSE stream"
 # A parse failure here is a hard failure, not a warning-and-pass: this is the

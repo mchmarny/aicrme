@@ -22,6 +22,7 @@ func newTestServer(t *testing.T) http.Handler {
 		SessionTTL: time.Hour,
 		LoginRate:  100,
 		AICR:       &aicrclient.Fake{},
+		WorkDir:    t.TempDir(),
 	}, bus.New(64), engine.New(bus.New(64), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -85,6 +86,7 @@ func TestProtectedRoutesRequireSession(t *testing.T) {
 func TestLoginRateLimited(t *testing.T) {
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "pw", SessionTTL: time.Hour, LoginRate: 2, AICR: &aicrclient.Fake{},
+		WorkDir: t.TempDir(),
 	}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -117,7 +119,7 @@ func TestHealthzIsPublic(t *testing.T) {
 }
 
 func TestEmptyPasswordRejected(t *testing.T) {
-	_, err := api.New(api.Config{Username: "admin", Password: ""}, bus.New(8),
+	_, err := api.New(api.Config{Username: "admin", Password: "", WorkDir: t.TempDir()}, bus.New(8),
 		engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
 	if err == nil {
 		t.Error("api.New() accepted an empty password")

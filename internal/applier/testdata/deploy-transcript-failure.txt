@@ -1,0 +1,23 @@
+
+══ Pre-flight checks ══════════════════════════════════════════════
+✓ Pre-flight checks passed
+
+══ Deploying AICR components ══════════════════════════════════════
+
+┌─ [1/3] cert-manager  →  cert-manager
+│  Manual (approx, set KUBECONFIG_FLAG/DRY_RUN_FLAG/COMPONENT_WAIT_ARGS as needed): cd /bundle/001-cert-manager && bash install.sh
+Release "cert-manager" does not exist. Installing it now.
+└─ ✓ cert-manager installed
+
+┌─ [2/3] kai-scheduler  →  kai-scheduler
+│  Manual (approx, set KUBECONFIG_FLAG/DRY_RUN_FLAG/COMPONENT_WAIT_ARGS as needed): cd /bundle/002-kai-scheduler && bash install.sh
+│  (async component — skipping --wait, keeping --timeout for hooks)
+Error: INSTALLATION FAILED: timed out waiting for the condition
+  --- Failed hook Job kai-scheduler-crd-upgrader diagnostics ---
+  Cleaning up stale Helm hook Job kai-scheduler-crd-upgrader in kai-scheduler...
+  --- End diagnostics for kai-scheduler-crd-upgrader ---
+  ↺ kai-scheduler: attempt 1/1 failed, retrying in 5s...
+Error: INSTALLATION FAILED: timed out waiting for the condition
+└─ ✗ kai-scheduler FAILED (after 2 attempts)
+⚠ kai-scheduler install failed, continuing (--best-effort)
+✗ Deployment completed with failures (--best-effort): kai-scheduler

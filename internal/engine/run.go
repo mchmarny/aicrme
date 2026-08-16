@@ -52,9 +52,16 @@ type Run struct {
 	Decisions map[string]string `json:"decisions"`
 	Artifacts map[string][]byte `json:"-"`
 	Pending   []string          `json:"pending,omitempty"`
-	Err       string            `json:"error,omitempty"`
-	StartedAt time.Time         `json:"startedAt"`
-	UpdatedAt time.Time         `json:"updatedAt"`
+	// StepIndex is the index of the next step to execute. It exists so a
+	// failed run can be retried from the step that failed rather than from
+	// the top: re-running Discover would redeploy the snapshot agent Job
+	// and take minutes, and re-running Recommend would discard the
+	// decisions the user already made. It advances only after a step
+	// succeeds, so a failure leaves it pointing at the step to retry.
+	StepIndex int       `json:"stepIndex"`
+	Err       string    `json:"error,omitempty"`
+	StartedAt time.Time `json:"startedAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // Clone returns a deep copy safe to hand to callers outside the engine lock.

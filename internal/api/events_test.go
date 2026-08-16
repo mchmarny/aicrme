@@ -39,7 +39,7 @@ func TestEventStreamReplaysFromLastEventID(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{},
+		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)

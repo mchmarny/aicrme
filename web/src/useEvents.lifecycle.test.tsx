@@ -61,6 +61,7 @@ describe('useEvents connection lifecycle', () => {
   afterEach(() => {
     // @ts-expect-error -- undo the test double
     delete global.EventSource
+    vi.unstubAllGlobals()
   })
 
   it('unsubscribes on unmount, leaving no open connection behind', () => {
@@ -216,5 +217,42 @@ describe('useEvents connection lifecycle', () => {
     expect(MockEventSource.instances.length).toBe(2 + MAX_GAP_RECONNECT_ATTEMPTS)
 
     vi.useRealTimers()
+  })
+
+  // EventSource surfaces no HTTP status on error, so the hook cannot tell an
+  // expired session from a network blip on its own -- it probes GET
+  // /api/session (204 authenticated, 401 not) to tell them apart. Only a
+  // genuine 401 may call onUnauthorized; EventSource's own retry already
+  // handles everything else.
+  it('calls onUnauthorized when the stream drops and the session probe reports a genuine 401', async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 401 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const onUnauthorized = vi.fn()
+
+    renderHook(() => useEvents(onUnauthorized))
+    const source = MockEventSource.instances[0]
+
+    await act(async () => {
+      source.onerror?.()
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/session')
+    expect(onUnauthorized).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not call onUnauthorized when the stream drops but the session probe reports the session is still live', async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const onUnauthorized = vi.fn()
+
+    renderHook(() => useEvents(onUnauthorized))
+    const source = MockEventSource.instances[0]
+
+    await act(async () => {
+      source.onerror?.()
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/session')
+    expect(onUnauthorized).not.toHaveBeenCalled()
   })
 })

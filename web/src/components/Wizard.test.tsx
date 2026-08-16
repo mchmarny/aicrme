@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { MAX_PROVISIONAL_OPTIONS_RETRIES, Wizard } from './Wizard'
+import { deriveRunState, MAX_PROVISIONAL_OPTIONS_RETRIES, Wizard } from './Wizard'
 import type { AicrEvent } from '../useEvents'
 import kwokRun from '../fixtures/kwok-run.json'
 
@@ -177,6 +177,33 @@ describe('Wizard', () => {
     await waitFor(() => expect(screen.getAllByRole('radiogroup')).toHaveLength(2), { timeout: 3000 })
     expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(screen.queryByText(/could not be verified/)).toBeNull()
+  })
+
+  // Regression guard (M1): run.error is derived by replaying every event a
+  // run has ever emitted, including a stale 'error' kind from an attempt
+  // that later succeeded -- deriveRunState used to have no way to drop it,
+  // so a successful Retry rendered the success state with the previous
+  // attempt's red failure line still above it. engine.Retry
+  // (internal/engine/engine.go) publishes a "run retrying" KindPhase event
+  // before relaunching execute, which is the signal deriveRunState now uses
+  // to clear the stale error.
+  it('clears a prior failure once a retry starts, and does not resurrect it after the retry succeeds', () => {
+    const failThenRetrySucceed: AicrEvent[] = [
+      { id: 1, runId: 'runX', at: '2026-08-15T00:00:00Z', kind: 'phase', level: 'info', phase: 'apply', message: 'phase started' },
+      { id: 2, runId: 'runX', at: '2026-08-15T00:00:01Z', kind: 'error', level: 'error', phase: 'apply', message: 'network-operator failed: no matches for kind "NodeFeatureRule"' },
+      { id: 3, runId: 'runX', at: '2026-08-15T00:00:02Z', kind: 'phase', level: 'error', message: 'run failed' },
+      { id: 4, runId: 'runX', at: '2026-08-15T00:00:03Z', kind: 'phase', level: 'info', message: 'run retrying' },
+      { id: 5, runId: 'runX', at: '2026-08-15T00:00:04Z', kind: 'phase', level: 'info', phase: 'apply', message: 'phase started' },
+      { id: 6, runId: 'runX', at: '2026-08-15T00:00:05Z', kind: 'phase', level: 'info', message: 'run done' },
+    ]
+
+    const beforeRetry = deriveRunState(failThenRetrySucceed.slice(0, 3))
+    expect(beforeRetry.state).toBe('failed')
+    expect(beforeRetry.error).toBeDefined()
+
+    const afterRetry = deriveRunState(failThenRetrySucceed)
+    expect(afterRetry.state).toBe('done')
+    expect(afterRetry.error).toBeUndefined()
   })
 
   it('shows a caveat rather than presenting an exhausted-retry provisional set as final', async () => {

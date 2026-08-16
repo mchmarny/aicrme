@@ -356,3 +356,15 @@ func TestAnalyzeFullyCapableClusterHasNoGaps(t *testing.T) {
 		t.Errorf("Punchline = %q, want %q", report.Punchline, want)
 	}
 }
+
+// A fully capable cluster and a cluster that was never measured both yield
+// zero gaps. The console must not congratulate the user for the second.
+func TestAnalyzeMarksWhetherASnapshotWasActuallyMeasured(t *testing.T) {
+	if got := gap.Analyze(nil); got.Analyzed {
+		t.Error("Analyzed = true for a nil snapshot, want false")
+	}
+	report := gap.Analyze(loadFixture(t, "snapshot-kwok-h100.yaml"))
+	if !report.Analyzed {
+		t.Error("Analyzed = false for a real snapshot, want true")
+	}
+}

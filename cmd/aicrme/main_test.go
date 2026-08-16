@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -218,5 +219,27 @@ func TestEnvOr(t *testing.T) {
 	t.Setenv(key, "registry.example.com/mirror/aicr:v0.19.0")
 	if got, want := envOr(key, defaultSnapshotAgentImage), os.Getenv(key); got != want {
 		t.Errorf("envOr(set) = %q, want the override %q", got, want)
+	}
+}
+
+func TestEnsureWorkDirsCreatesEveryCacheDir(t *testing.T) {
+	root := t.TempDir()
+	if err := ensureWorkDirs(root); err != nil {
+		t.Fatalf("ensureWorkDirs() error = %v", err)
+	}
+	for _, sub := range []string{"tmp", "home", "helm/cache", "helm/config", "helm/data", "kube/cache", "runs"} {
+		if _, err := os.Stat(filepath.Join(root, sub)); err != nil {
+			t.Errorf("missing %s: %v", sub, err)
+		}
+	}
+}
+
+func TestEnsureWorkDirsFailsOnUnwritableRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "blocked")
+	if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("setup error = %v", err)
+	}
+	if err := ensureWorkDirs(root); err == nil {
+		t.Error("ensureWorkDirs() error = nil, want a failure -- an unwritable work dir must not start silently")
 	}
 }

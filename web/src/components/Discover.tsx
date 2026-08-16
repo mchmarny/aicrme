@@ -11,6 +11,11 @@ export interface CapabilityReport {
   punchline: string
   usableGpus: number
   totalGpus: number
+  // gap.Report.Analyzed (internal/gap/gap.go): zero gaps means either
+  // "every capability present" or "nothing measured at all". Without this,
+  // a cluster that was never snapshotted renders the same green
+  // already-capable copy as one that is genuinely fully capable.
+  analyzed: boolean
   // gap.Report.Gaps (internal/gap/gap.go) carries no `omitempty`, so Go
   // marshals a nil slice as JSON null, not `[]` -- and a nil slice is
   // exactly what a cluster with every gap closed produces (see
@@ -30,7 +35,11 @@ export function Discover({ report }: { report: CapabilityReport }) {
         {report.detail && <p className="mt-1 text-sm text-slate-400">{report.detail}</p>}
       </div>
 
-      {gaps.length === 0 ? (
+      {!report.analyzed ? (
+        <p data-testid="no-snapshot" className="text-amber-400">
+          No cluster snapshot is available yet, so nothing has been measured — this is not a clean bill of health.
+        </p>
+      ) : gaps.length === 0 ? (
         <p data-testid="no-gaps" className="text-emerald-400">
           Every capability this workload needs is already installed — there is nothing left to close.
         </p>

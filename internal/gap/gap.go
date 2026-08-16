@@ -26,6 +26,12 @@ type Report struct {
 	Gaps       []Gap  `json:"gaps"`
 	UsableGPUs int    `json:"usableGpus"`
 	TotalGPUs  int    `json:"totalGpus"`
+	// Analyzed is false when Analyze had no usable snapshot. Gaps is empty
+	// in two very different situations -- every capability already present,
+	// and nothing measured at all -- and the console must not show the
+	// green "already capable" copy for the second. The headline strings
+	// differ too, but keying UI on prose is how prose changes become bugs.
+	Analyzed bool `json:"analyzed"`
 }
 
 // probe is the read-only view the rules evaluate against.
@@ -65,6 +71,7 @@ func Analyze(s *aicr.Snapshot) Report {
 		Headline:  headline(p),
 		Detail:    detail(p),
 		TotalGPUs: totalGPUs(p),
+		Analyzed:  true,
 	}
 	for _, rule := range rules {
 		if rule.Applies(p) {

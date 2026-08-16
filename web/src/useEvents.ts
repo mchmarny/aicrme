@@ -70,8 +70,16 @@ export const MAX_GAP_RECONNECT_ATTEMPTS = 3
  */
 export const GAP_RECONNECT_BASE_DELAY_MS = 250
 
-/** useEvents subscribes to /api/events and accumulates the ordered timeline. */
-export function useEvents() {
+/**
+ * useEvents subscribes to /api/events and accumulates the ordered timeline.
+ *
+ * onUnauthorized, if given, must be a stable reference (wrap it in
+ * useCallback at the call site). It is a dependency of the effect below, so
+ * a new function identity on every render would tear down and reopen the
+ * SSE connection continuously -- a bug that looks exactly like a flaky
+ * backend.
+ */
+export function useEvents(onUnauthorized?: () => void) {
   const [events, setEvents] = useState<AicrEvent[]>([])
   const [connected, setConnected] = useState(false)
   const [eventsLost, setEventsLost] = useState(0)
@@ -89,7 +97,20 @@ export function useEvents() {
     function connect() {
       source = new EventSource(`/api/events?since=${lastId.current}`)
       source.onopen = () => setConnected(true)
-      source.onerror = () => setConnected(false)
+      source.onerror = () => {
+        setConnected(false)
+        // EventSource surfaces no HTTP status, so a dropped stream is
+        // indistinguishable here from an expired session. After the 8-hour
+        // expiry the console previously sat on "reconnecting…" forever with
+        // no path back to the login screen. Probe a cheap authenticated
+        // route to tell the two apart; anything other than a 401 is a
+        // genuine blip and EventSource's own retry handles it.
+        fetch('/api/session')
+          .then(res => {
+            if (res.status === 401 && !torndown) onUnauthorized?.()
+          })
+          .catch(() => {})
+      }
       source.onmessage = (msg: MessageEvent<string>) => {
         const parsed = JSON.parse(msg.data) as AicrEvent
         if (detectGap(lastId.current, parsed.id) && gapAttempts.current < MAX_GAP_RECONNECT_ATTEMPTS) {
@@ -138,7 +159,9 @@ export function useEvents() {
       clearTimeout(backoffTimer)
       source.close()
     }
-  }, [])
+    // onUnauthorized must be a stable (useCallback-wrapped) reference -- see
+    // the function doc comment above.
+  }, [onUnauthorized])
 
   return { events, connected, eventsLost }
 }

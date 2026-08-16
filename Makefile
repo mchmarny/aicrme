@@ -80,6 +80,10 @@ lint-shell: ## Lints shell scripts with shellcheck
 test-chart: ## Runs helm lint plus the chart contract assertions (offline, no cluster)
 	./test/chart/contract.sh
 
+.PHONY: test-e2e-apply
+test-e2e-apply: ## Runs the Discover-to-Apply dry-run e2e on Kind+KWOK (needs Docker)
+	./test/e2e/apply-dryrun.sh
+
 .PHONY: test-web
 test-web: ## Runs the SPA unit tests
 	cd web && npm test

@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -95,6 +96,73 @@ func TestRunParksForDecisions(t *testing.T) {
 	final := waitState(t, e, run.ID, engine.StateDone)
 	if final.Decisions["platform"] != "kubeflow" {
 		t.Errorf("decisions not recorded: %v", final.Decisions)
+	}
+}
+
+// TestDecideRejectsKeysNotCurrentlyPending closes the gap the pre-fix Decide
+// left open: a single call supplying every key a later gate will ever
+// require -- sent at the FIRST gate the run parks on -- must not pre-satisfy
+// a downstream Requires() before that step's own gate is ever reached. The
+// pre-fix Decide merged every key the client sent, checking only that the
+// currently-pending keys were present, so
+// {"intent":"training","platform":"kubeflow","apply":"yes"} answered at the
+// Recommend gate would have satisfied steps.Apply.Requires() (steps/apply.go)
+// without the confirm gate it names ever firing.
+func TestDecideRejectsKeysNotCurrentlyPending(t *testing.T) {
+	b := bus.New(64)
+	a := newFakeStep(engine.PhaseDiscover)
+	c := newFakeStep(engine.PhaseRecommend, "intent", "platform")
+	d := newFakeStep(engine.PhaseApply, "apply")
+	e := engine.New(b, engine.NewMemoryStore(), a, c, d)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	if decideErr := e.Decide(run.ID, map[string]string{
+		"intent": "training", "platform": "kubeflow", "apply": "yes",
+	}); decideErr == nil {
+		t.Fatal("Decide() with a key not currently pending ('apply') should error")
+	}
+
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if _, ok := got.Decisions["apply"]; ok {
+		t.Error("apply decision was recorded even though the rejected call must not merge anything")
+	}
+	if len(d.ran) != 0 {
+		t.Fatal("Apply ran before its own confirm gate was ever satisfied")
+	}
+
+	// The legitimate two-key answer at this gate still works.
+	if decideErr := e.Decide(run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); decideErr != nil {
+		t.Fatalf("Decide() with only the pending keys error = %v", decideErr)
+	}
+
+	// The run now parks on Apply's own gate, proving "apply" is still
+	// genuinely pending rather than having been silently pre-satisfied.
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+	got, err = e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if len(got.Pending) != 1 || got.Pending[0] != "apply" {
+		t.Fatalf("Pending = %v, want [apply]", got.Pending)
+	}
+	if len(d.ran) != 0 {
+		t.Fatal("Apply ran before its confirm gate was answered")
+	}
+
+	if decideErr := e.Decide(run.ID, map[string]string{"apply": "yes"}); decideErr != nil {
+		t.Fatalf("Decide() error = %v", decideErr)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+	if len(d.ran) != 1 {
+		t.Errorf("Apply ran %d times, want 1", len(d.ran))
 	}
 }
 
@@ -212,5 +280,270 @@ func TestPhaseEventsPublished(t *testing.T) {
 	}
 	if phases == 0 {
 		t.Error("no phase events published")
+	}
+}
+
+// A step that fails once and then succeeds -- the exact shape Retry exists
+// for, since a mid-apply component failure is normal on real clusters.
+type flakyStep struct {
+	phase engine.Phase
+	fails int
+	runs  int
+	mu    sync.Mutex
+}
+
+func (f *flakyStep) Phase() engine.Phase { return f.phase }
+func (f *flakyStep) Requires() []string  { return nil }
+func (f *flakyStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs++
+	if f.runs <= f.fails {
+		return errors.New("boom")
+	}
+	return nil
+}
+
+func (f *flakyStep) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runs
+}
+
+func TestRetryResumesFromTheFailedStep(t *testing.T) {
+	b := bus.New(64)
+	first := newFakeStep(engine.PhaseDiscover)
+	flaky := &flakyStep{phase: engine.PhaseApply, fails: 1}
+	e := engine.New(b, engine.NewMemoryStore(), first, flaky)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	if _, err := e.Retry(run.ID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	done := waitState(t, e, run.ID, engine.StateDone)
+
+	if done.Err != "" {
+		t.Errorf("Err = %q, want cleared on a successful retry", done.Err)
+	}
+	// The first step must NOT re-run: the cursor resumes at the step that
+	// failed, so Discover's snapshot Job is not redeployed.
+	if got := len(first.ran); got != 1 {
+		t.Errorf("first step ran %d times, want 1", got)
+	}
+	if got := flaky.count(); got != 2 {
+		t.Errorf("failed step ran %d times, want 2", got)
+	}
+}
+
+func TestRetryRejectsARunThatIsNotFailed(t *testing.T) {
+	b := bus.New(64)
+	e := engine.New(b, engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	if _, err := e.Retry(run.ID); err == nil {
+		t.Error("Retry() error = nil, want a conflict on a completed run")
+	}
+}
+
+func TestRetryRejectsAnUnknownRun(t *testing.T) {
+	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	if _, err := e.Retry("nope"); err == nil {
+		t.Error("Retry() error = nil, want not-found")
+	}
+}
+
+// The epoch guard. Retry is the path that makes a second execute goroutine
+// reachable for the SAME run, which is exactly what Start's isLive check
+// cannot see: isLive answers "is a run live", not "is THIS goroutine still
+// the one driving it". A retried run must therefore reach exactly one
+// terminal state and publish exactly one terminal event -- a superseded
+// goroutine writing state again would produce two.
+func TestRetriedRunReachesExactlyOneTerminalState(t *testing.T) {
+	b := bus.New(256)
+	sub, unsubscribe := b.Subscribe(0)
+	defer unsubscribe()
+
+	flaky := &flakyStep{phase: engine.PhaseApply, fails: 1}
+	e := engine.New(b, engine.NewMemoryStore(), flaky)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	if _, err := e.Retry(run.ID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	done := waitState(t, e, run.ID, engine.StateDone)
+
+	if done.StepIndex != 1 {
+		t.Errorf("StepIndex = %d, want 1 (all steps consumed)", done.StepIndex)
+	}
+
+	// Drain what the bus has so far and count terminal events. A superseded
+	// goroutine calling finish() again is the failure this catches.
+	deadline := time.After(500 * time.Millisecond)
+	terminal := 0
+drain:
+	for {
+		select {
+		case ev := <-sub:
+			if ev.Message == "run done" {
+				terminal++
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+	if terminal != 1 {
+		t.Errorf("published %d 'run done' events, want exactly 1 -- a superseded goroutine wrote state", terminal)
+	}
+}
+
+// saveFailingStore wraps a Store and can be told to fail every Save call on
+// demand, to exercise Retry's rollback path when persistence fails.
+type saveFailingStore struct {
+	engine.Store
+	mu   sync.Mutex
+	fail bool
+}
+
+func (s *saveFailingStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return errors.New("save failed")
+	}
+	return s.Store.Save(ctx, r)
+}
+
+func (s *saveFailingStore) setFail(v bool) {
+	s.mu.Lock()
+	s.fail = v
+	s.mu.Unlock()
+}
+
+// TestRetryFailedSaveLeavesRunRetryable pins that a Save failure during
+// Retry does not wedge the run. Retry flips State to StateRunning before
+// persisting; if Save then fails and State is left at StateRunning with no
+// goroutine driving it, the run becomes unrecoverable without restarting
+// the process -- Start refuses because isLive(StateRunning) is true, and
+// Retry refuses because it requires StateFailed. This is currently inert
+// (memoryStore.Save never errors) but docs/phase-2-handoff.md's
+// ConfigMap-backed store, landing in Phase 2b, is precisely where Save
+// starts failing for real.
+func TestRetryFailedSaveLeavesRunRetryable(t *testing.T) {
+	b := bus.New(64)
+	boom := errors.New("boom")
+	a := newFakeStep(engine.PhaseDiscover)
+	a.err = boom
+	store := &saveFailingStore{Store: engine.NewMemoryStore()}
+	e := engine.New(b, store, a)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	store.setFail(true)
+	if _, retryErr := e.Retry(run.ID); retryErr == nil {
+		t.Fatal("Retry() error = nil, want the store's Save error")
+	}
+	store.setFail(false)
+
+	// The assertion that matters: State is still StateFailed, so a
+	// subsequent Retry could still succeed. Asserting only the error above
+	// would pass even with the run wedged at StateRunning.
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q -- a failed Save must not wedge the run", got.State, engine.StateFailed)
+	}
+}
+
+// flakyGatedStep requires a decision before it may run, and fails once then
+// succeeds -- it exists to pin that Retry does not re-park a run whose
+// decisions were already supplied before the failing attempt.
+type flakyGatedStep struct {
+	phase    engine.Phase
+	requires []string
+	fails    int
+	runs     int
+	mu       sync.Mutex
+}
+
+func (f *flakyGatedStep) Phase() engine.Phase { return f.phase }
+func (f *flakyGatedStep) Requires() []string  { return f.requires }
+func (f *flakyGatedStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs++
+	if f.runs <= f.fails {
+		return errors.New("boom")
+	}
+	return nil
+}
+
+// TestRetryDoesNotReparkForDecisions pins the path the product depends on:
+// a mid-Apply failure after the user has already answered its decision
+// prompt, followed by Retry, must resume straight into the step rather than
+// asking the question again. Retry never touches Decisions, and
+// awaitDecisions only checks key presence, so this should already hold --
+// but nothing pinned it, and a future change to either would silently
+// re-park a retried run.
+func TestRetryDoesNotReparkForDecisions(t *testing.T) {
+	b := bus.New(64)
+	step := &flakyGatedStep{phase: engine.PhaseApply, requires: []string{"apply"}, fails: 1}
+	e := engine.New(b, engine.NewMemoryStore(), step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	if err := e.Decide(run.ID, map[string]string{"apply": "yes"}); err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateFailed)
+
+	if _, err := e.Retry(run.ID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			got, _ := e.Get(run.ID)
+			t.Fatalf("timed out waiting for state %q, last state %q", engine.StateDone, got.State)
+		default:
+		}
+		got, err := e.Get(run.ID)
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if got.State == engine.StateAwaitingDecision {
+			t.Fatal("Retry re-parked the run for a decision it already had")
+		}
+		if got.State == engine.StateDone {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,7 +10,13 @@ import (
 )
 
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
-	run, err := s.engine.Start(r.Context())
+	// context.WithoutCancel: the run outlives this request by design --
+	// Apply alone takes 10-20 minutes on real hardware. Handing the engine
+	// the cancellable request context means the browser closing the tab
+	// (or a proxy timing out) cancels the run mid-install, and a
+	// store.Save failure under a canceled context would leave e.current
+	// live and permanently 409 every new run.
+	run, err := s.engine.Start(context.WithoutCancel(r.Context()))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -17,8 +24,29 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, run)
 }
 
+func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
+	// engine.Retry takes no context parameter for the same reason as
+	// engine.Get -- see handleGetRun.
+	run, err := s.engine.Retry(r.PathValue("id")) //nolint:contextcheck // see handleGetRun
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
-	run, err := s.engine.Get(r.PathValue("id"))
+	// engine.Get takes no context parameter by design (internal/engine is
+	// locked): it only reaches context.Background() on its store.Load
+	// fallback for a run this process didn't start, not a call this
+	// request's cancellation should govern today. That stops being true once
+	// Phase 2b's store rewrite makes Load/Save real ConfigMap API calls --
+	// at that point context.Background() here starts ignoring genuine
+	// caller cancellation instead of hitting an in-memory map, and
+	// Engine.Get/Retry will need a context.Context parameter threaded
+	// through from these handlers. grep for contextcheck in internal/api to
+	// find every site this affects.
+	run, err := s.engine.Get(r.PathValue("id")) //nolint:contextcheck // engine.Get takes no context parameter by design; internal/engine is locked.
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -36,7 +64,7 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	run, err := s.engine.Get(r.PathValue("id"))
+	run, err := s.engine.Get(r.PathValue("id")) //nolint:contextcheck // see handleGetRun
 	if err != nil {
 		writeErr(w, err)
 		return
