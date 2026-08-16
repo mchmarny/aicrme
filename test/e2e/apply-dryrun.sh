@@ -12,17 +12,17 @@
 # CRITICAL -- why this drives the console over HTTP against the image
 # e2e_build_and_load_image builds and loads into Kind, and must NEVER be
 # "optimised" into invoking deploy.sh (or the aicrme binary) on the host:
-# an earlier Phase 2a probe (docs/phase-2a-task-1-findings.md) ran
-# `deploy.sh --dry-run` successfully, but on the HOST, with helm v4.2.4 and
-# kubectl v1.36.3. The production image pins helm 3.19.0 and kubectl
-# 1.34.1 (Dockerfile ARG HELM_VERSION / ARG KUBECTL_VERSION), and the
-# generated install.sh BRANCHES on helm's major version -- helm>=4 gets
-# `--force-conflicts` and server-side apply, helm 3 gets neither. Different
-# command line, different apply semantics. The host probe's green result
-# therefore proves nothing about what this console actually ships; only a
-# run through the real image, on the real helm 3 binary, does. See the
-# in-image helm-major assertion below, which exists so this can never
-# silently drift again.
+# an earlier Phase 2a probe (docs/phase-2-handoff.md, "The Task 1 probe,
+# folded in from the deleted findings file") ran `deploy.sh --dry-run`
+# successfully, but on the HOST, with helm v4.2.4 and kubectl v1.36.3. The
+# production image pins helm 3.19.0 and kubectl 1.34.1 (Dockerfile ARG
+# HELM_VERSION / ARG KUBECTL_VERSION), and the generated install.sh
+# BRANCHES on helm's major version -- helm>=4 gets `--force-conflicts` and
+# server-side apply, helm 3 gets neither. Different command line, different
+# apply semantics. The host probe's green result therefore proves nothing
+# about what this console actually ships; only a run through the real
+# image, on the real helm 3 binary, does. See the in-image helm-major
+# assertion below, which exists so this can never silently drift again.
 #
 # Why simulated GPU nodes, the KWOK setup, and training/kubeflow: see
 # discover-recommend.sh's header -- this script shares that cluster setup
@@ -298,11 +298,12 @@ echo "${COMPONENT_STATUSES}" | grep -qx 'installed' || {
 # else. helm 3's --dry-run builds typed k8s objects client-side against
 # live discovery and fails hard when the kind isn't there ("no matches
 # for kind NodeFeatureRule ... ensure CRDs are installed first"); the
-# earlier host probe (docs/phase-2a-task-1-findings.md, helm v4.2.4)
-# happened to tolerate the same missing CRD and reached exit 0 on all 14
-# components -- arguably the LESS correct behavior, and evidence that
-# probe validated a code path (install.sh branches on helm major)
-# production doesn't take, not evidence this console is broken.
+# earlier host probe (docs/phase-2-handoff.md, "The dry-run ceiling"
+# section; helm v4.2.4) happened to tolerate the same missing CRD and
+# reached exit 0 on all 14 components -- arguably the LESS correct
+# behavior, and evidence that probe validated a code path (install.sh
+# branches on helm major) production doesn't take, not evidence this
+# console is broken.
 #
 # So this is the genuine ceiling of dry-run verification for an ordered
 # bundle with cross-component CRD dependencies, not a bug awaiting a fix:

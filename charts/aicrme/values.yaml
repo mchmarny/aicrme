@@ -20,6 +20,7 @@ resources:
 # directories deploy.sh needs. emptyDir, not a PVC: a bundle is regenerated
 # deterministically from the pinned, embedded recipe catalog on every run,
 # so nothing here needs to outlive the pod. sizeLimit is measured against a
-# real bundle -- see docs/phase-2a-task-1-findings.md.
+# real bundle -- see docs/phase-2-handoff.md, "New for 2b" section
+# (workDir.sizeLimit), which carries the measured 352K figure.
 workDir:
   sizeLimit: 1Gi
