@@ -139,6 +139,22 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		StartedAt: now,
 		UpdatedAt: now,
 	}
+	// Name the phase here rather than leaving it to the first step's own
+	// runStep/awaitDecisions call. Without this, the very first Save below
+	// -- which happens before any step has run -- persists Phase: "", and a
+	// crash in that window leaves a perfectly normal record that
+	// Recover's validateLoaded cannot tell apart from a corrupt one. Since
+	// that record is then never overwritten (the unreadable path swaps to a
+	// memory store precisely so it never is), the mistake would be
+	// permanent and silent: persistence disabled for the rest of the
+	// process, repeated on every subsequent restart. An engine built with no
+	// steps has nothing to derive a phase from; that construction is
+	// test-only (main.go always assembles a real step slice) and already
+	// completes immediately via execute's own i >= len(e.steps) branch, so
+	// it is left as the zero value rather than indexing into an empty slice.
+	if len(e.steps) > 0 {
+		r.Phase = e.steps[0].Phase()
+	}
 	e.current = r
 	e.resume = make(chan struct{}, 1)
 	e.epoch++

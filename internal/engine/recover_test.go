@@ -357,3 +357,104 @@ func TestRecoverRequiresExactlyOneBundleStep(t *testing.T) {
 		}
 	})
 }
+
+// TestStartSetsPhaseFromFirstStep pins the producer-side fix (Ruling 9): a
+// run returned by Start already names a declared Phase before any step has
+// executed, because Start sets it at construction rather than leaving it to
+// the first step's own runStep/awaitDecisions call.
+func TestStartSetsPhaseFromFirstStep(t *testing.T) {
+	e := fourStepEngine(engine.NewMemoryStore())
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if run.Phase != engine.PhaseDiscover {
+		t.Errorf("Phase = %q, want %q (fourStepEngine's first step)", run.Phase, engine.PhaseDiscover)
+	}
+}
+
+// TestRecoverInstallsARunPersistedBeforeAnyStepRan is the regression test
+// for the whole empty-Phase chain Ruling 9 fixes: a run persisted by Start's
+// very first Save -- before any step has completed -- must still recover
+// successfully rather than being rejected as unreadable. Without the fix, a
+// crash landing in that (previously) phase-less window would have disabled
+// persistence for the rest of the process, permanently: the record is never
+// overwritten once the unreadable path swaps to a memory store.
+func TestRecoverInstallsARunPersistedBeforeAnyStepRan(t *testing.T) {
+	store := engine.NewMemoryStore()
+	step := &ctxBlockingStep{phase: engine.PhaseDiscover, entered: make(chan struct{}, 1)}
+	e1 := engine.New(bus.New(64), store, step)
+
+	run, err := e1.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-step.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step never entered")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = e1.CancelAndWait(ctx)
+	})
+
+	if run.Phase != engine.PhaseDiscover {
+		t.Fatalf("Start()'s returned run has Phase = %q, want %q -- see TestStartSetsPhaseFromFirstStep",
+			run.Phase, engine.PhaseDiscover)
+	}
+
+	// A second engine recovering against the same store, simulating a
+	// restart while the first step was still in flight, must install this
+	// run rather than taking the unreadable path.
+	e2 := fourStepEngine(store)
+	if err := e2.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if e2.StoreUnreadable() {
+		t.Fatal("StoreUnreadable() = true, want a normal pre-first-step record to recover cleanly")
+	}
+	got := e2.Current()
+	if got == nil {
+		t.Fatal("Current() = nil, want the persisted pre-first-step run installed")
+	}
+	if got.ID != run.ID {
+		t.Errorf("ID = %q, want %q", got.ID, run.ID)
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
+	}
+	if !strings.Contains(got.Err, "interrupted") {
+		t.Errorf("Err = %q, want it to contain %q", got.Err, "interrupted")
+	}
+	if got.StepIndex != 0 {
+		t.Errorf("StepIndex = %d, want 0 -- no step had completed", got.StepIndex)
+	}
+}
+
+// TestStartWithNoStepsDoesNotPanic pins the guard: an engine built with no
+// steps (test-only -- main.go always assembles a real step slice, and
+// internal/api's test suite constructs engines this way deliberately, to
+// exercise HTTP behavior unrelated to step execution) has nothing to derive
+// an initial Phase from. Start must not index into the empty slice, and must
+// keep completing the run rather than failing it -- returning an error here
+// would break every internal/api test built on this construction, which
+// currently asserts Start succeeds and the run reaches StateDone immediately.
+func TestStartWithNoStepsDoesNotPanic(t *testing.T) {
+	e := engine.New(bus.New(8), engine.NewMemoryStore())
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v, want nil", err)
+	}
+	if run.Phase != "" {
+		t.Errorf("Phase = %q, want the zero value -- there is no step to derive it from", run.Phase)
+	}
+
+	final := waitState(t, e, run.ID, engine.StateDone)
+	if final.StepIndex != 0 {
+		t.Errorf("StepIndex = %d, want 0", final.StepIndex)
+	}
+}
