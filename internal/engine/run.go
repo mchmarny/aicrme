@@ -52,6 +52,9 @@ type Run struct {
 	Decisions map[string]string `json:"decisions"`
 	Artifacts map[string][]byte `json:"-"`
 	Pending   []string          `json:"pending,omitempty"`
+	// Components is the latest known state of each component the bundle
+	// installs.
+	Components []ComponentState `json:"components,omitempty"`
 	// StepIndex is the index of the next step to execute. It exists so a
 	// failed run can be retried from the step that failed rather than from
 	// the top: re-running Discover would redeploy the snapshot agent Job
@@ -62,6 +65,17 @@ type Run struct {
 	Err       string    `json:"error,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// ComponentState is the latest known state of one component the bundle
+// installs. It is a projection, not a log: exactly one row per component,
+// overwritten in place. Persisting this is what lets a recovered run redraw
+// the pipeline, without persisting the event stream that produced it.
+type ComponentState struct {
+	Name   string `json:"name"`
+	Index  int    `json:"index"`
+	Total  int    `json:"total"`
+	Status string `json:"status"`
 }
 
 // Clone returns a deep copy safe to hand to callers outside the engine lock.
@@ -76,5 +90,6 @@ func (r *Run) Clone() *Run {
 		out.Artifacts[k] = append([]byte(nil), v...)
 	}
 	out.Pending = append([]string(nil), r.Pending...)
+	out.Components = append([]ComponentState(nil), r.Components...)
 	return &out
 }
