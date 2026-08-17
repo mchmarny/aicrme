@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"maps"
@@ -10,11 +11,16 @@ import (
 	"runtime/debug"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/steps"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 const aicrModulePath = "github.com/NVIDIA/aicr"
@@ -487,5 +493,114 @@ func TestParseResourceRequests(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestOwnerReferenceResolvesToTheDeployment guards the property the whole
+// task exists for: the run ConfigMap's ownerReference must name the
+// Deployment, never its ReplicaSet. A ReplicaSet is replaced on every
+// rollout, and ownerReference garbage collection would then delete the run
+// state as a side effect of upgrading the console. The fake clientset also
+// carries a ReplicaSet with the *same name* -- the shape a same-name lookup
+// across kinds could confuse this with -- so the test fails if the helper
+// ever resolves anything but the typed Deployment object.
+func TestOwnerReferenceResolvesToTheDeployment(t *testing.T) {
+	const (
+		ns   = "aicrme"
+		name = "aicrme"
+	)
+	client := fake.NewSimpleClientset(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("deployment-uid")},
+		},
+		&appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("replicaset-uid")},
+		},
+	)
+
+	owner, err := resolveDeploymentOwner(context.Background(), client, ns, name)
+	if err != nil {
+		t.Fatalf("resolveDeploymentOwner() error = %v", err)
+	}
+	if owner.Kind != "Deployment" {
+		t.Errorf("Kind = %q, want Deployment -- a ReplicaSet owner is garbage-collected on every rollout and would delete run state with it", owner.Kind)
+	}
+	if owner.APIVersion != "apps/v1" {
+		t.Errorf("APIVersion = %q, want apps/v1", owner.APIVersion)
+	}
+	if owner.Name != name {
+		t.Errorf("Name = %q, want %q", owner.Name, name)
+	}
+	if owner.UID != types.UID("deployment-uid") {
+		t.Errorf("UID = %q, want the Deployment's UID (deployment-uid), not the same-named ReplicaSet's (replicaset-uid)", owner.UID)
+	}
+}
+
+// TestOwnerReferenceResolutionFailsWhenTheDeploymentIsMissing guards the
+// failure path newRunStore depends on to decide whether to degrade: a
+// missing or unreachable Deployment must return an error, not a zero-value
+// reference that would silently own the run ConfigMap by nothing at all.
+func TestOwnerReferenceResolutionFailsWhenTheDeploymentIsMissing(t *testing.T) {
+	client := fake.NewSimpleClientset()
+
+	if _, err := resolveDeploymentOwner(context.Background(), client, "aicrme", "aicrme"); err == nil {
+		t.Error("resolveDeploymentOwner() error = nil, want an error for a Deployment that does not exist")
+	}
+}
+
+// TestNoClientKeepsTheMemoryStore is Ruling 4 made concrete: with a nil
+// kubernetes.Interface, newRunStore must return a store that works with no
+// cluster at all, and must say so. A ConfigMapStore wired with a nil
+// kubernetes.Interface would panic the instant it touched kube.CoreV1(), so
+// a successful Save/LoadCurrent round trip here is proof of degradation, not
+// just a claim in a log line.
+func TestNoClientKeepsTheMemoryStore(t *testing.T) {
+	logs := captureWarnings(t)
+
+	store := newRunStore(context.Background(), nil, "aicrme", "aicrme")
+
+	run := &engine.Run{
+		ID:        "0123456789abcdef",
+		State:     engine.StateIdle,
+		StartedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatalf("Save() error = %v, want the in-memory store to accept a save with no cluster client", err)
+	}
+	got, err := store.LoadCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
+	}
+	if got.ID != run.ID {
+		t.Errorf("LoadCurrent().ID = %q, want %q", got.ID, run.ID)
+	}
+
+	if got := logs.String(); !strings.Contains(got, "no cluster client") {
+		t.Errorf("logged %q, want a warning naming the degradation (\"no cluster client\")", got)
+	}
+}
+
+// TestNewRunStoreDegradesWhenOwnerResolutionFails covers the other half of
+// newRunStore's fallback: a live cluster client but a Deployment lookup that
+// fails (RBAC, a control-plane blip, an unusual install order) must degrade
+// exactly like the no-client case, not fail startup.
+func TestNewRunStoreDegradesWhenOwnerResolutionFails(t *testing.T) {
+	logs := captureWarnings(t)
+	client := fake.NewSimpleClientset() // no Deployment object present
+
+	store := newRunStore(context.Background(), client, "aicrme", "aicrme")
+
+	run := &engine.Run{
+		ID:        "fedcba9876543210",
+		State:     engine.StateIdle,
+		StartedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatalf("Save() error = %v, want the fallback store to accept a save", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "aicrme") {
+		t.Errorf("logged %q, want a warning naming the Deployment lookup failure", got)
 	}
 }

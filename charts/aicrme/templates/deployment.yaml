@@ -6,6 +6,14 @@ metadata:
   labels: {{- include "aicrme.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Recreate, not the default RollingUpdate: replicas is 1, but RollingUpdate
+  # with the default maxSurge rounds up to 1, so old and new pods overlap
+  # during every upgrade. Both would recover from and write to the same run
+  # ConfigMap, against a design that assumes a single writer. A few seconds of
+  # downtime on upgrade costs a single-operator demo console nothing; leader
+  # election would be machinery for a problem this product does not have.
+  strategy:
+    type: Recreate
   selector:
     matchLabels: {{- include "aicrme.selectorLabels" . | nindent 6 }}
   template:
@@ -69,6 +77,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "aicrme.fullname" . }}
                   key: AICRME_NAMESPACE
+            # Names this Deployment object so main can resolve it directly
+            # (one Get, apps/v1) as the run ConfigMap's ownerReference --
+            # never the ReplicaSet, which is replaced on every rollout and
+            # would take the run state with it via garbage collection.
+            - name: AICRME_DEPLOYMENT_NAME
+              value: {{ include "aicrme.fullname" . | quote }}
             - name: AICRME_WORK_DIR
               value: /var/lib/aicrme
             # deploy.sh runs `mktemp -d`; helm and kubectl keep caches. With

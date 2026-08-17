@@ -303,6 +303,20 @@ else
   fi
 fi
 
+# --- Invariant 8: single writer against the run ConfigMap ------------------
+# The chart sets replicas: 1 but, with no strategy key, defaults to
+# RollingUpdate, whose maxSurge rounds up to 1 -- so old and new pods overlap
+# during every upgrade. Both would recover from and write to the same run
+# checkpoint concurrently, against a design that assumes exactly one writer.
+# strategy: Recreate accepts a few seconds of downtime on upgrade instead.
+echo "== single writer =="
+strategy_type=$(render | doc Deployment | yq -r '.spec.strategy.type' | val)
+if [[ "${strategy_type}" == "Recreate" ]]; then
+  pass "Deployment strategy is Recreate"
+else
+  fail "Deployment strategy" "got '${strategy_type}', want 'Recreate' -- RollingUpdate overlaps two writers against the same run ConfigMap during every upgrade"
+fi
+
 echo
 if [[ "${FAILURES}" -gt 0 ]]; then
   printf '\033[0;31mFAIL\033[0m: %s chart contract assertion(s) failed\n' "${FAILURES}"
