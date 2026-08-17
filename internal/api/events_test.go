@@ -84,3 +84,66 @@ func TestEventStreamReplaysFromLastEventID(t *testing.T) {
 		t.Error("did not replay the event after Last-Event-ID")
 	}
 }
+
+// TestEventsHandlerEmitsEpochControlEventFirst proves the epoch travels
+// ahead of any replay, as a named "epoch" frame with no id: field.
+// EventSource cannot read response headers, so the epoch has to travel in
+// the stream body; it must be named so the SPA can route it away from
+// onmessage (where run data lands), and it must carry no id because
+// assigning one would advance the very cursor the epoch exists to let the
+// client correct.
+func TestEventsHandlerEmitsEpochControlEventFirst(t *testing.T) {
+	b := bus.New(64)
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	ts, client := loggedInClient(t, srv.Handler())
+
+	b.Publish(bus.Event{Kind: bus.KindLog, Message: "data event"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/events", nil)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("stream error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	scanner := bufio.NewScanner(resp.Body)
+	var lines []string
+	deadline := time.Now().Add(2 * time.Second)
+	for scanner.Scan() && time.Now().Before(deadline) {
+		line := scanner.Text()
+		lines = append(lines, line)
+		if strings.Contains(line, `"data event"`) {
+			break
+		}
+	}
+	raw := strings.Join(lines, "\n")
+
+	eventLine := strings.Index(raw, "event: epoch")
+	if eventLine == -1 {
+		t.Fatalf("no named %q frame in stream:\n%s", "event: epoch", raw)
+	}
+	dataEventLine := strings.Index(raw, `"data event"`)
+	if dataEventLine == -1 || dataEventLine < eventLine {
+		t.Fatalf("epoch frame did not precede run data:\n%s", raw)
+	}
+
+	// The epoch control frame is the block of lines starting at "event:
+	// epoch" up to the blank line that terminates it; that block must not
+	// contain an id: field, which would advance the client's cursor.
+	block := raw[eventLine:]
+	if end := strings.Index(block, "\n\n"); end != -1 {
+		block = block[:end]
+	}
+	if strings.Contains(block, "id:") {
+		t.Fatalf("epoch control frame carries an id: field, which would advance the client cursor:\n%s", block)
+	}
+}

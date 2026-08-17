@@ -85,6 +85,7 @@ export function useEvents(onUnauthorized?: () => void) {
   const [eventsLost, setEventsLost] = useState(0)
   const lastId = useRef(0)
   const gapAttempts = useRef(0)
+  const epoch = useRef<string | null>(null)
 
   useEffect(() => {
     let source: EventSource
@@ -93,11 +94,24 @@ export function useEvents(onUnauthorized?: () => void) {
 
     // EventSource sends Last-Event-ID automatically on reconnect; ?since
     // seeds the very first connection after a full page reload, and reseeds
-    // a manual reconnect triggered by detectGap below.
+    // a manual reconnect triggered by detectGap or an epoch change below.
     function connect() {
-      source = new EventSource(`/api/events?since=${lastId.current}`)
-      source.onopen = () => setConnected(true)
-      source.onerror = () => {
+      // Handlers below close over mySource, not the outer source variable,
+      // and guard on `source === mySource`. Without that, an event queued
+      // by a source this function is about to supersede (an epoch change
+      // calls connect() reentrantly, from inside a handler on the old
+      // source) would still run its stale closure and mutate state -- the
+      // exact "queued frame from the old source" case the epoch reconnect
+      // exists to discard.
+      const mySource = new EventSource(`/api/events?since=${lastId.current}`)
+      source = mySource
+
+      mySource.onopen = () => {
+        if (source !== mySource) return
+        setConnected(true)
+      }
+      mySource.onerror = () => {
+        if (source !== mySource) return
         setConnected(false)
         // EventSource surfaces no HTTP status, so a dropped stream is
         // indistinguishable here from an expired session. After the 8-hour
@@ -111,7 +125,37 @@ export function useEvents(onUnauthorized?: () => void) {
           })
           .catch(() => {})
       }
-      source.onmessage = (msg: MessageEvent<string>) => {
+      // The epoch is a named ("event: epoch"), id-less SSE frame emitted
+      // before any replay -- see internal/api's handleEvents. It carries no
+      // id precisely so it can't advance lastId, which is why it needs its
+      // own listener instead of onmessage.
+      mySource.addEventListener('epoch', (msg: MessageEvent<string>) => {
+        if (source !== mySource) return
+        const { epoch: serverEpoch } = JSON.parse(msg.data) as { epoch: string }
+        if (epoch.current === null) {
+          // First connection this hook instance has ever made: lastId is
+          // already 0, so there is nothing a reconnect would fix.
+          epoch.current = serverEpoch
+          return
+        }
+        if (serverEpoch === epoch.current) return
+        // The epoch changed under an open connection: the process on the
+        // other end restarted, so lastId (issued by the old process) is a
+        // cursor the new process never handed out. Resetting lastId in
+        // place cannot fix this connection -- the server already chose its
+        // backlog from the stale cursor when it opened -- so tear it down,
+        // clear accumulated state, and reconnect from zero instead.
+        epoch.current = serverEpoch
+        lastId.current = 0
+        gapAttempts.current = 0
+        setEvents([])
+        setEventsLost(0)
+        clearTimeout(backoffTimer)
+        mySource.close()
+        connect()
+      })
+      mySource.onmessage = (msg: MessageEvent<string>) => {
+        if (source !== mySource) return
         const parsed = JSON.parse(msg.data) as AicrEvent
         if (detectGap(lastId.current, parsed.id) && gapAttempts.current < MAX_GAP_RECONNECT_ATTEMPTS) {
           // The bus silently dropped events for this subscriber. Reopen from
@@ -121,7 +165,7 @@ export function useEvents(onUnauthorized?: () => void) {
           // this fires again and the attempt cap above eventually gives up
           // rather than reconnecting forever.
           gapAttempts.current++
-          source.close()
+          mySource.close()
           const delay = GAP_RECONNECT_BASE_DELAY_MS * 2 ** (gapAttempts.current - 1)
           backoffTimer = setTimeout(() => {
             if (!torndown) connect()
