@@ -801,6 +801,9 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run is live; retry, wait for it to finish, or cancel before discarding")
 	}
+	previous := e.current
+	previousRecoveredPending := e.recoveredPending
+	epoch := e.epoch
 	e.current = nil
 	e.recoveredPending = false
 	e.mu.Unlock()
@@ -809,6 +812,29 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 	// calls CurrentID and Artifact on a per-watch-event path, and both take
 	// e.mu.
 	if err := e.store.Delete(ctx); err != nil {
+		// Put the run back. The record still exists, so the state this call
+		// cleared no longer describes the store -- and the console now offers
+		// the operator a Discard button whose second press would answer 404
+		// ("run not found") against a checkpoint that is still there, and
+		// which the next restart will recover all over again. Restoring makes
+		// the retry the SPA already invites actually retry the delete.
+		//
+		// This deliberately reverses the earlier "clear regardless so a store
+		// outage can never block Start" semantics: that reasoning predates
+		// Discard having a caller, and it traded a wedge nobody could reach
+		// for a lie the operator now can. recoveredPending comes back with
+		// it, because the record it gates on is still on the cluster.
+		//
+		// Guarded like every other rollback in this file: only restore if
+		// nothing has since claimed the slot. A Start landing in this window
+		// installs its own run and bumps the epoch, and that run must win --
+		// it is live and this one is not.
+		e.mu.Lock()
+		if e.current == nil && e.aliveLocked(epoch) {
+			e.current = previous
+			e.recoveredPending = previousRecoveredPending
+		}
+		e.mu.Unlock()
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "deleting the persisted run failed", err)
 	}
 	return nil

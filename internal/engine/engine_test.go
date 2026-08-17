@@ -1165,32 +1165,54 @@ func TestRetrySaveFailureRestoresRecoveryPending(t *testing.T) {
 	}
 }
 
-// deleteFailingStore wraps a Store and fails every Delete call, to exercise
-// Discard's error path. Per Ruling 1 it embeds a real store rather than
-// leaving engine.Store nil, since Save/Load/LoadCurrent all fall through
-// unmodified.
+// deleteFailingStore wraps a Store and fails Delete while armed, to exercise
+// Discard's error path and -- once disarmed -- the operator's second attempt
+// at it. Per Ruling 1 it embeds a real store rather than leaving engine.Store
+// nil, since Save/Load/LoadCurrent all fall through unmodified.
 type deleteFailingStore struct {
 	engine.Store
+
+	mu      sync.Mutex
+	failing bool
 }
 
-func (s *deleteFailingStore) Delete(context.Context) error {
-	return errors.New("delete failed")
+func (s *deleteFailingStore) Delete(ctx context.Context) error {
+	s.mu.Lock()
+	failing := s.failing
+	s.mu.Unlock()
+	if failing {
+		return errors.New("delete failed")
+	}
+	return s.Store.Delete(ctx)
+}
+
+func (s *deleteFailingStore) recover() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failing = false
 }
 
 // TestDiscardSurfacesStoreDeleteFailure covers concern 2: Discard is the
 // only release valve on Start's recoveredPending gate, so a Delete failure
 // nobody has exercised is exactly the kind of gap that could leave the
-// console wedged with no way out. It also pins the chosen failure semantics
-// (see the Fix round 1 report): e.current and recoveredPending are cleared
-// before the store I/O and stay cleared even when Delete fails, so Start is
-// never blocked by a store outage -- the error still surfaces to the caller.
+// console wedged with no way out.
+//
+// The failure semantics here are the REVERSE of what this test pinned in Fix
+// round 1, deliberately. Then, e.current and recoveredPending were cleared
+// before the store I/O and stayed cleared on failure, so a store outage could
+// never block Start. That reasoning predates Discard having any caller in the
+// SPA. Now that a recovered run renders a Discard button, clearing on failure
+// makes the console lie: the ConfigMap is still there, the operator's second
+// press answers 404 against a record that does exist, and the next restart
+// recovers it all over again. Restoring is what makes that second press
+// retry the delete, which is the only thing that can actually resolve it.
 func TestDiscardSurfacesStoreDeleteFailure(t *testing.T) {
 	inner := engine.NewMemoryStore()
 	seed := baseRun(testRunID, engine.StateFailed, engine.PhaseDiscover, 0)
 	if err := inner.Save(context.Background(), seed); err != nil {
 		t.Fatalf("seed Save() error = %v", err)
 	}
-	store := &deleteFailingStore{Store: inner}
+	store := &deleteFailingStore{Store: inner, failing: true}
 	e := fourStepEngine(store)
 
 	if err := e.Recover(context.Background()); err != nil {
@@ -1202,11 +1224,33 @@ func TestDiscardSurfacesStoreDeleteFailure(t *testing.T) {
 	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeUnavailable {
 		t.Fatalf("Discard() error = %v, want a StructuredError with ErrCodeUnavailable when Delete fails", err)
 	}
-	if got := e.Current(); got != nil {
-		t.Errorf("Current() = %+v, want nil even though Delete failed -- a store outage must not leave the run wedged in place", got)
+
+	got := e.Current()
+	if got == nil || got.ID != testRunID {
+		t.Fatalf("Current() = %+v, want the run restored -- the persisted record still exists, so dropping it in memory makes the console disagree with the cluster", got)
 	}
-	if _, err := e.Start(context.Background()); err != nil {
-		t.Errorf("Start() error = %v, want nil -- a failed Delete must not permanently block Start", err)
+	// recoveredPending must come back with it: the gate exists because that
+	// record is on the cluster, and it still is.
+	if _, startErr := e.Start(context.Background()); startErr == nil {
+		t.Error("Start() error = nil, want a conflict -- a failed Discard must not silently open the recovery gate over a record that is still there")
+	}
+
+	// The operator presses the button again once the store is reachable, which
+	// is the whole point of putting the run back.
+	store.recover()
+	if retryErr := e.Discard(context.Background(), testRunID); retryErr != nil {
+		t.Fatalf("second Discard() error = %v, want the retry to succeed", retryErr)
+	}
+	if got := e.Current(); got != nil {
+		t.Errorf("Current() = %+v, want nil after the successful discard", got)
+	}
+	// Checked before Start, which writes its own checkpoint and would make
+	// LoadCurrent succeed again for an entirely different run.
+	if _, loadErr := inner.LoadCurrent(context.Background()); loadErr == nil {
+		t.Error("LoadCurrent() succeeded, want the persisted record gone after the retried discard")
+	}
+	if _, startErr := e.Start(context.Background()); startErr != nil {
+		t.Errorf("Start() error = %v, want nil once the discard has actually landed", startErr)
 	}
 }
 
