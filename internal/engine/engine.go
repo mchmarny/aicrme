@@ -76,6 +76,22 @@ type Engine struct {
 	// microseconds before Drain() still reaches Start.
 	draining bool
 
+	// storeUnreadable is set by Recover when a persisted run existed but
+	// could not be read or failed validation. Recover itself has already
+	// done the half of the work that matters -- swapping store for a fresh
+	// memory store in the same call, so nothing this process subsequently
+	// does can overwrite the record it could not read. This flag exists
+	// purely so main can log the degradation; StoreUnreadable() is its
+	// accessor.
+	storeUnreadable bool
+
+	// recoveredPending is set by Recover when it installs a persisted run as
+	// the current one, and cleared only by an explicit operator action
+	// (Retry, or a discard). While set, the SPA's automatic POST /api/runs
+	// on load must not be allowed to silently replace the recovered run --
+	// Task 4 is where Start and Retry read this flag; Recover only sets it.
+	recoveredPending bool
+
 	// cancel stops the in-flight run's step context; done closes once its
 	// execute goroutine has exited AND persisted a terminal state. A cancel
 	// func alone would tell a caller the run was asked to stop but not when
