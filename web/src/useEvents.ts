@@ -145,6 +145,10 @@ export function useEvents(onUnauthorized?: () => void) {
         // place cannot fix this connection -- the server already chose its
         // backlog from the stale cursor when it opened -- so tear it down,
         // clear accumulated state, and reconnect from zero instead.
+        //
+        // connected is deliberately left untouched: the swap is a same-tab,
+        // same-session continuation, not a drop, so there is no "reconnecting…"
+        // interval to surface, and flashing one here would be a false signal.
         epoch.current = serverEpoch
         lastId.current = 0
         gapAttempts.current = 0
@@ -152,7 +156,11 @@ export function useEvents(onUnauthorized?: () => void) {
         setEventsLost(0)
         clearTimeout(backoffTimer)
         mySource.close()
-        connect()
+        // Guarded like the gap-reconnect call below: unreachable today,
+        // since cleanup sets torndown and closes mySource synchronously
+        // before this handler could fire again, but the two connect() call
+        // sites should agree so neither has to be re-derived as the safe one.
+        if (!torndown) connect()
       })
       mySource.onmessage = (msg: MessageEvent<string>) => {
         if (source !== mySource) return

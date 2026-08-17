@@ -3,6 +3,7 @@ package api_test
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -126,24 +127,24 @@ func TestEventsHandlerEmitsEpochControlEventFirst(t *testing.T) {
 		}
 	}
 	raw := strings.Join(lines, "\n")
-
-	eventLine := strings.Index(raw, "event: epoch")
-	if eventLine == -1 {
-		t.Fatalf("no named %q frame in stream:\n%s", "event: epoch", raw)
-	}
-	dataEventLine := strings.Index(raw, `"data event"`)
-	if dataEventLine == -1 || dataEventLine < eventLine {
-		t.Fatalf("epoch frame did not precede run data:\n%s", raw)
+	if !strings.Contains(raw, `"data event"`) {
+		t.Fatalf("run data never arrived in the stream:\n%s", raw)
 	}
 
-	// The epoch control frame is the block of lines starting at "event:
-	// epoch" up to the blank line that terminates it; that block must not
-	// contain an id: field, which would advance the client's cursor.
-	block := raw[eventLine:]
-	if end := strings.Index(block, "\n\n"); end != -1 {
-		block = block[:end]
-	}
-	if strings.Contains(block, "id:") {
-		t.Fatalf("epoch control frame carries an id: field, which would advance the client cursor:\n%s", block)
+	// SSE frames are separated by a blank line. Splitting on that separator
+	// -- rather than locating "event: epoch" by substring and slicing the
+	// stream from that offset, as an earlier version of this test did -- is
+	// what catches an id: field on either side of "event: epoch": a
+	// substring-anchored slice silently drops everything before the match,
+	// so an id: line placed ahead of "event: epoch" in the same frame was
+	// invisible to that check. Asserting the frame's full, exact contents
+	// (rather than just "no id: substring in here somewhere") is the
+	// strongest check available and cheap: the frame is a literal format
+	// string with one variable field.
+	frames := strings.Split(raw, "\n\n")
+	wantEpochFrame := fmt.Sprintf("event: epoch\ndata: {\"epoch\":%q}", b.Epoch())
+	if frames[0] != wantEpochFrame {
+		t.Fatalf("first SSE frame = %q, want %q -- the epoch frame must be first, byte-exact, and carry no id: field on either side of \"event: epoch\"",
+			frames[0], wantEpochFrame)
 	}
 }
