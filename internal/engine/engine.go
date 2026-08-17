@@ -644,9 +644,30 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 // forever -- a worse wedge than the one the block exists to prevent.
 func (e *Engine) Discard(ctx context.Context, runID string) error {
 	e.mu.Lock()
+	if e.draining {
+		e.mu.Unlock()
+		return ErrDraining
+	}
 	if e.current == nil || e.current.ID != runID {
 		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
+	}
+	// A live run has an execute goroutine driving it, and every one of that
+	// goroutine's e.current dereferences (execute, awaitDecisions, runStep,
+	// finish) is guarded only by an aliveLocked(epoch) check, never by a
+	// nil check on e.current itself -- nilling it here while that goroutine
+	// still owns the epoch crashes the whole process on its next
+	// checkpoint, not just this caller. This is deliberately not "bump
+	// epoch instead": every guarded dereference above sits in the same
+	// lock hold as its check today, so a bump would also close the gap
+	// right now, but that safety is an incidental property of the current
+	// code, not a structural guarantee -- a future dereference added
+	// between a checkpoint and its use would silently reopen it. Never
+	// nilling a live run holds regardless of that pairing, so it is the
+	// only guard this method relies on.
+	if isLive(e.current.State) {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run is live; retry, wait for it to finish, or cancel before discarding")
 	}
 	e.current = nil
 	e.recoveredPending = false

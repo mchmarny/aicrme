@@ -762,6 +762,29 @@ func TestDrainingEngineRefusesNewWork(t *testing.T) {
 			t.Fatalf("Retry() error = %v, want ErrDraining", retryErr)
 		}
 	})
+
+	// Added for consistency with Start/Retry (Ruling 12's Minor): Discard
+	// mutates engine state the same way they do, so it refuses during drain
+	// for the same reason -- one rule for every mutating action, rather than
+	// a caller having to remember Discard is the one exception.
+	t.Run("Discard", func(t *testing.T) {
+		failing := newFakeStep(engine.PhaseDiscover)
+		failing.err = errors.New("boom")
+		e := engine.New(bus.New(64), engine.NewMemoryStore(), failing)
+
+		run, err := e.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		waitState(t, e, run.ID, engine.StateFailed)
+
+		if cancelErr := e.CancelAndWait(context.Background()); cancelErr != nil {
+			t.Fatalf("CancelAndWait() error = %v", cancelErr)
+		}
+		if discardErr := e.Discard(context.Background(), run.ID); !errors.Is(discardErr, engine.ErrDraining) {
+			t.Fatalf("Discard() error = %v, want ErrDraining", discardErr)
+		}
+	})
 }
 
 // TestCancelAndWaitNeverReturnsWithARunStillLive is the interleaving nothing
@@ -1158,5 +1181,144 @@ func TestDiscardSurfacesStoreDeleteFailure(t *testing.T) {
 	}
 	if _, err := e.Start(context.Background()); err != nil {
 		t.Errorf("Start() error = %v, want nil -- a failed Delete must not permanently block Start", err)
+	}
+}
+
+// TestDiscardRejectsALiveRun is the regression test for Ruling 12:
+// Discard previously checked only the run ID, not whether the run was
+// live, so it could nil e.current out from under an in-flight execute
+// goroutine. Parks a run at a decision gate (StateAwaitingDecision is
+// live, same as StateRunning) and confirms Discard refuses it with
+// ErrCodeConflict rather than touching it.
+func TestDiscardRejectsALiveRun(t *testing.T) {
+	a := newFakeStep(engine.PhaseDiscover)
+	c := newFakeStep(engine.PhaseRecommend, "intent", "platform")
+	e := engine.New(bus.New(64), engine.NewMemoryStore(), a, c)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	err = e.Discard(context.Background(), run.ID)
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+		t.Fatalf("Discard() error = %v, want a StructuredError with ErrCodeConflict for a live run", err)
+	}
+
+	// Assert the run is still there, not just that an error came back --
+	// a Discard that errors after already nilling e.current would still be
+	// the bug this test exists to catch.
+	got := e.Current()
+	if got == nil || got.ID != run.ID {
+		t.Fatalf("Current() = %+v, want the live run left in place", got)
+	}
+	if got.State != engine.StateAwaitingDecision {
+		t.Errorf("State = %q, want %q -- a rejected Discard must not touch a live run's state", got.State, engine.StateAwaitingDecision)
+	}
+
+	// Let the run finish so it doesn't leak a goroutine past the test.
+	if err := e.Decide(run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+}
+
+// releaseBlockingStep blocks in Run until released, then completes
+// normally (not via context cancellation, unlike ctxBlockingStep). Phase is
+// configurable so a test can hold whichever step Retry will resume at --
+// here PhaseBundle, since Recover's bundleStepIndex() requires exactly one
+// step reporting it.
+type releaseBlockingStep struct {
+	phase   engine.Phase
+	release chan struct{}
+	entered chan struct{}
+}
+
+func (b *releaseBlockingStep) Phase() engine.Phase { return b.phase }
+func (b *releaseBlockingStep) Requires() []string  { return nil }
+func (b *releaseBlockingStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
+	close(b.entered)
+	<-b.release
+	return nil
+}
+
+// TestDiscardCannotRaceALiveRetryIntoANilCurrent reproduces the reviewer's
+// exact scenario from Ruling 12: recover a run, Retry it so it goes live
+// and blocks mid-step (simulating a stale browser tab still showing the
+// "recovered -- retry or discard?" prompt while another tab has already
+// clicked Retry), then Discard the same run ID. Before Ruling 12's guard
+// this crashed the whole process -- runStep's merge-back dereferenced a
+// nil e.current once the step unblocked. Asserts Discard is rejected and
+// the goroutine completes normally afterward, proving the run was left
+// intact rather than merely that an error came back.
+func TestDiscardCannotRaceALiveRetryIntoANilCurrent(t *testing.T) {
+	store := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateRunning, engine.PhaseApply, 3)
+	if err := store.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	bundle := &releaseBlockingStep{phase: engine.PhaseBundle, release: make(chan struct{}), entered: make(chan struct{})}
+	e := engine.New(bus.New(64), store,
+		newFakeStep(engine.PhaseDiscover),
+		newFakeStep(engine.PhaseRecommend),
+		bundle,
+		newFakeStep(engine.PhaseApply),
+	)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	if _, err := e.Retry(testRunID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	select {
+	case <-bundle.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Bundle step never entered")
+	}
+
+	err := e.Discard(context.Background(), testRunID)
+
+	// Unblock the step before asserting on err, not after: on the pre-fix
+	// code Discard has already nilled e.current by this point, and this is
+	// exactly what lets the superseded goroutine resume and dereference it
+	// -- a process-crashing panic, not a clean test failure. Asserting
+	// first (and returning via t.Fatalf on failure) would skip this line
+	// entirely and never actually reproduce the crash this test exists to
+	// pin.
+	close(bundle.release)
+
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+		t.Fatalf("Discard() error = %v, want ErrCodeConflict for a run that went live under Discard's feet", err)
+	}
+
+	waitState(t, e, testRunID, engine.StateDone)
+}
+
+// TestDiscardStillWorksOnARecoveredFailedRun confirms Ruling 12's new
+// isLive guard did not over-restrict Discard's original, already-tested
+// case: a recovered run that landed StateFailed (not live) must still be
+// discardable exactly as before.
+func TestDiscardStillWorksOnARecoveredFailedRun(t *testing.T) {
+	store := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateFailed, engine.PhaseDiscover, 0)
+	if err := store.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	if err := e.Discard(context.Background(), testRunID); err != nil {
+		t.Fatalf("Discard() error = %v, want nil -- a non-live recovered run must still be discardable", err)
+	}
+	if got := e.Current(); got != nil {
+		t.Errorf("Current() = %+v, want nil after Discard", got)
 	}
 }
