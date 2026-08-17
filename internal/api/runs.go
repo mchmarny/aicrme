@@ -25,9 +25,10 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
-	// engine.Retry takes no context parameter for the same reason as
-	// engine.Get -- see handleGetRun.
-	run, err := s.engine.Retry(r.PathValue("id")) //nolint:contextcheck // see handleGetRun
+	// context.WithoutCancel, same rationale as handleCreateRun: Retry can
+	// relaunch a step that runs up to 20 minutes (Apply), so this run must
+	// survive the request that kicked it off too.
+	run, err := s.engine.Retry(context.WithoutCancel(r.Context()), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -36,17 +37,11 @@ func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
-	// engine.Get takes no context parameter by design (internal/engine is
-	// locked): it only reaches context.Background() on its store.Load
-	// fallback for a run this process didn't start, not a call this
-	// request's cancellation should govern today. That stops being true once
-	// 2b-ii's store rewrite makes Load/Save real ConfigMap API calls --
-	// at that point context.Background() here starts ignoring genuine
-	// caller cancellation instead of hitting an in-memory map, and
-	// Engine.Get/Retry will need a context.Context parameter threaded
-	// through from these handlers. grep for contextcheck in internal/api to
-	// find every site this affects.
-	run, err := s.engine.Get(r.PathValue("id")) //nolint:contextcheck // engine.Get takes no context parameter by design; internal/engine is locked.
+	// engine.Get does no long-running work of its own -- its only I/O is a
+	// single store.Load fallback for a run this process didn't start -- so
+	// the request's own context is threaded through directly, unlike
+	// handleCreateRun/handleRetry's execution contexts.
+	run, err := s.engine.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -60,20 +55,35 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed request", http.StatusBadRequest)
 		return
 	}
-	// engine.Decide takes no context parameter for the same reason as
-	// engine.Get -- see handleGetRun. Its own Save call now reaches
-	// context.Background() bounded by an explicit timeout (Task 5 of
-	// 2b-ii); threading r.Context() through is Task 7's job.
-	if err := s.engine.Decide(r.PathValue("id"), decisions); err != nil { //nolint:contextcheck // see handleGetRun
+	// r.Context() threads through directly: unlike Retry, Decide does not
+	// launch any execution that outlives this request, so there is no
+	// execution context to detach here. Decide itself detaches only the
+	// cancellation of its own checkpoint save -- see engine.Decide's doc
+	// comment and decideSaveTimeout for why an operator's already-acked
+	// decision must not be rolled back by a closed browser tab.
+	if err := s.engine.Decide(r.Context(), r.PathValue("id"), decisions); err != nil {
 		writeErr(w, err)
 		return
 	}
-	run, err := s.engine.Get(r.PathValue("id")) //nolint:contextcheck // see handleGetRun
+	run, err := s.engine.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) handleDiscardRun(w http.ResponseWriter, r *http.Request) {
+	// r.Context() threads through directly: Discard's only I/O is a single
+	// store.Delete, and e.current is already cleared in-memory (under e.mu,
+	// synchronously) before that call, so a canceled request loses at worst
+	// the persisted ConfigMap deletion, not any in-memory state -- unlike
+	// Decide, there is no acknowledged operator state this could roll back.
+	if err := s.engine.Discard(r.Context(), r.PathValue("id")); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

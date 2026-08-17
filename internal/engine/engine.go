@@ -20,11 +20,13 @@ import (
 const terminalSaveTimeout = 5 * time.Second
 
 // decideSaveTimeout bounds the checkpoint write Decide issues before
-// acknowledging an operator's decision. Decide has no request context yet
-// -- threading the caller's context through Start/Retry/Get/Decide is Task
-// 7's job, not this one's. Until Task 7 lands, this stays a detached
-// background context bounded by an explicit timeout, the same shape
-// finish's own detached terminal write already uses.
+// acknowledging an operator's decision. Decide takes the caller's context
+// (Task 7) but must not let that context's cancellation govern this write:
+// an operator's decision that already returned 200 must never be silently
+// undone because a browser tab closed mid-save. So Decide detaches the
+// cancellation (context.WithoutCancel) while keeping the context's values,
+// and bounds the write with this timeout instead -- the same shape finish's
+// own detached terminal write already uses.
 const decideSaveTimeout = 5 * time.Second
 
 // canceledByShutdownMsg is Run.Err's message when the run is canceled by
@@ -287,7 +289,11 @@ func (e *Engine) CancelAndWait(ctx context.Context) error {
 // lock, so holding it across a ConfigMap round trip would stall every
 // observer publish for the length of an API call. Start and Retry already
 // use this exact shape.
-func (e *Engine) Decide(runID string, decisions map[string]string) error {
+//
+// ctx is the caller's request context, but only its values travel into the
+// save -- see decideSaveTimeout for why its cancellation is deliberately not
+// allowed to reach the save that persists the operator's decision.
+func (e *Engine) Decide(ctx context.Context, runID string, decisions map[string]string) error {
 	e.mu.Lock()
 
 	if e.current == nil || e.current.ID != runID {
@@ -343,7 +349,7 @@ func (e *Engine) Decide(runID string, decisions map[string]string) error {
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
 
-	saveCtx, cancel := context.WithTimeout(context.Background(), decideSaveTimeout)
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), decideSaveTimeout)
 	defer cancel()
 	if err := e.store.Save(saveCtx, snapshot); err != nil {
 		// Guarded the same way Start's and Retry's rollbacks are: identity
@@ -438,8 +444,11 @@ func (e *Engine) Artifact(runID, key string) ([]byte, bool) {
 	return append([]byte(nil), v...), true
 }
 
-// Get returns a copy of the run's current state.
-func (e *Engine) Get(runID string) (*Run, error) {
+// Get returns a copy of the run's current state. ctx governs only the
+// store.Load fallback below (a run this process didn't start, e.g. after a
+// restart before the SPA's next poll lands): the in-memory branch above
+// never touches the store, so ctx is unused on that path.
+func (e *Engine) Get(ctx context.Context, runID string) (*Run, error) {
 	e.mu.Lock()
 	if e.current != nil && e.current.ID == runID {
 		out := e.current.Clone()
@@ -447,7 +456,7 @@ func (e *Engine) Get(runID string) (*Run, error) {
 		return out, nil
 	}
 	e.mu.Unlock()
-	return e.store.Load(context.Background(), runID)
+	return e.store.Load(ctx, runID)
 }
 
 func (e *Engine) execute(ctx context.Context, epoch uint64) {
@@ -685,7 +694,14 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 // `helm upgrade --install`, which is idempotent, and deploy.sh's own
 // preflight and stale-hook-Job cleanup run again on the retry. Components
 // that already installed are no-ops on the second pass.
-func (e *Engine) Retry(runID string) (*Run, error) {
+//
+// ctx is the caller's request context, already detached by the handler
+// (context.WithoutCancel) before it reaches here -- Retry can relaunch a
+// step that runs for up to 20 minutes (Apply), same as Start, so the run
+// must survive the request that kicked it off. Both the relaunched
+// execution's context and the checkpoint Save below derive from it, mirroring
+// Start's identical shape.
+func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 	e.mu.Lock()
 	if e.draining {
 		e.mu.Unlock()
@@ -710,14 +726,14 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 	e.resume = make(chan struct{}, 1)
 	e.epoch++
 	epoch := e.epoch
-	runCtx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	e.cancel = cancel
 	e.done = make(chan struct{})
 	done := e.done
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
 
-	if err := e.store.Save(context.Background(), snapshot); err != nil {
+	if err := e.store.Save(ctx, snapshot); err != nil {
 		// Undo the flip to StateRunning so the run is not left wedged: with
 		// no goroutine launched (that only happens below, after Save
 		// succeeds) and State no longer StateFailed, neither Start

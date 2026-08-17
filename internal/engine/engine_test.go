@@ -62,11 +62,11 @@ func waitState(t *testing.T, e *engine.Engine, id string, want engine.State) *en
 	for {
 		select {
 		case <-deadline:
-			got, _ := e.Get(id)
+			got, _ := e.Get(context.Background(), id)
 			t.Fatalf("timed out waiting for state %q, last state %q", want, got.State)
 		default:
 		}
-		r, err := e.Get(id)
+		r, err := e.Get(context.Background(), id)
 		if err == nil && r.State == want {
 			return r
 		}
@@ -110,11 +110,11 @@ func TestRunParksForDecisions(t *testing.T) {
 		t.Fatal("gated step ran before decisions were supplied")
 	}
 
-	if err := e.Decide(run.ID, map[string]string{"intent": "training"}); err == nil {
+	if err := e.Decide(context.Background(), run.ID, map[string]string{"intent": "training"}); err == nil {
 		t.Error("Decide() with a missing key should error")
 	}
 
-	if err := e.Decide(run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); err != nil {
+	if err := e.Decide(context.Background(), run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); err != nil {
 		t.Fatalf("Decide() error = %v", err)
 	}
 
@@ -146,13 +146,13 @@ func TestDecideRejectsKeysNotCurrentlyPending(t *testing.T) {
 	}
 	waitState(t, e, run.ID, engine.StateAwaitingDecision)
 
-	if decideErr := e.Decide(run.ID, map[string]string{
+	if decideErr := e.Decide(context.Background(), run.ID, map[string]string{
 		"intent": "training", "platform": "kubeflow", "apply": "yes",
 	}); decideErr == nil {
 		t.Fatal("Decide() with a key not currently pending ('apply') should error")
 	}
 
-	got, err := e.Get(run.ID)
+	got, err := e.Get(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -164,14 +164,14 @@ func TestDecideRejectsKeysNotCurrentlyPending(t *testing.T) {
 	}
 
 	// The legitimate two-key answer at this gate still works.
-	if decideErr := e.Decide(run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); decideErr != nil {
+	if decideErr := e.Decide(context.Background(), run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); decideErr != nil {
 		t.Fatalf("Decide() with only the pending keys error = %v", decideErr)
 	}
 
 	// The run now parks on Apply's own gate, proving "apply" is still
 	// genuinely pending rather than having been silently pre-satisfied.
 	waitState(t, e, run.ID, engine.StateAwaitingDecision)
-	got, err = e.Get(run.ID)
+	got, err = e.Get(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -182,7 +182,7 @@ func TestDecideRejectsKeysNotCurrentlyPending(t *testing.T) {
 		t.Fatal("Apply ran before its confirm gate was answered")
 	}
 
-	if decideErr := e.Decide(run.ID, map[string]string{"apply": "yes"}); decideErr != nil {
+	if decideErr := e.Decide(context.Background(), run.ID, map[string]string{"apply": "yes"}); decideErr != nil {
 		t.Fatalf("Decide() error = %v", decideErr)
 	}
 	waitState(t, e, run.ID, engine.StateDone)
@@ -216,9 +216,9 @@ func TestGetReturnsCopy(t *testing.T) {
 	run, _ := e.Start(context.Background())
 	waitState(t, e, run.ID, engine.StateDone)
 
-	got, _ := e.Get(run.ID)
+	got, _ := e.Get(context.Background(), run.ID)
 	got.Decisions["tamper"] = "yes"
-	again, _ := e.Get(run.ID)
+	again, _ := e.Get(context.Background(), run.ID)
 	if _, ok := again.Decisions["tamper"]; ok {
 		t.Error("Get() returned a live reference, not a copy")
 	}
@@ -252,7 +252,7 @@ func TestGetDuringStepIsRaceFree(t *testing.T) {
 	<-step.entered
 
 	for i := 0; i < 200; i++ {
-		if _, err := e.Get(run.ID); err != nil {
+		if _, err := e.Get(context.Background(), run.ID); err != nil {
 			t.Fatalf("Get() error = %v", err)
 		}
 	}
@@ -347,7 +347,7 @@ func TestRetryResumesFromTheFailedStep(t *testing.T) {
 	}
 	waitState(t, e, run.ID, engine.StateFailed)
 
-	if _, err := e.Retry(run.ID); err != nil {
+	if _, err := e.Retry(context.Background(), run.ID); err != nil {
 		t.Fatalf("Retry() error = %v", err)
 	}
 	done := waitState(t, e, run.ID, engine.StateDone)
@@ -375,14 +375,14 @@ func TestRetryRejectsARunThatIsNotFailed(t *testing.T) {
 	}
 	waitState(t, e, run.ID, engine.StateDone)
 
-	if _, err := e.Retry(run.ID); err == nil {
+	if _, err := e.Retry(context.Background(), run.ID); err == nil {
 		t.Error("Retry() error = nil, want a conflict on a completed run")
 	}
 }
 
 func TestRetryRejectsAnUnknownRun(t *testing.T) {
 	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
-	if _, err := e.Retry("nope"); err == nil {
+	if _, err := e.Retry(context.Background(), "nope"); err == nil {
 		t.Error("Retry() error = nil, want not-found")
 	}
 }
@@ -407,7 +407,7 @@ func TestRetriedRunReachesExactlyOneTerminalState(t *testing.T) {
 	}
 	waitState(t, e, run.ID, engine.StateFailed)
 
-	if _, err := e.Retry(run.ID); err != nil {
+	if _, err := e.Retry(context.Background(), run.ID); err != nil {
 		t.Fatalf("Retry() error = %v", err)
 	}
 	done := waitState(t, e, run.ID, engine.StateDone)
@@ -484,7 +484,7 @@ func TestRetryFailedSaveLeavesRunRetryable(t *testing.T) {
 	waitState(t, e, run.ID, engine.StateFailed)
 
 	store.setFail(true)
-	if _, retryErr := e.Retry(run.ID); retryErr == nil {
+	if _, retryErr := e.Retry(context.Background(), run.ID); retryErr == nil {
 		t.Fatal("Retry() error = nil, want the store's Save error")
 	}
 	store.setFail(false)
@@ -492,7 +492,7 @@ func TestRetryFailedSaveLeavesRunRetryable(t *testing.T) {
 	// The assertion that matters: State is still StateFailed, so a
 	// subsequent Retry could still succeed. Asserting only the error above
 	// would pass even with the run wedged at StateRunning.
-	got, err := e.Get(run.ID)
+	got, err := e.Get(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -542,12 +542,12 @@ func TestRetryDoesNotReparkForDecisions(t *testing.T) {
 	}
 	waitState(t, e, run.ID, engine.StateAwaitingDecision)
 
-	if err := e.Decide(run.ID, map[string]string{"apply": "yes"}); err != nil {
+	if err := e.Decide(context.Background(), run.ID, map[string]string{"apply": "yes"}); err != nil {
 		t.Fatalf("Decide() error = %v", err)
 	}
 	waitState(t, e, run.ID, engine.StateFailed)
 
-	if _, err := e.Retry(run.ID); err != nil {
+	if _, err := e.Retry(context.Background(), run.ID); err != nil {
 		t.Fatalf("Retry() error = %v", err)
 	}
 
@@ -555,11 +555,11 @@ func TestRetryDoesNotReparkForDecisions(t *testing.T) {
 	for {
 		select {
 		case <-deadline:
-			got, _ := e.Get(run.ID)
+			got, _ := e.Get(context.Background(), run.ID)
 			t.Fatalf("timed out waiting for state %q, last state %q", engine.StateDone, got.State)
 		default:
 		}
-		got, err := e.Get(run.ID)
+		got, err := e.Get(context.Background(), run.ID)
 		if err != nil {
 			t.Fatalf("Get() error = %v", err)
 		}
@@ -618,7 +618,7 @@ func TestCancelAndWaitStopsAnInFlightRun(t *testing.T) {
 
 	// CancelAndWait must not return until the terminal state is persisted --
 	// a caller that returns early would let main exit before the run is done.
-	got, err := e.Get(run.ID)
+	got, err := e.Get(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -781,7 +781,7 @@ func TestDrainingEngineRefusesNewWork(t *testing.T) {
 		if cancelErr := e.CancelAndWait(context.Background()); cancelErr != nil {
 			t.Fatalf("CancelAndWait() error = %v", cancelErr)
 		}
-		if _, retryErr := e.Retry(run.ID); !errors.Is(retryErr, engine.ErrDraining) {
+		if _, retryErr := e.Retry(context.Background(), run.ID); !errors.Is(retryErr, engine.ErrDraining) {
 			t.Fatalf("Retry() error = %v, want ErrDraining", retryErr)
 		}
 	})
@@ -860,7 +860,7 @@ func TestCancelAndWaitNeverReturnsWithARunStillLive(t *testing.T) {
 			}
 			continue
 		}
-		got, err := e.Get(run.ID)
+		got, err := e.Get(context.Background(), run.ID)
 		if err != nil {
 			t.Fatalf("iteration %d: Get() error = %v", i, err)
 		}
@@ -930,7 +930,7 @@ func TestCancelWhileParkedForDecisionsFinishesTheRun(t *testing.T) {
 
 	// A run frozen at a gate with no goroutine is the wedge class Ruling 13
 	// fixed for Save failures; cancellation must not reintroduce it.
-	got, _ := e.Get(run.ID)
+	got, _ := e.Get(context.Background(), run.ID)
 	if got.State != engine.StateFailed {
 		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
 	}
@@ -1044,7 +1044,7 @@ func TestRetryClearsRecoveryPending(t *testing.T) {
 		t.Fatalf("Recover() error = %v", err)
 	}
 
-	if _, err := e.Retry(testRunID); err != nil {
+	if _, err := e.Retry(context.Background(), testRunID); err != nil {
 		t.Fatalf("Retry() error = %v", err)
 	}
 	waitState(t, e, testRunID, engine.StateDone)
@@ -1150,7 +1150,7 @@ func TestRetrySaveFailureRestoresRecoveryPending(t *testing.T) {
 	}
 
 	store.setFail(true)
-	if _, err := e.Retry(testRunID); err == nil {
+	if _, err := e.Retry(context.Background(), testRunID); err == nil {
 		t.Fatal("Retry() error = nil, want the manufactured Save failure to surface")
 	}
 	store.setFail(false)
@@ -1242,7 +1242,7 @@ func TestDiscardRejectsALiveRun(t *testing.T) {
 	}
 
 	// Let the run finish so it doesn't leak a goroutine past the test.
-	if err := e.Decide(run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); err != nil {
+	if err := e.Decide(context.Background(), run.ID, map[string]string{"intent": "training", "platform": "kubeflow"}); err != nil {
 		t.Fatalf("Decide() error = %v", err)
 	}
 	waitState(t, e, run.ID, engine.StateDone)
@@ -1294,7 +1294,7 @@ func TestDiscardCannotRaceALiveRetryIntoANilCurrent(t *testing.T) {
 		t.Fatalf("Recover() error = %v", err)
 	}
 
-	if _, err := e.Retry(testRunID); err != nil {
+	if _, err := e.Retry(context.Background(), testRunID); err != nil {
 		t.Fatalf("Retry() error = %v", err)
 	}
 	select {
@@ -1408,7 +1408,7 @@ func TestDecidePersistsBeforeAcknowledging(t *testing.T) {
 
 	decideErr := make(chan error, 1)
 	go func() {
-		decideErr <- e.Decide(run.ID, map[string]string{"apply": "yes"})
+		decideErr <- e.Decide(context.Background(), run.ID, map[string]string{"apply": "yes"})
 	}()
 
 	select {
@@ -1430,7 +1430,7 @@ func TestDecidePersistsBeforeAcknowledging(t *testing.T) {
 		t.Fatal("Decide() error = nil, want the manufactured Save failure to surface")
 	}
 
-	got, err := e.Get(run.ID)
+	got, err := e.Get(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -1489,7 +1489,7 @@ func TestDecideRollbackDoesNotOverwriteATerminalStateFromConcurrentShutdown(t *t
 
 	decideErr := make(chan error, 1)
 	go func() {
-		decideErr <- e.Decide(run.ID, map[string]string{"apply": "yes"})
+		decideErr <- e.Decide(context.Background(), run.ID, map[string]string{"apply": "yes"})
 	}()
 
 	select {
@@ -1521,7 +1521,7 @@ func TestDecideRollbackDoesNotOverwriteATerminalStateFromConcurrentShutdown(t *t
 		t.Fatal("Decide() error = nil, want the manufactured Save failure to surface")
 	}
 
-	got, err := e.Get(run.ID)
+	got, err := e.Get(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -1547,7 +1547,7 @@ func TestDecideSucceedsAndPersists(t *testing.T) {
 	waitState(t, e, run.ID, engine.StateAwaitingDecision)
 
 	before := store.count()
-	if decErr := e.Decide(run.ID, map[string]string{"apply": "yes"}); decErr != nil {
+	if decErr := e.Decide(context.Background(), run.ID, map[string]string{"apply": "yes"}); decErr != nil {
 		t.Fatalf("Decide() error = %v", decErr)
 	}
 	if delta := store.count() - before; delta != 1 {
@@ -1637,7 +1637,7 @@ func TestDecideDoesNotHoldTheLockDuringIO(t *testing.T) {
 
 	decideErr := make(chan error, 1)
 	go func() {
-		decideErr <- e.Decide(run.ID, map[string]string{"apply": "yes"})
+		decideErr <- e.Decide(context.Background(), run.ID, map[string]string{"apply": "yes"})
 	}()
 
 	select {

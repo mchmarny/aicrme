@@ -133,6 +133,7 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	protected.HandleFunc("POST /api/runs/{id}/retry", s.handleRetry)
+	protected.HandleFunc("DELETE /api/runs/{id}", s.handleDiscardRun)
 	protected.HandleFunc("GET /api/runs/{id}/bundle", s.handleBundle)
 	mux.Handle("/api/", s.auth.require(protected))
 

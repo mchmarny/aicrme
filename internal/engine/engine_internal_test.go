@@ -58,7 +58,7 @@ func TestSupersededGoroutineCannotWriteState(t *testing.T) {
 	// nothing left to do it after this window even under -race's overhead.
 	time.Sleep(200 * time.Millisecond)
 
-	got, err := e.Get(run.ID)
+	got, err := e.Get(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -112,7 +112,7 @@ func TestRetryRollbackDoesNotRestoreRecoveryPendingAgainstASupersededRun(t *test
 	e.recoveredPending = true
 	e.mu.Unlock()
 
-	if _, err := e.Retry(run.ID); err == nil {
+	if _, err := e.Retry(context.Background(), run.ID); err == nil {
 		t.Fatal("Retry() error = nil, want the manufactured Save failure to surface")
 	}
 
@@ -153,7 +153,7 @@ func TestDecideRollbackDoesNotRestoreStateAgainstASupersededRun(t *testing.T) {
 	e.current = run
 	e.mu.Unlock()
 
-	if err := e.Decide(run.ID, map[string]string{"apply": "yes"}); err == nil {
+	if err := e.Decide(context.Background(), run.ID, map[string]string{"apply": "yes"}); err == nil {
 		t.Fatal("Decide() error = nil, want the manufactured Save failure to surface")
 	}
 
