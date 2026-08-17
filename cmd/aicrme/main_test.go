@@ -243,3 +243,28 @@ func TestEnsureWorkDirsFailsOnUnwritableRoot(t *testing.T) {
 		t.Error("ensureWorkDirs() error = nil, want a failure -- an unwritable work dir must not start silently")
 	}
 }
+
+func TestRecipeNamespacesFromArtifact(t *testing.T) {
+	raw := []byte(`{"name":"r","version":"1","componentCount":2,"components":[
+		{"name":"a","namespace":"gpu-operator"},
+		{"name":"b","namespace":"monitoring"}]}`)
+
+	got := recipeNamespaces(raw)
+	for _, want := range []string{"gpu-operator", "monitoring"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("namespace %q missing from %v", want, got)
+		}
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2", len(got))
+	}
+}
+
+func TestRecipeNamespacesToleratesMissingOrCorruptArtifact(t *testing.T) {
+	if got := recipeNamespaces(nil); len(got) != 0 {
+		t.Errorf("nil artifact = %v, want empty", got)
+	}
+	if got := recipeNamespaces([]byte("not json")); len(got) != 0 {
+		t.Errorf("corrupt artifact = %v, want empty", got)
+	}
+}

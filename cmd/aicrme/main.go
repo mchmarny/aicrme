@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
@@ -15,11 +16,15 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
 	"github.com/mchmarny/aicrme/internal/applier"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/observer"
 	"github.com/mchmarny/aicrme/internal/steps"
 	"github.com/mchmarny/aicrme/internal/version"
 	"github.com/mchmarny/aicrme/internal/web"
@@ -75,6 +80,63 @@ func ensureWorkDirs(root string) error {
 		}
 	}
 	return nil
+}
+
+// recipeNamespaces extracts the namespaces the resolved recipe installs
+// into. A missing or unparseable artifact yields an empty set, which the
+// observer treats as "filter every namespaced workload out" -- the
+// fail-quiet direction, since narrating unrelated cluster activity is worse
+// than narrating nothing.
+func recipeNamespaces(raw []byte) map[string]struct{} {
+	out := map[string]struct{}{}
+	if len(raw) == 0 {
+		return out
+	}
+	var summary steps.RecipeSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		slog.Warn("recipe.json unparseable; observer will not narrate workloads", "error", err)
+		return out
+	}
+	for _, c := range summary.Components {
+		if c.Namespace != "" {
+			out[c.Namespace] = struct{}{}
+		}
+	}
+	return out
+}
+
+// newRunScopeFn returns an accessor the observer calls on every watch event.
+// It caches by run ID and refreshes only when that changes: Engine.Current()
+// deep-copies every artifact including the raw snapshot (tens of KB), so
+// calling it per event would copy megabytes per second to obtain a string.
+// CurrentID reads the ID under the same lock without cloning.
+//
+// The cache accepts staleness within a run: the namespace set reflects
+// whatever recipe.json held the first time the observer asked for the
+// current run's scope, not any later state. That is correct today because
+// recipe.json is written once by Recommend and never mutated after -- it
+// would need revisiting if a later phase made artifacts mutable mid-run.
+func newRunScopeFn(eng *engine.Engine) func() observer.RunScope {
+	var (
+		mu     sync.Mutex
+		cached observer.RunScope
+	)
+	return func() observer.RunScope {
+		id, ok := eng.CurrentID()
+		if !ok {
+			return observer.RunScope{}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if cached.RunID == id {
+			return cached
+		}
+		cached = observer.RunScope{RunID: id}
+		if run := eng.Current(); run != nil && run.ID == id {
+			cached.Namespaces = recipeNamespaces(run.Artifacts["recipe.json"])
+		}
+		return cached
+	}
 }
 
 func main() {
@@ -157,6 +219,28 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = client.Close() }()
+
+	// A failure here must not stop the console: the entire Discover-to-Apply
+	// arc works without cluster telemetry, and `make build && ./bin/aicrme`
+	// outside a cluster is a supported development path. Same degrade-with-a-
+	// warning posture as parseNodeSelector. Placed after every remaining
+	// os.Exit in main: `defer close(obsStop)` below would not run if an
+	// exit happened after it (gocritic's exitAfterDefer), and every startup
+	// failure that still exits is checked above this point.
+	var kube kubernetes.Interface
+	if cfg, cfgErr := rest.InClusterConfig(); cfgErr != nil {
+		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
+	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
+		slog.Warn("kubernetes client init failed; live cluster telemetry disabled", "error", clientErr)
+	} else {
+		kube = c
+	}
+
+	obsStop := make(chan struct{})
+	defer close(obsStop)
+	if startErr := observer.New(kube, b, newRunScopeFn(eng)).Start(obsStop); startErr != nil {
+		slog.Warn("observer failed to start; continuing without cluster telemetry", "error", startErr)
+	}
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
