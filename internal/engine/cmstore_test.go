@@ -122,6 +122,34 @@ func TestConfigMapStoreUpdatesExisting(t *testing.T) {
 	}
 }
 
+// An existing ConfigMap can have no BinaryData at all -- e.g. hand-created
+// via kubectl before this store ever wrote to it -- and Save must
+// initialize the map rather than panic on a nil-map write.
+func TestConfigMapStoreUpdatesRecordWithNilBinaryData(t *testing.T) {
+	owner := testOwner()
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       testNamespace,
+			Name:            testName,
+			OwnerReferences: []metav1.OwnerReference{owner},
+		},
+		// BinaryData deliberately left nil.
+	})
+
+	s := engine.NewConfigMapStore(client, testNamespace, testName, owner)
+	if err := s.Save(context.Background(), &engine.Run{ID: "run-a"}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	got, err := s.LoadCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
+	}
+	if got.ID != "run-a" {
+		t.Errorf("LoadCurrent().ID = %q, want %q", got.ID, "run-a")
+	}
+}
+
 // Assert the code, not the message: recovery keys off exactly this
 // distinction to tell "nothing to recover" apart from every other failure
 // mode a real backing store can produce.
@@ -136,6 +164,34 @@ func TestConfigMapStoreLoadCurrentNotFound(t *testing.T) {
 	var se *aicrerrors.StructuredError
 	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeNotFound {
 		t.Errorf("error = %v, want a StructuredError with ErrCodeNotFound", err)
+	}
+}
+
+// The single most load-bearing branch in this file: a non-404 Get error
+// must not collapse into NotFound. If it did, a transient failure (an
+// apiserver 5xx, or -- the realistic case, since the console runs
+// cluster-admin today but that is not guaranteed to stay that way -- a
+// future RBAC narrowing) would look exactly like "no prior run" to Task 3's
+// recovery, and the next Start would overwrite a perfectly good record
+// instead of surfacing the read failure.
+func TestConfigMapStoreLoadCurrentNonNotFoundGetErrorIsNotNotFound(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("get", "configmaps", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(corev1.Resource("configmaps"), testName, errors.New("no access"))
+	})
+
+	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+	_, err := s.LoadCurrent(context.Background())
+	if err == nil {
+		t.Fatal("LoadCurrent() error = nil, want the Forbidden error to surface")
+	}
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) {
+		t.Fatalf("error = %v, want a StructuredError", err)
+	}
+	if se.Code == aicrerrors.ErrCodeNotFound {
+		t.Errorf("Code = %v, want anything but ErrCodeNotFound -- "+
+			"a Forbidden error must not look like a cold start", se.Code)
 	}
 }
 
@@ -274,6 +330,36 @@ func TestConfigMapStoreGivesUpAfterBoundedConflicts(t *testing.T) {
 	}
 }
 
+// A non-conflict Update failure (RBAC narrowing, an apiserver 5xx) must
+// surface as an error on the first attempt rather than being retried --
+// retries exist for IsConflict specifically, not for API failures in
+// general.
+func TestConfigMapStoreUpdateNonConflictErrorIsNotRetried(t *testing.T) {
+	owner := testOwner()
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       testNamespace,
+			Name:            testName,
+			OwnerReferences: []metav1.OwnerReference{owner},
+		},
+		BinaryData: map[string][]byte{payloadKey: []byte("placeholder")},
+	})
+
+	var updateAttempts int
+	client.PrependReactor("update", "configmaps", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		updateAttempts++
+		return true, nil, apierrors.NewForbidden(corev1.Resource("configmaps"), testName, errors.New("no access"))
+	})
+
+	s := engine.NewConfigMapStore(client, testNamespace, testName, owner)
+	if err := s.Save(context.Background(), &engine.Run{ID: "run-a"}); err == nil {
+		t.Fatal("Save() error = nil, want the Forbidden Update error to surface")
+	}
+	if updateAttempts != 1 {
+		t.Errorf("update attempts = %d, want exactly 1 -- a non-conflict error must not be retried", updateAttempts)
+	}
+}
+
 // This is what stops the console clobbering a record left by a different
 // install that reused the ConfigMap name.
 func TestConfigMapStoreRejectsForeignOwner(t *testing.T) {
@@ -327,6 +413,20 @@ func TestConfigMapStoreDelete(t *testing.T) {
 	})
 }
 
+// A non-NotFound Delete failure must surface rather than be swallowed as
+// success -- only absence means the caller's intent is already satisfied.
+func TestConfigMapStoreDeleteNonNotFoundErrorSurfaces(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("delete", "configmaps", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(corev1.Resource("configmaps"), testName, errors.New("no access"))
+	})
+
+	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+	if err := s.Delete(context.Background()); err == nil {
+		t.Fatal("Delete() error = nil, want the Forbidden error to surface")
+	}
+}
+
 // Load is the by-ID lookup Task 3 does not use (it uses LoadCurrent), but it
 // is still part of the Store contract: a mismatched ID must be NotFound
 // rather than silently returning the wrong run.
@@ -354,8 +454,20 @@ func TestConfigMapStoreLoadByID(t *testing.T) {
 	}
 }
 
-// 20 concurrent Saves must all succeed and leave exactly one ConfigMap. Run
-// under -race: the mutex is what this test actually exercises.
+// This proves what it can actually prove against a fake clientset: 20
+// concurrent Save calls all complete without error and converge on exactly
+// one ConfigMap. It does NOT distinguish a mutex-protected Save from an
+// unprotected one -- k8s.io/client-go/testing's ObjectTracker deliberately
+// does not enforce resourceVersion on Update (see its versionedObject
+// comment: "Object content does not get changed to preserve the
+// traditional behavior"), so there is no staleness here for the retry loop
+// to ever detect, and every individual Get/Create/Update is already atomic
+// under the tracker's own lock regardless of configMapStore's mutex. What
+// actually carries this test without the mutex is the IsAlreadyExists retry
+// on the very first Create race: verified by removing s.mu from Save and
+// running this test 25 times under -race (5 runs x 5, then a 20-run batch)
+// with all 25 passing. The mutex's real justification is documented at its
+// declaration in cmstore.go, not here.
 func TestConfigMapStoreSerializesWrites(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())

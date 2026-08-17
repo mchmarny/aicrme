@@ -29,9 +29,21 @@ type configMapStore struct {
 	name      string
 	owner     metav1.OwnerReference
 
-	// mu serializes writes. Two concurrent Saves would each read-modify-write
-	// the same object and one would silently lose; conflict retries recover
-	// from *external* races, not from this process racing itself.
+	// mu serializes this process's own Save calls. It is not what makes
+	// writes correct: Save always overwrites the whole payload rather than
+	// merging into the existing record, so two interleaved Saves cannot tear
+	// or corrupt state -- last write wins either way, and the conflict-retry
+	// loop below already recovers a stale write against a real API server on
+	// its own. What mu buys is avoiding *self-inflicted* conflicts: without
+	// it, this process's own concurrent Saves would burn through the bounded
+	// retry budget on each other, a budget sized for genuine external races
+	// (a leftover replica mid-rollout, a human `kubectl edit`), not for
+	// contention this process could have avoided for free.
+	//
+	// Tripwire: if Save ever changes to merge into the existing record
+	// instead of overwriting it wholesale, mu stops being optional --
+	// a read-modify-write of a sub-field needs it for correctness, not
+	// just to conserve retry budget.
 	mu sync.Mutex
 }
 
