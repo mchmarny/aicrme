@@ -1177,9 +1177,11 @@ Resolve the owner reference to the **Deployment**, build the ConfigMap store whe
 client is non-nil, and call `eng.Recover(ctx)` **before** `httpSrv.ListenAndServe`.
 
 Treat `ErrStepConfig` as fatal (`slog.Error` + `os.Exit(1)`); anything else is already
-handled inside `Recover`. If `eng.StoreUnreadable()` reports true, swap the engine's
-store for `NewMemoryStore()` for the rest of the process so nothing overwrites a record
-it could not read.
+handled inside `Recover`. If `eng.StoreUnreadable()` reports true, **log it — that is all
+main does.** Per Ruling 4, `Recover` performs the store swap itself, because `Engine.store`
+is private and main cannot know the record is unreadable until after `New` has already
+taken the ConfigMap store. Do not go looking for a setter: there isn't one, and adding one
+would reintroduce the chicken-and-egg that ruling resolved.
 
 Recovery runs before serving so the SPA's automatic `POST /api/runs` cannot win the
 race. This does not reintroduce 2b-i's startup-hang class: every ConfigMap call is
