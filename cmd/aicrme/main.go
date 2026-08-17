@@ -53,9 +53,15 @@ const defaultWorkDir = "/var/lib/aicrme"
 const defaultApplyRetries = 5
 
 // runShutdownTimeout bounds how long shutdown waits for an in-flight run to
-// stop. It must exceed the applier's own killGrace (10s) so the process-group
-// SIGTERM -> SIGKILL escalation can complete; see internal/applier/exec.go.
-const runShutdownTimeout = 15 * time.Second
+// stop. One cancellation can spend two of the applier's killGrace windows
+// back to back (internal/applier/exec.go): 10s for the process-group SIGTERM
+// -> SIGKILL escalation, then up to another 10s of cmd.WaitDelay if a
+// descendant that escaped the process group is still holding the stdout pipe
+// open. 15s did not cover that. 30s does, and still fits inside the chart's
+// terminationGracePeriodSeconds of 45 alongside the concurrent HTTP drain --
+// test/chart/contract.sh pins the two against each other so they cannot
+// drift apart silently.
+const runShutdownTimeout = 30 * time.Second
 
 // httpShutdownTimeout bounds the HTTP drain. Runs concurrently with the
 // above, so the pod's total shutdown budget is the larger of the two, not
@@ -314,8 +320,12 @@ func main() {
 	// not return before the deploy.sh process tree is reaped" -- not "do not
 	// begin HTTP shutdown first". aicrme is PID 1 under the image's
 	// ENTRYPOINT with no init, so returning from main tears down the whole
-	// PID namespace and SIGKILLs helm before deploy.sh's INT/TERM trap can
-	// run, which is what strands a release in pending-install.
+	// PID namespace and SIGKILLs helm mid-release. Helm handles SIGTERM
+	// itself and marks the release failed; killed outright it leaves the
+	// release stranded in pending-install, which blocks the next
+	// `helm upgrade --install` until someone runs `helm rollback` by hand.
+	// deploy.sh's own INT/TERM trap is not what needs the time -- it is an
+	// `rm -rf` of the helm temp workdir and returns immediately.
 	var wg sync.WaitGroup
 	wg.Add(2)
 

@@ -216,11 +216,11 @@ fi
 
 # --- Invariant 7: the shutdown budget is explicit, not inherited ----------
 # cmd/aicrme drains HTTP and cancels any in-flight run concurrently, bounded
-# by runShutdownTimeout (15s), before it can return from main -- returning
-# early would tear down the PID namespace and SIGKILL helm mid-deploy,
-# stranding a release in pending-install. That only fits inside Kubernetes'
-# default terminationGracePeriodSeconds (30s) by luck; pinning it here makes
-# the budget survive an unrelated edit to the Deployment.
+# by runShutdownTimeout, before it can return from main -- returning early
+# would tear down the PID namespace and SIGKILL helm mid-release, stranding it
+# in pending-install. That only fits inside Kubernetes' default
+# terminationGracePeriodSeconds (30s) by luck; pinning it here makes the
+# budget survive an unrelated edit to the Deployment.
 echo "== shutdown budget =="
 grace_default=$(render | doc Deployment | yq -r '.spec.template.spec.terminationGracePeriodSeconds' | val)
 if [[ "${grace_default}" == "45" ]]; then
@@ -234,6 +234,50 @@ if [[ "${grace_override}" == "60" ]]; then
   pass "--set terminationGracePeriodSeconds=60 flows through"
 else
   fail "terminationGracePeriodSeconds override" "got '${grace_override}', want '60'"
+fi
+
+# The two halves of the budget live in different languages and neither
+# toolchain can see the other, exactly like the AICR image pin `make
+# check-aicr-pin` greps for. main.go's constants are the process's own wait;
+# the chart's grace period is the wall clock Kubernetes allows before SIGKILL.
+# Raising one without the other is silent until a real Apply is interrupted,
+# so read both and compare.
+SHUTDOWN_SRC="cmd/aicrme/main.go"
+go_seconds() {
+  # [0-9][0-9]* rather than [0-9]\+ : BSD sed's basic regex has no \+.
+  sed -n "s/^const $1 = \([0-9][0-9]*\) \* time.Second$/\1/p" "${SHUTDOWN_SRC}" | head -1
+}
+run_budget=$(go_seconds runShutdownTimeout)
+http_budget=$(go_seconds httpShutdownTimeout)
+if [[ -z "${run_budget}" || -z "${http_budget}" ]]; then
+  fail "shutdown constants readable" \
+    "could not read runShutdownTimeout/httpShutdownTimeout as whole seconds from ${SHUTDOWN_SRC}"
+else
+  # Concurrent, so the process's budget is the larger of the two, not the sum.
+  process_budget="${run_budget}"
+  if (( http_budget > process_budget )); then
+    process_budget="${http_budget}"
+  fi
+  if (( process_budget < grace_default )); then
+    pass "process shutdown budget ${process_budget}s fits inside terminationGracePeriodSeconds ${grace_default}s"
+  else
+    fail "shutdown budget fits the grace period" \
+      "process waits up to ${process_budget}s (max of runShutdownTimeout=${run_budget}s, httpShutdownTimeout=${http_budget}s) but the chart allows only ${grace_default}s before SIGKILL"
+  fi
+
+  # The run budget must also cover the applier's worst case: killGrace for the
+  # process-group SIGTERM -> SIGKILL escalation, then another killGrace of
+  # cmd.WaitDelay if a descendant that escaped the group still holds the
+  # stdout pipe open.
+  kill_grace=$(sed -n 's/^var killGrace = \([0-9][0-9]*\) \* time.Second$/\1/p' internal/applier/exec.go | head -1)
+  if [[ -z "${kill_grace}" ]]; then
+    fail "killGrace readable" "could not read killGrace as whole seconds from internal/applier/exec.go"
+  elif (( run_budget >= 2 * kill_grace )); then
+    pass "runShutdownTimeout ${run_budget}s covers two killGrace windows (2 x ${kill_grace}s)"
+  else
+    fail "runShutdownTimeout covers the applier's worst case" \
+      "runShutdownTimeout=${run_budget}s but one cancellation can spend 2 x killGrace=${kill_grace}s (escalation, then cmd.WaitDelay)"
+  fi
 fi
 
 echo
