@@ -52,17 +52,38 @@ no matches for kind "NodeFeatureRule" ... ensure CRDs are installed first
 
 ---
 
+> **SUPERSEDED IN PART, 2026-08-17 — read this before the section below.** The
+> dry-run ceiling is real and everything this document says about `--dry-run`
+> still holds. What does **not** hold is the inference drawn from it: that
+> simulated hardware therefore cannot validate the Apply chain, and that Phase 4
+> is a hard dependency for answering "does Apply work end to end".
+>
+> A real (non-`--dry-run`) install on the same KWOK cluster **completes**. All
+> 14 components install, the run reaches `StateDone`, and every Deployment,
+> DaemonSet and StatefulSet converges to its desired replica count — in 6m02s,
+> reproduced on three consecutive runs before this note was written. The ceiling
+> was a limit of `--dry-run` specifically, not of simulation: dry-run validates
+> each chart against the cluster as it *is*, never as the previous component
+> left it, so it can never get past a CRD an earlier component would register.
+> A real install registers them and the chain runs.
+>
+> `test/e2e/apply-real.sh` is now a CI gate asserting exactly that. Phase 4 is
+> still required for the **finale** — real drivers, real GPU scheduling, real
+> NCCL throughput, the 0-of-64-to-64-of-64 callback — but it is no longer
+> required to know whether the install chain works. Two claims below overstate
+> this and are marked inline.
+
 ## Phase 2a's exit criterion, stated explicitly
 
 **2a is a dry-run / demo milestone.** It proves: the console builds and downloads a real, version-pinned bundle for a resolved recipe; the confirm-gated Apply step genuinely invokes `deploy.sh` inside the production image with the production toolchain; the pipeline UI correctly renders that run's markers as they stream in; and the run fails, deterministically and for a well-understood reason, at the point dry-run structurally cannot go further.
 
-**2a is explicitly not validated for real-cluster Apply**, and it should not be presented or treated as such. Nothing in this phase runs `deploy.sh` without `--dry-run` against real hardware; nothing exercises real driver installs, real GPU scheduling, or a real multi-minute Apply. Full-chain validation — a real Apply reaching `StateDone` against real GPU nodes — requires Phase 4's real hardware, and that dependency now has empirical backing rather than being a stated preference: the dry-run ceiling above is a structural proof that dry-run *cannot* stand in for it, not merely a caution that it doesn't yet.
+**2a is explicitly not validated for real-cluster Apply**, and it should not be presented or treated as such. Nothing in this phase runs `deploy.sh` without `--dry-run` against real hardware; nothing exercises real driver installs, real GPU scheduling, or a real multi-minute Apply. Full-chain validation *against real GPU nodes* — real drivers, real scheduling, real throughput — still requires Phase 4's hardware. **Corrected 2026-08-17:** the sentence that used to sit here generalised the dry-run ceiling into "dry-run cannot stand in for real hardware, therefore simulation cannot validate the chain". The first half is true; the second does not follow, and is false. A real install on simulated hardware reaches `StateDone` with every workload converged (`test/e2e/apply-real.sh`). What Phase 4 is a hard dependency for is the finale, not the question "does Apply work".
 
 This closes Feedback 1 below on the "should 2a claim more than a demo milestone" question: no, and now there is a reason stronger than caution to say so.
 
 **What the e2e exit gate does *not* exercise.** Because the run always terminates at 3/14, `apply-dryrun.sh` covers only the `started`/`installed`/`failed` marker statuses and the `KindError` path. The async marker (`kai-scheduler`, the one component installed without `--wait`), `All components installed successfully.`, `StateDone` on Apply, the cockpit's `Done` branch, and `POST /retry` (the engine-level whole-run retry) are unit-covered only — no e2e script has ever driven them. The component-level `retrying` marker (`internal/applier/parse.go`'s `StatusRetrying`, emitted when `deploy.sh` retries a single failing component under its own quadratic backoff) sits in between: it is unit-covered by a hand-authored fixture — Task 1's captured transcript had zero retry markers, so there was nothing real to slice a fixture from — but a manual run of `make test-e2e-apply` (2026-08-16, all findings verified) produced genuine `retrying` markers for real: `network-operator` failed and `deploy.sh` retried it under `--retries 5`, so the observed marker sequence was `failed installed retrying started`. That means the parser's retry path is now validated against real `deploy.sh` output too, not only the synthesized fixture — but this was a one-off manual observation, not something CI asserts on every run, so treat it as evidence the path is real, not as ongoing coverage.
 
-Also record: **all five resolvable `(intent, platform)` pairs are GPU-stack recipes containing both `nfd` and `network-operator`** — verified directly against the simulated-H100 fixture (`training/kubeflow`, `training/slurm`, `training/any`, `inference/dynamo`, `inference/any` all include both component names in their resolved recipe). No alternative demo path sidesteps the dry-run ceiling by choosing a different `(intent, platform)` pair; the CRD-ordering limitation fires identically regardless of which of the five is picked. That is the strongest available argument that Phase 4 hardware is a hard dependency for full-chain validation, not merely the phase's stated preference, and it was not written down anywhere before this note.
+Also record: **all five resolvable `(intent, platform)` pairs are GPU-stack recipes containing both `nfd` and `network-operator`** — verified directly against the simulated-H100 fixture (`training/kubeflow`, `training/slurm`, `training/any`, `inference/dynamo`, `inference/any` all include both component names in their resolved recipe). No alternative demo path sidesteps the dry-run ceiling by choosing a different `(intent, platform)` pair; the CRD-ordering limitation fires identically regardless of which of the five is picked. That was written as the strongest available argument that Phase 4 hardware is a hard dependency for full-chain validation. **Corrected 2026-08-17:** it is a sound argument that no `(intent, platform)` choice sidesteps the *dry-run* ceiling, and nothing more. It says nothing about a real install, which completes on the same cluster. The observation stands; the conclusion drawn from it does not.
 
 **The confirm gate's enforcement boundary.** `test/e2e/apply-dryrun.sh`'s `pending == ["apply"]` assertion (right before the bundle download) proves the confirm gate *fires* — the run genuinely parks with only `apply` pending before Apply runs. It does not prove the gate *cannot be bypassed*: the script only ever sends the two decision calls in the order the console's own UI would, so it never attempts the pre-satisfying call a scripted integration could send instead (answering `intent`/`platform` and `apply` together at the very first gate). What actually enforces the boundary is `engine.Decide` (`internal/engine/engine.go`): it now rejects any decision key not present in `e.current.Pending` with `ErrCodeInvalidRequest`, so a single call carrying `{"intent":...,"platform":...,"apply":"yes"}` at the Recommend gate is refused outright rather than silently pre-satisfying `steps.Apply.Requires()` — proven by `TestDecideRejectsKeysNotCurrentlyPending` (`internal/engine/engine_test.go`), not by the e2e.
 

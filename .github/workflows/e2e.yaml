@@ -82,3 +82,39 @@ jobs:
         with:
           install_only: true
       - run: test/e2e/apply-dryrun.sh
+
+  apply-real:
+    runs-on: ubuntu-latest
+    # Same 75m budget as apply-dryrun: the script's own loops permit
+    # Discover 7.5m + Recommend/Bundle 3m + Apply 40m + a 3m settle, and this
+    # job adds the one cost --dry-run never pays -- pulling every component's
+    # container images. Two local verification runs installed all 14 in 6m02s
+    # each; the headroom is for a slow runner's pulls, not for the install.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+      # A real install pulls every component's images into the Kind nodes,
+      # which --dry-run never does. ubuntu-latest ships ~14GB free, most of it
+      # spoken for by preinstalled toolchains this job does not use; reclaiming
+      # them first is cheaper than diagnosing an ImagePullBackOff caused by a
+      # full disk, which surfaces as a component failure rather than as a disk
+      # error.
+      - name: reclaim runner disk for image pulls
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/android "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          df -h / | tail -1
+      - id: go
+        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+      # install_only: apply-real.sh creates and tears down its own multi-node
+      # Kind cluster (plus the KWOK controller and simulated GPU nodes inside
+      # it) and builds+loads the production console image itself; this step
+      # only needs to put kind, kubectl, and helm on the runner.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: test/e2e/apply-real.sh
