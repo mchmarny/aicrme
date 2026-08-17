@@ -715,6 +715,7 @@ func TestRecoverPublishesBootstrapEvents(t *testing.T) {
 		t.Fatalf("component events = %d, want exactly 2 (one per persisted row): %+v", len(componentEvents), componentEvents)
 	}
 	byName := map[string]bootstrapComponentPayload{}
+	levelByName := map[string]bus.Level{}
 	for _, ev := range componentEvents {
 		if ev.RunID != testRunID {
 			t.Errorf("component event RunID = %q, want %q", ev.RunID, testRunID)
@@ -724,12 +725,22 @@ func TestRecoverPublishesBootstrapEvents(t *testing.T) {
 			t.Fatalf("unmarshal component event Data: %v (data=%s)", err, ev.Data)
 		}
 		byName[p.Name] = p
+		levelByName[p.Name] = ev.Level
 	}
 	if got := byName["gpu-operator"]; got.Status != "installed" || got.Index != 1 || got.Total != 2 {
 		t.Errorf("gpu-operator payload = %+v, want status=installed index=1 total=2", got)
 	}
 	if got := byName["kai-scheduler"]; got.Status != "failed" || got.Index != 2 || got.Total != 2 {
 		t.Errorf("kai-scheduler payload = %+v, want status=failed index=2 total=2", got)
+	}
+	// A recovered failed component must carry the same severity a live one
+	// does (internal/applier/parse.go's reFailed -> bus.LevelError), not a
+	// uniform LevelInfo that flattens a failure into ordinary progress.
+	if got := levelByName["gpu-operator"]; got != bus.LevelInfo {
+		t.Errorf("gpu-operator Level = %q, want %q", got, bus.LevelInfo)
+	}
+	if got := levelByName["kai-scheduler"]; got != bus.LevelError {
+		t.Errorf("kai-scheduler Level = %q, want %q", got, bus.LevelError)
 	}
 
 	// web/src/components/Wizard.tsx's deriveRunState sets state to 'failed'

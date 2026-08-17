@@ -577,6 +577,24 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 			RunID: runID, Kind: bus.KindError, Phase: string(step.Phase()),
 			Level: bus.LevelError, Message: msg,
 		})
+
+		// Ruling 14: Components merges here too, unlike Artifacts and
+		// Decisions. Those two are step OUTPUTS -- a step that errors
+		// partway through may leave them inconsistent, which is exactly why
+		// merging them only on success is correct. Components is progress
+		// NARRATION, not an output: its partial value on a failing Apply
+		// (a few components installed, one failed) is precisely what
+		// recovery needs to redraw the pipeline instead of a bare failure.
+		// It is the one field whose half-written state is meaningful, so it
+		// is the one field that survives a failed step. Same epoch/identity
+		// guard as the success-path merge below, and it must land before
+		// finish's terminal save, or that save persists the pre-Apply rows.
+		e.mu.Lock()
+		if e.aliveLocked(epoch) {
+			e.current.Components = scratch.Components
+		}
+		e.mu.Unlock()
+
 		e.finish(ctx, epoch, StateFailed, msg)
 		return err
 	}

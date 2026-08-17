@@ -33,6 +33,13 @@ type fakeStep struct {
 	requires []string
 	err      error
 	ran      chan struct{}
+	// components, when set, is appended to r.Components before Run returns
+	// -- opt-in and nil by default, so every existing caller of newFakeStep
+	// is unaffected. Lets a test drive Apply's kind of partial-progress
+	// write (r.Components, not just r.Artifacts) through the real engine,
+	// including on the error path (err set alongside components), which is
+	// what runStep's merge-back on failure (Ruling 14) needs covered.
+	components []engine.ComponentState
 }
 
 func newFakeStep(p engine.Phase, requires ...string) *fakeStep {
@@ -45,6 +52,7 @@ func (f *fakeStep) Run(_ context.Context, r *engine.Run, emit engine.Emit) error
 	f.ran <- struct{}{}
 	emit(bus.Event{Kind: bus.KindLog, Message: string(f.phase) + " ran"})
 	r.Artifacts[string(f.phase)] = []byte("done")
+	r.Components = append(r.Components, f.components...)
 	return f.err
 }
 
@@ -1872,4 +1880,99 @@ drainTerminal:
 	}
 
 	waitState(t, e, run.ID, engine.StateDone)
+}
+
+// TestRunStepMergesPartialComponentStateOnFailure pins Ruling 14 (Task 6
+// fix round 1): runStep's merge-back historically ran only in the step
+// SUCCESS path, so a step's writes to r.Components -- Apply's per-component
+// projection -- were made against a private scratch copy and silently
+// discarded whenever the step returned an error, because the error branch
+// returned before reaching the merge block.
+//
+// This is the dominant Apply failure shape, not an edge case:
+// internal/applier/applier.go's Apply runs deploy.sh WITHOUT
+// --best-effort, so the first component to exhaust its retries ends the
+// whole run. A run that fails during Apply must still recover with the
+// rows the step wrote before it failed, or a recovered run redraws as a
+// bare failure again -- exactly what this task exists to prevent.
+//
+// Deliberately goes through e.Start(), not step.Run() directly:
+// internal/steps/apply_test.go already proves the step-local upsert logic
+// works in isolation, but nothing exercised whether those writes survive
+// runStep's merge-back on the failure path, which is where the bug
+// actually lived.
+func TestRunStepMergesPartialComponentStateOnFailure(t *testing.T) {
+	b := bus.New(64)
+	store := engine.NewMemoryStore()
+	failing := newFakeStep(engine.PhaseApply)
+	failing.err = errors.New("deploy.sh failed: exit status 1")
+	failing.components = []engine.ComponentState{
+		{Name: "gpu-operator", Index: 1, Total: 2, Status: "installed"},
+		{Name: "kai-scheduler", Index: 2, Total: 2, Status: "failed"},
+	}
+	e := engine.New(b, store, failing)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	final := waitState(t, e, run.ID, engine.StateFailed)
+	if len(final.Components) != 2 {
+		t.Fatalf("Components = %+v, want the 2 rows the failing step wrote before returning its error", final.Components)
+	}
+	byName := map[string]engine.ComponentState{}
+	for _, c := range final.Components {
+		byName[c.Name] = c
+	}
+	if got := byName["gpu-operator"]; got.Status != "installed" {
+		t.Errorf("gpu-operator = %+v, want status=installed", got)
+	}
+	if got := byName["kai-scheduler"]; got.Status != "failed" {
+		t.Errorf("kai-scheduler = %+v, want status=failed", got)
+	}
+
+	// The in-memory run being right is a different claim from the
+	// PERSISTED record being right, and recovery reads the record, not
+	// e.Current(). The merge must land before finish's terminal save, or
+	// that save captures the pre-Apply Components instead of these rows.
+	persisted, err := store.LoadCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
+	}
+	if len(persisted.Components) != 2 {
+		t.Fatalf("persisted Components = %+v, want 2 rows -- the terminal save must capture them, not the pre-Apply state", persisted.Components)
+	}
+}
+
+// TestRunStepMergesComponentStateOnSuccess is the success-path companion:
+// it pins that the pre-existing merge (never broken, only the failure
+// branch was) still runs, through the real engine rather than a direct
+// step.Run() call.
+func TestRunStepMergesComponentStateOnSuccess(t *testing.T) {
+	b := bus.New(64)
+	store := engine.NewMemoryStore()
+	ok := newFakeStep(engine.PhaseApply)
+	ok.components = []engine.ComponentState{
+		{Name: "gpu-operator", Index: 1, Total: 1, Status: "installed"},
+	}
+	e := engine.New(b, store, ok)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	final := waitState(t, e, run.ID, engine.StateDone)
+	if len(final.Components) != 1 || final.Components[0].Status != "installed" {
+		t.Fatalf("Components = %+v, want 1 row with status=installed", final.Components)
+	}
+
+	persisted, err := store.LoadCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
+	}
+	if len(persisted.Components) != 1 {
+		t.Fatalf("persisted Components = %+v, want 1 row", persisted.Components)
+	}
 }

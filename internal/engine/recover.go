@@ -300,7 +300,7 @@ func (e *Engine) publishRecoveryBootstrap(r *Run) {
 		data, _ := json.Marshal(bootstrapComponentData(c))
 		e.bus.Publish(bus.Event{
 			RunID: r.ID, Kind: bus.KindComponent, Phase: string(r.Phase),
-			Level: bus.LevelInfo, Component: c.Name,
+			Level: componentLevel(c.Status), Component: c.Name,
 			Message: c.Name + " " + c.Status, Data: data,
 		})
 	}
@@ -314,6 +314,28 @@ func (e *Engine) publishRecoveryBootstrap(r *Run) {
 		RunID: r.ID, Kind: bus.KindPhase, Phase: string(r.Phase),
 		Level: levelFor(r.State), Message: "run " + string(r.State),
 	})
+}
+
+// componentLevel mirrors the Level internal/applier/parse.go's parseLine
+// assigns each marker kind (reFailed -> LevelError, reRetry -> LevelWarn,
+// everything else -> LevelInfo), by string value rather than by importing
+// applier's Status* constants -- see bootstrapComponentData's doc comment
+// on why internal/engine does not depend on internal/applier. Checked
+// against web/src/components/Cockpit.tsx before adding this: ComponentRow
+// colors each row from ComponentState.status alone (statusClass) and never
+// reads the event's level field, so this has no rendering effect today.
+// It is still correct: a recovered failed component should carry the same
+// severity a live one does, for any consumer that does look at Level (the
+// raw event timeline, structured log export, ...), and it costs nothing.
+func componentLevel(status string) bus.Level {
+	switch status {
+	case "failed":
+		return bus.LevelError
+	case "retrying":
+		return bus.LevelWarn
+	default:
+		return bus.LevelInfo
+	}
 }
 
 // markStoreUnreadable records that a persisted run could not be trusted and
