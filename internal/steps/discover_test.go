@@ -16,6 +16,8 @@ import (
 	"github.com/mchmarny/aicrme/internal/gap"
 	"github.com/mchmarny/aicrme/internal/steps"
 	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func newRun() *engine.Run {
@@ -153,6 +155,7 @@ func TestDiscoverPlumbsAgentConfig(t *testing.T) {
 		Privileged:         true,
 		RequireGPU:         true,
 		DiscoverNetwork:    true,
+		Requests:           corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
 	}
 	step := steps.NewDiscover(fake, cfg)
 
@@ -184,6 +187,12 @@ func TestDiscoverPlumbsAgentConfig(t *testing.T) {
 	}
 	if got.Privileged != cfg.Privileged {
 		t.Errorf("Privileged = %v, want %v", got.Privileged, cfg.Privileged)
+	}
+	// Cmp, not string equality: a quantity round trip can change the
+	// serialization without changing the value, and the property that matters
+	// is that the agent is asked for 200m rather than AICR's 1000m default.
+	if q, ok := got.Requests[corev1.ResourceCPU]; !ok || q.Cmp(resource.MustParse("200m")) != 0 {
+		t.Errorf("Requests[cpu] = %v (present=%v), want 200m", q, ok)
 	}
 	if got.RequireGPU != cfg.RequireGPU {
 		t.Errorf("RequireGPU = %v, want %v", got.RequireGPU, cfg.RequireGPU)

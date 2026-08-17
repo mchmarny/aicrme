@@ -12,6 +12,7 @@ import (
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/gap"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // DiscoverConfig configures the AICR snapshot agent Job.
@@ -60,6 +61,25 @@ type DiscoverConfig struct {
 	// here so a later task (or the Phase 4 EKS fixture capture) can turn it
 	// on without touching this file again.
 	DiscoverNetwork bool
+
+	// Requests overrides the agent pod's container resource requests. Left
+	// nil in production, where AICR's own defaults apply: the agent asks for
+	// 1000m CPU (pkg/k8s/agent/job.go) because snapshotting a real cluster's
+	// hardware is genuine work, and lowering that on a real install would
+	// only make Discover slower.
+	//
+	// It exists for the same reason NodeSelector does -- a simulated cluster
+	// cannot satisfy an assumption a real one can. The KWOK e2e pins the
+	// agent onto the single real node (see NodeSelector above), and on a CI
+	// runner that node cannot fit 1000m alongside the console and
+	// kube-system: the agent pod stays Pending with "Insufficient cpu" and
+	// Discover times out after ten minutes. This was invisible until the
+	// e2e workflow first ran on a runner rather than a developer's laptop.
+	//
+	// Deliberately not exposed in values.yaml, same treatment as
+	// AICRME_SNAPSHOT_NODE_SELECTOR: it is a test-path knob, and shrinking
+	// the request on a real cluster is a way to make Discover worse.
+	Requests corev1.ResourceList
 }
 
 type discover struct {
@@ -109,6 +129,7 @@ func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) err
 		Privileged:         d.cfg.Privileged,
 		RequireGPU:         d.cfg.RequireGPU,
 		DiscoverNetwork:    d.cfg.DiscoverNetwork,
+		Requests:           d.cfg.Requests,
 		Cleanup:            true,
 	})
 	if err != nil {

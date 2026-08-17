@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -222,8 +224,13 @@ func main() {
 			// e2e test) can pin the agent Job off the tainted, fake-executing
 			// simulated GPU nodes and onto a real one.
 			NodeSelector: parseNodeSelector(os.Getenv("AICRME_SNAPSHOT_NODE_SELECTOR")),
-			Privileged:   true,
-			Timeout:      10 * time.Minute,
+			// Unset (nil) on every real deployment, where AICR's own 1000m
+			// CPU default applies. Exists so the KWOK e2e can fit the agent
+			// onto the one real node it is pinned to -- see the Requests
+			// field's doc on steps.DiscoverConfig.
+			Requests:   parseResourceRequests(os.Getenv("AICRME_SNAPSHOT_REQUESTS")),
+			Privileged: true,
+			Timeout:    10 * time.Minute,
 		}),
 		steps.NewRecommend(client),
 		steps.NewBundle(client, steps.BundleConfig{
@@ -376,6 +383,43 @@ func envOr(key, fallback string) string {
 // operator should be able to trace back to a typo), so every dropped pair,
 // and a fully malformed value that resolves to no selector at all, is
 // logged at Warn.
+// parseResourceRequests parses a "cpu=200m,memory=256Mi" list into a
+// ResourceList for the snapshot agent's container requests. It degrades the
+// same way parseNodeSelector does -- an unparseable entry is skipped with a
+// warning and the rest still apply, because dropping one malformed pair is
+// better than failing startup over a knob only the e2e sets.
+//
+// Returning nil for an empty or fully-unparseable value is what hands control
+// back to AICR's own defaults, which is the correct production behavior.
+func parseResourceRequests(s string) corev1.ResourceList {
+	if s == "" {
+		return nil
+	}
+	out := corev1.ResourceList{}
+	for _, pair := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(pair, "=")
+		k = strings.TrimSpace(k)
+		if !ok || k == "" {
+			slog.Warn("AICRME_SNAPSHOT_REQUESTS: skipping unparseable pair",
+				"pair", pair, "value", s)
+			continue
+		}
+		q, err := resource.ParseQuantity(strings.TrimSpace(v))
+		if err != nil {
+			slog.Warn("AICRME_SNAPSHOT_REQUESTS: skipping unparseable quantity",
+				"key", k, "pair", pair, "error", err)
+			continue
+		}
+		out[corev1.ResourceName(k)] = q
+	}
+	if len(out) == 0 {
+		slog.Warn("AICRME_SNAPSHOT_REQUESTS set but produced no usable requests; "+
+			"the snapshot agent falls back to AICR's own defaults", "value", s)
+		return nil
+	}
+	return out
+}
+
 func parseNodeSelector(s string) map[string]string {
 	if s == "" {
 		return nil

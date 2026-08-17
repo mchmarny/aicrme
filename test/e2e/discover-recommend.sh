@@ -129,8 +129,20 @@ e2e_install_chart "${NS}" "${IMAGE}"
 # stage-fast.yaml pod-complete Stage), so it would stay Pending on every
 # fake GPU node and Discover would time out loudly rather than ever
 # completing. Pin the agent Job onto the real node instead.
+# AICRME_SNAPSHOT_REQUESTS shrinks the agent's CPU request from AICR's 1000m
+# default (pkg/k8s/agent/job.go). Pinning the agent onto the one real node,
+# above, means it competes there with the console and all of kube-system --
+# and a CI runner's node cannot fit 1000m on top of those. The first time
+# this workflow ran on a runner rather than a developer's laptop, the agent
+# pod sat Pending with "0/7 nodes are available: 1 Insufficient cpu, 6
+# node(s) had untolerated taint(s)" and Discover timed out after ten
+# minutes. The real request is right for a real cluster, where the agent
+# reads actual hardware; against KWOK's fake nodes there is no such work to
+# do, so 200m is ample. Test-path only -- never set this in values.yaml.
 echo "--- pin the snapshot agent off the simulated GPU nodes onto the real one"
-kubectl -n "${NS}" set env deploy/aicrme 'AICRME_SNAPSHOT_NODE_SELECTOR=node-role.kubernetes.io/control-plane='
+kubectl -n "${NS}" set env deploy/aicrme \
+  'AICRME_SNAPSHOT_NODE_SELECTOR=node-role.kubernetes.io/control-plane=' \
+  'AICRME_SNAPSHOT_REQUESTS=cpu=200m'
 kubectl -n "${NS}" rollout status deploy/aicrme --timeout=120s
 
 kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &

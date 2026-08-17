@@ -106,6 +106,8 @@ e2e_install_chart "${NS}" "${IMAGE}"
 # separate calls would roll the Deployment twice and double the wait.
 # AICRME_SNAPSHOT_NODE_SELECTOR: see discover-recommend.sh's header for why
 # the snapshot agent must be pinned off the tainted simulated GPU nodes.
+# AICRME_SNAPSHOT_REQUESTS: see discover-recommend.sh's header for why the
+# agent's 1000m CPU default does not fit on a CI runner's single real node.
 # AICRME_APPLY_DRY_RUN: internal/steps.ApplyConfig.DryRun -> the applier
 # sets DRY_RUN_FLAG=--dry-run for deploy.sh (internal/applier/applier.go),
 # which every generated install.sh interpolates into its `helm upgrade
@@ -114,6 +116,7 @@ e2e_install_chart "${NS}" "${IMAGE}"
 echo "--- pin the snapshot agent off the simulated GPU nodes and enable Apply's dry-run"
 kubectl -n "${NS}" set env deploy/aicrme \
   'AICRME_SNAPSHOT_NODE_SELECTOR=node-role.kubernetes.io/control-plane=' \
+  'AICRME_SNAPSHOT_REQUESTS=cpu=200m' \
   'AICRME_APPLY_DRY_RUN=true'
 kubectl -n "${NS}" rollout status deploy/aicrme --timeout=120s
 

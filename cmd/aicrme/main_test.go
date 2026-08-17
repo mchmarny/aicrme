@@ -13,6 +13,8 @@ import (
 
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/steps"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 const aicrModulePath = "github.com/NVIDIA/aicr"
@@ -411,5 +413,79 @@ func TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning(t *testing.T) {
 	}
 	if fake.artifactCalls != 0 {
 		t.Errorf("Artifact() called %d times, want 0 -- CurrentID() alone should short-circuit", fake.artifactCalls)
+	}
+}
+
+func TestParseResourceRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want map[corev1.ResourceName]string
+	}{
+		{
+			name: "unset leaves AICR's own defaults in charge",
+			in:   "",
+			want: nil,
+		},
+		{
+			name: "single quantity",
+			in:   "cpu=200m",
+			want: map[corev1.ResourceName]string{corev1.ResourceCPU: "200m"},
+		},
+		{
+			name: "multiple quantities",
+			in:   "cpu=200m,memory=256Mi",
+			want: map[corev1.ResourceName]string{corev1.ResourceCPU: "200m", corev1.ResourceMemory: "256Mi"},
+		},
+		{
+			name: "surrounding whitespace is trimmed",
+			in:   " cpu = 200m , memory = 256Mi ",
+			want: map[corev1.ResourceName]string{corev1.ResourceCPU: "200m", corev1.ResourceMemory: "256Mi"},
+		},
+		{
+			name: "an unparseable quantity is skipped, the rest still apply",
+			in:   "cpu=not-a-quantity,memory=256Mi",
+			want: map[corev1.ResourceName]string{corev1.ResourceMemory: "256Mi"},
+		},
+		{
+			name: "a pair with no separator is skipped",
+			in:   "cpu,memory=256Mi",
+			want: map[corev1.ResourceName]string{corev1.ResourceMemory: "256Mi"},
+		},
+		{
+			// nil, not an empty ResourceList: an empty list would be forwarded
+			// to AICR as an explicit "request nothing" override, which is a
+			// different and worse outcome than falling back to its defaults.
+			name: "nothing usable falls back rather than requesting nothing",
+			in:   "cpu=not-a-quantity",
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseResourceRequests(tt.in)
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("parseResourceRequests(%q) = %v, want nil", tt.in, got)
+				}
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseResourceRequests(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+			for name, want := range tt.want {
+				// Cmp, not String: the property is the quantity's value, and a
+				// parse/serialize round trip may not preserve the spelling.
+				q, ok := got[name]
+				if !ok {
+					t.Errorf("%s missing from %v", name, got)
+					continue
+				}
+				if q.Cmp(resource.MustParse(want)) != 0 {
+					t.Errorf("%s = %v, want %v", name, q, want)
+				}
+			}
+		})
 	}
 }
