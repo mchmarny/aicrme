@@ -36,7 +36,7 @@ type bundle struct {
 // (it calls assertOwns and reads unexported state), which cannot travel
 // through engine.Run.Artifacts' []byte values. The alternative -- a holder
 // shared between the two steps -- would be in-memory state the ConfigMap
-// store in Phase 2b then has to lose across a pod restart, which is the
+// store in 2b-ii then has to lose across a pod restart, which is the
 // exact case that store exists to fix. Re-resolving survives a restart for
 // free: every input is persisted (the raw snapshot bytes, the two
 // decisions) and the catalog is embedded in the pinned aicr module, so the
@@ -133,7 +133,7 @@ func assertMatchesApproved(result *aicr.RecipeResult, approved []byte) error {
 	}
 	// Bounded by len(summary.Components), the slice the loop below actually
 	// indexes -- not the self-reported summary.ComponentCount. recipe.json is
-	// Phase 2b's persisted, kubectl-editable ConfigMap state: a
+	// 2b-ii's persisted, kubectl-editable ConfigMap state: a
 	// ComponentCount that disagrees with the real length of Components would
 	// pass this check and then panic on the out-of-range index below, and a
 	// panic here runs on engine.Engine's step goroutine, which has no

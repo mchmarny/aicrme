@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"maps"
 	"os"
@@ -9,6 +10,9 @@ import (
 	"runtime/debug"
 	"strings"
 	"testing"
+
+	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/steps"
 )
 
 const aicrModulePath = "github.com/NVIDIA/aicr"
@@ -241,5 +245,171 @@ func TestEnsureWorkDirsFailsOnUnwritableRoot(t *testing.T) {
 	}
 	if err := ensureWorkDirs(root); err == nil {
 		t.Error("ensureWorkDirs() error = nil, want a failure -- an unwritable work dir must not start silently")
+	}
+}
+
+// recipeFixture marshals a real steps.RecipeSummary rather than hand-rolling
+// a JSON literal, so a tag or shape change in the struct this test exists to
+// pin shows up as a build-time or round-trip difference here too, instead of
+// leaving a stale literal (and this test) green while production drifts.
+func recipeFixture(t *testing.T, components ...steps.ComponentSummary) []byte {
+	t.Helper()
+	raw, err := json.Marshal(steps.RecipeSummary{
+		Name:           "r",
+		Version:        "1",
+		ComponentCount: len(components),
+		Components:     components,
+	})
+	if err != nil {
+		t.Fatalf("marshal recipe fixture: %v", err)
+	}
+	return raw
+}
+
+func TestRecipeNamespacesFromArtifact(t *testing.T) {
+	raw := recipeFixture(t,
+		steps.ComponentSummary{Name: "a", Namespace: "gpu-operator"},
+		steps.ComponentSummary{Name: "b", Namespace: "monitoring"},
+	)
+
+	got := recipeNamespaces(raw)
+	for _, want := range []string{"gpu-operator", "monitoring"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("namespace %q missing from %v", want, got)
+		}
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2", len(got))
+	}
+}
+
+func TestRecipeNamespacesToleratesMissingOrCorruptArtifact(t *testing.T) {
+	if got := recipeNamespaces(nil); len(got) != 0 {
+		t.Errorf("nil artifact = %v, want empty", got)
+	}
+	if got := recipeNamespaces([]byte("not json")); len(got) != 0 {
+		t.Errorf("corrupt artifact = %v, want empty", got)
+	}
+}
+
+// fakeRunReader is a runReader test double that counts artifact reads, so
+// tests can assert the cache actually avoids the per-event engine round trip
+// rather than just asserting on the returned value.
+type fakeRunReader struct {
+	id            string
+	ok            bool
+	run           *engine.Run
+	artifactCalls int
+}
+
+func (f *fakeRunReader) CurrentID() (string, bool) { return f.id, f.ok }
+
+func (f *fakeRunReader) Artifact(runID, key string) ([]byte, bool) {
+	f.artifactCalls++
+	if f.run == nil || f.run.ID != runID {
+		return nil, false
+	}
+	v, ok := f.run.Artifacts[key]
+	return v, ok
+}
+
+// TestNewRunScopeFnDoesNotCacheBeforeRecipeExists is the regression test for
+// the bug this round fixes: caching an empty Namespaces the first time a run
+// is asked about -- before Recommend has written recipe.json -- used to pin
+// that empty set for the rest of the run (RunID already matched the cache on
+// every later call), silently dropping every namespaced workload event for
+// a window that spans Discover's 10-minute timeout plus the operator's
+// awaiting-decision pause.
+func TestNewRunScopeFnDoesNotCacheBeforeRecipeExists(t *testing.T) {
+	fake := &fakeRunReader{
+		id: "run-1", ok: true,
+		run: &engine.Run{ID: "run-1", Artifacts: map[string][]byte{}},
+	}
+	scope := newRunScopeFn(fake)
+
+	sc := scope()
+	if sc.RunID != "run-1" {
+		t.Fatalf("RunID = %q, want run-1", sc.RunID)
+	}
+	if len(sc.Namespaces) != 0 {
+		t.Fatalf("Namespaces = %v, want empty before recipe.json exists", sc.Namespaces)
+	}
+
+	// Recommend writes recipe.json partway through the run.
+	fake.run.Artifacts["recipe.json"] = recipeFixture(t, steps.ComponentSummary{Name: "a", Namespace: "gpu-operator"})
+
+	sc = scope()
+	if _, ok := sc.Namespaces["gpu-operator"]; !ok {
+		t.Errorf("Namespaces = %v, want gpu-operator once recipe.json exists -- an empty pre-recipe scope must not stick", sc.Namespaces)
+	}
+}
+
+// TestNewRunScopeFnCachesOnceRecipeExists guards the reason the cache exists
+// at all: once a run's namespaces are resolved, repeated calls must not
+// re-invoke Current(), which deep-copies every artifact.
+func TestNewRunScopeFnCachesOnceRecipeExists(t *testing.T) {
+	fake := &fakeRunReader{
+		id: "run-1", ok: true,
+		run: &engine.Run{ID: "run-1", Artifacts: map[string][]byte{
+			"recipe.json": recipeFixture(t, steps.ComponentSummary{Name: "a", Namespace: "gpu-operator"}),
+		}},
+	}
+	scope := newRunScopeFn(fake)
+
+	for range 3 {
+		scope()
+	}
+
+	if fake.artifactCalls != 1 {
+		t.Errorf("Artifact() called %d times, want 1 -- resolved namespaces should be cached, not recomputed", fake.artifactCalls)
+	}
+}
+
+// TestNewRunScopeFnRefreshesOnRunTransition guards against a stale-run leak:
+// once the engine moves to a new run, the new run's scope must never carry
+// the previous run's namespaces.
+func TestNewRunScopeFnRefreshesOnRunTransition(t *testing.T) {
+	fake := &fakeRunReader{
+		id: "run-1", ok: true,
+		run: &engine.Run{ID: "run-1", Artifacts: map[string][]byte{
+			"recipe.json": recipeFixture(t, steps.ComponentSummary{Name: "a", Namespace: "gpu-operator"}),
+		}},
+	}
+	scope := newRunScopeFn(fake)
+
+	if sc := scope(); sc.RunID != "run-1" {
+		t.Fatalf("RunID = %q, want run-1", sc.RunID)
+	}
+
+	fake.id = "run-2"
+	fake.run = &engine.Run{ID: "run-2", Artifacts: map[string][]byte{
+		"recipe.json": recipeFixture(t, steps.ComponentSummary{Name: "b", Namespace: "monitoring"}),
+	}}
+
+	sc := scope()
+	if sc.RunID != "run-2" {
+		t.Fatalf("RunID = %q, want run-2", sc.RunID)
+	}
+	if _, ok := sc.Namespaces["gpu-operator"]; ok {
+		t.Errorf("Namespaces = %v, still carries run-1's gpu-operator", sc.Namespaces)
+	}
+	if _, ok := sc.Namespaces["monitoring"]; !ok {
+		t.Errorf("Namespaces = %v, want monitoring (run-2's own recipe)", sc.Namespaces)
+	}
+}
+
+// TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning covers the
+// idle-engine path: CurrentID alone must decide there is nothing to scope,
+// without any further trip into the engine.
+func TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning(t *testing.T) {
+	fake := &fakeRunReader{ok: false}
+	scope := newRunScopeFn(fake)
+
+	sc := scope()
+	if sc.RunID != "" || len(sc.Namespaces) != 0 {
+		t.Errorf("scope() = %+v, want the zero value when no run is current", sc)
+	}
+	if fake.artifactCalls != 0 {
+		t.Errorf("Artifact() called %d times, want 0 -- CurrentID() alone should short-circuit", fake.artifactCalls)
 	}
 }

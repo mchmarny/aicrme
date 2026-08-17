@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -442,7 +443,7 @@ func (s *saveFailingStore) setFail(v bool) {
 // the process -- Start refuses because isLive(StateRunning) is true, and
 // Retry refuses because it requires StateFailed. This is currently inert
 // (memoryStore.Save never errors) but docs/phase-2-handoff.md's
-// ConfigMap-backed store, landing in Phase 2b, is precisely where Save
+// ConfigMap-backed store, landing in 2b-ii, is precisely where Save
 // starts failing for real.
 func TestRetryFailedSaveLeavesRunRetryable(t *testing.T) {
 	b := bus.New(64)
@@ -545,5 +546,409 @@ func TestRetryDoesNotReparkForDecisions(t *testing.T) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ctxBlockingStep blocks until its context is canceled, which is what a
+// canceled deploy.sh does: SIGTERM propagates through the process group,
+// deploy.sh's trap runs, and Wait() returns once the tree is reaped -- here
+// represented by <-ctx.Done(). Named distinctly from the existing
+// blockingStep above (which blocks on a release channel, not ctx) since the
+// two are unrelated fixtures that happen to share a shape.
+type ctxBlockingStep struct {
+	phase   engine.Phase
+	entered chan struct{}
+}
+
+func (b *ctxBlockingStep) Phase() engine.Phase { return b.phase }
+func (b *ctxBlockingStep) Requires() []string  { return nil }
+func (b *ctxBlockingStep) Run(ctx context.Context, _ *engine.Run, _ engine.Emit) error {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestCancelAndWaitStopsAnInFlightRun(t *testing.T) {
+	b := bus.New(64)
+	step := &ctxBlockingStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1)}
+	e := engine.New(b, engine.NewMemoryStore(), step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-step.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step never entered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("CancelAndWait() error = %v", cancelErr)
+	}
+
+	// CancelAndWait must not return until the terminal state is persisted --
+	// a caller that returns early would let main exit before the run is done.
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
+	}
+	if !strings.Contains(got.Err, "canceled") {
+		t.Errorf("Err = %q, want it to say the run was canceled", got.Err)
+	}
+}
+
+// ctxCanceledStore rejects a Save whose context is already dead, the way any
+// store that issues a real API call does -- client-go checks ctx.Err() and
+// returns before the request ever leaves the process. It is the only way this
+// package can observe finish()'s context.WithoutCancel: memoryStore.Save
+// takes `_ context.Context` and ignores it, so with that double alone the
+// entire terminal-save contract is unverified in both directions.
+type ctxCanceledStore struct {
+	engine.Store
+}
+
+func (s *ctxCanceledStore) Save(ctx context.Context, r *engine.Run) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// TestTerminalStateIsPersistedDespiteCancellation pins the branch's headline
+// contract: finish() detaches the terminal write from the (by then canceled)
+// run context, so shutdown records how the run ended instead of leaving it
+// recorded as running with no goroutine behind it.
+//
+// It asserts through store.Load, never e.Get: e.Get returns
+// e.current.Clone() while the run is still the current one and never touches
+// the store at all, so it reports the in-memory terminal state whether or not
+// the persisted one was ever written. Once 2b-ii swaps in the ConfigMap
+// store, a Save under the canceled run context returns context.Canceled
+// before issuing an API call, and the run is left wedged at `running` across
+// a restart.
+func TestTerminalStateIsPersistedDespiteCancellation(t *testing.T) {
+	t.Run("canceled mid-step", func(t *testing.T) {
+		b := bus.New(64)
+		step := &ctxBlockingStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1)}
+		store := &ctxCanceledStore{Store: engine.NewMemoryStore()}
+		e := engine.New(b, store, step)
+
+		run, err := e.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		select {
+		case <-step.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("step never entered")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+			t.Fatalf("CancelAndWait() error = %v", cancelErr)
+		}
+
+		assertPersistedTerminalState(t, store, run.ID)
+	})
+
+	t.Run("canceled parked at a decision gate", func(t *testing.T) {
+		b := bus.New(64)
+		store := &ctxCanceledStore{Store: engine.NewMemoryStore()}
+		e := engine.New(b, store, newFakeStep(engine.PhaseRecommend, "intent"))
+
+		run, err := e.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+			t.Fatalf("CancelAndWait() error = %v", cancelErr)
+		}
+
+		assertPersistedTerminalState(t, store, run.ID)
+	})
+}
+
+func assertPersistedTerminalState(t *testing.T, store engine.Store, runID string) {
+	t.Helper()
+	saved, err := store.Load(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("store.Load() error = %v", err)
+	}
+	if saved.State != engine.StateFailed {
+		t.Errorf("persisted State = %q, want %q -- the terminal write must not ride the canceled run context",
+			saved.State, engine.StateFailed)
+	}
+	if !strings.Contains(saved.Err, "canceled") {
+		t.Errorf("persisted Err = %q, want it to say the run was canceled", saved.Err)
+	}
+}
+
+// Both halves keep their original assertions; they need one engine each
+// because CancelAndWait is now terminal for the engine it is called on --
+// draining is never cleared, so the second half's Start would be refused on
+// an engine the first half had already drained. That is the contract, not a
+// workaround: an engine told to shut down must not accept a run afterwards.
+func TestCancelAndWaitIsIdempotentAndSafeWithNoRun(t *testing.T) {
+	ctx := context.Background()
+
+	// No run has ever started.
+	idle := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	if err := idle.CancelAndWait(ctx); err != nil {
+		t.Fatalf("CancelAndWait() with no run error = %v", err)
+	}
+
+	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	run, err := e.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	// Run already finished on its own; canceling is a no-op, twice.
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("first CancelAndWait() error = %v", cancelErr)
+	}
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("second CancelAndWait() error = %v", cancelErr)
+	}
+}
+
+// TestDrainingEngineRefusesNewWork pins the flag CancelAndWait sets. Both
+// entry points that install a fresh cancel/done pair have to honor it, or
+// CancelAndWait goes back to being able to wait on a run that has already
+// been replaced.
+func TestDrainingEngineRefusesNewWork(t *testing.T) {
+	t.Run("Start", func(t *testing.T) {
+		e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+		if err := e.CancelAndWait(context.Background()); err != nil {
+			t.Fatalf("CancelAndWait() error = %v", err)
+		}
+		_, err := e.Start(context.Background())
+		if !errors.Is(err, engine.ErrDraining) {
+			t.Fatalf("Start() error = %v, want ErrDraining", err)
+		}
+	})
+
+	t.Run("Retry", func(t *testing.T) {
+		failing := newFakeStep(engine.PhaseDiscover)
+		failing.err = errors.New("boom")
+		e := engine.New(bus.New(64), engine.NewMemoryStore(), failing)
+
+		run, err := e.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		waitState(t, e, run.ID, engine.StateFailed)
+
+		if cancelErr := e.CancelAndWait(context.Background()); cancelErr != nil {
+			t.Fatalf("CancelAndWait() error = %v", cancelErr)
+		}
+		if _, retryErr := e.Retry(run.ID); !errors.Is(retryErr, engine.ErrDraining) {
+			t.Fatalf("Retry() error = %v, want ErrDraining", retryErr)
+		}
+	})
+}
+
+// TestCancelAndWaitNeverReturnsWithARunStillLive is the interleaving nothing
+// covered. CancelAndWait used to snapshot cancel/done under the lock, release
+// it, and wait on that one channel: a Start landing in between installed a
+// new pair, so the wait completed against the previous (already terminal)
+// run's closed channel and returned nil while the new run's goroutine was
+// still inside its step. main then returns, tearing down the PID namespace
+// under a live deploy.sh.
+//
+// The assertion is deliberately synchronous -- no polling. A nil return from
+// CancelAndWait means done was closed, which means execute returned, which
+// means finish already wrote the terminal state. Polling here would hide the
+// exact defect the test exists for.
+func TestCancelAndWaitNeverReturnsWithARunStillLive(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		step := &ctxBlockingStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1)}
+		e := engine.New(bus.New(8), engine.NewMemoryStore(), step)
+
+		var (
+			wg        sync.WaitGroup
+			release   = make(chan struct{})
+			run       *engine.Run
+			startErr  error
+			cancelErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-release
+			run, startErr = e.Start(context.Background())
+		}()
+		go func() {
+			defer wg.Done()
+			<-release
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cancelErr = e.CancelAndWait(ctx)
+		}()
+		close(release)
+		wg.Wait()
+
+		if cancelErr != nil {
+			t.Fatalf("iteration %d: CancelAndWait() error = %v", i, cancelErr)
+		}
+		if startErr != nil {
+			// Refused as draining: there is no run to have left behind.
+			if !errors.Is(startErr, engine.ErrDraining) {
+				t.Fatalf("iteration %d: Start() error = %v, want ErrDraining", i, startErr)
+			}
+			continue
+		}
+		got, err := e.Get(run.ID)
+		if err != nil {
+			t.Fatalf("iteration %d: Get() error = %v", i, err)
+		}
+		if got.State == engine.StateRunning || got.State == engine.StateAwaitingDecision {
+			t.Fatalf("iteration %d: CancelAndWait() returned nil with run %s still in state %q",
+				i, run.ID, got.State)
+		}
+	}
+}
+
+// stuckStep ignores its context entirely -- the pathological case
+// CancelAndWait's deadline exists for.
+type stuckStep struct {
+	phase   engine.Phase
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *stuckStep) Phase() engine.Phase { return s.phase }
+func (s *stuckStep) Requires() []string  { return nil }
+func (s *stuckStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return nil
+}
+
+func TestCancelAndWaitTimesOutRatherThanBlockingForever(t *testing.T) {
+	b := bus.New(64)
+	stuck := &stuckStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	e := engine.New(b, engine.NewMemoryStore(), stuck)
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-stuck.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step never entered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := e.CancelAndWait(ctx); err == nil {
+		t.Error("CancelAndWait() error = nil, want a timeout error")
+	}
+	close(stuck.release)
+}
+
+func TestCancelWhileParkedForDecisionsFinishesTheRun(t *testing.T) {
+	b := bus.New(64)
+	e := engine.New(b, engine.NewMemoryStore(), newFakeStep(engine.PhaseRecommend, "intent"))
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+		t.Fatalf("CancelAndWait() error = %v", cancelErr)
+	}
+
+	// A run frozen at a gate with no goroutine is the wedge class Ruling 13
+	// fixed for Save failures; cancellation must not reintroduce it.
+	got, _ := e.Get(run.ID)
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
+	}
+}
+
+// TestArtifactReturnsACopy pins the reason Artifact exists: the observer's
+// run-scope accessor calls it on the per-event path, so it must not hand out
+// a reference into engine-owned state that a caller could then mutate.
+func TestArtifactReturnsACopy(t *testing.T) {
+	e := engine.New(bus.New(64), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	key := string(engine.PhaseDiscover)
+	got, ok := e.Artifact(run.ID, key)
+	if !ok || string(got) != "done" {
+		t.Fatalf("Artifact(%q) = %q, %v, want \"done\", true", key, got, ok)
+	}
+
+	got[0] = 'X'
+	again, _ := e.Artifact(run.ID, key)
+	if string(again) != "done" {
+		t.Errorf("Artifact() = %q after a caller mutated an earlier result -- it handed out the live backing array", again)
+	}
+}
+
+func TestArtifactReportsMisses(t *testing.T) {
+	e := engine.New(bus.New(64), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+
+	if _, ok := e.Artifact("any-run", "recipe.json"); ok {
+		t.Error("Artifact() ok = true before any run has started")
+	}
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	// The run ID argument is what stops a caller that paired this with
+	// CurrentID from attributing a new run's artifact to the old run's scope.
+	if _, ok := e.Artifact("some-other-run", string(engine.PhaseDiscover)); ok {
+		t.Error("Artifact() ok = true for a run ID that is not the current run")
+	}
+	if _, ok := e.Artifact(run.ID, "never-written"); ok {
+		t.Error("Artifact() ok = true for an absent key")
+	}
+}
+
+func TestCurrentIDDoesNotRequireAClone(t *testing.T) {
+	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+
+	if _, ok := e.CurrentID(); ok {
+		t.Error("CurrentID() ok = true before any run, want false")
+	}
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	id, ok := e.CurrentID()
+	if !ok || id != run.ID {
+		t.Errorf("CurrentID() = %q, %v, want %q, true", id, ok, run.ID)
 	}
 }

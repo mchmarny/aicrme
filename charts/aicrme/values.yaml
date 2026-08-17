@@ -24,3 +24,10 @@ resources:
 # (workDir.sizeLimit), which carries the measured 352K figure.
 workDir:
   sizeLimit: 1Gi
+
+# Shutdown budget. cmd/aicrme drains HTTP and stops any in-flight run
+# concurrently, bounded by runShutdownTimeout (15s) -- which itself must
+# exceed the applier's 10s process-group kill grace. 45s leaves margin over
+# that 15s worst case; the Kubernetes default of 30s would work today but
+# leaves nothing if either budget grows.
+terminationGracePeriodSeconds: 45

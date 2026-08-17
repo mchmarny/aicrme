@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
@@ -11,14 +12,19 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
 	"github.com/mchmarny/aicrme/internal/applier"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/observer"
 	"github.com/mchmarny/aicrme/internal/steps"
 	"github.com/mchmarny/aicrme/internal/version"
 	"github.com/mchmarny/aicrme/internal/web"
@@ -46,6 +52,29 @@ const defaultWorkDir = "/var/lib/aicrme"
 // surfaces as a warn event, so the wait is visible rather than silent.
 const defaultApplyRetries = 5
 
+// runShutdownTimeout bounds how long shutdown waits for an in-flight run to
+// stop. The worst case is killGrace (internal/applier/exec.go, 10s: the
+// process-group SIGTERM -> SIGKILL escalation) plus terminalSaveTimeout
+// (internal/engine/engine.go, 5s: the detached terminal-state write once the
+// step returns) -- roughly 15s. cmd.WaitDelay does not add a second window on
+// top of that: os/exec starts its timer the instant cmd.Cancel returns, the
+// same moment the escalation goroutine starts its own, so the two race
+// concurrently rather than run back to back (see os/exec's watchCtx and the
+// WaitDelay doc comment: "starts when either the associated Context is done
+// or a call to Wait observes that the child process has exited, whichever
+// occurs first"). 15s was the right estimate but zero slack; 30s gives real
+// headroom and still fits inside the chart's terminationGracePeriodSeconds of
+// 45 alongside the concurrent HTTP drain -- test/chart/contract.sh pins
+// runShutdownTimeout against killGrace + terminalSaveTimeout, and both
+// against the grace period, so they cannot drift apart silently.
+const runShutdownTimeout = 30 * time.Second
+
+// httpShutdownTimeout bounds the HTTP drain. Runs concurrently with the
+// above, so the pod's total shutdown budget is the larger of the two, not
+// their sum -- which is what lets both fit inside
+// terminationGracePeriodSeconds.
+const httpShutdownTimeout = 10 * time.Second
+
 // workSubdirs are the directories the console and deploy.sh need writable.
 // With readOnlyRootFilesystem: true, the emptyDir at AICRME_WORK_DIR is the
 // only writable path in the container, so every tool that wants scratch
@@ -63,6 +92,85 @@ func ensureWorkDirs(root string) error {
 		}
 	}
 	return nil
+}
+
+// recipeNamespaces extracts the namespaces the resolved recipe installs
+// into. A missing or unparseable artifact yields an empty set, which the
+// observer treats as "filter every namespaced workload out" -- the
+// fail-quiet direction, since narrating unrelated cluster activity is worse
+// than narrating nothing.
+func recipeNamespaces(raw []byte) map[string]struct{} {
+	out := map[string]struct{}{}
+	if len(raw) == 0 {
+		return out
+	}
+	var summary steps.RecipeSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		slog.Warn("recipe.json unparseable; observer will not narrate workloads", "error", err)
+		return out
+	}
+	for _, c := range summary.Components {
+		if c.Namespace != "" {
+			out[c.Namespace] = struct{}{}
+		}
+	}
+	return out
+}
+
+// runReader narrows *engine.Engine to what newRunScopeFn needs, so its
+// caching logic -- the part with real behavior to get wrong -- can be
+// exercised with a fake instead of a live Engine. Neither method clones a
+// whole Run: this accessor runs on the observer's per-event path.
+type runReader interface {
+	CurrentID() (string, bool)
+	Artifact(runID, key string) ([]byte, bool)
+}
+
+// newRunScopeFn returns an accessor the observer calls on every watch event.
+// It caches by run ID and refreshes only when that changes. Neither the
+// cached path nor the miss path may call Engine.Current(), which deep-copies
+// every artifact including the raw snapshot (tens of KB): observer.publish
+// resolves the scope before it can apply the namespace filter, so on a busy
+// cluster this runs for state changes on every Deployment and DaemonSet,
+// in scope or not. CurrentID reads the ID under the engine lock without
+// cloning, and Artifact copies exactly the one artifact this needs.
+//
+// The cache is populated only once recipe.json exists. Recommend does not
+// run until the operator supplies the intent/platform decisions
+// (recommend.Requires), and that wait -- plus Discover's own 10-minute
+// timeout ahead of it -- can span most of a run. If the accessor cached an
+// empty Namespaces the first time it was asked inside that window, every
+// later call for the same run ID would keep returning it (RunID already
+// matches the cache), so every namespaced workload event for the rest of
+// the run would be silently dropped by observer.publish with no error
+// anywhere. Caching only once the artifact is non-empty means a pre-recipe
+// call recomputes on every invocation until Recommend writes it, then locks
+// in the real value from then on -- safe because recipe.json, once written,
+// is never mutated again.
+func newRunScopeFn(eng runReader) func() observer.RunScope {
+	var (
+		mu     sync.Mutex
+		cached observer.RunScope
+	)
+	return func() observer.RunScope {
+		id, ok := eng.CurrentID()
+		if !ok {
+			return observer.RunScope{}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if cached.RunID == id {
+			return cached
+		}
+		sc := observer.RunScope{RunID: id}
+		raw, _ := eng.Artifact(id, "recipe.json")
+		if len(raw) == 0 {
+			return sc // recipe not resolved yet -- caching this would pin an empty scope for the whole run
+		}
+		sc.Namespaces = recipeNamespaces(raw)
+		cached = sc
+		return sc
+	}
 }
 
 func main() {
@@ -146,6 +254,48 @@ func main() {
 	}
 	defer func() { _ = client.Close() }()
 
+	// A failure here must not stop the console: the entire Discover-to-Apply
+	// arc works without cluster telemetry, and `make build && ./bin/aicrme`
+	// outside a cluster is a supported development path. Same degrade-with-a-
+	// warning posture as parseNodeSelector. Placed after every remaining
+	// os.Exit in main: `defer close(obsStop)` below would not run if an
+	// exit happened after it (gocritic's exitAfterDefer), and every startup
+	// failure that still exits is checked above this point.
+	var kube kubernetes.Interface
+	// rest.InClusterConfig does no network I/O -- env vars and two file
+	// reads -- so inside a pod kube is essentially always non-nil here; it
+	// is Start below, not this block, that first talks to the API server.
+	if cfg, cfgErr := rest.InClusterConfig(); cfgErr != nil {
+		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
+	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
+		slog.Warn("kubernetes client init failed; live cluster telemetry disabled", "error", clientErr)
+	} else {
+		kube = c
+	}
+
+	// Started in a goroutine, not called inline: Start ends by blocking on
+	// the informer factory's WaitForCacheSync, which carries no deadline of
+	// its own -- it returns only once every watched type has synced or
+	// obsStop closes, and obsStop closes only when main returns (the defer
+	// above). A synchronous call here would mean an unreachable, partitioned,
+	// or merely slow API server blocks httpSrv.ListenAndServe() from ever
+	// running, so the chart's liveness probe (initialDelaySeconds: 5,
+	// periodSeconds: 10, default failureThreshold: 3 --
+	// charts/aicrme/templates/deployment.yaml) kills the pod roughly every
+	// 35s: a permanent CrashLoopBackOff of the whole console, caused by the
+	// one subsystem that is supposed to be optional. Handlers are registered
+	// before the informer factory starts, so events flow whether or not this
+	// goroutine's Start call has returned yet; its return value is consumed
+	// only for this warning.
+	obsStop := make(chan struct{})
+	defer close(obsStop)
+	obs := observer.New(kube, b, newRunScopeFn(eng))
+	go func() {
+		if startErr := obs.Start(obsStop); startErr != nil {
+			slog.Warn("observer failed to start; continuing without cluster telemetry", "error", startErr)
+		}
+	}()
+
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
@@ -166,9 +316,42 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+
+	// Drain first: canceling the run lands it in StateFailed, which isLive
+	// does not consider live, so an unguarded POST /api/runs during the wait
+	// below would start a run that shutdown then kills mid-flight.
+	srv.Drain()
+
+	// HTTP drain and engine cleanup run concurrently. The invariant is "do
+	// not return before the deploy.sh process tree is reaped" -- not "do not
+	// begin HTTP shutdown first". aicrme is PID 1 under the image's
+	// ENTRYPOINT with no init, so returning from main tears down the whole
+	// PID namespace and SIGKILLs helm mid-release. Helm handles SIGTERM
+	// itself and marks the release failed; killed outright it leaves the
+	// release stranded in pending-install, which blocks the next
+	// `helm upgrade --install` until someone runs `helm rollback` by hand.
+	// deploy.sh's own INT/TERM trap is not what needs the time -- it is an
+	// `rm -rf` of the helm temp workdir and returns immediately.
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		httpCtx, cancelHTTP := context.WithTimeout(context.Background(), httpShutdownTimeout)
+		defer cancelHTTP()
+		_ = httpSrv.Shutdown(httpCtx)
+	}()
+
+	go func() {
+		defer wg.Done()
+		engCtx, cancelEng := context.WithTimeout(context.Background(), runShutdownTimeout)
+		defer cancelEng()
+		if err := eng.CancelAndWait(engCtx); err != nil {
+			slog.Error("in-flight run did not stop cleanly", "error", err)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func envOr(key, fallback string) string {

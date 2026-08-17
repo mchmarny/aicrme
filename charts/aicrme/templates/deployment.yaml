@@ -26,6 +26,7 @@ spec:
         checksum/secret: {{ include "aicrme.authPassword" . | sha256sum }}
     spec:
       serviceAccountName: {{ include "aicrme.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       # Must agree with the Dockerfile's `USER 10001` / `adduser -u 10001`.
       securityContext:
         runAsNonRoot: true

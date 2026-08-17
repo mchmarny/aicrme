@@ -4,12 +4,32 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
 )
+
+// terminalSaveTimeout bounds the detached write finish performs. Terminal
+// state must persist even when the run was canceled, so this write cannot
+// use the (now-dead) step context -- but it also cannot block shutdown
+// indefinitely against an unreachable API server.
+const terminalSaveTimeout = 5 * time.Second
+
+// canceledByShutdownMsg is Run.Err's message when the run is canceled by
+// console shutdown, whether mid-step or parked at a decision gate. Both
+// call sites share the constant so the wording (and this package's own
+// tests, which match against it) cannot drift apart.
+const canceledByShutdownMsg = "canceled: console shutting down"
+
+// ErrDraining is what Start and Retry return once CancelAndWait has begun
+// shutting the engine down. ErrCodeUnavailable is what makes internal/api's
+// writeErr answer 503, matching the shape Server.Drain already returns for a
+// mutation arriving during shutdown.
+var ErrDraining = aicrerrors.New(aicrerrors.ErrCodeUnavailable,
+	"engine is shutting down; not accepting new runs")
 
 // Emit publishes a console event. The engine stamps RunID and Phase, so steps
 // only supply Kind, Level, Message, Component, and Data.
@@ -43,6 +63,26 @@ type Engine struct {
 	// goroutine, so "is a run live" and "is THIS goroutine still the one
 	// driving it" are different questions.
 	epoch uint64
+
+	// draining is set by CancelAndWait and never cleared: the process is on
+	// its way out. It is what makes the engine authoritative about its own
+	// lifecycle rather than dependent on the HTTP layer. Without it,
+	// CancelAndWait snapshots cancel/done once and then waits on that one
+	// channel, so a Start landing just after the snapshot is canceled and
+	// waited for -- CancelAndWait returns nil while the new run's goroutine
+	// is still mid-flight and main returns out from under it.
+	// Server.Drain narrows that window but cannot close it: requireNotDraining
+	// gates the outer mux, so a POST /api/runs that clears the check
+	// microseconds before Drain() still reaches Start.
+	draining bool
+
+	// cancel stops the in-flight run's step context; done closes once its
+	// execute goroutine has exited AND persisted a terminal state. A cancel
+	// func alone would tell a caller the run was asked to stop but not when
+	// it actually had -- and the whole point of shutdown ordering is not
+	// returning from main until the deploy.sh process tree is reaped.
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // New returns an Engine that will execute steps in the order given.
@@ -65,6 +105,10 @@ func randomID() string {
 // the run is registered; callers observe progress over the bus.
 func (e *Engine) Start(ctx context.Context) (*Run, error) {
 	e.mu.Lock()
+	if e.draining {
+		e.mu.Unlock()
+		return nil, ErrDraining
+	}
 	if e.current != nil && isLive(e.current.State) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "a run is already in progress")
@@ -83,6 +127,12 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 	e.resume = make(chan struct{}, 1)
 	e.epoch++
 	epoch := e.epoch
+	// The run context derives from the detached one so an HTTP request
+	// ending still cannot kill a 20-minute Apply.
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	e.cancel = cancel
+	e.done = make(chan struct{})
+	done := e.done
 	snapshot := r.Clone()
 	e.mu.Unlock()
 
@@ -98,9 +148,17 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 			e.current = previous
 		}
 		e.mu.Unlock()
+		// No goroutine will ever run for this epoch, so done would
+		// otherwise sit open forever -- a CancelAndWait call in this
+		// window must still see "no run in flight", not block for its
+		// whole deadline.
+		close(done)
 		return nil, err
 	}
-	go e.execute(context.WithoutCancel(ctx), epoch)
+	go func() {
+		defer close(done)
+		e.execute(runCtx, epoch)
+	}()
 	return snapshot, nil
 }
 
@@ -122,6 +180,42 @@ func isLive(s State) bool {
 // "bite when Reset lands" note names the feature that will make this
 // reachable through the public API.
 func (e *Engine) aliveLocked(epoch uint64) bool { return e.epoch == epoch }
+
+// CancelAndWait cancels the in-flight run and blocks until its execute
+// goroutine has exited and persisted a terminal state, or ctx expires.
+//
+// Idempotent and safe with no run in flight: a second call sees an
+// already-closed done channel and returns immediately. The deadline matters
+// -- a step that ignores its context would otherwise block shutdown forever,
+// and Kubernetes will SIGKILL the pod at terminationGracePeriodSeconds
+// regardless of what this returns.
+//
+// Setting draining in the same lock hold that snapshots cancel/done is what
+// makes the wait meaningful: a Start or Retry that had already taken the lock
+// has by then installed its own cancel/done for this snapshot to pick up, and
+// one arriving afterwards is refused with ErrDraining. Either way there is no
+// run this call could return nil while leaving live. After this returns, the
+// engine accepts no new runs -- it is a shutdown-only operation, not a "stop
+// the current run" one.
+func (e *Engine) CancelAndWait(ctx context.Context) error {
+	e.mu.Lock()
+	e.draining = true
+	cancel, done := e.cancel, e.done
+	e.mu.Unlock()
+
+	if cancel == nil || done == nil {
+		return nil
+	}
+	cancel()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return aicrerrors.New(aicrerrors.ErrCodeTimeout,
+			"timed out waiting for the in-flight run to stop")
+	}
+}
 
 // Decide supplies user decisions and unparks a run waiting on them.
 func (e *Engine) Decide(runID string, decisions map[string]string) error {
@@ -184,6 +278,47 @@ func (e *Engine) Current() *Run {
 		return nil
 	}
 	return e.current.Clone()
+}
+
+// CurrentID returns the current run's ID without cloning the run. Current()
+// deep-copies every artifact -- including the raw snapshot, which is tens of
+// kilobytes -- so a caller that only needs the ID on a hot path (the
+// observer, on every watch event) must not go through it.
+func (e *Engine) CurrentID() (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.current == nil {
+		return "", false
+	}
+	return e.current.ID, true
+}
+
+// Artifact returns a copy of one artifact of the current run. It reports
+// false when runID is not the current run or the key is absent -- taking the
+// ID rather than reading e.current.ID is what keeps a caller that paired this
+// with CurrentID from silently attributing a new run's artifact to the old
+// run's scope.
+//
+// It exists so per-event callers stay off Current(), which deep-copies every
+// artifact: snapshot.yaml alone is 67-74 KB in the KWOK fixtures and larger
+// on real hardware, and the observer's run-scope accessor consults an
+// artifact on every watch event for the whole window before recipe.json is
+// written.
+//
+// The returned slice is a copy, not the stored one: handing out the live
+// backing array would give a per-event caller a reference into engine-owned
+// state.
+func (e *Engine) Artifact(runID, key string) ([]byte, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.current == nil || e.current.ID != runID {
+		return nil, false
+	}
+	v, ok := e.current.Artifacts[key]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), v...), true
 }
 
 // Get returns a copy of the run's current state.
@@ -269,6 +404,10 @@ func (e *Engine) awaitDecisions(ctx context.Context, epoch uint64, step Step) bo
 		select {
 		case <-resume:
 		case <-ctx.Done():
+			// A run frozen mid-gate with no goroutine is the same wedge
+			// class Ruling 13 fixed for Save failures. Harmless with the
+			// memory store (the process is exiting) but 2b-ii persists this.
+			e.finish(ctx, epoch, StateFailed, canceledByShutdownMsg)
 			return false
 		}
 	}
@@ -307,11 +446,19 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, step Step) error {
 	}
 
 	if err := step.Run(ctx, scratch, emit); err != nil {
+		// context.Canceled.Error() is "context canceled" -- accurate but
+		// useless to an operator watching the console for why their install
+		// stopped. Use the same wording awaitDecisions produces when
+		// canceled at a gate.
+		msg := err.Error()
+		if errors.Is(err, context.Canceled) {
+			msg = canceledByShutdownMsg
+		}
 		e.bus.Publish(bus.Event{
 			RunID: runID, Kind: bus.KindError, Phase: string(step.Phase()),
-			Level: bus.LevelError, Message: err.Error(),
+			Level: bus.LevelError, Message: msg,
 		})
-		e.finish(ctx, epoch, StateFailed, err.Error())
+		e.finish(ctx, epoch, StateFailed, msg)
 		return err
 	}
 
@@ -355,7 +502,9 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
 
-	_ = e.store.Save(ctx, snapshot)
+	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), terminalSaveTimeout)
+	defer saveCancel()
+	_ = e.store.Save(saveCtx, snapshot)
 	e.bus.Publish(bus.Event{
 		RunID: snapshot.ID, Kind: bus.KindPhase,
 		Level: levelFor(state), Message: "run " + string(state),
@@ -371,6 +520,10 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 // that already installed are no-ops on the second pass.
 func (e *Engine) Retry(runID string) (*Run, error) {
 	e.mu.Lock()
+	if e.draining {
+		e.mu.Unlock()
+		return nil, ErrDraining
+	}
 	if e.current == nil || e.current.ID != runID {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
@@ -386,6 +539,10 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 	e.resume = make(chan struct{}, 1)
 	e.epoch++
 	epoch := e.epoch
+	runCtx, cancel := context.WithCancel(context.Background())
+	e.cancel = cancel
+	e.done = make(chan struct{})
+	done := e.done
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
 
@@ -404,12 +561,18 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 			e.current.UpdatedAt = time.Now().UTC()
 		}
 		e.mu.Unlock()
+		// See Start's identical rationale: no goroutine will ever run for
+		// this epoch, so done must not sit open forever.
+		close(done)
 		return nil, err
 	}
 	e.bus.Publish(bus.Event{
 		RunID: runID, Kind: bus.KindPhase, Message: "run retrying",
 	})
-	go e.execute(context.Background(), epoch)
+	go func() {
+		defer close(done)
+		e.execute(runCtx, epoch)
+	}()
 	return snapshot, nil
 }
 

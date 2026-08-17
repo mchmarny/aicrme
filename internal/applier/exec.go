@@ -15,8 +15,17 @@ import (
 // past the cap is flushed as its own line.
 const maxLineBytes = 64 << 10
 
-// killGrace is how long a canceled deploy.sh has to run its own INT/TERM
-// trap (which removes the helm temp workdir) before the process is killed.
+// killGrace is how long a canceled deploy.sh's process tree has before the
+// group is SIGKILLed.
+//
+// What needs those ten seconds is helm, not deploy.sh's own INT/TERM trap:
+// that trap is `rm -rf "${HELM_WORKDIR}"; exit 130`, an instantaneous
+// directory removal that would be satisfied by a fraction of a second. Helm
+// handles SIGTERM itself and marks the release failed; SIGKILLed instead it
+// strands the release in pending-install, which blocks the next
+// `helm upgrade --install` until someone runs `helm rollback` by hand. Do
+// not shrink this on the reasoning that an `rm -rf` cannot need ten seconds.
+//
 // It is a var, not a const, solely so tests can shrink it to exercise the
 // SIGKILL escalation path without paying its full cost on every run; no
 // non-test code ever assigns to it, and internal/applier has no
@@ -48,9 +57,9 @@ type BashExec struct{}
 // which spawns `helm upgrade --wait`, which spawns kubectl -- so on context
 // cancellation Run signals that whole process group, not just the bash
 // process os/exec started directly. It sends SIGTERM rather than SIGKILL so
-// deploy.sh's own trap (and helm's own cleanup) can run before anything is
-// force-killed, and only escalates to a group SIGKILL after killGrace, and
-// only if the tree is still alive.
+// helm can handle it (and deploy.sh's trap can drop its temp workdir) before
+// anything is force-killed, and only escalates to a group SIGKILL after
+// killGrace, and only if the tree is still alive.
 //
 // Stdout and Stderr are set to the identical writer value, so os/exec's
 // childStderr (interfaceEqual(c.Stderr, c.Stdout)) reuses Stdout's pipe for
