@@ -107,17 +107,21 @@ func recipeNamespaces(raw []byte) map[string]struct{} {
 
 // runReader narrows *engine.Engine to what newRunScopeFn needs, so its
 // caching logic -- the part with real behavior to get wrong -- can be
-// exercised with a fake instead of a live Engine.
+// exercised with a fake instead of a live Engine. Neither method clones a
+// whole Run: this accessor runs on the observer's per-event path.
 type runReader interface {
 	CurrentID() (string, bool)
-	Current() *engine.Run
+	Artifact(runID, key string) ([]byte, bool)
 }
 
 // newRunScopeFn returns an accessor the observer calls on every watch event.
-// It caches by run ID and refreshes only when that changes: Engine.Current()
-// deep-copies every artifact including the raw snapshot (tens of KB), so
-// calling it per event would copy megabytes per second to obtain a string.
-// CurrentID reads the ID under the same lock without cloning.
+// It caches by run ID and refreshes only when that changes. Neither the
+// cached path nor the miss path may call Engine.Current(), which deep-copies
+// every artifact including the raw snapshot (tens of KB): observer.publish
+// resolves the scope before it can apply the namespace filter, so on a busy
+// cluster this runs for state changes on every Deployment and DaemonSet,
+// in scope or not. CurrentID reads the ID under the engine lock without
+// cloning, and Artifact copies exactly the one artifact this needs.
 //
 // The cache is populated only once recipe.json exists. Recommend does not
 // run until the operator supplies the intent/platform decisions
@@ -147,10 +151,7 @@ func newRunScopeFn(eng runReader) func() observer.RunScope {
 			return cached
 		}
 		sc := observer.RunScope{RunID: id}
-		var raw []byte
-		if run := eng.Current(); run != nil && run.ID == id {
-			raw = run.Artifacts["recipe.json"]
-		}
+		raw, _ := eng.Artifact(id, "recipe.json")
 		if len(raw) == 0 {
 			return sc // recipe not resolved yet -- caching this would pin an empty scope for the whole run
 		}

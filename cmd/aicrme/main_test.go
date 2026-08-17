@@ -292,21 +292,25 @@ func TestRecipeNamespacesToleratesMissingOrCorruptArtifact(t *testing.T) {
 	}
 }
 
-// fakeRunReader is a runReader test double that counts Current() calls, so
-// tests can assert the cache actually avoids the expensive clone rather than
-// just asserting on the returned value.
+// fakeRunReader is a runReader test double that counts artifact reads, so
+// tests can assert the cache actually avoids the per-event engine round trip
+// rather than just asserting on the returned value.
 type fakeRunReader struct {
-	id           string
-	ok           bool
-	run          *engine.Run
-	currentCalls int
+	id            string
+	ok            bool
+	run           *engine.Run
+	artifactCalls int
 }
 
 func (f *fakeRunReader) CurrentID() (string, bool) { return f.id, f.ok }
 
-func (f *fakeRunReader) Current() *engine.Run {
-	f.currentCalls++
-	return f.run
+func (f *fakeRunReader) Artifact(runID, key string) ([]byte, bool) {
+	f.artifactCalls++
+	if f.run == nil || f.run.ID != runID {
+		return nil, false
+	}
+	v, ok := f.run.Artifacts[key]
+	return v, ok
 }
 
 // TestNewRunScopeFnDoesNotCacheBeforeRecipeExists is the regression test for
@@ -356,8 +360,8 @@ func TestNewRunScopeFnCachesOnceRecipeExists(t *testing.T) {
 		scope()
 	}
 
-	if fake.currentCalls != 1 {
-		t.Errorf("Current() called %d times, want 1 -- resolved namespaces should be cached, not recomputed", fake.currentCalls)
+	if fake.artifactCalls != 1 {
+		t.Errorf("Artifact() called %d times, want 1 -- resolved namespaces should be cached, not recomputed", fake.artifactCalls)
 	}
 }
 
@@ -396,7 +400,7 @@ func TestNewRunScopeFnRefreshesOnRunTransition(t *testing.T) {
 
 // TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning covers the
 // idle-engine path: CurrentID alone must decide there is nothing to scope,
-// without ever paying for Current()'s clone.
+// without any further trip into the engine.
 func TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning(t *testing.T) {
 	fake := &fakeRunReader{ok: false}
 	scope := newRunScopeFn(fake)
@@ -405,7 +409,7 @@ func TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning(t *testing.T) {
 	if sc.RunID != "" || len(sc.Namespaces) != 0 {
 		t.Errorf("scope() = %+v, want the zero value when no run is current", sc)
 	}
-	if fake.currentCalls != 0 {
-		t.Errorf("Current() called %d times, want 0 -- CurrentID() alone should short-circuit", fake.currentCalls)
+	if fake.artifactCalls != 0 {
+		t.Errorf("Artifact() called %d times, want 0 -- CurrentID() alone should short-circuit", fake.artifactCalls)
 	}
 }

@@ -889,6 +889,53 @@ func TestCancelWhileParkedForDecisionsFinishesTheRun(t *testing.T) {
 	}
 }
 
+// TestArtifactReturnsACopy pins the reason Artifact exists: the observer's
+// run-scope accessor calls it on the per-event path, so it must not hand out
+// a reference into engine-owned state that a caller could then mutate.
+func TestArtifactReturnsACopy(t *testing.T) {
+	e := engine.New(bus.New(64), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	key := string(engine.PhaseDiscover)
+	got, ok := e.Artifact(run.ID, key)
+	if !ok || string(got) != "done" {
+		t.Fatalf("Artifact(%q) = %q, %v, want \"done\", true", key, got, ok)
+	}
+
+	got[0] = 'X'
+	again, _ := e.Artifact(run.ID, key)
+	if string(again) != "done" {
+		t.Errorf("Artifact() = %q after a caller mutated an earlier result -- it handed out the live backing array", again)
+	}
+}
+
+func TestArtifactReportsMisses(t *testing.T) {
+	e := engine.New(bus.New(64), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+
+	if _, ok := e.Artifact("any-run", "recipe.json"); ok {
+		t.Error("Artifact() ok = true before any run has started")
+	}
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	// The run ID argument is what stops a caller that paired this with
+	// CurrentID from attributing a new run's artifact to the old run's scope.
+	if _, ok := e.Artifact("some-other-run", string(engine.PhaseDiscover)); ok {
+		t.Error("Artifact() ok = true for a run ID that is not the current run")
+	}
+	if _, ok := e.Artifact(run.ID, "never-written"); ok {
+		t.Error("Artifact() ok = true for an absent key")
+	}
+}
+
 func TestCurrentIDDoesNotRequireAClone(t *testing.T) {
 	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
 

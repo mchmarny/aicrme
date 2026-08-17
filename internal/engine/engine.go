@@ -293,6 +293,34 @@ func (e *Engine) CurrentID() (string, bool) {
 	return e.current.ID, true
 }
 
+// Artifact returns a copy of one artifact of the current run. It reports
+// false when runID is not the current run or the key is absent -- taking the
+// ID rather than reading e.current.ID is what keeps a caller that paired this
+// with CurrentID from silently attributing a new run's artifact to the old
+// run's scope.
+//
+// It exists so per-event callers stay off Current(), which deep-copies every
+// artifact: snapshot.yaml alone is 67-74 KB in the KWOK fixtures and larger
+// on real hardware, and the observer's run-scope accessor consults an
+// artifact on every watch event for the whole window before recipe.json is
+// written.
+//
+// The returned slice is a copy, not the stored one: handing out the live
+// backing array would give a per-event caller a reference into engine-owned
+// state.
+func (e *Engine) Artifact(runID, key string) ([]byte, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.current == nil || e.current.ID != runID {
+		return nil, false
+	}
+	v, ok := e.current.Artifacts[key]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), v...), true
+}
+
 // Get returns a copy of the run's current state.
 func (e *Engine) Get(runID string) (*Run, error) {
 	e.mu.Lock()
