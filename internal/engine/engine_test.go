@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1445,6 +1446,82 @@ func TestDecidePersistsBeforeAcknowledging(t *testing.T) {
 	}
 }
 
+// TestDecideRollbackDoesNotOverwriteATerminalStateFromConcurrentShutdown
+// reproduces the narrow window a same-epoch (not superseded) rollback can
+// still corrupt: awaitDecisions is still parked on <-resume while Decide's
+// Save is in flight (resume is not sent until Save succeeds), so a SIGTERM
+// landing in that exact window cancels the run's context, awaitDecisions
+// takes the ctx.Done() branch, and finish sets StateFailed -- all via the
+// SAME epoch, since only Start and Retry bump it. Without an isLive check
+// alongside the identity+epoch guard, Decide's rollback (once its own Save
+// finally fails) would overwrite that terminal state with
+// StateAwaitingDecision: a live state with no goroutine behind it, the
+// exact wedge class this whole discipline exists to prevent.
+//
+// Reuses blockingThenFailingStore: blockAt: 3 blocks Decide's own Save
+// (call 3, same reasoning as TestDecidePersistsBeforeAcknowledging) while
+// finish's terminal save (call 4, once CancelAndWait triggers it) passes
+// straight through the same store unblocked.
+func TestDecideRollbackDoesNotOverwriteATerminalStateFromConcurrentShutdown(t *testing.T) {
+	b := bus.New(64)
+	step := newFakeStep(engine.PhaseApply, "apply")
+	store := &blockingThenFailingStore{
+		Store:   engine.NewMemoryStore(),
+		blockAt: 3,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	e := engine.New(b, store, step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	decideErr := make(chan error, 1)
+	go func() {
+		decideErr <- e.Decide(run.ID, map[string]string{"apply": "yes"})
+	}()
+
+	select {
+	case <-store.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Decide's Save never reached the blocking store")
+	}
+
+	// Simulate SIGTERM landing while Decide's Save is still outstanding.
+	// CancelAndWait blocks until the run's goroutine has exited and
+	// persisted a terminal state, which requires finish's own Save (call 4)
+	// to go through -- it is not the blocked call, so it does.
+	cancelErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cancelErr <- e.CancelAndWait(ctx)
+	}()
+
+	waitState(t, e, run.ID, engine.StateFailed)
+	if cancErr := <-cancelErr; cancErr != nil {
+		t.Fatalf("CancelAndWait() error = %v", cancErr)
+	}
+
+	// Now let Decide's own Save fail and its rollback run, against a run
+	// that is already terminal.
+	close(store.release)
+	if decErr := <-decideErr; decErr == nil {
+		t.Fatal("Decide() error = nil, want the manufactured Save failure to surface")
+	}
+
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q -- the rollback overwrote a terminal state set by a concurrent shutdown with a live one", got.State, engine.StateFailed)
+	}
+}
+
 // TestDecideSucceedsAndPersists is the happy-path pair to the test above:
 // on success Decide saves exactly once and the persisted snapshot carries
 // the new decisions.
@@ -1487,27 +1564,16 @@ func TestDecideSucceedsAndPersists(t *testing.T) {
 // many happened across a narrow window.
 type countingSaveStore struct {
 	engine.Store
-	mu int64ish
-}
-
-// int64ish avoids importing sync/atomic's Int64 type alias concerns across
-// Go versions; a mutex-guarded int is simpler here and Save is not hot.
-type int64ish struct {
-	sync.Mutex
-	n int
+	calls atomic.Int64
 }
 
 func (s *countingSaveStore) Save(ctx context.Context, r *engine.Run) error {
-	s.mu.Lock()
-	s.mu.n++
-	s.mu.Unlock()
+	s.calls.Add(1)
 	return s.Store.Save(ctx, r)
 }
 
 func (s *countingSaveStore) count() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.mu.n
+	return int(s.calls.Load())
 }
 
 // blockingDecideStore blocks the Nth Save call on a channel until released,
@@ -1721,12 +1787,24 @@ func TestBestEffortCheckpointFailureIsLogged(t *testing.T) {
 	}
 	waitForTerminalEvent(t, sub, run.ID)
 
+	// Match the composed line, not a bare substring: "run checkpoint
+	// failed" is also a substring of finish's "terminal run checkpoint
+	// failed..." (which this same countingFailStore also fails, at
+	// LevelError), and this store's failFrom:2 makes that terminal line
+	// appear in the same buffer. slog's TextHandler quotes msg exactly, so
+	// `msg="run checkpoint failed"` (closing quote immediately after
+	// "failed") cannot match the longer terminal message, whose quoted
+	// value continues past that point -- unlike two independent
+	// strings.Contains checks, which the terminal ERROR line and any one
+	// mid-step WARN line can satisfy between them even if the level and
+	// message of each were swapped or downgraded.
+	const wantLine = `level=WARN msg="run checkpoint failed"`
 	logs := buf.String()
-	if !strings.Contains(logs, "run checkpoint failed") {
-		t.Errorf("logs = %q, want a checkpoint-failed entry", logs)
-	}
-	if !strings.Contains(logs, "level=WARN") {
-		t.Errorf("logs = %q, want a WARN-level entry for the mid-step checkpoint failure", logs)
+	// Two mid-step checkpoints fail with failFrom:2 on this one-step,
+	// no-Requires engine: runStep's phase-start save and its step-success
+	// save. Both must warn.
+	if got := strings.Count(logs, wantLine); got < 2 {
+		t.Errorf("logs contain %d occurrences of %q, want at least 2\nlogs:\n%s", got, wantLine, logs)
 	}
 
 	waitState(t, e, run.ID, engine.StateDone)

@@ -283,6 +283,24 @@ else
     fail "runShutdownTimeout covers the engine's worst case" \
       "runShutdownTimeout=${run_budget}s but cancellation can take killGrace=${kill_grace}s + terminalSaveTimeout=${terminal_save}s"
   fi
+
+  # Decide runs synchronously inside handleDecide, so its own Save call
+  # (bounded by decideSaveTimeout, not the run's execution context -- Task 7
+  # threads request contexts through it) is bounded by the HTTP drain, not
+  # the run-cancellation one. Nothing today stops decideSaveTimeout from
+  # being raised past httpShutdownTimeout and letting shutdown abandon an
+  # in-flight decision write mid-Save; pin it the same way terminal_save is
+  # pinned against run_budget above.
+  decide_save=$(sed -n 's/^const decideSaveTimeout = \([0-9][0-9]*\) \* time.Second$/\1/p' internal/engine/engine.go | head -1)
+  if [[ -z "${decide_save}" ]]; then
+    fail "decideSaveTimeout readable" \
+      "could not read decideSaveTimeout from internal/engine/engine.go as whole seconds"
+  elif (( http_budget >= decide_save )); then
+    pass "httpShutdownTimeout ${http_budget}s covers decideSaveTimeout ${decide_save}s"
+  else
+    fail "httpShutdownTimeout covers Decide's worst case" \
+      "httpShutdownTimeout=${http_budget}s but handleDecide's Save call can take decideSaveTimeout=${decide_save}s"
+  fi
 fi
 
 echo

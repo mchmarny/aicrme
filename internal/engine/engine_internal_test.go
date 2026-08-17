@@ -123,3 +123,44 @@ func TestRetryRollbackDoesNotRestoreRecoveryPendingAgainstASupersededRun(t *test
 		t.Error("recoveredPending restored true after the run was superseded mid-Save -- the rollback's aliveLocked guard did not cover it")
 	}
 }
+
+// TestDecideRollbackDoesNotRestoreStateAgainstASupersededRun pins the same
+// guard class Task 4's Retry rollback needed pinned one commit earlier
+// (Ruling 13, see engine.go's own "a guard no test can break is not a
+// guard"): Decide's failed-Save rollback must skip restoring
+// Decisions/Pending/State/UpdatedAt once this goroutine's epoch is no
+// longer the live one, or it stomps whatever legitimately superseded this
+// run in the interim. Reuses supersedingFailStore (defined above for
+// Retry's identical test) rather than inventing a second fake for the same
+// job -- it bumps e.epoch from inside Save itself, manufacturing the one
+// condition no public API can produce today, for the identical reason
+// TestSupersededGoroutineCannotWriteState's doc comment gives.
+func TestDecideRollbackDoesNotRestoreStateAgainstASupersededRun(t *testing.T) {
+	store := &supersedingFailStore{Store: NewMemoryStore()}
+	e := New(bus.New(8), store)
+	store.e = e
+
+	run := &Run{
+		ID:        "0123456789abcdef",
+		State:     StateAwaitingDecision,
+		Pending:   []string{"apply"},
+		Decisions: map[string]string{},
+		Artifacts: map[string][]byte{},
+		StartedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	e.mu.Lock()
+	e.current = run
+	e.mu.Unlock()
+
+	if err := e.Decide(run.ID, map[string]string{"apply": "yes"}); err == nil {
+		t.Fatal("Decide() error = nil, want the manufactured Save failure to surface")
+	}
+
+	e.mu.Lock()
+	state := e.current.State
+	e.mu.Unlock()
+	if state == StateAwaitingDecision {
+		t.Error("State rolled back to StateAwaitingDecision after the run was superseded mid-Save -- the rollback's aliveLocked guard did not cover it")
+	}
+}

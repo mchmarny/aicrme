@@ -348,9 +348,18 @@ func (e *Engine) Decide(runID string, decisions map[string]string) error {
 	if err := e.store.Save(saveCtx, snapshot); err != nil {
 		// Guarded the same way Start's and Retry's rollbacks are: identity
 		// plus epoch-aliveness, so this cannot stomp a run that has since
-		// legitimately superseded this one.
+		// legitimately superseded this one. isLive additionally guards a
+		// window unique to Decide: awaitDecisions is still blocked on
+		// <-resume while this Save is in flight (resume is not sent until
+		// Save succeeds), so a shutdown landing in that window cancels the
+		// run's context, awaitDecisions takes the ctx.Done() branch, and
+		// finish sets StateFailed -- via this SAME epoch, since only Start
+		// and Retry bump it. Without the isLive check, this rollback would
+		// overwrite that terminal state with StateAwaitingDecision, leaving
+		// a live state with no goroutine behind it: exactly the wedge this
+		// whole discipline exists to prevent.
 		e.mu.Lock()
-		if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) {
+		if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) && isLive(e.current.State) {
 			e.current.Decisions = prev.Decisions
 			e.current.Pending = prev.Pending
 			e.current.State = prev.State
