@@ -697,15 +697,21 @@ func assertPersistedTerminalState(t *testing.T, store engine.Store, runID string
 	}
 }
 
+// Both halves keep their original assertions; they need one engine each
+// because CancelAndWait is now terminal for the engine it is called on --
+// draining is never cleared, so the second half's Start would be refused on
+// an engine the first half had already drained. That is the contract, not a
+// workaround: an engine told to shut down must not accept a run afterwards.
 func TestCancelAndWaitIsIdempotentAndSafeWithNoRun(t *testing.T) {
-	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
 	ctx := context.Background()
 
 	// No run has ever started.
-	if err := e.CancelAndWait(ctx); err != nil {
+	idle := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+	if err := idle.CancelAndWait(ctx); err != nil {
 		t.Fatalf("CancelAndWait() with no run error = %v", err)
 	}
 
+	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
 	run, err := e.Start(ctx)
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -718,6 +724,103 @@ func TestCancelAndWaitIsIdempotentAndSafeWithNoRun(t *testing.T) {
 	}
 	if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
 		t.Fatalf("second CancelAndWait() error = %v", cancelErr)
+	}
+}
+
+// TestDrainingEngineRefusesNewWork pins the flag CancelAndWait sets. Both
+// entry points that install a fresh cancel/done pair have to honor it, or
+// CancelAndWait goes back to being able to wait on a run that has already
+// been replaced.
+func TestDrainingEngineRefusesNewWork(t *testing.T) {
+	t.Run("Start", func(t *testing.T) {
+		e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+		if err := e.CancelAndWait(context.Background()); err != nil {
+			t.Fatalf("CancelAndWait() error = %v", err)
+		}
+		_, err := e.Start(context.Background())
+		if !errors.Is(err, engine.ErrDraining) {
+			t.Fatalf("Start() error = %v, want ErrDraining", err)
+		}
+	})
+
+	t.Run("Retry", func(t *testing.T) {
+		failing := newFakeStep(engine.PhaseDiscover)
+		failing.err = errors.New("boom")
+		e := engine.New(bus.New(64), engine.NewMemoryStore(), failing)
+
+		run, err := e.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		waitState(t, e, run.ID, engine.StateFailed)
+
+		if cancelErr := e.CancelAndWait(context.Background()); cancelErr != nil {
+			t.Fatalf("CancelAndWait() error = %v", cancelErr)
+		}
+		if _, retryErr := e.Retry(run.ID); !errors.Is(retryErr, engine.ErrDraining) {
+			t.Fatalf("Retry() error = %v, want ErrDraining", retryErr)
+		}
+	})
+}
+
+// TestCancelAndWaitNeverReturnsWithARunStillLive is the interleaving nothing
+// covered. CancelAndWait used to snapshot cancel/done under the lock, release
+// it, and wait on that one channel: a Start landing in between installed a
+// new pair, so the wait completed against the previous (already terminal)
+// run's closed channel and returned nil while the new run's goroutine was
+// still inside its step. main then returns, tearing down the PID namespace
+// under a live deploy.sh.
+//
+// The assertion is deliberately synchronous -- no polling. A nil return from
+// CancelAndWait means done was closed, which means execute returned, which
+// means finish already wrote the terminal state. Polling here would hide the
+// exact defect the test exists for.
+func TestCancelAndWaitNeverReturnsWithARunStillLive(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		step := &ctxBlockingStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1)}
+		e := engine.New(bus.New(8), engine.NewMemoryStore(), step)
+
+		var (
+			wg        sync.WaitGroup
+			release   = make(chan struct{})
+			run       *engine.Run
+			startErr  error
+			cancelErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-release
+			run, startErr = e.Start(context.Background())
+		}()
+		go func() {
+			defer wg.Done()
+			<-release
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cancelErr = e.CancelAndWait(ctx)
+		}()
+		close(release)
+		wg.Wait()
+
+		if cancelErr != nil {
+			t.Fatalf("iteration %d: CancelAndWait() error = %v", i, cancelErr)
+		}
+		if startErr != nil {
+			// Refused as draining: there is no run to have left behind.
+			if !errors.Is(startErr, engine.ErrDraining) {
+				t.Fatalf("iteration %d: Start() error = %v, want ErrDraining", i, startErr)
+			}
+			continue
+		}
+		got, err := e.Get(run.ID)
+		if err != nil {
+			t.Fatalf("iteration %d: Get() error = %v", i, err)
+		}
+		if got.State == engine.StateRunning || got.State == engine.StateAwaitingDecision {
+			t.Fatalf("iteration %d: CancelAndWait() returned nil with run %s still in state %q",
+				i, run.ID, got.State)
+		}
 	}
 }
 

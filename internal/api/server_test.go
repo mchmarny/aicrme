@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -96,6 +97,38 @@ func TestDrainKeepsSafeMethodsServing(t *testing.T) {
 	defer eventsResp.Body.Close()
 	if eventsResp.StatusCode != http.StatusOK {
 		t.Errorf("events status = %d, want %d", eventsResp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestDrainedEngineRejectsRunCreation covers the half requireNotDraining
+// cannot: it gates the outer mux, so a POST /api/runs that clears the check
+// microseconds before Drain() still reaches engine.Start. The engine's own
+// draining flag is what refuses that request, and engine.ErrDraining carries
+// ErrCodeUnavailable so writeErr answers 503 -- the same shape the middleware
+// returns -- rather than a bare 500. The server here is deliberately never
+// drained, so only the engine can be producing the status.
+func TestDrainedEngineRejectsRunCreation(t *testing.T) {
+	b := bus.New(64)
+	eng := engine.New(b, engine.NewMemoryStore())
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+	}, b, eng, testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	if cancelErr := eng.CancelAndWait(context.Background()); cancelErr != nil {
+		t.Fatalf("CancelAndWait() error = %v", cancelErr)
+	}
+
+	ts, client := loggedInClient(t, srv.Handler())
+	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /api/runs error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
 }
 

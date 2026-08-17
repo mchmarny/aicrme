@@ -24,6 +24,13 @@ const terminalSaveTimeout = 5 * time.Second
 // tests, which match against it) cannot drift apart.
 const canceledByShutdownMsg = "canceled: console shutting down"
 
+// ErrDraining is what Start and Retry return once CancelAndWait has begun
+// shutting the engine down. ErrCodeUnavailable is what makes internal/api's
+// writeErr answer 503, matching the shape Server.Drain already returns for a
+// mutation arriving during shutdown.
+var ErrDraining = aicrerrors.New(aicrerrors.ErrCodeUnavailable,
+	"engine is shutting down; not accepting new runs")
+
 // Emit publishes a console event. The engine stamps RunID and Phase, so steps
 // only supply Kind, Level, Message, Component, and Data.
 type Emit func(bus.Event)
@@ -57,6 +64,18 @@ type Engine struct {
 	// driving it" are different questions.
 	epoch uint64
 
+	// draining is set by CancelAndWait and never cleared: the process is on
+	// its way out. It is what makes the engine authoritative about its own
+	// lifecycle rather than dependent on the HTTP layer. Without it,
+	// CancelAndWait snapshots cancel/done once and then waits on that one
+	// channel, so a Start landing just after the snapshot is canceled and
+	// waited for -- CancelAndWait returns nil while the new run's goroutine
+	// is still mid-flight and main returns out from under it.
+	// Server.Drain narrows that window but cannot close it: requireNotDraining
+	// gates the outer mux, so a POST /api/runs that clears the check
+	// microseconds before Drain() still reaches Start.
+	draining bool
+
 	// cancel stops the in-flight run's step context; done closes once its
 	// execute goroutine has exited AND persisted a terminal state. A cancel
 	// func alone would tell a caller the run was asked to stop but not when
@@ -86,6 +105,10 @@ func randomID() string {
 // the run is registered; callers observe progress over the bus.
 func (e *Engine) Start(ctx context.Context) (*Run, error) {
 	e.mu.Lock()
+	if e.draining {
+		e.mu.Unlock()
+		return nil, ErrDraining
+	}
 	if e.current != nil && isLive(e.current.State) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "a run is already in progress")
@@ -166,8 +189,17 @@ func (e *Engine) aliveLocked(epoch uint64) bool { return e.epoch == epoch }
 // -- a step that ignores its context would otherwise block shutdown forever,
 // and Kubernetes will SIGKILL the pod at terminationGracePeriodSeconds
 // regardless of what this returns.
+//
+// Setting draining in the same lock hold that snapshots cancel/done is what
+// makes the wait meaningful: a Start or Retry that had already taken the lock
+// has by then installed its own cancel/done for this snapshot to pick up, and
+// one arriving afterwards is refused with ErrDraining. Either way there is no
+// run this call could return nil while leaving live. After this returns, the
+// engine accepts no new runs -- it is a shutdown-only operation, not a "stop
+// the current run" one.
 func (e *Engine) CancelAndWait(ctx context.Context) error {
 	e.mu.Lock()
+	e.draining = true
 	cancel, done := e.cancel, e.done
 	e.mu.Unlock()
 
@@ -460,6 +492,10 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 // that already installed are no-ops on the second pass.
 func (e *Engine) Retry(runID string) (*Run, error) {
 	e.mu.Lock()
+	if e.draining {
+		e.mu.Unlock()
+		return nil, ErrDraining
+	}
 	if e.current == nil || e.current.ID != runID {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
