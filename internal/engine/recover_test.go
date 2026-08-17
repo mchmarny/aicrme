@@ -70,17 +70,22 @@ func (s *recoverStore) SaveCalls() int {
 	return s.saveCalls
 }
 
-// fourStepEngine returns an engine over Discover, Recommend, Bundle, Apply --
-// the shape main.go assembles today -- so bundleStepIndex() resolves to 2 and
-// StepIndex 3 represents "Apply not yet complete."
-func fourStepEngine(store engine.Store) *engine.Engine {
-	b := bus.New(64)
+// fourStepEngineOn is fourStepEngine over a caller-supplied bus, for tests
+// that need to read the events recovery publishes.
+func fourStepEngineOn(b *bus.Bus, store engine.Store) *engine.Engine {
 	return engine.New(b, store,
 		newFakeStep(engine.PhaseDiscover),
 		newFakeStep(engine.PhaseRecommend),
 		newFakeStep(engine.PhaseBundle),
 		newFakeStep(engine.PhaseApply),
 	)
+}
+
+// fourStepEngine returns an engine over Discover, Recommend, Bundle, Apply --
+// the shape main.go assembles today -- so bundleStepIndex() resolves to 2 and
+// StepIndex 3 represents "Apply not yet complete."
+func fourStepEngine(store engine.Store) *engine.Engine {
+	return fourStepEngineOn(bus.New(64), store)
 }
 
 // testRunID matches validRunID's format (16 hex characters, mirroring
@@ -732,7 +737,7 @@ func TestRecoverPublishesBootstrapEvents(t *testing.T) {
 	}
 
 	events := b.Replay(0)
-	var componentEvents, phaseEvents, errorEvents []bus.Event
+	var componentEvents, phaseEvents, errorEvents, recoveredEvents []bus.Event
 	for _, ev := range events {
 		switch ev.Kind {
 		case bus.KindComponent:
@@ -741,9 +746,27 @@ func TestRecoverPublishesBootstrapEvents(t *testing.T) {
 			phaseEvents = append(phaseEvents, ev)
 		case bus.KindError:
 			errorEvents = append(errorEvents, ev)
+		case bus.KindRecovered:
+			recoveredEvents = append(recoveredEvents, ev)
 		case bus.KindLog, bus.KindCluster, bus.KindDecision:
 			// Bootstrap never publishes these kinds; nothing to collect.
 		}
+	}
+
+	// The marker the console keys its retry/discard affordance off. Exactly
+	// one, and first: everything after it describes a run the operator has
+	// already been told is waiting on them.
+	if len(recoveredEvents) != 1 {
+		t.Fatalf("recovered events = %d, want exactly 1: %+v", len(recoveredEvents), recoveredEvents)
+	}
+	if events[0].Kind != bus.KindRecovered {
+		t.Errorf("first published event Kind = %q, want %q", events[0].Kind, bus.KindRecovered)
+	}
+	if recoveredEvents[0].RunID != testRunID {
+		t.Errorf("recovered event RunID = %q, want %q", recoveredEvents[0].RunID, testRunID)
+	}
+	if recoveredEvents[0].Phase != string(engine.PhaseApply) {
+		t.Errorf("recovered event Phase = %q, want %q", recoveredEvents[0].Phase, engine.PhaseApply)
 	}
 
 	if len(componentEvents) != 2 {
@@ -803,5 +826,85 @@ func TestRecoverPublishesBootstrapEvents(t *testing.T) {
 	}
 	if want := "interrupted by a console restart"; errorEvents[0].Message != want {
 		t.Errorf("error event Message = %q, want exactly %q", errorEvents[0].Message, want)
+	}
+}
+
+// TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState is the Go half of
+// the Critical finding. TestRecoverPublishesBootstrapEvents exercises exactly
+// one combination -- PhaseApply, StateRunning-flipped-to-failed -- and that is
+// why nothing caught a console with no reachable operator action anywhere
+// else: a restart at the Recommend decision gate (the longest idle window in
+// the product, since it waits on a human) and a restart after any completed
+// run both land outside it.
+//
+// Every phase a restart can interrupt, crossed with every state a recovered
+// record can carry, must publish the marker AND must actually be gated: the
+// marker is only worth anything if it is published exactly when Start is
+// refusing, and refusing exactly when the marker is published. Asserting both
+// together is what stops the two drifting into a console that says "waiting
+// for you" while quietly accepting new runs, or blocks new runs while saying
+// nothing.
+func TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState(t *testing.T) {
+	phases := []engine.Phase{
+		engine.PhaseDiscover, engine.PhaseRecommend, engine.PhaseBundle, engine.PhaseApply,
+	}
+	states := []engine.State{
+		engine.StateIdle, engine.StateRunning, engine.StateAwaitingDecision,
+		engine.StateFailed, engine.StateDone, engine.StateActive,
+	}
+
+	for _, phase := range phases {
+		for _, state := range states {
+			t.Run(string(phase)+"/"+string(state), func(t *testing.T) {
+				store := newRecoverStore()
+				store.loadCurrent = baseRun(testRunID, state, phase, 0)
+				b := bus.New(64)
+				e := fourStepEngineOn(b, store)
+
+				if err := e.Recover(context.Background()); err != nil {
+					t.Fatalf("Recover() error = %v", err)
+				}
+
+				var markers []bus.Event
+				for _, ev := range b.Replay(0) {
+					if ev.Kind == bus.KindRecovered {
+						markers = append(markers, ev)
+					}
+				}
+				if len(markers) != 1 {
+					t.Fatalf("recovered markers = %d, want exactly 1: %+v", len(markers), markers)
+				}
+				if markers[0].RunID != testRunID {
+					t.Errorf("marker RunID = %q, want %q", markers[0].RunID, testRunID)
+				}
+				if markers[0].Phase != string(phase) {
+					t.Errorf("marker Phase = %q, want %q -- the console renders the phase it names", markers[0].Phase, phase)
+				}
+
+				// The gate the marker exists to explain. Without the marker
+				// this 409 is what the operator hits with no way out.
+				if _, err := e.Start(context.Background()); err == nil {
+					t.Error("Start() error = nil, want a conflict -- a marker published for a run Start would happily replace is a lie")
+				} else {
+					var se *aicrerrors.StructuredError
+					if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+						t.Errorf("Start() error = %v, want ErrCodeConflict", err)
+					}
+				}
+
+				// Discard is the affordance that must exist for EVERY state,
+				// including the terminal ones Retry refuses outright. This is
+				// Scenario B: a completed run's record survives, the next
+				// helm upgrade recovers it, and Retry answers "run is not in
+				// a failed state" -- so if Discard did not work here the
+				// console would be bricked by an ordinary upgrade.
+				if err := e.Discard(context.Background(), testRunID); err != nil {
+					t.Fatalf("Discard() error = %v, want a recovered run discardable in every state", err)
+				}
+				if _, err := e.Start(context.Background()); err != nil {
+					t.Errorf("Start() after Discard error = %v, want nil -- discard must free the console", err)
+				}
+			})
+		}
 	}
 }

@@ -5,7 +5,7 @@ export interface AicrEvent {
   id: number
   runId?: string
   at: string
-  kind: 'phase' | 'log' | 'component' | 'cluster' | 'decision' | 'error'
+  kind: 'phase' | 'log' | 'component' | 'cluster' | 'decision' | 'error' | 'recovered'
   phase?: string
   level: 'info' | 'warn' | 'error'
   component?: string

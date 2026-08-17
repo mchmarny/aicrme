@@ -80,7 +80,12 @@ function Console({ onUnauthorized }: { onUnauthorized: () => void }) {
           </button>
         </div>
       )}
-      <Wizard events={events} />
+      {/* A discard clears the engine's recovery gate but publishes no bus
+          event, so nothing in the stream tells this effect that POST
+          /api/runs has stopped answering 409. Bumping the same token the
+          error path uses re-runs it, which is what lets the console start a
+          fresh run without the operator reloading the page. */}
+      <Wizard events={events} onDiscarded={() => setRetryToken(n => n + 1)} />
     </main>
   )
 }

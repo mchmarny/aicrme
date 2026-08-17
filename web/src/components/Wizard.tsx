@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AicrEvent } from '../useEvents'
-import { ApiError, decide as decideApi, fetchOptions, retryRun, type Options } from '../api'
+import { ApiError, decide as decideApi, discardRun, fetchOptions, retryRun, type Options } from '../api'
+import { deriveComponents } from '../pipeline'
 import { Cockpit } from './Cockpit'
 import { Discover, type CapabilityReport } from './Discover'
 import { Recommend, type RecipeSummary } from './Recommend'
@@ -33,7 +34,30 @@ export interface RunState {
   report: CapabilityReport | null
   recipe: RecipeSummary | null
   error?: string
+  /**
+   * True while this run is one restart recovery installed and the engine is
+   * refusing new runs until an operator retries or discards it
+   * (internal/engine's recoveredPending gate). Nothing else in the stream
+   * carries it: a recovered `done` run publishes exactly what a run that
+   * just finished normally publishes, and a recovered `failed` run publishes
+   * exactly what an ordinary failure publishes. Optional so existing
+   * constructors of this type (Cockpit's tests) stay valid; undefined reads
+   * as false everywhere.
+   */
+  recovered?: boolean
 }
+
+/**
+ * RECOVERY_INTERRUPTED_ERROR is internal/engine/recover.go's recoveredErr
+ * verbatim. Recover sets it only on a run it found live or idle -- i.e. one
+ * the restart actually cut off -- so a recovered run whose error is anything
+ * else had already failed on its own before the pod went away. Those are
+ * different things to tell an operator deciding whether Retry is safe, and
+ * this constant is what keeps them apart. A string match, like the "run
+ * done"/"run failed"/"run retrying" messages deriveRunState already keys on;
+ * internal/engine/recover_test.go pins the producing side exactly.
+ */
+export const RECOVERY_INTERRUPTED_ERROR = 'interrupted by a console restart'
 
 function isCapabilityReport(data: unknown): data is CapabilityReport {
   return typeof data === 'object' && data !== null && 'headline' in data && 'gaps' in data
@@ -91,7 +115,14 @@ export function deriveRunState(events: AicrEvent[]): RunState {
         // subsequently successful run -- out.error is otherwise sticky
         // because deriving replays every event this run has ever emitted,
         // including a 'kind === error' from an attempt that later succeeded.
-        if (e.message === 'run retrying') out.error = undefined
+        //
+        // It is also the moment the recovery gate closes server-side:
+        // engine.Retry clears recoveredPending as its first act, so the
+        // console must stop offering retry/discard for this run too.
+        if (e.message === 'run retrying') {
+          out.error = undefined
+          out.recovered = false
+        }
         break
       case 'decision':
         out.state = 'awaiting_decision'
@@ -99,6 +130,13 @@ export function deriveRunState(events: AicrEvent[]): RunState {
       case 'error':
         out.state = 'failed'
         out.error = e.message
+        break
+      // Deliberately does not touch out.state: recovery publishes this ahead
+      // of the "run <state>" event that carries the state, so a recovered run
+      // resolves through exactly the same branches a live one does and only
+      // gains the flag.
+      case 'recovered':
+        out.recovered = true
         break
     }
 
@@ -140,12 +178,131 @@ function ResolvedRecommend({ recipe }: { recipe: RecipeSummary | null }) {
   )
 }
 
-export function Wizard({ events }: { events: AicrEvent[] }) {
+/**
+ * recoverySummary is what the operator is actually told happened. The three
+ * cases are genuinely different situations and collapsing them would be a
+ * lie in at least one:
+ *
+ *  - a run the restart cut off mid-flight (engine.Recover flipped it to
+ *    failed and set RECOVERY_INTERRUPTED_ERROR),
+ *  - a run that had already failed on its own before the pod went away, whose
+ *    error is its real one and whose Retry means "try that step again",
+ *  - a run that had already finished. Nothing interrupted it and there is
+ *    nothing to retry -- but its record outlives the pod, so every
+ *    `helm upgrade` of a release that has completed one demo recovers it and
+ *    finds Start refusing. Discard is the only way out, and saying
+ *    "interrupted" here would send an operator looking for a failure that
+ *    never happened.
+ */
+function recoverySummary(run: RunState): string {
+  if (run.state === 'done') {
+    return 'It finished before the console restarted, so there is nothing left to run. Discard it to start a new one.'
+  }
+  if (run.state !== 'failed') {
+    return 'It was recovered after a console restart and is holding the console until you decide what to do with it.'
+  }
+  if (run.error === RECOVERY_INTERRUPTED_ERROR) {
+    return `The console restarted while this run was in the ${run.phase ?? 'discover'} phase, so it never finished. Retrying picks it up from the step it stopped on.`
+  }
+  return `This run had already failed during the ${run.phase ?? 'discover'} phase before the console restarted.`
+}
+
+/**
+ * Recovered is the console's whole screen for a recovered run, in every
+ * phase. It replaces the phase body rather than sitting above it because the
+ * phase body is actively misleading here: a run recovered on `recommend`
+ * renders "Resolving the recipe for the answers you gave…" forever, since no
+ * step is running and none ever will be until the operator acts.
+ *
+ * It keys off run.state, never run.phase. The affordance used to live inside
+ * Cockpit, which Wizard renders only for bundle/apply, so a restart at the
+ * Recommend decision gate -- the longest idle window in the product, since it
+ * waits on a human -- reached a console with no button anywhere. And Discard
+ * is offered in every state, including the terminal ones Retry refuses, which
+ * is the only exit from a recovered `done` run.
+ */
+function Recovered({ events, run, busy, onRetry, onDiscard }: {
+  events: AicrEvent[]
+  run: RunState
+  busy: boolean
+  onRetry: () => void
+  onDiscard: () => void
+}) {
+  // Redraws whatever the persisted component projection carried, from the
+  // bootstrap KindComponent events Recover replays -- the reason those events
+  // exist at all. Empty for a run that never reached Apply.
+  const components = deriveComponents(events, run.recipe?.components.map(c => c.name))
+  const showOwnError = run.state === 'failed' && run.error && run.error !== RECOVERY_INTERRUPTED_ERROR
+
+  return (
+    <section data-testid="recovered-run" className="mx-auto max-w-2xl space-y-5">
+      <div>
+        <h2 className="text-2xl font-semibold text-amber-400">A previous run is waiting for you</h2>
+        <p className="mt-2 text-sm text-slate-300">{recoverySummary(run)}</p>
+      </div>
+
+      {showOwnError && <p className="text-sm text-red-400">{run.error}</p>}
+
+      {components.length > 0 && (
+        <ul className="space-y-1 font-mono text-xs text-slate-400">
+          {components.map(c => (
+            <li key={c.name} data-testid={`recovered-component-${c.name}`}>
+              {c.name} <span className="uppercase text-slate-500">{c.status}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <p className="text-xs text-slate-500">
+        The console will not start a new run until you choose.
+      </p>
+
+      <div className="flex items-center gap-4">
+        {run.state === 'failed' && (
+          <button
+            data-testid="recovery-retry"
+            disabled={busy}
+            onClick={onRetry}
+            className="rounded bg-emerald-600 px-4 py-2 text-white disabled:opacity-50"
+          >
+            Retry this run
+          </button>
+        )}
+        <button
+          data-testid="recovery-discard"
+          disabled={busy}
+          onClick={onDiscard}
+          className="rounded border border-slate-700 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+        >
+          Discard and start over
+        </button>
+      </div>
+    </section>
+  )
+}
+
+/**
+ * onDiscarded lets the console start a fresh run the moment a discard
+ * succeeds, without a page reload. Discard publishes no bus event -- it
+ * deletes the run rather than transitioning it -- so nothing in the stream
+ * would otherwise tell App.tsx that POST /api/runs has stopped 409ing.
+ */
+export function Wizard({ events, onDiscarded }: { events: AicrEvent[]; onDiscarded?: () => void }) {
   const run = useMemo(() => deriveRunState(events), [events])
   const [options, setOptions] = useState<Options | null>(null)
   const [optionsError, setOptionsError] = useState('')
-  const [decideError, setDecideError] = useState('')
+  const [actionError, setActionError] = useState('')
   const [retryToken, setRetryToken] = useState(0)
+  const [busy, setBusy] = useState(false)
+  // The id of the run this console just discarded. The discard is already
+  // durable server-side, but the event stream still ends on that run until
+  // the replacement publishes its first event, so deriveRunState keeps
+  // reporting it as the current, recovered run for that window. Remembering
+  // the id is what stops the panel flashing back up with buttons that would
+  // now 404.
+  const [discardedRunId, setDiscardedRunId] = useState<string | undefined>(undefined)
+
+  const recovered = !!run.recovered
 
   // CLIENT CONTRACT (internal/api/options.go handleOptions): /api/options is
   // not safe to fetch once on mount and cache -- before Discover finishes
@@ -168,8 +325,13 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
   // schedules a bounded, backed-off refetch instead of being handed
   // straight to Recommend; retryToken lets the "Retry" button on an
   // outright fetch failure restart the same cascade from attempt zero.
+  //
+  // A recovered run is skipped outright: it is parked on the recovery panel
+  // with no step running, so the questions cannot be answered until the
+  // operator retries -- and engine.Retry publishes "run retrying", which
+  // clears run.recovered and re-fires this effect for the resumed run.
   useEffect(() => {
-    if (run.phase !== 'recommend') return
+    if (run.phase !== 'recommend' || recovered) return
     let canceled = false
     let timer: ReturnType<typeof setTimeout> | undefined
 
@@ -192,7 +354,7 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
 
     attempt(0)
     return () => { canceled = true; clearTimeout(timer) }
-  }, [run.phase, retryToken])
+  }, [run.phase, recovered, retryToken])
 
   // Record<string, string> rather than the original { intent, platform }
   // literal: the cockpit's confirm gate sends { apply: 'yes' } through this
@@ -201,21 +363,42 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
   // function-parameter contravariance holds under strictFunctionTypes.
   async function handleDecide(d: Record<string, string>) {
     if (!run.runId) return
-    setDecideError('')
+    setActionError('')
     try {
       await decideApi(run.runId, d)
     } catch (err) {
-      setDecideError(err instanceof ApiError ? err.message : (err as Error).message)
+      setActionError(err instanceof ApiError ? err.message : (err as Error).message)
     }
   }
 
   async function handleRetry() {
     if (!run.runId) return
-    setDecideError('')
+    setActionError('')
+    setBusy(true)
     try {
       await retryRun(run.runId)
     } catch (err) {
-      setDecideError(err instanceof ApiError ? err.message : (err as Error).message)
+      setActionError(err instanceof ApiError ? err.message : (err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Only reachable from the recovery panel: engine.Discard refuses a live
+  // run, and a recovered one is the only non-live run the console ever shows.
+  async function handleDiscard() {
+    if (!run.runId) return
+    const discarded = run.runId
+    setActionError('')
+    setBusy(true)
+    try {
+      await discardRun(discarded)
+      setDiscardedRunId(discarded)
+      onDiscarded?.()
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : (err as Error).message)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -265,24 +448,47 @@ export function Wizard({ events }: { events: AicrEvent[] }) {
   // the timeline rail narrows from w-96 to w-80, and Cockpit itself (unlike
   // Discover/Recommend) renders full-width rather than centered under
   // mx-auto max-w-2xl, so the live component pipeline gets the room a
-  // one-line-per-decision wizard screen never needed.
-  const cockpit = run.phase === 'bundle' || run.phase === 'apply'
+  // one-line-per-decision wizard screen never needed. A recovered run is
+  // never the cockpit, whatever phase it stopped in: it is a decision, not a
+  // pipeline, and Recovered redraws the persisted component rows itself.
+  const cockpit = !recovered && (run.phase === 'bundle' || run.phase === 'apply')
+
+  function renderBody() {
+    if (recovered) {
+      // The discard already succeeded; the panel's buttons would 404 now, and
+      // App.tsx's POST /api/runs is in flight. Say so rather than re-offering
+      // an action against a run that no longer exists.
+      if (run.runId && run.runId === discardedRunId) {
+        return <p className="text-slate-500 text-sm">Discarded. Starting a new run…</p>
+      }
+      return (
+        <Recovered
+          events={events}
+          run={run}
+          busy={busy}
+          onRetry={handleRetry}
+          onDiscard={handleDiscard}
+        />
+      )
+    }
+    if (cockpit) {
+      return <Cockpit events={events} run={run} onDecide={handleDecide} onRetry={handleRetry} />
+    }
+    if (run.phase === 'recommend') return renderRecommend()
+    if (run.report) return <Discover report={run.report} />
+    return <p className="text-slate-500 text-sm">Discovering the cluster…</p>
+  }
 
   return (
     <div className="flex gap-8">
       <div className="min-w-0 flex-1">
-        {run.error && <p className="mb-4 text-red-400 text-sm">{run.error}</p>}
-        {decideError && <p className="mb-4 text-red-400 text-sm">{decideError}</p>}
+        {/* Suppressed for a recovered run: Recovered states the situation in
+            its own words, and repeating the raw engine error above it reads
+            as a second, unrelated failure. */}
+        {!recovered && run.error && <p className="mb-4 text-red-400 text-sm">{run.error}</p>}
+        {actionError && <p className="mb-4 text-red-400 text-sm">{actionError}</p>}
 
-        {cockpit ? (
-          <Cockpit events={events} run={run} onDecide={handleDecide} onRetry={handleRetry} />
-        ) : run.phase === 'recommend' ? (
-          renderRecommend()
-        ) : run.report ? (
-          <Discover report={run.report} />
-        ) : (
-          <p className="text-slate-500 text-sm">Discovering the cluster…</p>
-        )}
+        {renderBody()}
       </div>
 
       <aside className={`${cockpit ? 'w-80' : 'w-96'} shrink-0 border-l border-slate-800 pl-8`}>

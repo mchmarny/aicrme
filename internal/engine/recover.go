@@ -298,6 +298,13 @@ type bootstrapComponentData struct {
 	Status string `json:"status"`
 }
 
+// recoveryMarkerMsg is the KindRecovered event's message. Worded for every
+// state a recovered record can carry, not just an interrupted one: a run that
+// had already finished before the restart was not interrupted by anything,
+// and telling the operator it was would be a lie in the most common case of
+// all (any `helm upgrade` of a release that has completed one demo).
+const recoveryMarkerMsg = "recovered a previous run; retry or discard it before starting a new one"
+
 // publishRecoveryBootstrap tells the SPA about a recovered run over the bus
 // rather than a second fetch path: the stream is already the SPA's source
 // of truth (web/src/components/Wizard.tsx's deriveRunState and
@@ -305,15 +312,24 @@ type bootstrapComponentData struct {
 // GET /api/runs/current would create a second source needing reconciling
 // against it instead.
 //
-// It publishes, in order: one KindComponent event per persisted component
-// row, so deriveComponents redraws the pipeline; the interruption notice as
-// a distinct KindError event when the run carries one, so the cockpit can
-// say "interrupted by a console restart" instead of a generic failure; and
-// last, the run's identity and phase as a KindPhase event worded exactly
-// "run " + state, matching the message engine.go's finish already uses for
-// a live run, so a recovered run resolves through the identical
-// deriveRunState branch.
+// It publishes, in order: the KindRecovered marker, which is the only event
+// carrying the fact that this run is blocking Start until an operator acts;
+// one KindComponent event per persisted component row, so deriveComponents
+// redraws the pipeline; the interruption notice as a distinct KindError event
+// when the run carries one, so the console can say "interrupted by a console
+// restart" instead of a generic failure; and last, the run's identity and
+// phase as a KindPhase event worded exactly "run " + state, matching the
+// message engine.go's finish already uses for a live run, so a recovered run
+// resolves through the identical deriveRunState branch.
+//
+// The marker goes first so it is set before the state-bearing event that
+// follows, and because a subscriber reading the stream top-down should learn
+// what it is looking at before it looks at it.
 func (e *Engine) publishRecoveryBootstrap(r *Run) {
+	e.bus.Publish(bus.Event{
+		RunID: r.ID, Kind: bus.KindRecovered, Phase: string(r.Phase),
+		Level: bus.LevelWarn, Message: recoveryMarkerMsg,
+	})
 	for _, c := range r.Components {
 		// ComponentState and bootstrapComponentData share the same field
 		// names, order, and types (only their json tags differ), so a
