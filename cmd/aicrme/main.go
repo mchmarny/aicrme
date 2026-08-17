@@ -105,18 +105,33 @@ func recipeNamespaces(raw []byte) map[string]struct{} {
 	return out
 }
 
+// runReader narrows *engine.Engine to what newRunScopeFn needs, so its
+// caching logic -- the part with real behavior to get wrong -- can be
+// exercised with a fake instead of a live Engine.
+type runReader interface {
+	CurrentID() (string, bool)
+	Current() *engine.Run
+}
+
 // newRunScopeFn returns an accessor the observer calls on every watch event.
 // It caches by run ID and refreshes only when that changes: Engine.Current()
 // deep-copies every artifact including the raw snapshot (tens of KB), so
 // calling it per event would copy megabytes per second to obtain a string.
 // CurrentID reads the ID under the same lock without cloning.
 //
-// The cache accepts staleness within a run: the namespace set reflects
-// whatever recipe.json held the first time the observer asked for the
-// current run's scope, not any later state. That is correct today because
-// recipe.json is written once by Recommend and never mutated after -- it
-// would need revisiting if a later phase made artifacts mutable mid-run.
-func newRunScopeFn(eng *engine.Engine) func() observer.RunScope {
+// The cache is populated only once recipe.json exists. Recommend does not
+// run until the operator supplies the intent/platform decisions
+// (recommend.Requires), and that wait -- plus Discover's own 10-minute
+// timeout ahead of it -- can span most of a run. If the accessor cached an
+// empty Namespaces the first time it was asked inside that window, every
+// later call for the same run ID would keep returning it (RunID already
+// matches the cache), so every namespaced workload event for the rest of
+// the run would be silently dropped by observer.publish with no error
+// anywhere. Caching only once the artifact is non-empty means a pre-recipe
+// call recomputes on every invocation until Recommend writes it, then locks
+// in the real value from then on -- safe because recipe.json, once written,
+// is never mutated again.
+func newRunScopeFn(eng runReader) func() observer.RunScope {
 	var (
 		mu     sync.Mutex
 		cached observer.RunScope
@@ -131,11 +146,17 @@ func newRunScopeFn(eng *engine.Engine) func() observer.RunScope {
 		if cached.RunID == id {
 			return cached
 		}
-		cached = observer.RunScope{RunID: id}
+		sc := observer.RunScope{RunID: id}
+		var raw []byte
 		if run := eng.Current(); run != nil && run.ID == id {
-			cached.Namespaces = recipeNamespaces(run.Artifacts["recipe.json"])
+			raw = run.Artifacts["recipe.json"]
 		}
-		return cached
+		if len(raw) == 0 {
+			return sc // recipe not resolved yet -- caching this would pin an empty scope for the whole run
+		}
+		sc.Namespaces = recipeNamespaces(raw)
+		cached = sc
+		return sc
 	}
 }
 
@@ -228,6 +249,9 @@ func main() {
 	// exit happened after it (gocritic's exitAfterDefer), and every startup
 	// failure that still exits is checked above this point.
 	var kube kubernetes.Interface
+	// rest.InClusterConfig does no network I/O -- env vars and two file
+	// reads -- so inside a pod kube is essentially always non-nil here; it
+	// is Start below, not this block, that first talks to the API server.
 	if cfg, cfgErr := rest.InClusterConfig(); cfgErr != nil {
 		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
 	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
@@ -236,11 +260,28 @@ func main() {
 		kube = c
 	}
 
+	// Started in a goroutine, not called inline: Start ends by blocking on
+	// the informer factory's WaitForCacheSync, which carries no deadline of
+	// its own -- it returns only once every watched type has synced or
+	// obsStop closes, and obsStop closes only when main returns (the defer
+	// above). A synchronous call here would mean an unreachable, partitioned,
+	// or merely slow API server blocks httpSrv.ListenAndServe() from ever
+	// running, so the chart's liveness probe (initialDelaySeconds: 5,
+	// periodSeconds: 10, default failureThreshold: 3 --
+	// charts/aicrme/templates/deployment.yaml) kills the pod roughly every
+	// 35s: a permanent CrashLoopBackOff of the whole console, caused by the
+	// one subsystem that is supposed to be optional. Handlers are registered
+	// before the informer factory starts, so events flow whether or not this
+	// goroutine's Start call has returned yet; its return value is consumed
+	// only for this warning.
 	obsStop := make(chan struct{})
 	defer close(obsStop)
-	if startErr := observer.New(kube, b, newRunScopeFn(eng)).Start(obsStop); startErr != nil {
-		slog.Warn("observer failed to start; continuing without cluster telemetry", "error", startErr)
-	}
+	obs := observer.New(kube, b, newRunScopeFn(eng))
+	go func() {
+		if startErr := obs.Start(obsStop); startErr != nil {
+			slog.Warn("observer failed to start; continuing without cluster telemetry", "error", startErr)
+		}
+	}()
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
