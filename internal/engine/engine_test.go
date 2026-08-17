@@ -1,8 +1,10 @@
 package engine_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,18 @@ import (
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 )
+
+// captureLogs redirects the default logger for one test so a checkpoint
+// failure's slog output can be asserted on directly. Level is Warn so both
+// the mid-step warnings and finish's error-level entry are captured.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return buf
+}
 
 type fakeStep struct {
 	phase    engine.Phase
@@ -1321,4 +1335,463 @@ func TestDiscardStillWorksOnARecoveredFailedRun(t *testing.T) {
 	if got := e.Current(); got != nil {
 		t.Errorf("Current() = %+v, want nil after Discard", got)
 	}
+}
+
+// --- Task 5: save-failure policy ---------------------------------------
+
+// blockingThenFailingStore blocks the Nth Save call until released, then
+// fails it. Used by TestDecidePersistsBeforeAcknowledging to give a
+// prematurely-sent resume signal a large, deterministic window to let the
+// parked awaitDecisions goroutine react and mistakenly proceed before
+// Decide's own Save call (and rollback) ever completes -- a store that
+// fails instantly would only catch that ordering bug by scheduler luck, and
+// this task's bite-proof step requires it to be caught reliably.
+type blockingThenFailingStore struct {
+	engine.Store
+	mu      sync.Mutex
+	calls   int
+	blockAt int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingThenFailingStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	if n == s.blockAt {
+		select {
+		case s.entered <- struct{}{}:
+		default:
+		}
+		<-s.release
+		return errors.New("save failed")
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// TestDecidePersistsBeforeAcknowledging pins the headline fix: Decide must
+// not mutate Decisions, clear Pending, flip State to running, and signal
+// resume unless the mutation was actually persisted. Before this task,
+// Decide never called Save at all, so a pod dying right after a 200 lost
+// the operator's choice and recovery re-parked for a decision already made.
+//
+// Call 1 is Start's own initial write and call 2 is awaitDecisions' single
+// parking checkpoint for this one-key gate, so call 3 is guaranteed to be
+// Decide's -- see blockingDecideStore's identical reasoning below.
+func TestDecidePersistsBeforeAcknowledging(t *testing.T) {
+	b := bus.New(64)
+	step := newFakeStep(engine.PhaseApply, "apply")
+	store := &blockingThenFailingStore{
+		Store:   engine.NewMemoryStore(),
+		blockAt: 3,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	e := engine.New(b, store, step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	decideErr := make(chan error, 1)
+	go func() {
+		decideErr <- e.Decide(run.ID, map[string]string{"apply": "yes"})
+	}()
+
+	select {
+	case <-store.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Decide's Save never reached the blocking store")
+	}
+
+	// A prematurely-sent resume signal gets a full, generous window here to
+	// wake the parked goroutine and let it wrongly proceed while Decide's
+	// own Save call is still outstanding.
+	time.Sleep(200 * time.Millisecond)
+	if len(step.ran) != 0 {
+		t.Fatal("step ran before Decide's Save even returned -- resume was signaled before the decision was durably recorded")
+	}
+
+	close(store.release)
+	if decErr := <-decideErr; decErr == nil {
+		t.Fatal("Decide() error = nil, want the manufactured Save failure to surface")
+	}
+
+	got, err := e.Get(run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.State != engine.StateAwaitingDecision {
+		t.Errorf("State = %q, want %q -- a failed Save must roll back the state transition", got.State, engine.StateAwaitingDecision)
+	}
+	if _, ok := got.Decisions["apply"]; ok {
+		t.Error("Decisions contains \"apply\" after a failed Save -- the mutation was not rolled back")
+	}
+	if len(got.Pending) != 1 || got.Pending[0] != "apply" {
+		t.Errorf("Pending = %v, want [\"apply\"] restored", got.Pending)
+	}
+
+	// The step must not have advanced: a resume signal sent despite the
+	// failed Save would let it proceed on a decision that was never
+	// recorded.
+	select {
+	case <-step.ran:
+		t.Error("step ran despite Decide's Save failing -- resume was signaled before the decision was durably recorded")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestDecideSucceedsAndPersists is the happy-path pair to the test above:
+// on success Decide saves exactly once and the persisted snapshot carries
+// the new decisions.
+func TestDecideSucceedsAndPersists(t *testing.T) {
+	b := bus.New(64)
+	step := newFakeStep(engine.PhaseApply, "apply")
+	inner := engine.NewMemoryStore()
+	store := &countingSaveStore{Store: inner}
+	e := engine.New(b, store, step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	before := store.count()
+	if decErr := e.Decide(run.ID, map[string]string{"apply": "yes"}); decErr != nil {
+		t.Fatalf("Decide() error = %v", decErr)
+	}
+	if delta := store.count() - before; delta != 1 {
+		t.Errorf("Decide() issued %d Save calls, want exactly 1", delta)
+	}
+
+	persisted, err := inner.LoadCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
+	}
+	if persisted.Decisions["apply"] != "yes" {
+		t.Errorf("persisted Decisions[\"apply\"] = %q, want \"yes\" -- Decide's Save did not carry the new decision", persisted.Decisions["apply"])
+	}
+	if persisted.State != engine.StateRunning {
+		t.Errorf("persisted State = %q, want %q", persisted.State, engine.StateRunning)
+	}
+
+	waitState(t, e, run.ID, engine.StateDone)
+}
+
+// countingSaveStore counts every Save call so a test can assert exactly how
+// many happened across a narrow window.
+type countingSaveStore struct {
+	engine.Store
+	mu int64ish
+}
+
+// int64ish avoids importing sync/atomic's Int64 type alias concerns across
+// Go versions; a mutex-guarded int is simpler here and Save is not hot.
+type int64ish struct {
+	sync.Mutex
+	n int
+}
+
+func (s *countingSaveStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	s.mu.n++
+	s.mu.Unlock()
+	return s.Store.Save(ctx, r)
+}
+
+func (s *countingSaveStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mu.n
+}
+
+// blockingDecideStore blocks the Nth Save call on a channel until released,
+// signaling entered first. Task 5's constraint is that no store I/O happens
+// while Decide holds e.mu -- callIndex pins the block to Decide's own Save
+// deterministically: call 1 is Start's initial write, call 2 is
+// awaitDecisions' single parking checkpoint for a one-key gate, so call 3 is
+// guaranteed to be Decide's.
+type blockingDecideStore struct {
+	engine.Store
+	mu      sync.Mutex
+	calls   int
+	blockAt int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingDecideStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	if n == s.blockAt {
+		select {
+		case s.entered <- struct{}{}:
+		default:
+		}
+		<-s.release
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// TestDecideDoesNotHoldTheLockDuringIO is the constraint the observer's
+// per-watch-event scope accessor depends on: CurrentID takes e.mu on a hot
+// path, so a Decide call blocked inside a slow store round trip must not
+// block it too.
+func TestDecideDoesNotHoldTheLockDuringIO(t *testing.T) {
+	b := bus.New(64)
+	step := newFakeStep(engine.PhaseApply, "apply")
+	store := &blockingDecideStore{
+		Store:   engine.NewMemoryStore(),
+		blockAt: 3,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	e := engine.New(b, store, step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	decideErr := make(chan error, 1)
+	go func() {
+		decideErr <- e.Decide(run.ID, map[string]string{"apply": "yes"})
+	}()
+
+	select {
+	case <-store.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Decide's Save never reached the blocking store")
+	}
+
+	idDone := make(chan struct{})
+	go func() {
+		if _, ok := e.CurrentID(); !ok {
+			t.Error("CurrentID() ok = false, want true")
+		}
+		close(idDone)
+	}()
+	select {
+	case <-idDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("CurrentID blocked behind Decide's in-flight Save -- e.mu must not be held during store I/O")
+	}
+
+	close(store.release)
+	if err := <-decideErr; err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+}
+
+// stepIndexRecordingStore records the StepIndex and Phase of every Save
+// call so a test can inspect the exact sequence a run's checkpoints took.
+type stepIndexRecordingStore struct {
+	engine.Store
+	mu    sync.Mutex
+	saves []stepIndexSave
+}
+
+type stepIndexSave struct {
+	phase     engine.Phase
+	stepIndex int
+}
+
+func (s *stepIndexRecordingStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	s.saves = append(s.saves, stepIndexSave{phase: r.Phase, stepIndex: r.StepIndex})
+	s.mu.Unlock()
+	return s.Store.Save(ctx, r)
+}
+
+func (s *stepIndexRecordingStore) snapshot() []stepIndexSave {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]stepIndexSave(nil), s.saves...)
+}
+
+// TestStepSuccessCheckpointsCursorBeforeNextStep pins the ordering fix: the
+// save that follows a step's success must carry the advanced StepIndex
+// before the next step's own checkpoint is written. Before this task, the
+// merge-back save ran before execute()'s own StepIndex increment, so a
+// crash in that window replayed a completed step on Retry.
+func TestStepSuccessCheckpointsCursorBeforeNextStep(t *testing.T) {
+	b := bus.New(64)
+	step1 := newFakeStep(engine.PhaseDiscover)
+	step2 := newFakeStep(engine.PhaseRecommend)
+	store := &stepIndexRecordingStore{Store: engine.NewMemoryStore()}
+	e := engine.New(b, store, step1, step2)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateDone)
+
+	saves := store.snapshot()
+	lastDiscoverStepIndex := -1
+	sawRecommend := false
+	for _, sv := range saves {
+		if sv.phase == engine.PhaseDiscover {
+			lastDiscoverStepIndex = sv.stepIndex
+		}
+		if sv.phase == engine.PhaseRecommend && !sawRecommend {
+			sawRecommend = true
+			if sv.stepIndex != 1 {
+				t.Errorf("first Recommend-phase save has StepIndex = %d, want 1 -- step 2 began before step 1's checkpoint carried the advanced cursor", sv.stepIndex)
+			}
+		}
+	}
+	if lastDiscoverStepIndex != 1 {
+		t.Errorf("last Discover-phase save carried StepIndex = %d, want 1 -- the step-success checkpoint must carry the advanced cursor", lastDiscoverStepIndex)
+	}
+}
+
+// countingFailStore fails every Save call from the Nth (1-indexed) onward,
+// deterministically -- independent of goroutine scheduling -- so a test can
+// pin exactly which checkpoint in a call sequence is expected to fail.
+type countingFailStore struct {
+	engine.Store
+	mu       sync.Mutex
+	calls    int
+	failFrom int
+}
+
+func (s *countingFailStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	if s.failFrom > 0 && n >= s.failFrom {
+		return errors.New("save failed")
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// waitForTerminalEvent blocks until it observes the run's terminal phase
+// event (the last statement finish() executes) or the deadline passes.
+// Waiting on this rather than polling Get()/waitState matters for tests that
+// then inspect a shared log buffer: e.current.State flips to a terminal
+// value under e.mu *before* finish() attempts its Save and any logging that
+// follows a failure, so a test that only waits for that state flip can read
+// the log buffer concurrently with finish() still writing to it -- a real
+// data race, not a flaky one. The channel receive here happens-after every
+// statement finish() executed in program order (same goroutine), including
+// its slog calls, which is what makes reading the buffer safe afterward.
+func waitForTerminalEvent(t *testing.T, sub <-chan bus.Event, runID string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-sub:
+			if ev.RunID == runID && ev.Kind == bus.KindPhase && strings.HasPrefix(ev.Message, "run ") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the run's terminal event")
+		}
+	}
+}
+
+// TestBestEffortCheckpointFailureIsLogged pins the "never silent" half of
+// the policy: a failing mid-step save must not fail the run, but must warn
+// -- six to thirty of these across a run is the only signal recovery has
+// quietly stopped working.
+func TestBestEffortCheckpointFailureIsLogged(t *testing.T) {
+	buf := captureLogs(t)
+	b := bus.New(64)
+	sub, unsubscribe := b.Subscribe(0)
+	defer unsubscribe()
+
+	step := newFakeStep(engine.PhaseDiscover) // no Requires -- no decision gate to cross
+	store := &countingFailStore{Store: engine.NewMemoryStore(), failFrom: 2}
+	e := engine.New(b, store, step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForTerminalEvent(t, sub, run.ID)
+
+	logs := buf.String()
+	if !strings.Contains(logs, "run checkpoint failed") {
+		t.Errorf("logs = %q, want a checkpoint-failed entry", logs)
+	}
+	if !strings.Contains(logs, "level=WARN") {
+		t.Errorf("logs = %q, want a WARN-level entry for the mid-step checkpoint failure", logs)
+	}
+
+	waitState(t, e, run.ID, engine.StateDone)
+}
+
+// terminalOnlyFailStore fails a Save only when the snapshot's State is
+// terminal, so a test can isolate finish()'s own checkpoint from every
+// mid-run one.
+type terminalOnlyFailStore struct {
+	engine.Store
+}
+
+func (s *terminalOnlyFailStore) Save(ctx context.Context, r *engine.Run) error {
+	if r.State == engine.StateDone || r.State == engine.StateFailed || r.State == engine.StateActive {
+		return errors.New("terminal save failed")
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// TestTerminalSaveFailureIsVisible pins the last leg of the policy:
+// finish's terminal save cannot roll back the run is already terminal --
+// but a failure there must not vanish silently. It must log at error level
+// and publish a bus event, because the real consequence is that the next
+// startup recovers a stale earlier checkpoint instead of finding nothing.
+func TestTerminalSaveFailureIsVisible(t *testing.T) {
+	buf := captureLogs(t)
+	b := bus.New(64)
+	sub, unsubscribe := b.Subscribe(0)
+	defer unsubscribe()
+
+	step := newFakeStep(engine.PhaseDiscover)
+	store := &terminalOnlyFailStore{Store: engine.NewMemoryStore()}
+	e := engine.New(b, store, step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// Drain for the KindError event first: finish() publishes it before the
+	// terminal phase event, and both happen after the failed Save and its
+	// slog.Error call, in that same goroutine's program order -- receiving
+	// either over the channel is what makes the subsequent buf.String() read
+	// safe rather than racing a still-running finish().
+	deadline := time.After(2 * time.Second)
+	foundErrorEvent := false
+drainTerminal:
+	for !foundErrorEvent {
+		select {
+		case ev := <-sub:
+			if ev.RunID == run.ID && ev.Kind == bus.KindError && ev.Level == bus.LevelError {
+				foundErrorEvent = true
+			}
+		case <-deadline:
+			break drainTerminal
+		}
+	}
+	if !foundErrorEvent {
+		t.Fatal("no error-level bus event published for the failed terminal checkpoint")
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "level=ERROR") {
+		t.Errorf("logs = %q, want an ERROR-level entry for the terminal checkpoint failure", logs)
+	}
+
+	waitState(t, e, run.ID, engine.StateDone)
 }

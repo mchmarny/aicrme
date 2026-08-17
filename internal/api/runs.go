@@ -60,7 +60,11 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed request", http.StatusBadRequest)
 		return
 	}
-	if err := s.engine.Decide(r.PathValue("id"), decisions); err != nil {
+	// engine.Decide takes no context parameter for the same reason as
+	// engine.Get -- see handleGetRun. Its own Save call now reaches
+	// context.Background() bounded by an explicit timeout (Task 5 of
+	// 2b-ii); threading r.Context() through is Task 7's job.
+	if err := s.engine.Decide(r.PathValue("id"), decisions); err != nil { //nolint:contextcheck // see handleGetRun
 		writeErr(w, err)
 		return
 	}
