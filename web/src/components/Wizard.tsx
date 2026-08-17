@@ -45,6 +45,15 @@ export interface RunState {
    * as false everywhere.
    */
   recovered?: boolean
+  /**
+   * Artifacts the store dropped from this run's checkpoint to fit its size
+   * limit (internal/engine/envelope.go's encodeRun), carried on the recovery
+   * marker's Data. Non-empty means Retry cannot work: recovery rewinds to
+   * Bundle, and internal/steps/bundle.go reads snapshot.yaml, which is the
+   * first artifact shed. The record is honest about the loss; this is what
+   * lets the console be.
+   */
+  truncated?: string[]
 }
 
 /**
@@ -65,6 +74,17 @@ function isCapabilityReport(data: unknown): data is CapabilityReport {
 
 function isRecipeSummary(data: unknown): data is RecipeSummary {
   return typeof data === 'object' && data !== null && 'componentCount' in data && 'components' in data
+}
+
+/**
+ * isRecoveryMarkerData matches internal/engine/recover.go's
+ * recoveryMarkerData. The field is omitted entirely for an intact record, so
+ * its presence is the signal -- an empty array would be indistinguishable
+ * from "not carried".
+ */
+function isRecoveryMarkerData(data: unknown): data is { truncated: string[] } {
+  return typeof data === 'object' && data !== null && 'truncated' in data
+    && Array.isArray((data as { truncated: unknown }).truncated)
 }
 
 /**
@@ -137,6 +157,7 @@ export function deriveRunState(events: AicrEvent[]): RunState {
       // gains the flag.
       case 'recovered':
         out.recovered = true
+        if (isRecoveryMarkerData(e.data)) out.truncated = e.data.truncated
         break
     }
 
@@ -233,6 +254,14 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
   // exist at all. Empty for a run that never reached Apply.
   const components = deriveComponents(events, run.recipe?.components.map(c => c.name))
   const showOwnError = run.state === 'failed' && run.error && run.error !== RECOVERY_INTERRUPTED_ERROR
+  // The record lost artifacts to the size guard, so a retry resumes at a step
+  // that will read one of them and fail. Retry is still offered rather than
+  // hidden: suppressing it would be a confident claim resting on the current
+  // step slice (only Discover produces an artifact large enough to trigger
+  // shedding, so every truncated record happens to sit at or past Recommend,
+  // which reads it) -- an accidental property, not a structural one, and
+  // removing the only forward action on an accident is worse than warning.
+  const truncated = run.truncated ?? []
 
   return (
     <section data-testid="recovered-run" className="mx-auto max-w-2xl space-y-5">
@@ -251,6 +280,16 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
             </li>
           ))}
         </ul>
+      )}
+
+      {truncated.length > 0 && (
+        <p data-testid="recovery-truncated" className="rounded border border-amber-900 bg-amber-950/30 p-3 text-xs text-amber-400">
+          This run's checkpoint was too large to store in full, so{' '}
+          <span className="font-mono">{truncated.join(', ')}</span>{' '}
+          {truncated.length === 1 ? 'was' : 'were'} dropped from it. Retrying will
+          almost certainly fail at the first step that needs one of them —
+          discarding and starting over is the reliable way forward.
+        </p>
       )}
 
       <p className="text-xs text-slate-500">

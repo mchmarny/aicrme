@@ -112,17 +112,23 @@ func gunzipJSON(blob []byte, v any) error {
 // naming each dropped key in envelope.Truncated. Every other checkpoint in
 // this engine is best-effort-with-a-warning; this makes the size guard behave
 // the same way, because the alternative is a run no operator action can free
-// (see maxPayload). Largest-first is not arbitrary: snapshot.yaml dominates
-// the record on any real cluster, and it is the artifact a recovered run
-// needs least -- recovery rewinds to Bundle, past Discover and Recommend, so
-// the smaller recipe.json it actually reads is the last thing shed rather
-// than the first.
+// (see maxPayload).
+//
+// Largest-first minimizes HOW MUCH IS LOST -- the fewest artifacts shed to get
+// under the cap -- and nothing more than that. It does NOT preserve
+// retryability, and an earlier version of this comment claimed it did, on the
+// reasoning that recovery rewinds to Bundle and Bundle reads only the small
+// recipe.json. That is wrong: internal/steps/bundle.go reads recipe.json AND
+// decodeSnapshot(run.Artifacts["snapshot.yaml"]), so wherever shedding fires
+// at all, snapshot.yaml is the first thing to go and the rewound retry fails
+// immediately at decodeSnapshot. Truncation is a one-way door for this run.
 //
 // What survives is the state machine itself: ID, state, phase, StepIndex,
-// decisions, and the component projection. A retry that then needs a shed
-// artifact fails at that step with a legible error and the operator can
-// discard -- which is a worse outcome than a complete record, and a far
-// better one than a console with no reachable action at all.
+// decisions, and the component projection. That is enough to recover the run
+// as a record an operator can see and discard, which is the point -- a worse
+// outcome than a complete record, and a far better one than a console with no
+// reachable action at all. Run.Truncated carries the loss out of the store so
+// the console can say so instead of offering a retry that cannot work.
 //
 // It still fails closed when there is nothing left to shed: a record whose
 // decisions and component rows alone exceed the limit is not a large
@@ -142,6 +148,13 @@ func encodeRun(r *Run) ([]byte, error) {
 		StartedAt:  r.StartedAt,
 		UpdatedAt:  r.UpdatedAt,
 		Artifacts:  make(map[string][]byte, len(r.Artifacts)),
+		// Carried forward, not recomputed. A run recovered from a truncated
+		// record no longer HAS the shed artifact, so re-encoding it would fit
+		// on the first try and produce a record claiming completeness while
+		// still missing everything the first truncation dropped. A shed key
+		// is absent from r.Artifacts by definition, so the loop below can
+		// never append a duplicate.
+		Truncated: append([]string(nil), r.Truncated...),
 	}
 	for k, v := range r.Artifacts {
 		if ephemeralArtifacts[k] {
@@ -221,6 +234,7 @@ func decodeRun(blob []byte) (*Run, error) {
 		StartedAt:  env.StartedAt,
 		UpdatedAt:  env.UpdatedAt,
 		Artifacts:  env.Artifacts,
+		Truncated:  env.Truncated,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

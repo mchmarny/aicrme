@@ -246,10 +246,14 @@ function recoveryEvents(
   state: string,
   error?: string,
   components: Array<{ name: string; status: string }> = [],
+  truncated?: string[],
 ): AicrEvent[] {
   const out: AicrEvent[] = [{
     id: 1, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:00:00Z', kind: 'recovered', level: 'warn',
     phase, message: 'recovered a previous run; retry or discard it before starting a new one',
+    // internal/engine/recover.go omits Data entirely for an intact record,
+    // so its absence is meaningful and this mirrors that.
+    ...(truncated ? { data: { truncated } } : {}),
   }]
   components.forEach((c, i) => {
     out.push({
@@ -427,6 +431,31 @@ describe('Wizard: a recovered run', () => {
 
     expect(screen.queryByTestId('recovered-run')).toBeNull()
     expect(screen.queryByTestId('recovery-discard')).toBeNull()
+  })
+
+  // A truncated checkpoint cannot be retried: recovery rewinds to Bundle, and
+  // internal/steps/bundle.go reads snapshot.yaml, which is the first artifact
+  // the size guard sheds. The record has always named the loss; without this
+  // the console offered "Retry this run" for a record whose retry is a dead
+  // end -- honest storage, dishonest UI.
+  it('warns that a truncated checkpoint cannot be retried, naming what was dropped', () => {
+    render(<Wizard events={recoveryEvents(
+      'apply', 'failed', 'interrupted by a console restart', [], ['snapshot.yaml'])} />)
+
+    const note = screen.getByTestId('recovery-truncated')
+    expect(note.textContent).toMatch(/snapshot\.yaml/)
+    expect(note.textContent).toMatch(/too large to store in full/)
+    expect(note.textContent).toMatch(/discarding and starting over/i)
+    // Retry stays reachable rather than hidden: suppressing it would rest on
+    // the current step slice happening to guarantee failure, which is an
+    // accident of today's steps, not a structural property.
+    expect(screen.getByTestId('recovery-retry')).toBeDefined()
+    expect(screen.getByTestId('recovery-discard')).toBeDefined()
+  })
+
+  it('shows no truncation warning for an intact recovered record', () => {
+    render(<Wizard events={recoveryEvents('apply', 'failed', 'interrupted by a console restart')} />)
+    expect(screen.queryByTestId('recovery-truncated')).toBeNull()
   })
 
   it('leaves an ordinary failure on the cockpit rather than the recovery panel', () => {

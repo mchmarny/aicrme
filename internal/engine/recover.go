@@ -311,6 +311,17 @@ type bootstrapComponentData struct {
 // all (any `helm upgrade` of a release that has completed one demo).
 const recoveryMarkerMsg = "recovered a previous run; retry or discard it before starting a new one"
 
+// recoveryMarkerData is the KindRecovered event's Data payload. It exists so
+// the console can distinguish a recovered run that can be retried from one
+// whose checkpoint lost artifacts to the size guard -- for the latter, Retry
+// is guaranteed to fail at the first step that reads a dropped key
+// (internal/steps/bundle.go reads snapshot.yaml, which is the first artifact
+// shed), so offering it unqualified would be the console lying about a
+// record that was itself honest.
+type recoveryMarkerData struct {
+	Truncated []string `json:"truncated,omitempty"`
+}
+
 // publishRecoveryBootstrap tells the SPA about a recovered run over the bus
 // rather than a second fetch path: the stream is already the SPA's source
 // of truth (web/src/components/Wizard.tsx's deriveRunState and
@@ -332,9 +343,17 @@ const recoveryMarkerMsg = "recovered a previous run; retry or discard it before 
 // follows, and because a subscriber reading the stream top-down should learn
 // what it is looking at before it looks at it.
 func (e *Engine) publishRecoveryBootstrap(r *Run) {
+	// Data carries the shed-artifact list so the console can say a retry
+	// cannot work rather than offering one that fails at the first step
+	// needing what the store dropped. Omitted entirely for the ordinary case,
+	// so the field's presence means something.
+	var data json.RawMessage
+	if len(r.Truncated) > 0 {
+		data, _ = json.Marshal(recoveryMarkerData{Truncated: r.Truncated})
+	}
 	e.bus.Publish(bus.Event{
 		RunID: r.ID, Kind: bus.KindRecovered, Phase: string(r.Phase),
-		Level: bus.LevelWarn, Message: recoveryMarkerMsg,
+		Level: bus.LevelWarn, Message: recoveryMarkerMsg, Data: data,
 	})
 	for _, c := range r.Components {
 		// ComponentState and bootstrapComponentData share the same field

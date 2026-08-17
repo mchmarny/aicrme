@@ -143,7 +143,7 @@ func TestEncodeShedsOversizedArtifactsRatherThanFailing(t *testing.T) {
 		t.Error("snapshot.yaml survived, want the largest artifact shed first")
 	}
 	if _, ok := out.Artifacts["recipe.json"]; !ok {
-		t.Error("recipe.json was shed, want shedding to stop as soon as the record fits -- recovery rewinds to Bundle, which reads exactly this artifact")
+		t.Error("recipe.json was shed, want shedding to stop as soon as the record fits -- largest-first exists to minimize what is lost, not to keep the run retryable (Bundle reads snapshot.yaml too, so a truncated run cannot be retried at all)")
 	}
 	if in.Artifacts["snapshot.yaml"] == nil {
 		t.Error("encodeRun mutated the caller's run")
@@ -286,4 +286,78 @@ func gzipBombForTest(t *testing.T, size int) []byte {
 		t.Fatalf("close: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// TestTruncatedSurvivesTheRoundTrip is what makes the console able to say a
+// retry cannot work. The record was already honest about the loss --
+// envelope.Truncated named it -- but decodeRun dropped the field on the way
+// out, so nothing in the process knew, and the recovery panel offered "Retry
+// this run" for a record whose retry fails at the first step reading a
+// dropped key.
+func TestTruncatedSurvivesTheRoundTrip(t *testing.T) {
+	in := testRun()
+	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if len(out.Truncated) != 1 || out.Truncated[0] != "snapshot.yaml" {
+		t.Errorf("Run.Truncated = %v, want [snapshot.yaml] -- a decoded record must carry its own incompleteness", out.Truncated)
+	}
+	if len(in.Truncated) != 0 {
+		t.Error("encodeRun mutated the caller's run")
+	}
+}
+
+// A record that fits leaves Run.Truncated empty, so the flag means something
+// rather than being set on every load.
+func TestTruncatedEmptyOnAnIntactRecord(t *testing.T) {
+	blob, err := encodeRun(testRun())
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if len(out.Truncated) != 0 {
+		t.Errorf("Run.Truncated = %v, want empty for an intact record", out.Truncated)
+	}
+}
+
+// The loss must be sticky across saves. A run recovered from a truncated
+// record no longer holds the shed artifact, so re-encoding it fits on the
+// first try -- and if Truncated were recomputed rather than carried forward,
+// the very next checkpoint would produce a record claiming completeness while
+// still missing everything the first truncation dropped.
+func TestTruncatedIsCarriedForwardOnRewrite(t *testing.T) {
+	in := testRun()
+	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	recovered, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+
+	// The record this process would write next, from the run it recovered.
+	rewritten, err := encodeRun(recovered)
+	if err != nil {
+		t.Fatalf("encodeRun(recovered) error = %v", err)
+	}
+	out, err := decodeRun(rewritten)
+	if err != nil {
+		t.Fatalf("decodeRun(rewritten) error = %v", err)
+	}
+	if len(out.Truncated) != 1 || out.Truncated[0] != "snapshot.yaml" {
+		t.Errorf("Run.Truncated after a rewrite = %v, want [snapshot.yaml] still named", out.Truncated)
+	}
 }

@@ -65,6 +65,18 @@ type Run struct {
 	Err       string    `json:"error,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// Truncated names artifacts the store dropped to fit its size limit (see
+	// encodeRun). It is read-mostly state about the RECORD, not the run: the
+	// engine never sets it, decodeRun populates it on load, and encodeRun
+	// carries it forward so a record that has already lost an artifact keeps
+	// saying so on every subsequent save.
+	//
+	// It exists because a truncated record cannot be retried -- Bundle reads
+	// snapshot.yaml, which is the first artifact shed -- so a console that
+	// only knew the record was recoverable would offer a Retry guaranteed to
+	// fail at the step it resumes on. The record was honest about the loss;
+	// this is what makes the console honest too.
+	Truncated []string `json:"truncated,omitempty"`
 }
 
 // ComponentState is the latest known state of one component the bundle
@@ -91,5 +103,6 @@ func (r *Run) Clone() *Run {
 	}
 	out.Pending = append([]string(nil), r.Pending...)
 	out.Components = append([]ComponentState(nil), r.Components...)
+	out.Truncated = append([]string(nil), r.Truncated...)
 	return &out
 }
