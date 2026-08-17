@@ -20,6 +20,11 @@ func (o *Observer) onAdd(obj any) {
 	case *appsv1.DaemonSet:
 		o.workload[dsKey(t)] = dsSummary(t)
 	case *appsv1.Deployment:
+		// Deliberately without onDeployment's observedGeneration gate: that
+		// gate suppresses *emission* of a status describing the previous
+		// spec, and this path emits nothing. Seeding a mid-rollout pairing is
+		// harmless -- the next update compares against it and publishes the
+		// difference.
 		o.workload[deployKey(t)] = deploySummary(t)
 	case *corev1.Node:
 		o.gpuQty[nodeKey(t)] = nodeGPUs(t)
