@@ -31,10 +31,13 @@ func (o *Observer) onAdd(obj any) {
 	}
 }
 
-// onDelete drops the cache entry so a delete-then-recreate of the same name
-// does not inherit the old object's state. DeletedFinalStateUnknown is the
-// tombstone client-go delivers when a watch gap meant the final object was
-// missed.
+// onDelete releases the cache entry. This is memory hygiene, not
+// correctness: stateKey carries the object's UID, so a recreate already gets
+// a fresh key and cannot inherit the deleted object's state either way.
+// Without it, o.workload and o.gpuQty retain one permanently unreachable
+// entry per deleted object for the life of the process.
+// DeletedFinalStateUnknown is the tombstone client-go delivers when a watch
+// gap meant the final object was missed.
 func (o *Observer) onDelete(obj any) {
 	if tomb, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tomb.Obj

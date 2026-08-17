@@ -371,8 +371,14 @@ func TestNodeEquivalentQuantitySerializationsAreOneState(t *testing.T) {
 }
 
 // A node already at capacity when the console started must never be
-// narrated as a transition from zero -- the first sighting records a
-// baseline, it does not emit.
+// narrated as a transition from zero.
+//
+// Note which mechanism actually carries this end to end: onAdd seeds gpuQty
+// from the informer's initial list, so by the time the Update below arrives
+// `had` is already true and onNode's prev.Cmp(cur) == 0 early return fires
+// first. The `if !had` first-sighting guard is unreachable from here --
+// replacing it with `_ = had` leaves this test green. It is pinned directly
+// in handlers_internal_test.go instead.
 func TestNodeAlreadyAtCapacityIsNotNarratedAsZeroToEight(t *testing.T) {
 	initial := node("gpu-node-2", "8")
 	client := fake.NewSimpleClientset(initial)
@@ -396,10 +402,18 @@ func TestNodeAlreadyAtCapacityIsNotNarratedAsZeroToEight(t *testing.T) {
 	}
 }
 
-// A delete-then-recreate of the same name must not inherit the deleted
-// object's cached state: the recreate's own Add must not emit, and the
-// update that follows it must be diffed against the recreate's baseline.
-func TestDeleteThenRecreateDoesNotInheritState(t *testing.T) {
+// What this actually pins: the recreate's own Add re-seeds the baseline
+// silently, and the update that follows is diffed against that baseline
+// rather than against the pre-delete state.
+//
+// It does NOT pin onDelete, and it cannot: stateKey carries the object's UID
+// (handlers.go), and daemonSet() hardcodes UID "ds-uid", so the recreate here
+// reuses the deleted object's key and its own onAdd overwrites the stale
+// entry whether or not onDelete ran. With a realistic distinct UID the
+// recreate gets a fresh key and cannot inherit either -- state inheritance is
+// precluded by the key itself, in both directions. onDelete is memory
+// hygiene, and handlers_internal_test.go is where that is pinned.
+func TestRecreatedWorkloadIsDiffedAgainstItsOwnAddBaseline(t *testing.T) {
 	initial := daemonSet("gpu-operator", "nvidia-driver-daemonset", 8, 8)
 	client := fake.NewSimpleClientset(initial)
 	b := bus.New(256)
