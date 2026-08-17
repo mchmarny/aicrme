@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -498,5 +499,40 @@ func TestConfigMapStoreSerializesWrites(t *testing.T) {
 	}
 	if len(list.Items) != 1 {
 		t.Errorf("ConfigMaps = %d, want exactly 1 after %d concurrent Saves", len(list.Items), writers)
+	}
+}
+
+// TestConfigMapStoreCallTimeoutReturnsRatherThanBlockingForever pins Ruling
+// 15: every ConfigMap call this store issues is bounded on its own,
+// regardless of what the caller's context does or does not enforce.
+// client-go's fake clientset does not consult ctx at all when invoking a
+// reactor (verified against k8s.io/client-go/gentype.FakeClient.Get, which
+// discards its ctx parameter before calling Invokes) -- so a reactor that
+// blocks forever hangs the calling goroutine unconditionally, exactly what
+// a wedged real API server looks like from this store's perspective.
+// context.Background() is used deliberately: the property under test is
+// that the store enforces its own bound even when the caller supplies none.
+func TestConfigMapStoreCallTimeoutReturnsRatherThanBlockingForever(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	hang := make(chan struct{}) // never closed: a permanently wedged API server
+	client.PrependReactor("get", "configmaps", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		<-hang
+		return false, nil, nil
+	})
+	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+
+	start := time.Now()
+	err := s.Save(context.Background(), &engine.Run{ID: "run-a"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Save() error = nil, want the store's own call timeout to surface against a reactor that never returns")
+	}
+	// Generous relative to the store's own bound (cmStoreCallTimeout, 10s):
+	// this asserts "returned promptly," not an exact deadline, so it stays
+	// robust against scheduler noise under -race without also accepting
+	// "eventually" as a passing outcome.
+	if elapsed > 20*time.Second {
+		t.Errorf("Save() took %s to return against a hung reactor, want it bounded near the store's own call timeout, not blocking indefinitely", elapsed)
 	}
 }

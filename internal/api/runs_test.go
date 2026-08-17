@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -462,5 +463,162 @@ func TestRequestCancellationReachesTheStore(t *testing.T) {
 
 	if !store.canceled {
 		t.Error("store.Load's context was not canceled -- the request context was not threaded through to it")
+	}
+}
+
+// retryProbeStep fails its first Run (driving the run to StateFailed so
+// Retry is legal), then on every later Run blocks until released and
+// records whether its own context was ever canceled while blocked. It is
+// the regression test's only way to observe the execution context
+// handleRetry hands to the relaunched step -- there is no legal way to read
+// it from outside internal/engine.
+type retryProbeStep struct {
+	mu       sync.Mutex
+	attempt  int
+	entered  chan struct{}
+	release  chan struct{}
+	canceled bool
+}
+
+func (*retryProbeStep) Phase() engine.Phase { return engine.PhaseApply }
+func (*retryProbeStep) Requires() []string  { return nil }
+
+func (s *retryProbeStep) Run(ctx context.Context, _ *engine.Run, _ engine.Emit) error {
+	s.mu.Lock()
+	s.attempt++
+	first := s.attempt == 1
+	s.mu.Unlock()
+	if first {
+		return errors.New("boom")
+	}
+	close(s.entered)
+	<-s.release
+	s.mu.Lock()
+	s.canceled = ctx.Err() != nil
+	s.mu.Unlock()
+	return nil
+}
+
+// Canceled reports whether the step's context was ever observed canceled.
+// Locked, not a raw field read: the write happens on the engine's own
+// execute goroutine, synchronized with a caller here only through
+// pollDirectRunState's e.mu-mediated happens-before chain (see that
+// function's comment) -- reading through the same mutex the write used
+// keeps that property robust rather than relying on the chain alone.
+func (s *retryProbeStep) Canceled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.canceled
+}
+
+// pollDirectRunState drives GET /api/runs/{id} directly through h (no
+// network) until it reports want or 2 seconds pass. Both this function's
+// callers in TestRetryExecutionSurvivesRequestCancellation rely on it for
+// more than convenience: engine.Get takes e.mu, and finish (which sets the
+// terminal state this polls for) takes e.mu too, so observing the state
+// change here is also what makes reading retryProbeStep.Canceled()
+// afterwards race-free -- Retry itself returns as soon as the run is
+// registered, well before the relaunched step's Run (and its write to
+// canceled) has necessarily completed, so the HTTP response alone is not a
+// safe synchronization point for that read.
+func pollDirectRunState(t *testing.T, h http.Handler, cookie *http.Cookie, id string, want engine.State) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last engine.Run
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/"+id, nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if decErr := json.NewDecoder(rec.Body).Decode(&last); decErr != nil {
+			t.Fatalf("decode error = %v", decErr)
+		}
+		if last.State == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("run never reached state %q, last = %q", want, last.State)
+}
+
+// TestRetryExecutionSurvivesRequestCancellation is the regression test for
+// handleRetry's context.WithoutCancel(r.Context()) call: reverting it to
+// r.Context() reintroduces "a closed browser tab cancels a 10-20 minute
+// Apply retry mid-flight" while every other test in this package and
+// internal/engine stays green, which is exactly why this needed its own
+// test rather than relying on the suite to catch it incidentally.
+func TestRetryExecutionSurvivesRequestCancellation(t *testing.T) {
+	b := bus.New(64)
+	step := &retryProbeStep{entered: make(chan struct{}), release: make(chan struct{})}
+	e := engine.New(b, engine.NewMemoryStore(), step)
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+	}, b, e, testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	h := srv.Handler()
+	cookie := directLogin(t, h)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/runs", strings.NewReader("{}"))
+	createReq.AddCookie(cookie)
+	createRec := httptest.NewRecorder()
+	h.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusAccepted {
+		t.Fatalf("create status = %d, want %d", createRec.Code, http.StatusAccepted)
+	}
+	var created engine.Run
+	if decErr := json.NewDecoder(createRec.Body).Decode(&created); decErr != nil {
+		t.Fatalf("decode error = %v", decErr)
+	}
+
+	pollDirectRunState(t, h, cookie, created.ID, engine.StateFailed)
+
+	// Retry with a cancelable context, canceled only once the relaunched
+	// step is confirmed mid-flight -- a context canceled before the request
+	// is even sent would never reach the handler at all with a real
+	// net/http.Client (the Transport refuses to send an already-canceled
+	// request), which is why this drives the handler directly rather than
+	// through httptest.Server.
+	ctx, cancel := context.WithCancel(context.Background())
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/runs/"+created.ID+"/retry", nil).WithContext(ctx)
+	retryReq.AddCookie(cookie)
+	retryRec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(retryRec, retryReq)
+		close(done)
+	}()
+
+	select {
+	case <-step.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retried step was never entered")
+	}
+	cancel()
+	// A generous window for an incorrectly-threaded cancellation to
+	// propagate to the step's context before it is inspected below.
+	time.Sleep(50 * time.Millisecond)
+	close(step.release)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry request never returned")
+	}
+	if retryRec.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want %d", retryRec.Code, http.StatusOK)
+	}
+
+	// Retry (and so the HTTP response above) returns as soon as the run is
+	// registered, not once the relaunched step finishes -- wait for the
+	// run's own terminal state before reading Canceled(), see
+	// pollDirectRunState's comment for why that also makes the read safe.
+	pollDirectRunState(t, h, cookie, created.ID, engine.StateDone)
+
+	if step.Canceled() {
+		t.Error("the retried step's context was canceled by the request's own cancellation -- handleRetry must detach the execution context")
 	}
 }

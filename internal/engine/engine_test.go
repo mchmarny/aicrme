@@ -1568,6 +1568,66 @@ func TestDecideSucceedsAndPersists(t *testing.T) {
 	waitState(t, e, run.ID, engine.StateDone)
 }
 
+// ctxRespectingStore's Save fails if the context it is handed is already
+// canceled. memoryStore (which it wraps) ignores context entirely, so it
+// cannot distinguish a save Decide detached from one it didn't -- this is
+// what makes that distinction observable from a test.
+type ctxRespectingStore struct {
+	engine.Store
+}
+
+func (s *ctxRespectingStore) Save(ctx context.Context, r *engine.Run) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// TestDecideSurvivesAnAlreadyCanceledCallerContext is the regression test
+// for engine.go's context.WithoutCancel(ctx) inside Decide: reverting it to
+// a bare ctx reintroduces "a browser tab closed the instant before Decide's
+// save reaches the store silently discards the operator's decision" while
+// every other Decide test stays green -- all four existing ones pass
+// context.Background(), never a canceled or mid-cancel context, so none of
+// them can catch this. The property asserted is the one that actually
+// matters: not merely that the save observed a non-canceled context, but
+// that the decision is both accepted (nil error) and durably persisted
+// (read back through LoadCurrent, not just Get's in-memory copy) despite
+// the caller's context being canceled before Decide is ever called.
+func TestDecideSurvivesAnAlreadyCanceledCallerContext(t *testing.T) {
+	b := bus.New(64)
+	step := newFakeStep(engine.PhaseApply, "apply")
+	inner := engine.NewMemoryStore()
+	store := &ctxRespectingStore{Store: inner}
+	e := engine.New(b, store, step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before Decide is even called, not mid-flight
+
+	if decErr := e.Decide(ctx, run.ID, map[string]string{"apply": "yes"}); decErr != nil {
+		t.Fatalf("Decide() error = %v, want nil -- an already-canceled caller context must not fail the save", decErr)
+	}
+
+	persisted, err := inner.LoadCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("LoadCurrent() error = %v", err)
+	}
+	if persisted.Decisions["apply"] != "yes" {
+		t.Errorf("persisted Decisions[\"apply\"] = %q, want \"yes\" -- the decision did not survive an already-canceled caller context", persisted.Decisions["apply"])
+	}
+	if persisted.State != engine.StateRunning {
+		t.Errorf("persisted State = %q, want %q", persisted.State, engine.StateRunning)
+	}
+
+	waitState(t, e, run.ID, engine.StateDone)
+}
+
 // countingSaveStore counts every Save call so a test can assert exactly how
 // many happened across a narrow window.
 type countingSaveStore struct {

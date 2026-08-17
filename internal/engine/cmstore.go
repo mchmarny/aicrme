@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"sync"
+	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,69 @@ const payloadKey = "run"
 // belt to that braces, and it is bounded because an unbounded retry against a
 // genuinely contended object is an infinite loop, not resilience.
 const maxConflictRetries = 5
+
+// cmStoreCallTimeout bounds every ConfigMap API call this store issues, on
+// behalf of every caller -- Get's Load, Retry's checkpoint Save, and
+// Discard's Delete previously relied on nothing but the raw caller context,
+// which internal/api's handlers thread from the request today (Task 7).
+// Once main.go wires this store in for real, a wedged API server -- a
+// control-plane partition, a stuck proxy, anything that accepts a
+// connection and never answers -- would otherwise hang the HTTP request
+// that triggered it indefinitely: main.go sets no http.Server.WriteTimeout,
+// and this store cannot assume every caller remembers to supply its own
+// deadline. Ruling 15: the store is what knows it performs network I/O, so
+// the guarantee belongs here, not at each call site.
+//
+// Composes with a caller's own shorter deadline rather than replacing it --
+// nested context.WithTimeout calls always resolve to the earlier of the two
+// deadlines, so Decide's decideSaveTimeout (5s, engine.go) still governs its
+// own save even though this bound is longer. The two are not duplicates and
+// neither should be collapsed into the other: decideSaveTimeout also
+// detaches cancellation (context.WithoutCancel) so an already-acknowledged
+// operator decision survives a canceled caller context, a concern this
+// timeout does not address at all -- see engine.go's Decide.
+const cmStoreCallTimeout = 10 * time.Second
+
+// withCallTimeout runs fn against a context bounded by cmStoreCallTimeout
+// (composed with ctx's own deadline, see cmStoreCallTimeout's comment) and
+// returns as soon as either fn completes or the bound expires, whichever
+// comes first.
+//
+// fn runs in its own goroutine because the bound must hold even against a
+// callee that does not itself respect context cancellation. That is exactly
+// the case for client-go's fake clientset, which this package's own tests
+// use: its generated Get/Create/Update/Delete methods discard ctx entirely
+// before invoking a reactor (verified against
+// k8s.io/client-go/gentype.FakeClient.Get), so a reactor that blocks
+// ignores any deadline passed in unless something outside the fake itself
+// enforces one -- which is what this function is for. A timed-out fn's
+// goroutine is abandoned, not stopped (Go has no way to preempt a running
+// goroutine); it is left to exit on its own whenever whatever it was
+// blocked on eventually resolves. This call's caller is unblocked either
+// way, which is the property that matters to an HTTP request waiting on it.
+func withCallTimeout[T any](ctx context.Context, fn func(context.Context) (T, error)) (T, error) {
+	ctx, cancel := context.WithTimeout(ctx, cmStoreCallTimeout)
+	defer cancel()
+
+	type result struct {
+		val T
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := fn(ctx)
+		done <- result{v, err}
+	}()
+
+	select {
+	case r := <-done:
+		return r.val, r.err
+	case <-ctx.Done():
+		var zero T
+		return zero, aicrerrors.Wrap(aicrerrors.ErrCodeTimeout,
+			"ConfigMap call did not complete within the store's call timeout", ctx.Err())
+	}
+}
 
 type configMapStore struct {
 	client    kubernetes.Interface
@@ -66,7 +130,19 @@ func (s *configMapStore) Save(ctx context.Context, r *Run) error {
 	if err != nil {
 		return err
 	}
+	_, err = withCallTimeout(ctx, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.save(ctx, blob)
+	})
+	return err
+}
 
+// save is Save's body, split out so withCallTimeout can run it in its own
+// goroutine. s.mu.Lock is acquired in here rather than in Save itself: if it
+// were acquired before withCallTimeout is even called, a Save contending
+// against an already-wedged prior Save (whose goroutine is still holding mu,
+// abandoned past its own timeout) would block on Lock before the timeout
+// logic ever ran, defeating the bound entirely.
+func (s *configMapStore) save(ctx context.Context, blob []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -140,6 +216,10 @@ func foreignOwner(existing []metav1.OwnerReference, want types.UID) bool {
 // recover" -- that is exactly the mistake that would let a new run overwrite
 // a record that was merely unreadable at that moment.
 func (s *configMapStore) LoadCurrent(ctx context.Context) (*Run, error) {
+	return withCallTimeout(ctx, s.loadCurrent)
+}
+
+func (s *configMapStore) loadCurrent(ctx context.Context) (*Run, error) {
 	cm, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeNotFound,
@@ -176,6 +256,16 @@ func (s *configMapStore) Load(ctx context.Context, id string) (*Run, error) {
 // Delete removes the ConfigMap. A missing ConfigMap is success: the caller's
 // intent (no checkpoint should remain) is already satisfied.
 func (s *configMapStore) Delete(ctx context.Context) error {
+	_, err := withCallTimeout(ctx, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.delete(ctx)
+	})
+	return err
+}
+
+// delete is Delete's body, split out for the same reason save is: s.mu.Lock
+// must happen inside the goroutine withCallTimeout races against the bound,
+// not before it is spawned.
+func (s *configMapStore) delete(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
