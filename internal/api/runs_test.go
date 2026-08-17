@@ -541,12 +541,227 @@ func pollDirectRunState(t *testing.T, h http.Handler, cookie *http.Cookie, id st
 	t.Fatalf("run never reached state %q, last = %q", want, last.State)
 }
 
+// saveCtxProbeStore blocks one chosen Save call until released, then records
+// the ctx.Err() that call was handed. That context is the only thing
+// handleCreateRun's and handleRetry's context.WithoutCancel actually governs:
+// engine.Start and engine.Retry each pass their caller's context straight to
+// store.Save (internal/engine/engine.go), and each rolls the run back and
+// launches no goroutine at all if that Save fails.
+//
+// Probing the STORE, not the step, is the point. A step's context comes from
+// engine.Retry's own context.WithoutCancel a few lines further down, so a
+// test that watches the step passes whether or not the handler detached
+// anything -- which is exactly how TestRetryExecutionSurvivesRequestCancellation
+// (below) went green against the bug its comment names. Nothing but the
+// checkpoint context distinguishes the two.
+//
+// It embeds a real store rather than stubbing every method, so Load,
+// LoadCurrent, and Delete behave normally and only Save is instrumented.
+type saveCtxProbeStore struct {
+	engine.Store
+
+	entered chan struct{}
+	release chan struct{}
+
+	mu       sync.Mutex
+	armed    bool
+	probed   bool
+	observed error
+}
+
+// Arm makes the next Save the probed one. Called at the point in each test
+// where the interesting checkpoint is about to be issued, rather than
+// counting Save calls from process start -- the number of checkpoints a run
+// takes before that point is an engine implementation detail no test in this
+// package should have to track.
+func (s *saveCtxProbeStore) Arm() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.armed = true
+}
+
+func (s *saveCtxProbeStore) Save(ctx context.Context, r *engine.Run) error {
+	s.mu.Lock()
+	probe := s.armed && !s.probed
+	if probe {
+		s.probed = true
+	}
+	s.mu.Unlock()
+	if !probe {
+		return s.Store.Save(ctx, r)
+	}
+
+	close(s.entered)
+	<-s.release
+	err := ctx.Err()
+	s.mu.Lock()
+	s.observed = err
+	s.mu.Unlock()
+	if err != nil {
+		// A real store fails a write under a canceled context; returning nil
+		// here would hide the rollback that failure triggers and leave only
+		// the recorded error to fail on.
+		return err
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// Observed reports the ctx.Err() the probed Save saw, or nil if it was never
+// reached.
+func (s *saveCtxProbeStore) Observed() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.observed
+}
+
+// awaitProbe blocks until the probed Save is in flight, cancels the request,
+// gives an incorrectly-threaded cancellation a generous window to reach the
+// store's context, and releases the call.
+func awaitProbe(t *testing.T, store *saveCtxProbeStore, cancel context.CancelFunc) {
+	t.Helper()
+	select {
+	case <-store.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the probed checkpoint Save was never reached")
+	}
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	close(store.release)
+}
+
+func newProbeStore() *saveCtxProbeStore {
+	return &saveCtxProbeStore{
+		Store:   engine.NewMemoryStore(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+// TestCreateRunCheckpointSurvivesRequestCancellation is handleCreateRun's
+// half of the contract, which had no test at all. engine.Start writes its
+// first checkpoint before launching the run's goroutine and rolls the whole
+// run back if that write fails, so a request context reaching it means a
+// browser tab closing during the round trip leaves no run started and a 500
+// where the SPA expects a 202.
+func TestCreateRunCheckpointSurvivesRequestCancellation(t *testing.T) {
+	b := bus.New(64)
+	store := newProbeStore()
+	store.Arm() // Start's own checkpoint is the very first Save this store sees.
+	e := engine.New(b, store, failingStep{})
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+	}, b, e, testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	h := srv.Handler()
+	cookie := directLogin(t, h)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/api/runs", strings.NewReader("{}")).WithContext(ctx)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	awaitProbe(t, store, cancel)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("create request never returned after the checkpoint unblocked")
+	}
+
+	if got := store.Observed(); got != nil {
+		t.Errorf("Start's checkpoint context was canceled (%v) by the request's own cancellation -- handleCreateRun must detach the execution context, or a closed tab rolls the run back before its goroutine is ever launched", got)
+	}
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("create status = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+}
+
+// TestRetryCheckpointSurvivesRequestCancellation is the assertion
+// TestRetryExecutionSurvivesRequestCancellation below was supposed to make.
+// That test is satisfied by engine.Retry's own context.WithoutCancel on the
+// execution context, so reverting handleRetry to r.Context() leaves it -- and
+// the rest of internal/api -- green. This one watches the retry checkpoint
+// instead, which is governed by nothing but the handler's choice.
+func TestRetryCheckpointSurvivesRequestCancellation(t *testing.T) {
+	b := bus.New(64)
+	store := newProbeStore()
+	e := engine.New(b, store, failingStep{})
+	srv, err := api.New(api.Config{
+		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
+		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+	}, b, e, testfs.Static())
+	if err != nil {
+		t.Fatalf("api.New() error = %v", err)
+	}
+	h := srv.Handler()
+	cookie := directLogin(t, h)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/runs", strings.NewReader("{}"))
+	createReq.AddCookie(cookie)
+	createRec := httptest.NewRecorder()
+	h.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusAccepted {
+		t.Fatalf("create status = %d, want %d", createRec.Code, http.StatusAccepted)
+	}
+	var created engine.Run
+	if decErr := json.NewDecoder(createRec.Body).Decode(&created); decErr != nil {
+		t.Fatalf("decode error = %v", decErr)
+	}
+	pollDirectRunState(t, h, cookie, created.ID, engine.StateFailed)
+
+	// Armed only now: everything before this is the failing run's own
+	// checkpoints, and the next Save is Retry's.
+	store.Arm()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/runs/"+created.ID+"/retry", nil).WithContext(ctx)
+	retryReq.AddCookie(cookie)
+	retryRec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(retryRec, retryReq)
+		close(done)
+	}()
+
+	awaitProbe(t, store, cancel)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry request never returned after the checkpoint unblocked")
+	}
+
+	if got := store.Observed(); got != nil {
+		t.Errorf("Retry's checkpoint context was canceled (%v) by the request's own cancellation -- handleRetry must detach the execution context, or a closed tab rolls the retry back to StateFailed and no goroutine is ever launched", got)
+	}
+	if retryRec.Code != http.StatusOK {
+		t.Errorf("retry status = %d, want %d", retryRec.Code, http.StatusOK)
+	}
+}
+
 // TestRetryExecutionSurvivesRequestCancellation is the regression test for
 // handleRetry's context.WithoutCancel(r.Context()) call: reverting it to
 // r.Context() reintroduces "a closed browser tab cancels a 10-20 minute
 // Apply retry mid-flight" while every other test in this package and
 // internal/engine stays green, which is exactly why this needed its own
 // test rather than relying on the suite to catch it incidentally.
+//
+// Kept, but it is not the assertion its name promises: the step's context
+// comes from engine.Retry's own context.WithoutCancel (internal/engine/
+// engine.go), so this passes with handleRetry reverted. What it does still
+// pin is that the engine's detachment holds, which is worth keeping.
+// TestRetryCheckpointSurvivesRequestCancellation above is what bites on the
+// handler.
 func TestRetryExecutionSurvivesRequestCancellation(t *testing.T) {
 	b := bus.New(64)
 	step := &retryProbeStep{entered: make(chan struct{}), release: make(chan struct{})}
