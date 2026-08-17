@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -607,23 +608,110 @@ func TestConfigMapStoreLoadByID(t *testing.T) {
 	}
 }
 
-// This proves what it can actually prove against a fake clientset: 20
-// concurrent Save calls all complete without error and converge on exactly
-// one ConfigMap. It does NOT distinguish a mutex-protected Save from an
-// unprotected one -- k8s.io/client-go/testing's ObjectTracker deliberately
-// does not enforce resourceVersion on Update (see its versionedObject
-// comment: "Object content does not get changed to preserve the
-// traditional behavior"), so there is no staleness here for the retry loop
-// to ever detect, and every individual Get/Create/Update is already atomic
-// under the tracker's own lock regardless of configMapStore's mutex. What
-// actually carries this test without the mutex is the IsAlreadyExists retry
-// on the very first Create race: verified by removing s.mu from Save and
-// running this test 25 times under -race (5 runs x 5, then a 20-run batch)
-// with all 25 passing. The mutex's real justification is documented at its
-// declaration in cmstore.go, not here.
+// resourceVersionGuard is the optimistic-concurrency check
+// k8s.io/client-go/testing's ObjectTracker deliberately does not perform (see
+// its versionedObject comment: "Object content does not get changed to
+// preserve the traditional behavior"). Without it there is no staleness for
+// configMapStore's retry loop to detect, so a test over the bare fake cannot
+// tell a mutex-protected Save from an unprotected one at all -- which is
+// exactly how the previous version of the test below passed with both of
+// cmstore.go's mutex lines deleted.
+//
+// It also widens the read-to-write window with a short sleep. A real API
+// call is milliseconds of network; the fake's is a map lookup, so without
+// this the interleaving the mutex prevents almost never happens and the test
+// would fail only intermittently on the mutation it exists to catch.
+type resourceVersionGuard struct {
+	mu        sync.Mutex
+	version   int
+	updates   int
+	conflicts int
+}
+
+const rvGuardReadDelay = 200 * time.Microsecond
+
+// install wires the guard into client and seeds a record at version 1 owned
+// by owner, so every writer takes the Get/Update path rather than racing on
+// Create.
+func (g *resourceVersionGuard) install(t *testing.T, client *fake.Clientset, owner metav1.OwnerReference) {
+	t.Helper()
+	g.version = 1
+	seed := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       testNamespace,
+			Name:            testName,
+			OwnerReferences: []metav1.OwnerReference{owner},
+			ResourceVersion: "1",
+		},
+		BinaryData: map[string][]byte{payloadKey: []byte("placeholder")},
+	}
+	gvr := corev1.SchemeGroupVersion.WithResource("configmaps")
+	if err := client.Tracker().Create(gvr, seed, testNamespace); err != nil {
+		t.Fatalf("seeding the guarded record failed: %v", err)
+	}
+
+	client.PrependReactor("get", "configmaps", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		time.Sleep(rvGuardReadDelay)
+		return false, nil, nil
+	})
+
+	client.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		cm, ok := action.(k8stesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+		if !ok {
+			return false, nil, nil
+		}
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.updates++
+		// The writer read at some version and is writing back at that same
+		// version; anything else means another writer landed in between.
+		if cm.ResourceVersion != strconv.Itoa(g.version) {
+			g.conflicts++
+			return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), testName,
+				errors.New("stale resourceVersion "+cm.ResourceVersion))
+		}
+		g.version++
+		cm.ResourceVersion = strconv.Itoa(g.version)
+		// Handled here rather than falling through: Fake.Invokes hands each
+		// reactor its own DeepCopy of the action, so a version stamped on this
+		// copy would never reach the default tracker reactor.
+		if err := client.Tracker().Update(gvr, cm, testNamespace); err != nil {
+			return true, nil, err
+		}
+		return true, cm, nil
+	})
+}
+
+func (g *resourceVersionGuard) counts() (updates, conflicts int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.updates, g.conflicts
+}
+
+// TestConfigMapStoreSerializesWrites pins what configMapStore's mutex is
+// actually for: not correctness -- Save overwrites the whole payload, so
+// interleaved writes cannot tear -- but conserving the bounded conflict-retry
+// budget, which exists for writers OUTSIDE this process (a leftover replica
+// mid-rollout, a human `kubectl edit`) and must not be spent on contention
+// this process inflicted on itself.
+//
+// Under resourceVersionGuard, that is directly observable: with the mutex
+// held across each Save's Get and Update, 20 concurrent writers produce
+// exactly 20 Updates and zero conflicts. Delete the mutex and the same 20
+// writers read the same version concurrently, collide, and start burning
+// retries.
+//
+// The counting assertions are the point. "No errors, exactly one ConfigMap"
+// -- what this test used to assert -- holds either way, which is why it
+// passed with both mutex lines removed and quietly disarmed the Tripwire
+// comment it was supposed to be guarding.
 func TestConfigMapStoreSerializesWrites(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+	owner := testOwner()
+	guard := &resourceVersionGuard{}
+	guard.install(t, client, owner)
+
+	s := engine.NewConfigMapStore(client, testNamespace, testName, owner)
 	ctx := context.Background()
 
 	const writers = 20
@@ -643,6 +731,14 @@ func TestConfigMapStoreSerializesWrites(t *testing.T) {
 		if err != nil {
 			t.Errorf("Save() error = %v, want nil under concurrent writers", err)
 		}
+	}
+
+	updates, conflicts := guard.counts()
+	if conflicts != 0 {
+		t.Errorf("the API server rejected %d Update(s) as stale, want 0 -- this process's own Saves are contending with each other and spending a retry budget reserved for external writers", conflicts)
+	}
+	if updates != writers {
+		t.Errorf("Update calls = %d, want exactly %d (one per writer, none retried)", updates, writers)
 	}
 
 	list, err := client.CoreV1().ConfigMaps(testNamespace).List(ctx, metav1.ListOptions{})
