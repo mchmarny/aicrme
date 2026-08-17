@@ -26,8 +26,10 @@ workDir:
   sizeLimit: 1Gi
 
 # Shutdown budget. cmd/aicrme drains HTTP and stops any in-flight run
-# concurrently, bounded by runShutdownTimeout (15s) -- which itself must
-# exceed the applier's 10s process-group kill grace. 45s leaves margin over
-# that 15s worst case; the Kubernetes default of 30s would work today but
-# leaves nothing if either budget grows.
+# concurrently, bounded by runShutdownTimeout (30s) -- which itself must
+# exceed the applier's 10s process-group kill grace plus the engine's 5s
+# terminal-state write. 45s leaves margin over that 30s budget; the
+# Kubernetes default of 30s would leave none at all.
+# test/chart/contract.sh reads both constants from source and pins them
+# against this value, so the two cannot drift apart silently.
 terminationGracePeriodSeconds: 45

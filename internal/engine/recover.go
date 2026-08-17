@@ -224,14 +224,22 @@ func (e *Engine) Recover(ctx context.Context) error {
 		return nil
 	}
 
+	// Pending names the decisions a now-nonexistent awaitDecisions goroutine
+	// was blocked on. No such goroutine survives a restart in any state, so
+	// this clear is unconditional. It used to sit inside the branch below,
+	// which left the one case that most needs it uncovered: a SIGTERM at a
+	// decision gate makes finish() write StateFailed while leaving Pending
+	// populated, so a record already StateFailed on disk recovered as
+	// state=failed pending=[intent platform] -- exactly the self-inconsistent
+	// combination this clear exists to prevent, and the combination the state
+	// machine never otherwise produces. Nothing is lost by dropping it:
+	// Retry re-enters awaitDecisions, which rebuilds Pending from
+	// step.Requires() against the decisions already recorded.
+	r.Pending = nil
+
 	if isLive(r.State) || r.State == StateIdle {
 		r.State = StateFailed
 		r.Err = recoveredErr
-		// Pending named the decisions a now-nonexistent awaitDecisions
-		// goroutine was blocked on. Leaving it set alongside StateFailed
-		// would be a self-inconsistent record -- Pending implies
-		// StateAwaitingDecision -- for Task 4/6 to have to reason about.
-		r.Pending = nil
 	}
 
 	// Rewind on retryability, not on how the run reached its state. The

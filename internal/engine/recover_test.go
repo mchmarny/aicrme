@@ -157,6 +157,41 @@ func TestRecoverClearsPendingOnInterruptedRun(t *testing.T) {
 	}
 }
 
+// TestRecoverClearsPendingOnAlreadyTerminalRun is the case
+// TestRecoverClearsPendingOnInterruptedRun could not reach, because the clear
+// used to live inside Recover's isLive||StateIdle branch: a record that is
+// ALREADY terminal on disk with Pending still populated. That is not a
+// hypothetical shape -- a SIGTERM at a decision gate makes awaitDecisions
+// take its ctx.Done() branch and finish() write StateFailed over a run whose
+// Pending awaitDecisions had just set, so StateFailed+Pending is exactly what
+// the console persists on every shutdown-at-a-gate. StateDone and StateActive
+// cover the terminal states the branch never touched at all.
+func TestRecoverClearsPendingOnAlreadyTerminalRun(t *testing.T) {
+	for _, state := range []engine.State{engine.StateFailed, engine.StateDone, engine.StateActive} {
+		t.Run(string(state), func(t *testing.T) {
+			store := newRecoverStore()
+			run := baseRun(testRunID, state, engine.PhaseRecommend, 1)
+			run.Pending = []string{"intent", "platform"}
+			store.loadCurrent = run
+			e := fourStepEngine(store)
+
+			if err := e.Recover(context.Background()); err != nil {
+				t.Fatalf("Recover() error = %v", err)
+			}
+			got := e.Current()
+			if got == nil {
+				t.Fatal("Current() = nil, want the recovered run installed")
+			}
+			if got.State != state {
+				t.Errorf("State = %q, want %q unchanged -- this run was already terminal", got.State, state)
+			}
+			if len(got.Pending) != 0 {
+				t.Errorf("Pending = %v, want empty -- no awaitDecisions goroutine survives a restart in any state", got.Pending)
+			}
+		})
+	}
+}
+
 // TestRecoverLeavesTerminalRunsAlone pins that StateDone and StateActive
 // restore as-is -- neither implies a dead goroutine the way the non-terminal
 // states do.
