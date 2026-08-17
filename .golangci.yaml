@@ -3,7 +3,14 @@ version: "2"
 # Run configuration
 run:
   go: "1.26"
-  timeout: 5m
+  # 10m, not 5m: the Phase 2b-i observer pulled client-go's informer and
+  # typed-lister machinery into the type-check graph, and the first CI run
+  # after that merge reported "0 issues" and then failed on the 5m timeout
+  # at 5m04s (exit code 4) -- a green lint recorded as a red build. A 2-core
+  # GitHub runner is the slow case; a dev laptop finishes well inside this.
+  # This is the only place the timeout is set; the Makefile deliberately does
+  # not pass --timeout, so local and CI cannot drift apart.
+  timeout: 10m
   tests: true
   modules-download-mode: readonly
   # Queue behind golangci-lint's machine-wide lock instead of failing with

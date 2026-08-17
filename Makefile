@@ -19,8 +19,12 @@ tidy: ## Formats code and tidies modules
 	go mod tidy
 
 .PHONY: lint
+# No --timeout flag on purpose: .golangci.yaml's run.timeout is the single
+# source, and CI runs golangci-lint-action, which reads that file and takes no
+# flag from this target. A flag here would silently override the config locally
+# and let the two diverge.
 lint: ## Lints Go sources
-	golangci-lint run --timeout 5m ./...
+	golangci-lint run ./...
 
 .PHONY: test
 test: ## Runs unit tests with race detector and coverage
