@@ -581,11 +581,12 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		return err
 	}
 
-	// Merge the step's writes back under the lock. Artifacts and Decisions are
-	// the only fields a step may add to; the engine owns everything else. A
-	// step can run for up to twenty minutes (Apply), which is precisely the
-	// window in which this run can be superseded by a retry -- re-check here,
-	// not just at the top of the function.
+	// Merge the step's writes back under the lock. Artifacts, Decisions, and
+	// Components (Task 6: Apply's per-component projection) are the only
+	// fields a step may add to; the engine owns everything else. A step can
+	// run for up to twenty minutes (Apply), which is precisely the window in
+	// which this run can be superseded by a retry -- re-check here, not just
+	// at the top of the function.
 	e.mu.Lock()
 	if !e.aliveLocked(epoch) {
 		e.mu.Unlock()
@@ -597,6 +598,11 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	for k, v := range scratch.Decisions {
 		e.current.Decisions[k] = v
 	}
+	// scratch.Components started as a full clone of e.current.Components
+	// (see the Clone call above) and the step only ever upserts rows in
+	// place, so it is already the complete, current projection -- unlike
+	// Artifacts and Decisions, there is nothing to merge key-by-key.
+	e.current.Components = scratch.Components
 	// Advance the cursor before this checkpoint is taken, not after: the
 	// save below must carry the advanced StepIndex, and it must complete
 	// before the next step begins (it does, trivially -- this call is

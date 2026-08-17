@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -611,5 +612,150 @@ func TestStartWithNoStepsDoesNotPanic(t *testing.T) {
 	final := waitState(t, e, run.ID, engine.StateDone)
 	if final.StepIndex != 0 {
 		t.Errorf("StepIndex = %d, want 0", final.StepIndex)
+	}
+}
+
+// TestRecoverRestoresComponentState pins that a persisted run's per-component
+// projection (Task 1's engine.ComponentState) survives the load-and-install
+// path unmangled: names and their latest status are what let a recovered run
+// redraw the pipeline instead of a bare failure.
+func TestRecoverRestoresComponentState(t *testing.T) {
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateDone, engine.PhaseApply, 4)
+	run.Components = []engine.ComponentState{
+		{Name: "gpu-operator", Index: 1, Total: 2, Status: "installed"},
+		{Name: "kai-scheduler", Index: 2, Total: 2, Status: "installed"},
+	}
+	store.loadCurrent = run
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	got := e.Current()
+	if got == nil {
+		t.Fatal("Current() = nil, want the recovered run installed")
+	}
+	if len(got.Components) != 2 {
+		t.Fatalf("Components = %+v, want exactly 2 rows, unchanged from the persisted record", got.Components)
+	}
+	want := map[string]engine.ComponentState{
+		"gpu-operator":  {Name: "gpu-operator", Index: 1, Total: 2, Status: "installed"},
+		"kai-scheduler": {Name: "kai-scheduler", Index: 2, Total: 2, Status: "installed"},
+	}
+	for _, c := range got.Components {
+		if c != want[c.Name] {
+			t.Errorf("Components row %+v, want %+v", c, want[c.Name])
+		}
+	}
+}
+
+// bootstrapComponentPayload mirrors the JSON shape Recover's bootstrap
+// KindComponent events carry -- the same field names applier.ComponentData
+// uses (internal/applier/parse.go), which is what the SPA's
+// web/src/pipeline.ts isComponentData actually checks. Declared locally
+// rather than imported: internal/engine must not depend on internal/applier.
+type bootstrapComponentPayload struct {
+	Name   string `json:"name"`
+	Index  int    `json:"index"`
+	Total  int    `json:"total"`
+	Status string `json:"status"`
+}
+
+// TestRecoverPublishesBootstrapEvents pins the mechanism that lets a
+// recovered run render as a pipeline with no frontend change: Recover
+// publishes the run's identity and phase, one KindComponent event per
+// persisted component row, and (since this run lands StateFailed) the
+// interruption notice as a distinct KindError event.
+//
+// Every assertion below is exact-count-and-exact-value, not
+// strings.Contains: the brief calls out that the last two tasks each shipped
+// a test that passed while the property it named was broken, because a
+// substring assertion also matched a different, louder event. Counting
+// events by Kind and requiring an exact Message match closes that hole --
+// a neighboring event cannot satisfy "there is exactly one KindPhase event
+// and its Message is exactly 'run failed'".
+func TestRecoverPublishesBootstrapEvents(t *testing.T) {
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateRunning, engine.PhaseApply, 3)
+	run.Components = []engine.ComponentState{
+		{Name: "gpu-operator", Index: 1, Total: 2, Status: "installed"},
+		{Name: "kai-scheduler", Index: 2, Total: 2, Status: "failed"},
+	}
+	store.loadCurrent = run
+
+	b := bus.New(64)
+	e := engine.New(b, store,
+		newFakeStep(engine.PhaseDiscover),
+		newFakeStep(engine.PhaseRecommend),
+		newFakeStep(engine.PhaseBundle),
+		newFakeStep(engine.PhaseApply),
+	)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	events := b.Replay(0)
+	var componentEvents, phaseEvents, errorEvents []bus.Event
+	for _, ev := range events {
+		switch ev.Kind {
+		case bus.KindComponent:
+			componentEvents = append(componentEvents, ev)
+		case bus.KindPhase:
+			phaseEvents = append(phaseEvents, ev)
+		case bus.KindError:
+			errorEvents = append(errorEvents, ev)
+		case bus.KindLog, bus.KindCluster, bus.KindDecision:
+			// Bootstrap never publishes these kinds; nothing to collect.
+		}
+	}
+
+	if len(componentEvents) != 2 {
+		t.Fatalf("component events = %d, want exactly 2 (one per persisted row): %+v", len(componentEvents), componentEvents)
+	}
+	byName := map[string]bootstrapComponentPayload{}
+	for _, ev := range componentEvents {
+		if ev.RunID != testRunID {
+			t.Errorf("component event RunID = %q, want %q", ev.RunID, testRunID)
+		}
+		var p bootstrapComponentPayload
+		if err := json.Unmarshal(ev.Data, &p); err != nil {
+			t.Fatalf("unmarshal component event Data: %v (data=%s)", err, ev.Data)
+		}
+		byName[p.Name] = p
+	}
+	if got := byName["gpu-operator"]; got.Status != "installed" || got.Index != 1 || got.Total != 2 {
+		t.Errorf("gpu-operator payload = %+v, want status=installed index=1 total=2", got)
+	}
+	if got := byName["kai-scheduler"]; got.Status != "failed" || got.Index != 2 || got.Total != 2 {
+		t.Errorf("kai-scheduler payload = %+v, want status=failed index=2 total=2", got)
+	}
+
+	// web/src/components/Wizard.tsx's deriveRunState sets state to 'failed'
+	// only on an exact Message == "run failed" match -- the same wording
+	// engine.go's finish() already uses for a live run, so the recovered
+	// case renders through the identical path.
+	if len(phaseEvents) != 1 {
+		t.Fatalf("phase events = %d, want exactly 1: %+v", len(phaseEvents), phaseEvents)
+	}
+	if phaseEvents[0].RunID != testRunID {
+		t.Errorf("phase event RunID = %q, want %q", phaseEvents[0].RunID, testRunID)
+	}
+	if phaseEvents[0].Phase != string(engine.PhaseApply) {
+		t.Errorf("phase event Phase = %q, want %q", phaseEvents[0].Phase, engine.PhaseApply)
+	}
+	if phaseEvents[0].Message != "run failed" {
+		t.Errorf("phase event Message = %q, want exactly %q", phaseEvents[0].Message, "run failed")
+	}
+
+	if len(errorEvents) != 1 {
+		t.Fatalf("error events = %d, want exactly 1 (the interruption notice): %+v", len(errorEvents), errorEvents)
+	}
+	if errorEvents[0].RunID != testRunID {
+		t.Errorf("error event RunID = %q, want %q", errorEvents[0].RunID, testRunID)
+	}
+	if want := "interrupted by a console restart"; errorEvents[0].Message != want {
+		t.Errorf("error event Message = %q, want exactly %q", errorEvents[0].Message, want)
 	}
 }

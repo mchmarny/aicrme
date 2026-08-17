@@ -3,12 +3,14 @@ package engine
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/mchmarny/aicrme/internal/bus"
 )
 
 // maxLoadAttempts bounds LoadCurrent's retry loop. A pod restarting and the
@@ -247,11 +249,71 @@ func (e *Engine) Recover(ctx context.Context) error {
 	e.recoveredPending = true
 	e.mu.Unlock()
 
+	// bus.Publish takes its own mutex; per the "no store I/O under e.mu"
+	// rule this phase enforces everywhere else, the bootstrap publishes
+	// must run after e.mu.Unlock() too, or nesting the two locks invites
+	// the same lock-ordering hazard the observer's scope accessor already
+	// has to avoid.
+	e.publishRecoveryBootstrap(r)
+
 	// This only ever fires after an unplanned restart, so it is the single
 	// most useful startup line the console can emit -- the bus events Task 6
 	// adds reach the SPA, not the pod's own logs.
 	slog.Info("recovered a persisted run", "run", r.ID, "state", r.State, "step", r.StepIndex, "rewound", rewound)
 	return nil
+}
+
+// bootstrapComponentData is the wire shape a bootstrap KindComponent event
+// carries in Data -- the same field names as applier.ComponentData
+// (internal/applier/parse.go), which is what the SPA's web/src/pipeline.ts
+// isComponentData actually checks. Declared locally rather than imported:
+// internal/engine must not depend on internal/applier, which is a caller of
+// this package (via internal/steps), not a dependency of it.
+type bootstrapComponentData struct {
+	Name   string `json:"name"`
+	Index  int    `json:"index,omitempty"`
+	Total  int    `json:"total,omitempty"`
+	Status string `json:"status"`
+}
+
+// publishRecoveryBootstrap tells the SPA about a recovered run over the bus
+// rather than a second fetch path: the stream is already the SPA's source
+// of truth (web/src/components/Wizard.tsx's deriveRunState and
+// web/src/pipeline.ts's deriveComponents both replay it), so adding a
+// GET /api/runs/current would create a second source needing reconciling
+// against it instead.
+//
+// It publishes, in order: one KindComponent event per persisted component
+// row, so deriveComponents redraws the pipeline; the interruption notice as
+// a distinct KindError event when the run carries one, so the cockpit can
+// say "interrupted by a console restart" instead of a generic failure; and
+// last, the run's identity and phase as a KindPhase event worded exactly
+// "run " + state, matching the message engine.go's finish already uses for
+// a live run, so a recovered run resolves through the identical
+// deriveRunState branch.
+func (e *Engine) publishRecoveryBootstrap(r *Run) {
+	for _, c := range r.Components {
+		// ComponentState and bootstrapComponentData share the same field
+		// names, order, and types (only their json tags differ), so a
+		// direct conversion is what staticcheck's S1016 asks for in place
+		// of a struct literal that just copies the same four fields.
+		data, _ := json.Marshal(bootstrapComponentData(c))
+		e.bus.Publish(bus.Event{
+			RunID: r.ID, Kind: bus.KindComponent, Phase: string(r.Phase),
+			Level: bus.LevelInfo, Component: c.Name,
+			Message: c.Name + " " + c.Status, Data: data,
+		})
+	}
+	if r.Err != "" {
+		e.bus.Publish(bus.Event{
+			RunID: r.ID, Kind: bus.KindError, Phase: string(r.Phase),
+			Level: bus.LevelError, Message: r.Err,
+		})
+	}
+	e.bus.Publish(bus.Event{
+		RunID: r.ID, Kind: bus.KindPhase, Phase: string(r.Phase),
+		Level: levelFor(r.State), Message: "run " + string(r.State),
+	})
 }
 
 // markStoreUnreadable records that a persisted run could not be trusted and
