@@ -136,6 +136,14 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		e.mu.Unlock()
 		return nil, ErrDraining
 	}
+	// Checked before isLive: a recovered run lands StateFailed, which is not
+	// live, so without this the SPA's automatic POST /api/runs on load would
+	// silently replace it before the operator ever saw it.
+	if e.recoveredPending {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"a recovered run is waiting for retry or discard")
+	}
 	if e.current != nil && isLive(e.current.State) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "a run is already in progress")
@@ -576,6 +584,9 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not in a failed state")
 	}
 	prevErr := e.current.Err
+	// Retry is the intended resume path for a recovered run: accepting it
+	// here is the operator action that clears the bootstrap gate in Start.
+	e.recoveredPending = false
 	e.current.State = StateRunning
 	e.current.Err = ""
 	e.current.UpdatedAt = time.Now().UTC()
@@ -617,6 +628,28 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 		e.execute(runCtx, epoch)
 	}()
 	return snapshot, nil
+}
+
+// Discard drops a recovered run and its persisted record, freeing the
+// console to start fresh. Without it, a recovered run would block Start
+// forever -- a worse wedge than the one the block exists to prevent.
+func (e *Engine) Discard(ctx context.Context, runID string) error {
+	e.mu.Lock()
+	if e.current == nil || e.current.ID != runID {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
+	}
+	e.current = nil
+	e.recoveredPending = false
+	e.mu.Unlock()
+
+	// Store I/O deliberately outside the lock: the observer's scope accessor
+	// calls CurrentID and Artifact on a per-watch-event path, and both take
+	// e.mu.
+	if err := e.store.Delete(ctx); err != nil {
+		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "deleting the persisted run failed", err)
+	}
+	return nil
 }
 
 func levelFor(s State) bus.Level {

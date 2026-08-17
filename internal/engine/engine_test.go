@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 )
@@ -950,5 +951,133 @@ func TestCurrentIDDoesNotRequireAClone(t *testing.T) {
 	id, ok := e.CurrentID()
 	if !ok || id != run.ID {
 		t.Errorf("CurrentID() = %q, %v, want %q, true", id, ok, run.ID)
+	}
+}
+
+// TestStartIsRefusedWhileRecoveryIsPending pins the bootstrap contract:
+// web/src/App.tsx posts /api/runs automatically on load, and Start rejected
+// only isLive states -- StateFailed, which is what Recover produces, is not
+// live. Without this refusal, the SPA's routine startup POST silently
+// replaces a recovered run before the operator ever sees it.
+func TestStartIsRefusedWhileRecoveryIsPending(t *testing.T) {
+	store := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateRunning, engine.PhaseDiscover, 0)
+	if err := store.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	_, err := e.Start(context.Background())
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+		t.Fatalf("Start() error = %v, want a StructuredError with ErrCodeConflict while a recovered run is pending", err)
+	}
+	// Start must refuse before touching e.current -- the recovered run must
+	// still be the one installed, not replaced and then rejected.
+	if got := e.Current(); got == nil || got.ID != testRunID {
+		t.Errorf("Current() = %+v, want the recovered run left in place", got)
+	}
+}
+
+// TestRetryClearsRecoveryPending pins Retry as the intended resume path: once
+// it accepts the recovered run and the run reaches a terminal state on its
+// own, Start must behave normally again with no further operator action.
+func TestRetryClearsRecoveryPending(t *testing.T) {
+	store := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateRunning, engine.PhaseApply, 3)
+	if err := store.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	if _, err := e.Retry(testRunID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	waitState(t, e, testRunID, engine.StateDone)
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v, want nil once the run is terminal and Retry has cleared recoveredPending", err)
+	}
+}
+
+// TestDiscardClearsRecoveryPendingAndDeletes pins Discard's whole contract in
+// one test: without it, a recovered run blocks Start forever and the console
+// can never begin a new run -- a worse wedge than the bug the block exists to
+// prevent.
+func TestDiscardClearsRecoveryPendingAndDeletes(t *testing.T) {
+	store := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateFailed, engine.PhaseDiscover, 0)
+	if err := store.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if got := e.Current(); got == nil {
+		t.Fatal("Current() = nil, want the recovered run installed")
+	}
+
+	if err := e.Discard(context.Background(), testRunID); err != nil {
+		t.Fatalf("Discard() error = %v", err)
+	}
+	if got := e.Current(); got != nil {
+		t.Errorf("Current() = %+v, want nil after Discard", got)
+	}
+
+	_, err := store.LoadCurrent(context.Background())
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeNotFound {
+		t.Errorf("LoadCurrent() error = %v, want ErrCodeNotFound -- Discard must delete the persisted record", err)
+	}
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v, want nil now that the recovered run was discarded", err)
+	}
+}
+
+// TestDiscardRejectsUnknownRunID guards against a stale browser tab
+// discarding a run the operator has since replaced: Discard must check the
+// run ID, not just drop whatever is current.
+func TestDiscardRejectsUnknownRunID(t *testing.T) {
+	store := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateFailed, engine.PhaseDiscover, 0)
+	if err := store.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	err := e.Discard(context.Background(), "not-the-current-run")
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeNotFound {
+		t.Fatalf("Discard() error = %v, want a StructuredError with ErrCodeNotFound for a stale run ID", err)
+	}
+	if got := e.Current(); got == nil || got.ID != testRunID {
+		t.Errorf("Current() = %+v, want the recovered run left untouched by a rejected Discard", got)
+	}
+}
+
+// TestStartIsNormalWithoutRecovery pins the zero value: recoveredPending must
+// default false so a cold start (no Recover call, as internal/api's
+// zero-step-engine suite exercises) behaves exactly as it did before this
+// contract existed.
+func TestStartIsNormalWithoutRecovery(t *testing.T) {
+	e := engine.New(bus.New(64), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v, want nil -- recoveredPending must default false on a cold start", err)
 	}
 }
