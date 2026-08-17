@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
@@ -17,9 +18,19 @@ import (
 const envelopeVersion = 1
 
 // maxPayload bounds the encoded record. Kubernetes caps a ConfigMap at
-// roughly 1MiB; failing at 800KiB with a named error beats letting the API
-// server reject an oversized object with something opaque, and leaves room
-// for the object's own metadata.
+// roughly 1MiB; stopping at 800KiB beats letting the API server reject an
+// oversized object with something opaque, and leaves room for the object's
+// own metadata.
+//
+// Exceeding it sheds artifacts rather than failing the write (see
+// encodeRun). It used to fail closed, and that turned a large cluster into
+// an unusable product: Decide is the one checkpoint that is mandatory rather
+// than best-effort, so an oversized snapshot made it fail deterministically,
+// roll the run back to awaiting_decision, and leave Discard refusing on
+// "run is live" -- no operator action anywhere reached a working console,
+// and a restart only replayed the same oversized artifact. Shedding keeps
+// every write path succeeding; what degrades is durability, loudly and in
+// one named place, instead of the product.
 const maxPayload = 800 << 10
 
 // maxDecompressed bounds what decodeRun will expand. A small stored payload
@@ -51,6 +62,13 @@ type envelope struct {
 	StartedAt  time.Time         `json:"startedAt"`
 	UpdatedAt  time.Time         `json:"updatedAt"`
 	Artifacts  map[string][]byte `json:"artifacts,omitempty"`
+	// Truncated names the artifacts encodeRun dropped to fit maxPayload, so
+	// the record says what is missing rather than looking complete. Added
+	// without bumping envelopeVersion on purpose: it is optional on both
+	// sides, so a record written by this build still decodes in a build
+	// rolled back to the previous image, and bumping the version would turn
+	// a rollback into an unreadable-record degradation for no gain.
+	Truncated []string `json:"truncated,omitempty"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -89,6 +107,27 @@ func gunzipJSON(blob []byte, v any) error {
 
 // encodeRun projects a Run into a compressed envelope. It never mutates the
 // caller's run.
+//
+// A record over maxPayload sheds artifacts, largest first, until it fits,
+// naming each dropped key in envelope.Truncated. Every other checkpoint in
+// this engine is best-effort-with-a-warning; this makes the size guard behave
+// the same way, because the alternative is a run no operator action can free
+// (see maxPayload). Largest-first is not arbitrary: snapshot.yaml dominates
+// the record on any real cluster, and it is the artifact a recovered run
+// needs least -- recovery rewinds to Bundle, past Discover and Recommend, so
+// the smaller recipe.json it actually reads is the last thing shed rather
+// than the first.
+//
+// What survives is the state machine itself: ID, state, phase, StepIndex,
+// decisions, and the component projection. A retry that then needs a shed
+// artifact fails at that step with a legible error and the operator can
+// discard -- which is a worse outcome than a complete record, and a far
+// better one than a console with no reachable action at all.
+//
+// It still fails closed when there is nothing left to shed: a record whose
+// decisions and component rows alone exceed the limit is not a large
+// cluster, it is a bug, and silently persisting a record with fields
+// dropped from the state machine would be worse than refusing.
 func encodeRun(r *Run) ([]byte, error) {
 	env := envelope{
 		Version:    envelopeVersion,
@@ -114,11 +153,48 @@ func encodeRun(r *Run) ([]byte, error) {
 	if err != nil {
 		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "encoding run failed", err)
 	}
+	if len(blob) <= maxPayload {
+		return blob, nil
+	}
+
+	shedBytes := 0
+	for len(env.Artifacts) > 0 && len(blob) > maxPayload {
+		key := largestArtifact(env.Artifacts)
+		shedBytes += len(env.Artifacts[key])
+		delete(env.Artifacts, key)
+		env.Truncated = append(env.Truncated, key)
+		if blob, err = gzipJSON(env); err != nil {
+			return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "encoding run failed", err)
+		}
+	}
 	if len(blob) > maxPayload {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
 			fmt.Sprintf("run state too large to checkpoint: %d bytes compressed, limit %d", len(blob), maxPayload))
 	}
+
+	slog.Warn("run checkpoint exceeded the ConfigMap payload limit; artifacts were dropped so the record could still be written. "+
+		"Durability is degraded: this run is still recoverable as a state machine, but a retry that reads one of the dropped artifacts will fail and the operator will have to discard and start over",
+		"run", r.ID, "dropped", env.Truncated, "droppedBytes", shedBytes,
+		"compressedBytes", len(blob), "limit", maxPayload)
 	return blob, nil
+}
+
+// largestArtifact returns the key of the biggest artifact. Ties break on the
+// key name so the same run always sheds in the same order -- a checkpoint
+// that dropped a different artifact on each save would make a recovered
+// record's contents depend on map iteration order.
+func largestArtifact(artifacts map[string][]byte) string {
+	best := ""
+	found := false
+	for k, v := range artifacts {
+		switch {
+		case !found, len(v) > len(artifacts[best]):
+			best, found = k, true
+		case len(v) == len(artifacts[best]) && k < best:
+			best = k
+		}
+	}
+	return best
 }
 
 // decodeRun reverses encodeRun. An unrecognized version is refused rather
@@ -151,6 +227,13 @@ func decodeRun(blob []byte) (*Run, error) {
 	}
 	if r.Artifacts == nil {
 		r.Artifacts = map[string][]byte{}
+	}
+	// The write side already warned once, in the process that shed them. This
+	// is the read side saying the same thing to whoever is looking at the
+	// startup log of the process that has to live with the consequence.
+	if len(env.Truncated) > 0 {
+		slog.Warn("run checkpoint was written truncated; these artifacts are absent, so a retry that reads one of them will fail and the run has to be discarded instead",
+			"run", env.ID, "dropped", env.Truncated)
 	}
 	return r, nil
 }

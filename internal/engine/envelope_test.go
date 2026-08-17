@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"encoding/base64"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -87,17 +89,149 @@ func TestEncodeCompresses(t *testing.T) {
 	}
 }
 
-func TestEncodeRejectsOversizedPayload(t *testing.T) {
-	in := testRun()
-	// Incompressible, so it cannot be squeezed under the cap. A periodic
-	// fill (e.g. byte(i*7)) is exactly what DEFLATE's LZ77 window crushes --
-	// a 4MiB buffer like that gzips to ~16KiB and never trips maxPayload, so
-	// this needs a genuinely non-repeating source.
-	big := make([]byte, 4<<20)
-	if _, err := rand.Read(big); err != nil {
+// incompressibleBytes returns n bytes no DEFLATE window can crush. A periodic
+// fill (e.g. byte(i*7)) is exactly what LZ77 eats -- a 4MiB buffer like that
+// gzips to ~16KiB and never trips maxPayload -- so every oversize fixture
+// below needs a genuinely non-repeating source.
+func incompressibleBytes(t *testing.T, n int) []byte {
+	t.Helper()
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
 		t.Fatalf("rand.Read() error = %v", err)
 	}
-	in.Artifacts["snapshot.yaml"] = big
+	return b
+}
+
+// TestEncodeShedsOversizedArtifactsRatherThanFailing is I5's subject: an
+// oversized record must still be persistable. Failing the encode instead made
+// Decide -- the one mandatory checkpoint -- fail deterministically, roll the
+// run back to awaiting_decision, and leave Discard refusing because that
+// state is live, with no operator action anywhere that reached a working
+// console. Shedding the artifact that will not fit degrades durability
+// instead of the product.
+func TestEncodeShedsOversizedArtifactsRatherThanFailing(t *testing.T) {
+	in := testRun()
+	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
+	in.Artifacts["recipe.json"] = []byte(`{"components":[{"name":"gpu-operator"}]}`)
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v, want the oversized artifact shed rather than the write failed", err)
+	}
+	if len(blob) > maxPayload {
+		t.Errorf("encoded size %d exceeds maxPayload %d -- shedding must actually bring the record under the cap", len(blob), maxPayload)
+	}
+
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	// The state machine is what recovery actually needs, and all of it must
+	// survive: a truncated record that lost StepIndex or Decisions would be
+	// worse than no record at all.
+	if out.ID != in.ID || out.State != in.State || out.Phase != in.Phase || out.StepIndex != in.StepIndex {
+		t.Errorf("scalar fields drifted on a truncated record: %+v", out)
+	}
+	if out.Decisions["intent"] != "inference" {
+		t.Errorf("Decisions = %v, want them preserved on a truncated record", out.Decisions)
+	}
+	if len(out.Components) != 1 || out.Components[0].Name != "nfd" {
+		t.Errorf("Components = %v, want the projection preserved on a truncated record", out.Components)
+	}
+	// Largest first: the 1MiB snapshot goes, the 40-byte recipe stays.
+	if _, ok := out.Artifacts["snapshot.yaml"]; ok {
+		t.Error("snapshot.yaml survived, want the largest artifact shed first")
+	}
+	if _, ok := out.Artifacts["recipe.json"]; !ok {
+		t.Error("recipe.json was shed, want shedding to stop as soon as the record fits -- recovery rewinds to Bundle, which reads exactly this artifact")
+	}
+	if in.Artifacts["snapshot.yaml"] == nil {
+		t.Error("encodeRun mutated the caller's run")
+	}
+}
+
+// The record must say what is missing rather than looking complete: a
+// truncated envelope that decoded as an ordinary one would present a run as
+// fully recoverable when a retry is going to fail on the first artifact read.
+func TestEncodeNamesTheArtifactsItShed(t *testing.T) {
+	in := testRun()
+	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	var env envelope
+	if err := gunzipJSON(blob, &env); err != nil {
+		t.Fatalf("gunzipJSON() error = %v", err)
+	}
+	if len(env.Truncated) != 1 || env.Truncated[0] != "snapshot.yaml" {
+		t.Errorf("Truncated = %v, want exactly [snapshot.yaml]", env.Truncated)
+	}
+}
+
+// A record that fits keeps Truncated empty: the marker must mean something,
+// not be set on every write.
+func TestEncodeLeavesTruncatedEmptyWhenTheRecordFits(t *testing.T) {
+	blob, err := encodeRun(testRun())
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	var env envelope
+	if err := gunzipJSON(blob, &env); err != nil {
+		t.Fatalf("gunzipJSON() error = %v", err)
+	}
+	if len(env.Truncated) != 0 {
+		t.Errorf("Truncated = %v, want empty for a record that fits", env.Truncated)
+	}
+}
+
+// Shedding must be deterministic, not map-iteration-order dependent: two
+// saves of the same run that dropped different artifacts would make a
+// recovered record's contents unpredictable. Two equally oversized artifacts
+// leave exactly one survivor, and it must be the same one every time.
+func TestEncodeShedsDeterministically(t *testing.T) {
+	blobs := make([]string, 0, 5)
+	for range 5 {
+		in := testRun()
+		big := incompressibleBytes(t, 600<<10)
+		// Same length, so only the tie-break on key name can decide.
+		in.Artifacts["aaa.bin"] = big
+		in.Artifacts["zzz.bin"] = append([]byte(nil), big...)
+
+		blob, err := encodeRun(in)
+		if err != nil {
+			t.Fatalf("encodeRun() error = %v", err)
+		}
+		out, err := decodeRun(blob)
+		if err != nil {
+			t.Fatalf("decodeRun() error = %v", err)
+		}
+		keys := make([]string, 0, len(out.Artifacts))
+		for k := range out.Artifacts {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		blobs = append(blobs, strings.Join(keys, ","))
+	}
+	for i, got := range blobs {
+		if got != blobs[0] {
+			t.Fatalf("run %d shed a different set (%q) than run 0 (%q) -- shedding depends on map iteration order", i, got, blobs[0])
+		}
+	}
+}
+
+// The guard still fails closed where shedding cannot help: nothing here is an
+// artifact, so there is nothing to drop, and silently persisting a record
+// missing pieces of the state machine itself would be worse than refusing.
+func TestEncodeRejectsOversizedPayload(t *testing.T) {
+	in := testRun()
+	in.Artifacts = map[string][]byte{}
+	// Incompressible decision values: base64 of random bytes uses 64 symbols,
+	// so DEFLATE recovers at most ~25% and 2MiB of it stays well past the cap.
+	big := incompressibleBytes(t, 2<<20)
+	in.Decisions = map[string]string{"intent": base64.RawStdEncoding.EncodeToString(big)}
+
 	if _, err := encodeRun(in); err == nil {
 		t.Fatal("encodeRun() error = nil, want ErrTooLarge")
 	} else if !strings.Contains(err.Error(), "too large") {

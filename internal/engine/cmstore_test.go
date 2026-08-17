@@ -3,6 +3,7 @@ package engine_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 )
 
@@ -649,6 +651,99 @@ func TestConfigMapStoreSerializesWrites(t *testing.T) {
 	}
 	if len(list.Items) != 1 {
 		t.Errorf("ConfigMaps = %d, want exactly 1 after %d concurrent Saves", len(list.Items), writers)
+	}
+}
+
+// waitStateSlow is engine_test.go's waitState with a longer budget. Every
+// checkpoint in the test below gzips a 1MiB incompressible artifact twice --
+// once to find it does not fit, once after shedding it -- and half a dozen of
+// those under -race comfortably outruns waitState's 2s.
+func waitStateSlow(t *testing.T, e *engine.Engine, id string, want engine.State) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var last engine.State
+	for time.Now().Before(deadline) {
+		r, err := e.Get(context.Background(), id)
+		if err == nil {
+			if r.State == want {
+				return
+			}
+			last = r.State
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("run never reached state %q, last = %q", want, last)
+}
+
+// oversizeStep writes an artifact that cannot be compressed under
+// envelope.go's maxPayload, so every checkpoint after it has to deal with a
+// record over the limit. 1MiB of random bytes is past the 800KiB cap on its
+// own and DEFLATE cannot claw any of it back.
+type oversizeStep struct{ phase engine.Phase }
+
+func (s oversizeStep) Phase() engine.Phase { return s.phase }
+func (s oversizeStep) Requires() []string  { return nil }
+func (s oversizeStep) Run(_ context.Context, r *engine.Run, _ engine.Emit) error {
+	big := make([]byte, 1<<20)
+	if _, err := rand.Read(big); err != nil {
+		return err
+	}
+	r.Artifacts["snapshot.yaml"] = big
+	return nil
+}
+
+// TestOversizedStateDoesNotWedgeTheRun is I5's end-to-end consequence, driven
+// through a real configMapStore so the encode path is the production one.
+//
+// Decide is the engine's one mandatory checkpoint. While an oversized record
+// failed the encode outright, a cluster whose snapshot exceeded the limit put
+// the console somewhere no operator action reached: Decide 503'd and rolled
+// the run back to awaiting_decision, Discard refused because that state is
+// live, and a restart replayed the same oversized artifact into the same
+// wall. The run must instead reach StateDone with the record still readable.
+func TestOversizedStateDoesNotWedgeTheRun(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	store := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+	e := engine.New(bus.New(64), store,
+		oversizeStep{phase: engine.PhaseDiscover},
+		newFakeStep(engine.PhaseRecommend, "intent"),
+	)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitStateSlow(t, e, run.ID, engine.StateAwaitingDecision)
+
+	if decErr := e.Decide(context.Background(), run.ID, map[string]string{"intent": "training"}); decErr != nil {
+		t.Fatalf("Decide() error = %v -- an oversized artifact must not fail the one checkpoint the run cannot proceed without", decErr)
+	}
+	waitStateSlow(t, e, run.ID, engine.StateDone)
+
+	// Degraded, not absent: the record is still there and still decodes, so
+	// the next restart recovers a real state machine rather than taking the
+	// unreadable path. Polled rather than read once -- finish() flips
+	// e.current to StateDone under the lock and only then issues its detached
+	// terminal save, so the state Get reports leads the persisted record by
+	// one write.
+	var got *engine.Run
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var loadErr error
+		got, loadErr = store.LoadCurrent(context.Background())
+		if loadErr != nil {
+			t.Fatalf("LoadCurrent() error = %v, want the truncated record still readable", loadErr)
+		}
+		if got.State == engine.StateDone {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got.ID != run.ID || got.State != engine.StateDone {
+		t.Errorf("recovered record = %s/%s, want %s/%s", got.ID, got.State, run.ID, engine.StateDone)
+	}
+	if _, ok := got.Artifacts["snapshot.yaml"]; ok {
+		t.Error("snapshot.yaml survived, want the oversized artifact shed to keep the record writable")
 	}
 }
 
