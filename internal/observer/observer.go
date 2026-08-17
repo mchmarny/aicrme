@@ -89,6 +89,16 @@ func (o *Observer) Start(stopCh <-chan struct{}) error {
 		return err
 	}
 
+	deployInf := factory.Apps().V1().Deployments().Informer()
+	if err := o.register(deployInf, o.onDeployment); err != nil {
+		return err
+	}
+
+	nodeInf := factory.Core().V1().Nodes().Informer()
+	if err := o.register(nodeInf, o.onNode); err != nil {
+		return err
+	}
+
 	factory.Start(stopCh)
 	for typ, ok := range factory.WaitForCacheSync(stopCh) {
 		if !ok {
