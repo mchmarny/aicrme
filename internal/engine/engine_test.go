@@ -606,6 +606,97 @@ func TestCancelAndWaitStopsAnInFlightRun(t *testing.T) {
 	}
 }
 
+// ctxCanceledStore rejects a Save whose context is already dead, the way any
+// store that issues a real API call does -- client-go checks ctx.Err() and
+// returns before the request ever leaves the process. It is the only way this
+// package can observe finish()'s context.WithoutCancel: memoryStore.Save
+// takes `_ context.Context` and ignores it, so with that double alone the
+// entire terminal-save contract is unverified in both directions.
+type ctxCanceledStore struct {
+	engine.Store
+}
+
+func (s *ctxCanceledStore) Save(ctx context.Context, r *engine.Run) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Store.Save(ctx, r)
+}
+
+// TestTerminalStateIsPersistedDespiteCancellation pins the branch's headline
+// contract: finish() detaches the terminal write from the (by then canceled)
+// run context, so shutdown records how the run ended instead of leaving it
+// recorded as running with no goroutine behind it.
+//
+// It asserts through store.Load, never e.Get: e.Get returns
+// e.current.Clone() while the run is still the current one and never touches
+// the store at all, so it reports the in-memory terminal state whether or not
+// the persisted one was ever written. Once 2b-ii swaps in the ConfigMap
+// store, a Save under the canceled run context returns context.Canceled
+// before issuing an API call, and the run is left wedged at `running` across
+// a restart.
+func TestTerminalStateIsPersistedDespiteCancellation(t *testing.T) {
+	t.Run("canceled mid-step", func(t *testing.T) {
+		b := bus.New(64)
+		step := &ctxBlockingStep{phase: engine.PhaseApply, entered: make(chan struct{}, 1)}
+		store := &ctxCanceledStore{Store: engine.NewMemoryStore()}
+		e := engine.New(b, store, step)
+
+		run, err := e.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		select {
+		case <-step.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("step never entered")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+			t.Fatalf("CancelAndWait() error = %v", cancelErr)
+		}
+
+		assertPersistedTerminalState(t, store, run.ID)
+	})
+
+	t.Run("canceled parked at a decision gate", func(t *testing.T) {
+		b := bus.New(64)
+		store := &ctxCanceledStore{Store: engine.NewMemoryStore()}
+		e := engine.New(b, store, newFakeStep(engine.PhaseRecommend, "intent"))
+
+		run, err := e.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		waitState(t, e, run.ID, engine.StateAwaitingDecision)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if cancelErr := e.CancelAndWait(ctx); cancelErr != nil {
+			t.Fatalf("CancelAndWait() error = %v", cancelErr)
+		}
+
+		assertPersistedTerminalState(t, store, run.ID)
+	})
+}
+
+func assertPersistedTerminalState(t *testing.T, store engine.Store, runID string) {
+	t.Helper()
+	saved, err := store.Load(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("store.Load() error = %v", err)
+	}
+	if saved.State != engine.StateFailed {
+		t.Errorf("persisted State = %q, want %q -- the terminal write must not ride the canceled run context",
+			saved.State, engine.StateFailed)
+	}
+	if !strings.Contains(saved.Err, "canceled") {
+		t.Errorf("persisted Err = %q, want it to say the run was canceled", saved.Err)
+	}
+}
+
 func TestCancelAndWaitIsIdempotentAndSafeWithNoRun(t *testing.T) {
 	e := engine.New(bus.New(8), engine.NewMemoryStore(), newFakeStep(engine.PhaseDiscover))
 	ctx := context.Background()
