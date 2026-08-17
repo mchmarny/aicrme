@@ -465,10 +465,11 @@ func (s *saveFailingStore) setFail(v bool) {
 // persisting; if Save then fails and State is left at StateRunning with no
 // goroutine driving it, the run becomes unrecoverable without restarting
 // the process -- Start refuses because isLive(StateRunning) is true, and
-// Retry refuses because it requires StateFailed. This is currently inert
-// (memoryStore.Save never errors) but docs/phase-2-handoff.md's
-// ConfigMap-backed store, landing in 2b-ii, is precisely where Save
-// starts failing for real.
+// Retry refuses because it requires StateFailed. memoryStore.Save itself
+// still never errors, which is why this test wraps it in a fake that can --
+// but that is no longer merely a hypothetical: 2b-ii's ConfigMap-backed
+// store (internal/engine/cmstore.go) is wired into production
+// (cmd/aicrme/main.go) and is precisely where Save starts failing for real.
 func TestRetryFailedSaveLeavesRunRetryable(t *testing.T) {
 	b := bus.New(64)
 	boom := errors.New("boom")
@@ -655,10 +656,12 @@ func (s *ctxCanceledStore) Save(ctx context.Context, r *engine.Run) error {
 // It asserts through store.Load, never e.Get: e.Get returns
 // e.current.Clone() while the run is still the current one and never touches
 // the store at all, so it reports the in-memory terminal state whether or not
-// the persisted one was ever written. Once 2b-ii swaps in the ConfigMap
-// store, a Save under the canceled run context returns context.Canceled
-// before issuing an API call, and the run is left wedged at `running` across
-// a restart.
+// the persisted one was ever written. Now that 2b-ii's ConfigMap store is
+// wired into production (cmd/aicrme/main.go's newRunStore), that distinction
+// is not academic: a Save issued under the canceled run context would return
+// context.Canceled before ever reaching the API server, leaving the run
+// wedged at `running` across a restart -- exactly what finish's detachment
+// above exists to prevent.
 func TestTerminalStateIsPersistedDespiteCancellation(t *testing.T) {
 	t.Run("canceled mid-step", func(t *testing.T) {
 		b := bus.New(64)
