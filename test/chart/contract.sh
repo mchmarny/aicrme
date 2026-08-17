@@ -328,23 +328,25 @@ else
 fi
 
 # --- Invariant 9: the startup budget fits inside the probe that kills for it -
-# Shutdown has three pinned budgets above; startup had none, and its margin was
-# five seconds held up by an accident. cmd/aicrme resolves the run store's
-# ownerReference (deploymentLookupTimeout) and then runs eng.Recover, whose
-# every ConfigMap call is bounded by cmStoreCallTimeout, all BEFORE
-# httpSrv.ListenAndServe -- so against an API server that accepts connections
-# and never answers, nothing serves /healthz until that whole sum elapses, and
-# the probe below starts failing the pod in the meantime. 2b-i's regression was
+# Shutdown has three pinned budgets above; startup had none. cmd/aicrme
+# resolves the run store's ownerReference (deploymentLookupTimeout) and then
+# runs eng.Recover, whose load path retries up to maxLoadAttempts times with
+# every ConfigMap call bounded by cmStoreCallTimeout -- all BEFORE
+# httpSrv.ListenAndServe, so nothing serves /healthz until that sum elapses
+# and the governing probe is already counting failures. 2b-i's regression was
 # exactly this shape (an unbounded WaitForCacheSync ahead of the listener) and
 # cost a permanent CrashLoopBackOff.
 #
-# The accident: loadCurrentRetryable (internal/engine/recover.go) retries
-# ErrCodeInternal only, and a hung API server surfaces as ErrCodeTimeout from
-# withCallTimeout -- so the load does NOT consume all maxLoadAttempts. Widening
-# that set to include ErrCodeTimeout reads like an obvious improvement (a
-# timeout IS transient) and triples the load half of the budget. This
-# assertion reads the retry set from source so that edit fails here instead of
-# in a customer's CrashLoopBackOff.
+# maxLoadAttempts is applied UNCONDITIONALLY rather than inferred from
+# loadCurrentRetryable's membership. The first version of this assertion did
+# infer it, reasoning that a hung API server surfaces as ErrCodeTimeout, which
+# the retry set excludes, so only one attempt runs -- and it certified a 20s
+# budget the shipped configuration did not have. It modeled one failure shape
+# and missed the worse one: a control plane that accepts the connection and
+# then errors (a proxy 504, a reset after ~10s) surfaces as ErrCodeInternal,
+# which IS in the set, so all three attempts run at up to cmStoreCallTimeout
+# each. Any retryable code costs a full window per attempt, so the only budget
+# worth asserting is the one that assumes every attempt is spent.
 echo "== startup budget =="
 
 # probe_num PROBE FIELD DEFAULT — a probe field off the rendered Deployment,
@@ -358,7 +360,9 @@ probe_num() {
 
 # A startupProbe, when present, is what governs startup: Kubernetes disables
 # the liveness and readiness probes entirely until it succeeds. Without one,
-# the liveness probe is the clock, which is the case today.
+# the liveness probe is the clock -- which is a far tighter window, so a chart
+# that drops the startupProbe fails this assertion rather than silently
+# reverting to it.
 if [[ "$(render | doc Deployment | yq -r '.spec.template.spec.containers[] | has("startupProbe")' | val)" == "true" ]]; then
   probe="startupProbe"
 else
@@ -379,18 +383,10 @@ if [[ -z "${lookup_budget}" || -z "${cm_call_budget}" || -z "${max_load_attempts
 elif [[ -z "${probe_initial}" || -z "${probe_period}" || -z "${probe_threshold}" ]]; then
   fail "${probe} readable" "could not read initialDelaySeconds/periodSeconds/failureThreshold for the container's ${probe}"
 else
-  # How many cmStoreCallTimeout windows a hung API server can actually cost
-  # the load path, read from loadCurrentRetryable's own body rather than
-  # assumed.
-  retry_set=$(awk '/^func loadCurrentRetryable/,/^}/' internal/engine/recover.go)
-  if grep -q 'ErrCodeTimeout' <<<"${retry_set}"; then
-    load_attempts="${max_load_attempts}"
-    retry_note="loadCurrentRetryable retries ErrCodeTimeout, so a hung API server consumes all ${max_load_attempts} attempts"
-  else
-    load_attempts=1
-    retry_note="loadCurrentRetryable excludes ErrCodeTimeout, so a hung API server costs one attempt, not ${max_load_attempts}"
-  fi
-  startup_budget=$(( lookup_budget + load_attempts * cm_call_budget ))
+  # Every retryable failure costs a full cmStoreCallTimeout window, and
+  # ErrCodeInternal -- what a control plane that errors after accepting the
+  # connection produces -- is retryable, so the worst case spends all of them.
+  startup_budget=$(( lookup_budget + max_load_attempts * cm_call_budget ))
 
   # The pod dies on the failureThreshold-th CONSECUTIVE failure, so the last
   # probe that can still save it fires at initialDelay + period*(threshold-1),
@@ -400,10 +396,10 @@ else
   kill_at=$(( probe_initial + probe_period * (probe_threshold - 1) ))
 
   if (( startup_budget < kill_at )); then
-    pass "startup budget ${startup_budget}s fits inside the ${probe}'s ${kill_at}s (${retry_note})"
+    pass "startup budget ${startup_budget}s (deploymentLookupTimeout=${lookup_budget}s + maxLoadAttempts=${max_load_attempts} x cmStoreCallTimeout=${cm_call_budget}s) fits inside the ${probe}'s ${kill_at}s"
   else
     fail "startup budget fits the ${probe}" \
-      "worst-case startup is ${startup_budget}s (deploymentLookupTimeout=${lookup_budget}s + ${load_attempts} x cmStoreCallTimeout=${cm_call_budget}s) but the ${probe} kills the pod at ${kill_at}s (initialDelaySeconds=${probe_initial} + periodSeconds=${probe_period} x (failureThreshold=${probe_threshold} - 1)) -- ${retry_note}"
+      "worst-case startup is ${startup_budget}s (deploymentLookupTimeout=${lookup_budget}s + maxLoadAttempts=${max_load_attempts} x cmStoreCallTimeout=${cm_call_budget}s -- an API server that errors after accepting the connection returns ErrCodeInternal, which loadCurrentRetryable retries) but the ${probe} kills the pod at ${kill_at}s (initialDelaySeconds=${probe_initial} + periodSeconds=${probe_period} x (failureThreshold=${probe_threshold} - 1))"
   fi
 fi
 

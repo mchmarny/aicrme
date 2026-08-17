@@ -411,11 +411,19 @@ func main() {
 	// obsStop closes, and obsStop closes only when main returns (the defer
 	// above). A synchronous call here would mean an unreachable, partitioned,
 	// or merely slow API server blocks httpSrv.ListenAndServe() from ever
-	// running, so the chart's liveness probe (initialDelaySeconds: 5,
-	// periodSeconds: 10, default failureThreshold: 3 --
-	// charts/aicrme/templates/deployment.yaml) kills the pod roughly every
-	// 35s: a permanent CrashLoopBackOff of the whole console, caused by the
-	// one subsystem that is supposed to be optional. Handlers are registered
+	// running -- and the chart's probes are already counting against that.
+	// The startupProbe governs until it first succeeds (initialDelaySeconds:
+	// 5, periodSeconds: 5, failureThreshold: 11 --
+	// charts/aicrme/templates/deployment.yaml), which kills the pod at 55s;
+	// once startup has succeeded the livenessProbe takes over and kills on
+	// its third consecutive failure, at 25s. Either way the result of
+	// blocking here is a permanent CrashLoopBackOff of the whole console,
+	// caused by the one subsystem that is supposed to be optional. (A pod
+	// dies on the failureThreshold-th CONSECUTIVE failure, so the last probe
+	// that can still save it fires at initialDelaySeconds + periodSeconds x
+	// (failureThreshold - 1) -- one period earlier than the arithmetic an
+	// earlier version of this comment used, which named a fourth liveness
+	// probe that never runs.) Handlers are registered
 	// before the informer factory starts, so events flow whether or not this
 	// goroutine's Start call has returned yet; its return value is consumed
 	// only for this warning.

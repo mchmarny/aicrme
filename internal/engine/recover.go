@@ -147,19 +147,25 @@ func (e *Engine) validateLoaded(r *Run) error {
 // this case as non-retryable. The code is gated explicitly instead, the
 // same way the rest of this file inspects StructuredError.
 //
-// Excluding ErrCodeTimeout is a startup-budget constraint, not an oversight.
-// It reads like an obvious improvement -- a timeout IS transient -- but
-// ErrCodeTimeout is exactly what cmstore's withCallTimeout returns against an
-// API server that accepts connections and never answers, which is the failure
-// this whole retry loop would otherwise be waiting out three times. Recover
-// runs before :8080 accepts anything, so that wait is dead time the liveness
-// probe is already counting: today's worst case is deploymentLookupTimeout
-// (10s) + one cmStoreCallTimeout (10s) = 20s against a probe that kills the
-// pod at 25s. Adding ErrCodeTimeout here makes it 40s -- a guaranteed
-// CrashLoopBackOff, and the same startup-hang class 2b-i shipped and this
-// phase exists not to repeat. test/chart/contract.sh reads this function's
-// body and fails the build if the set widens without the probe budget
-// widening with it.
+// This set is startup-budget-bearing, and the budget assumes the worst: every
+// member costs up to cmStoreCallTimeout per attempt, maxLoadAttempts of them
+// run back to back, and all of it happens before :8080 accepts anything. That
+// is not hypothetical for ErrCodeInternal -- a control plane that accepts the
+// connection and then errors (a proxy 504, a reset) produces exactly this
+// code after burning its full call timeout, so the realistic worst case is
+// deploymentLookupTimeout + maxLoadAttempts x cmStoreCallTimeout = 40s.
+// test/chart/contract.sh asserts the chart's startupProbe window covers that
+// figure, so raising maxLoadAttempts or cmStoreCallTimeout fails the build
+// unless the probe moves with it.
+//
+// ErrCodeTimeout is left out for a narrower reason, and explicitly NOT as a
+// budget guarantee: an earlier version of that contract assertion inferred
+// "only one attempt can run" from this exclusion and certified a 20s margin
+// the shipped chart did not have, because it modeled a hung server and
+// ignored an erroring one. The real reason is evidential -- a call that
+// already burned its entire cmStoreCallTimeout has told us the server is not
+// answering at all, so two more identical waits buy 20 more seconds of
+// startup for the same answer.
 func loadCurrentRetryable(err error) bool {
 	var se *aicrerrors.StructuredError
 	return errors.As(err, &se) && se.Code == aicrerrors.ErrCodeInternal

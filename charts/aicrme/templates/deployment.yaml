@@ -101,6 +101,27 @@ spec:
               value: /var/lib/aicrme/helm/data
             - name: KUBECACHEDIR
               value: /var/lib/aicrme/kube/cache
+          # Startup, not liveness, is what has to cover the work cmd/aicrme
+          # does before httpSrv.ListenAndServe: resolving the run store's
+          # ownerReference (deploymentLookupTimeout, 10s) and then
+          # eng.Recover, whose load path retries up to maxLoadAttempts times
+          # at cmStoreCallTimeout each. A control plane that accepts the
+          # connection and then errors after its full timeout -- a proxy 504,
+          # a reset -- surfaces as ErrCodeInternal, which IS in
+          # loadCurrentRetryable's set, so all three attempts run: ~40s in
+          # which nothing answers /healthz. The liveness probe alone kills at
+          # 25s, so that was a CrashLoopBackOff waiting for a slow control
+          # plane. A startupProbe disables both liveness and readiness until
+          # it succeeds, and this window allows 55s.
+          # test/chart/contract.sh reads those three Go constants and pins
+          # them against this window, so neither side can move alone.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 11
           readinessProbe:
             httpGet:
               path: /healthz
