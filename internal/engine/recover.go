@@ -146,6 +146,20 @@ func (e *Engine) validateLoaded(r *Run) error {
 // context-based causes, not ErrCodeInternal, so it would silently treat
 // this case as non-retryable. The code is gated explicitly instead, the
 // same way the rest of this file inspects StructuredError.
+//
+// Excluding ErrCodeTimeout is a startup-budget constraint, not an oversight.
+// It reads like an obvious improvement -- a timeout IS transient -- but
+// ErrCodeTimeout is exactly what cmstore's withCallTimeout returns against an
+// API server that accepts connections and never answers, which is the failure
+// this whole retry loop would otherwise be waiting out three times. Recover
+// runs before :8080 accepts anything, so that wait is dead time the liveness
+// probe is already counting: today's worst case is deploymentLookupTimeout
+// (10s) + one cmStoreCallTimeout (10s) = 20s against a probe that kills the
+// pod at 25s. Adding ErrCodeTimeout here makes it 40s -- a guaranteed
+// CrashLoopBackOff, and the same startup-hang class 2b-i shipped and this
+// phase exists not to repeat. test/chart/contract.sh reads this function's
+// body and fails the build if the set widens without the probe budget
+// widening with it.
 func loadCurrentRetryable(err error) bool {
 	var se *aicrerrors.StructuredError
 	return errors.As(err, &se) && se.Code == aicrerrors.ErrCodeInternal
