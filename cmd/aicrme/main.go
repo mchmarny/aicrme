@@ -221,16 +221,24 @@ func resolveDeploymentOwner(ctx context.Context, kube kubernetes.Interface, name
 }
 
 // newRunStore resolves the ConfigMap-backed run store, or falls back to an
-// in-memory one with a warning. kube is nil outside a cluster (rest.
-// InClusterConfig fails on a developer laptop) -- `make build &&
-// ./bin/aicrme` outside a cluster stays a supported development path, so
-// persistence being unavailable must degrade, never fail startup. A
-// resolution error with a live client (RBAC, a control-plane blip, an
-// unusual install order that starts the pod before the Deployment object is
-// visible to its own API server) degrades the same way: recovering a run is
-// a convenience, the console starting is not. Per Ruling 4, this is the only
-// place that ever chooses the store; Engine.store is set once in New and, on
-// the unreadable-record path, reassigned only by Recover itself.
+// in-memory one. kube is nil outside a cluster (rest.InClusterConfig fails
+// on a developer laptop) -- `make build && ./bin/aicrme` outside a cluster
+// stays a supported development path, so this is expected and logs at Warn
+// (the kube client construction above already explains why kube is nil for
+// the telemetry side; this is the persistence-specific consequence, not a
+// second diagnosis of the same cause).
+//
+// A resolution error with a live client is a different animal and logs at
+// Error, not Warn: it means a pod holding cluster-admin cannot look up its
+// own Deployment (RBAC, a control-plane blip, an unusual install order that
+// starts the pod before the Deployment object is visible to its own API
+// server), and /healthz reports identically healthy either way -- this log
+// line is the only signal an operator gets that the durability this whole
+// phase exists to provide has silently gone missing.
+//
+// Per Ruling 4, this is the only place that ever chooses the store;
+// Engine.store is set once in New and, on the unreadable-record path,
+// reassigned only by Recover itself.
 func newRunStore(ctx context.Context, kube kubernetes.Interface, namespace, deploymentName string) engine.Store {
 	if kube == nil {
 		slog.Warn("no cluster client; run state will not survive a pod restart")
@@ -240,7 +248,7 @@ func newRunStore(ctx context.Context, kube kubernetes.Interface, namespace, depl
 	defer cancel()
 	owner, err := resolveDeploymentOwner(lookupCtx, kube, namespace, deploymentName)
 	if err != nil {
-		slog.Warn("resolving the console Deployment for the run store's owner reference failed; run state will not survive a pod restart",
+		slog.Error("resolving the console Deployment for the run store's owner reference failed despite a live cluster client; run state will not survive a pod restart",
 			"deployment", deploymentName, "namespace", namespace, "error", err)
 		return engine.NewMemoryStore()
 	}
@@ -290,15 +298,18 @@ func main() {
 	// outside a cluster is a supported development path. Same degrade-with-a-
 	// warning posture as parseNodeSelector. No defer is registered by this
 	// block, so its position relative to the fatal checks above and below it
-	// does not matter the way it would for one that did.
+	// does not matter the way it would for one that did. This warns about
+	// telemetry only -- newRunStore below logs its own, more specific
+	// warning about persistence for the same nil kube, so this does not
+	// repeat that half of the consequence.
 	var kube kubernetes.Interface
 	// rest.InClusterConfig does no network I/O -- env vars and two file
 	// reads -- so inside a pod kube is essentially always non-nil here; it
 	// is Start below, not this block, that first talks to the API server.
 	if cfg, cfgErr := rest.InClusterConfig(); cfgErr != nil {
-		slog.Warn("no in-cluster config; live cluster telemetry and run persistence disabled", "error", cfgErr)
+		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
 	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
-		slog.Warn("kubernetes client init failed; live cluster telemetry and run persistence disabled", "error", clientErr)
+		slog.Warn("kubernetes client init failed; live cluster telemetry disabled", "error", clientErr)
 	} else {
 		kube = c
 	}
