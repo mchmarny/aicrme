@@ -1,5 +1,12 @@
 name: e2e
+# Mirrors ci.yaml's triggers deliberately. Phases 0-1, 2a, and 2b-i all
+# merged straight to main with no pull request, so a pull_request-only
+# trigger meant these three jobs had never executed in CI at all -- the
+# amd64 coverage this workflow exists to provide was assumed, not observed
+# (every real run to date has been a developer's arm64 Mac).
 on:
+  push:
+    branches: [main]
   pull_request:
 
 permissions:
