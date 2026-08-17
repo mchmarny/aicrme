@@ -243,10 +243,20 @@ fi
 # Raising one without the other is silent until a real Apply is interrupted,
 # so read both and compare.
 SHUTDOWN_SRC="cmd/aicrme/main.go"
-go_seconds() {
+
+# go_const_seconds FILE NAME — reads `const NAME = <n> * time.Second` from a Go
+# source file as whole seconds, or nothing if it is not declared that way.
+go_const_seconds() {
   # [0-9][0-9]* rather than [0-9]\+ : BSD sed's basic regex has no \+.
-  sed -n "s/^const $1 = \([0-9][0-9]*\) \* time.Second$/\1/p" "${SHUTDOWN_SRC}" | head -1
+  sed -n "s/^const $2 = \([0-9][0-9]*\) \* time.Second$/\1/p" "$1" | head -1
 }
+
+# go_const_int FILE NAME — reads a bare `const NAME = <n>`.
+go_const_int() {
+  sed -n "s/^const $2 = \([0-9][0-9]*\)$/\1/p" "$1" | head -1
+}
+
+go_seconds() { go_const_seconds "${SHUTDOWN_SRC}" "$1"; }
 run_budget=$(go_seconds runShutdownTimeout)
 http_budget=$(go_seconds httpShutdownTimeout)
 if [[ -z "${run_budget}" || -z "${http_budget}" ]]; then
@@ -283,6 +293,157 @@ else
     fail "runShutdownTimeout covers the engine's worst case" \
       "runShutdownTimeout=${run_budget}s but cancellation can take killGrace=${kill_grace}s + terminalSaveTimeout=${terminal_save}s"
   fi
+
+  # Decide runs synchronously inside handleDecide, so its own Save call
+  # (bounded by decideSaveTimeout, not the run's execution context -- Task 7
+  # threads request contexts through it) is bounded by the HTTP drain, not
+  # the run-cancellation one. Nothing today stops decideSaveTimeout from
+  # being raised past httpShutdownTimeout and letting shutdown abandon an
+  # in-flight decision write mid-Save; pin it the same way terminal_save is
+  # pinned against run_budget above.
+  decide_save=$(sed -n 's/^const decideSaveTimeout = \([0-9][0-9]*\) \* time.Second$/\1/p' internal/engine/engine.go | head -1)
+  if [[ -z "${decide_save}" ]]; then
+    fail "decideSaveTimeout readable" \
+      "could not read decideSaveTimeout from internal/engine/engine.go as whole seconds"
+  elif (( http_budget >= decide_save )); then
+    pass "httpShutdownTimeout ${http_budget}s covers decideSaveTimeout ${decide_save}s"
+  else
+    fail "httpShutdownTimeout covers Decide's worst case" \
+      "httpShutdownTimeout=${http_budget}s but handleDecide's Save call can take decideSaveTimeout=${decide_save}s"
+  fi
+fi
+
+# --- Invariant 8: single writer against the run ConfigMap ------------------
+# The chart sets replicas: 1 but, with no strategy key, defaults to
+# RollingUpdate, whose maxSurge rounds up to 1 -- so old and new pods overlap
+# during every upgrade. Both would recover from and write to the same run
+# checkpoint concurrently, against a design that assumes exactly one writer.
+# strategy: Recreate accepts a few seconds of downtime on upgrade instead.
+echo "== single writer =="
+strategy_type=$(render | doc Deployment | yq -r '.spec.strategy.type' | val)
+if [[ "${strategy_type}" == "Recreate" ]]; then
+  pass "Deployment strategy is Recreate"
+else
+  fail "Deployment strategy" "got '${strategy_type}', want 'Recreate' -- RollingUpdate overlaps two writers against the same run ConfigMap during every upgrade"
+fi
+
+# --- Invariant 9: the startup budget fits inside the probe that kills for it -
+# Shutdown has three pinned budgets above; startup had none. cmd/aicrme
+# resolves the run store's ownerReference (deploymentLookupTimeout) and then
+# runs eng.Recover, whose load path retries up to maxLoadAttempts times with
+# every ConfigMap call bounded by cmStoreCallTimeout -- all BEFORE
+# httpSrv.ListenAndServe, so nothing serves /healthz until that sum elapses
+# and the governing probe is already counting failures. 2b-i's regression was
+# exactly this shape (an unbounded WaitForCacheSync ahead of the listener) and
+# cost a permanent CrashLoopBackOff.
+#
+# maxLoadAttempts is applied UNCONDITIONALLY rather than inferred from
+# loadCurrentRetryable's membership. The first version of this assertion did
+# infer it, reasoning that a hung API server surfaces as ErrCodeTimeout, which
+# the retry set excludes, so only one attempt runs -- and it certified a 20s
+# budget the shipped configuration did not have. It modeled one failure shape
+# and missed the worse one: a control plane that accepts the connection and
+# then errors (a proxy 504, a reset after ~10s) surfaces as ErrCodeInternal,
+# which IS in the set, so all three attempts run at up to cmStoreCallTimeout
+# each. Any retryable code costs a full window per attempt, so the only budget
+# worth asserting is the one that assumes every attempt is spent.
+echo "== startup budget =="
+
+# probe_num PROBE FIELD DEFAULT — a probe field off the rendered Deployment,
+# falling back to the Kubernetes default when the chart leaves it unset.
+probe_num() {
+  local got
+  got=$(render | doc Deployment | yq -r ".spec.template.spec.containers[].$1.$2" | val)
+  if [[ -z "${got}" ]]; then got="$3"; fi
+  printf '%s' "${got}"
+}
+
+# A startupProbe, when present, is what governs startup: Kubernetes disables
+# the liveness and readiness probes entirely until it succeeds. Without one,
+# the liveness probe is the clock -- which is a far tighter window, so a chart
+# that drops the startupProbe fails this assertion rather than silently
+# reverting to it.
+if [[ "$(render | doc Deployment | yq -r '.spec.template.spec.containers[] | has("startupProbe")' | val)" == "true" ]]; then
+  probe="startupProbe"
+else
+  probe="livenessProbe"
+fi
+
+probe_initial=$(probe_num "${probe}" initialDelaySeconds 0)
+probe_period=$(probe_num "${probe}" periodSeconds 10)
+probe_threshold=$(probe_num "${probe}" failureThreshold 3)
+
+lookup_budget=$(go_const_seconds cmd/aicrme/main.go deploymentLookupTimeout)
+cm_call_budget=$(go_const_seconds internal/engine/cmstore.go cmStoreCallTimeout)
+max_load_attempts=$(go_const_int internal/engine/recover.go maxLoadAttempts)
+
+if [[ -z "${lookup_budget}" || -z "${cm_call_budget}" || -z "${max_load_attempts}" ]]; then
+  fail "startup constants readable" \
+    "could not read deploymentLookupTimeout (cmd/aicrme/main.go), cmStoreCallTimeout (internal/engine/cmstore.go), and maxLoadAttempts (internal/engine/recover.go)"
+elif [[ -z "${probe_initial}" || -z "${probe_period}" || -z "${probe_threshold}" ]]; then
+  fail "${probe} readable" "could not read initialDelaySeconds/periodSeconds/failureThreshold for the container's ${probe}"
+else
+  # Every retryable failure costs a full cmStoreCallTimeout window, and
+  # ErrCodeInternal -- what a control plane that errors after accepting the
+  # connection produces -- is retryable, so the worst case spends all of them.
+  startup_budget=$(( lookup_budget + max_load_attempts * cm_call_budget ))
+
+  # The pod dies on the failureThreshold-th CONSECUTIVE failure, so the last
+  # probe that can still save it fires at initialDelay + period*(threshold-1),
+  # one period earlier than the naive initialDelay + period*threshold. Using
+  # the naive figure would make this assertion pass in a window where the pod
+  # is already being killed.
+  kill_at=$(( probe_initial + probe_period * (probe_threshold - 1) ))
+
+  if (( startup_budget < kill_at )); then
+    pass "startup budget ${startup_budget}s (deploymentLookupTimeout=${lookup_budget}s + maxLoadAttempts=${max_load_attempts} x cmStoreCallTimeout=${cm_call_budget}s) fits inside the ${probe}'s ${kill_at}s"
+  else
+    fail "startup budget fits the ${probe}" \
+      "worst-case startup is ${startup_budget}s (deploymentLookupTimeout=${lookup_budget}s + maxLoadAttempts=${max_load_attempts} x cmStoreCallTimeout=${cm_call_budget}s -- an API server that errors after accepting the connection returns ErrCodeInternal, which loadCurrentRetryable retries) but the ${probe} kills the pod at ${kill_at}s (initialDelaySeconds=${probe_initial} + periodSeconds=${probe_period} x (failureThreshold=${probe_threshold} - 1))"
+  fi
+fi
+
+# --- Invariant 10: the run store's identity is the chart's, not a guess -----
+# main.go resolves the run ConfigMap's ownerReference with ONE Get against
+# AICRME_DEPLOYMENT_NAME, so that env var must name this very Deployment
+# object. If it drifts, the Get 404s, newRunStore logs an error, and the
+# console silently falls back to an in-memory store -- /healthz stays green
+# while the whole phase's durability is gone. Both sides come from
+# aicrme.fullname today; nothing but this asserts they still agree.
+echo "== run store identity =="
+dep_name=$(render | doc Deployment | yq -r '.metadata.name' | val)
+dep_env_name=$(render | doc Deployment |
+               yq -r '.spec.template.spec.containers[].env[] | select(.name == "AICRME_DEPLOYMENT_NAME") | .value' | val)
+if [[ -n "${dep_name}" && "${dep_env_name}" == "${dep_name}" ]]; then
+  pass "AICRME_DEPLOYMENT_NAME (${dep_env_name}) names the Deployment object"
+else
+  fail "AICRME_DEPLOYMENT_NAME" \
+    "env value '${dep_env_name}' does not equal the Deployment's metadata.name '${dep_name}' -- the ownerReference lookup would 404 and run state would silently stop surviving restarts"
+fi
+
+# Checked under a release name the fullname helper does NOT collapse
+# (contains "aicrme" is false), because that is the branch where the two
+# could realistically diverge.
+alt_dep_name=$(helm template other "${CHART}" | doc Deployment | yq -r '.metadata.name' | val)
+alt_env_name=$(helm template other "${CHART}" | doc Deployment |
+               yq -r '.spec.template.spec.containers[].env[] | select(.name == "AICRME_DEPLOYMENT_NAME") | .value' | val)
+if [[ -n "${alt_dep_name}" && "${alt_env_name}" == "${alt_dep_name}" ]]; then
+  pass "AICRME_DEPLOYMENT_NAME follows the Deployment name under a non-collapsing release name (${alt_dep_name})"
+else
+  fail "AICRME_DEPLOYMENT_NAME under an alternate release name" \
+    "env value '${alt_env_name}' does not equal the Deployment's metadata.name '${alt_dep_name}'"
+fi
+
+# The run store's ConfigMap is created at runtime and must never be templated:
+# a templated one reverts to the chart's rendered content on every
+# `helm upgrade`, wiping the state an in-flight Apply is actively
+# checkpointing. main.go names it "<fullname>-run" (runStoreSuffix).
+run_cm=$(render | doc ConfigMap | yq -r '.metadata.name' | grep -c "^${dep_name}-run$" || true)
+if [[ "${run_cm}" == "0" ]]; then
+  pass "no template renders the run store ConfigMap ${dep_name}-run"
+else
+  fail "run store ConfigMap is not templated" \
+    "the chart renders a ConfigMap named ${dep_name}-run -- helm upgrade would revert it to the chart's content and wipe an in-flight run's checkpoints"
 fi
 
 echo

@@ -37,7 +37,10 @@ func TestReplay(t *testing.T) {
 		{name: "caught up", capacity: 8, publish: 3, since: 3, wantIDs: nil},
 		{name: "ring evicts oldest", capacity: 2, publish: 4, since: 0, wantIDs: []uint64{3, 4}},
 		{name: "ring wraps multiple times", capacity: 3, publish: 10, since: 0, wantIDs: []uint64{8, 9, 10}},
-		{name: "since beyond head", capacity: 8, publish: 2, since: 99, wantIDs: nil},
+		// since=99 exceeds nextID (2): an impossible cursor from a previous
+		// process, so it replays everything rather than filtering it all out.
+		// See TestSinceAboveNextIDReplaysEverything for the focused case.
+		{name: "since above nextID replays everything", capacity: 8, publish: 2, since: 99, wantIDs: []uint64{1, 2}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,6 +196,79 @@ func TestSubscribeOrderingUnderConcurrentPublish(t *testing.T) {
 	for i := 1; i < len(got); i++ {
 		if got[i] <= got[i-1] {
 			t.Fatalf("events out of order at index %d: got[%d]=%d, got[%d]=%d", i, i-1, got[i-1], i, got[i])
+		}
+	}
+}
+
+// TestEpochDiffersAcrossBuses proves the epoch is generated per Bus instance,
+// not derived from something two processes started in the same second could
+// share (a timestamp). The SPA's restart detection depends on this: an epoch
+// that collided across a restart would look like no restart happened at all.
+func TestEpochDiffersAcrossBuses(t *testing.T) {
+	b1 := bus.New(8)
+	b2 := bus.New(8)
+
+	if b1.Epoch() == "" {
+		t.Fatal("Epoch() returned an empty string")
+	}
+	if b1.Epoch() == b2.Epoch() {
+		t.Fatalf("two independent Bus instances share an epoch: %q", b1.Epoch())
+	}
+}
+
+// TestSinceBelowNextIDReplaysTheRemainder is the ordinary reconnect case: a
+// cursor from earlier in the same process's run replays only what came
+// after it.
+func TestSinceBelowNextIDReplaysTheRemainder(t *testing.T) {
+	b := bus.New(8)
+	b.Publish(bus.Event{Message: "one"})
+	b.Publish(bus.Event{Message: "two"})
+	b.Publish(bus.Event{Message: "three"})
+
+	got := b.Replay(1) // nextID is 3; since (1) is below it
+	wantIDs := []uint64{2, 3}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("Replay(1) returned %d events, want %d", len(got), len(wantIDs))
+	}
+	for i, want := range wantIDs {
+		if got[i].ID != want {
+			t.Errorf("event[%d].ID = %d, want %d", i, got[i].ID, want)
+		}
+	}
+}
+
+// TestSinceEqualToNextIDReplaysNothing is the boundary: a client fully
+// caught up with the process that issued its cursor gets an empty replay,
+// not the whole backlog.
+func TestSinceEqualToNextIDReplaysNothing(t *testing.T) {
+	b := bus.New(8)
+	b.Publish(bus.Event{Message: "one"})
+	b.Publish(bus.Event{Message: "two"})
+
+	got := b.Replay(2) // nextID is 2; since == nextID
+	if len(got) != 0 {
+		t.Fatalf("Replay(2) returned %d events, want 0", len(got))
+	}
+}
+
+// TestSinceAboveNextIDReplaysEverything is the case a restart produces: the
+// client's cursor was issued by a process that no longer exists, so it sits
+// above the new process's nextID -- a cursor no live process could have
+// handed out. Filtering everything below it (the pre-fix behavior) is the
+// silent-stream bug; replaying from 0 is the fix.
+func TestSinceAboveNextIDReplaysEverything(t *testing.T) {
+	b := bus.New(8)
+	b.Publish(bus.Event{Message: "one"})
+	b.Publish(bus.Event{Message: "two"})
+
+	got := b.Replay(99) // nextID is 2; since (99) is above it
+	wantIDs := []uint64{1, 2}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("Replay(99) returned %d events, want %d", len(got), len(wantIDs))
+	}
+	for i, want := range wantIDs {
+		if got[i].ID != want {
+			t.Errorf("event[%d].ID = %d, want %d", i, got[i].ID, want)
 		}
 	}
 }

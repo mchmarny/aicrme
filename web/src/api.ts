@@ -78,6 +78,21 @@ export async function retryRun(runId: string): Promise<Run> {
 }
 
 /**
+ * discardRun drops a recovered run and its persisted ConfigMap record
+ * (DELETE /api/runs/{id} -> engine.Discard), which is the only thing that
+ * clears the recovery gate for a run Retry refuses: Retry requires
+ * StateFailed, so a run recovered in a terminal state -- notably the `done`
+ * one every `helm upgrade` of a release that has completed a demo recovers --
+ * has no other way out, and POST /api/runs answers 409 until it is gone.
+ *
+ * 204 No Content on success, so there is no body to decode.
+ */
+export async function discardRun(runId: string): Promise<void> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' })
+  if (!res.ok) throw new ApiError(res.status, 'Failed to discard the run')
+}
+
+/**
  * bundleUrl is a plain href rather than a fetch: the browser's own download
  * handling gets the filename from Content-Disposition, and the session
  * cookie rides along on the navigation.

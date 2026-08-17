@@ -519,7 +519,7 @@ Required cases, each its own test function:
 1. `TestConfigMapStoreSaveThenLoadCurrent` — save a run, `LoadCurrent` returns it with artifacts intact.
 2. `TestConfigMapStoreCreatesWithOwnerReference` — after `Save`, the created ConfigMap carries exactly the owner passed to the constructor, and its `Kind` is `Deployment`. Assert on `Kind`, not just presence: a ReplicaSet owner would be garbage-collected on the next rollout, deleting run state.
 3. `TestConfigMapStoreUpdatesExisting` — two saves produce one ConfigMap, not two, and the second's content wins.
-4. `TestConfigMapStoreLoadCurrentNotFound` — no ConfigMap yields an error for which `aicrerrors.Code(err) == aicrerrors.ErrCodeNotFound`. This is the distinction recovery keys on, so assert the *code*, not the message.
+4. `TestConfigMapStoreLoadCurrentNotFound` — no ConfigMap yields an error carrying `aicrerrors.ErrCodeNotFound`. Assert the *code*, not the message, because recovery keys on exactly this distinction. The pinned module exposes no `Code(err)` helper, so use the repo's established pattern: `var se *aicrerrors.StructuredError; errors.As(err, &se) && se.Code == aicrerrors.ErrCodeNotFound`.
 5. `TestConfigMapStoreCorruptRecordIsNotNotFound` — a ConfigMap whose payload is garbage yields an error whose code is **not** `ErrCodeNotFound`.
 6. `TestConfigMapStoreRetriesOnConflict` — prepend a reactor returning `apierrors.NewConflict` for the first `update`, then succeeding; assert `Save` succeeds and that exactly two update attempts were made.
 7. `TestConfigMapStoreGivesUpAfterBoundedConflicts` — a reactor that always conflicts makes `Save` return an error rather than looping forever.
@@ -740,7 +740,11 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 	r, err := e.store.LoadCurrent(ctx)
 	if err != nil {
-		if aicrerrors.Code(err) == aicrerrors.ErrCodeNotFound {
+		// aicr@v0.19.0's errors package exposes no Code(err) helper -- New,
+		// Wrap, IsTransient and friends only -- so the code is reached through
+		// errors.As, matching how the rest of this repo inspects it.
+		var se *aicrerrors.StructuredError
+		if errors.As(err, &se) && se.Code == aicrerrors.ErrCodeNotFound {
 			return nil // cold start, the common case
 		}
 		// Unreadable is NOT absent. Refusing to install it is half the
@@ -840,7 +844,7 @@ does can overwrite state it could not parse."
 Add to `internal/engine/engine_test.go`:
 
 1. `TestStartIsRefusedWhileRecoveryIsPending` — after `Recover` installs a run,
-   `Start` returns an error with `aicrerrors.Code(err) == aicrerrors.ErrCodeConflict`.
+   `Start` returns an error carrying `aicrerrors.ErrCodeConflict` (reached via `errors.As`, as above).
    This is the blocker: the SPA posts `/api/runs` automatically on load and `Start`
    rejects only `isLive` states, so a recovered `StateFailed` run was replaced on the
    normal path before the operator saw it.
@@ -1173,9 +1177,11 @@ Resolve the owner reference to the **Deployment**, build the ConfigMap store whe
 client is non-nil, and call `eng.Recover(ctx)` **before** `httpSrv.ListenAndServe`.
 
 Treat `ErrStepConfig` as fatal (`slog.Error` + `os.Exit(1)`); anything else is already
-handled inside `Recover`. If `eng.StoreUnreadable()` reports true, swap the engine's
-store for `NewMemoryStore()` for the rest of the process so nothing overwrites a record
-it could not read.
+handled inside `Recover`. If `eng.StoreUnreadable()` reports true, **log it — that is all
+main does.** Per Ruling 4, `Recover` performs the store swap itself, because `Engine.store`
+is private and main cannot know the record is unreadable until after `New` has already
+taken the ConfigMap store. Do not go looking for a setter: there isn't one, and adding one
+would reintroduce the chicken-and-egg that ruling resolved.
 
 Recovery runs before serving so the SPA's automatic `POST /api/runs` cannot win the
 race. This does not reintroduce 2b-i's startup-hang class: every ConfigMap call is

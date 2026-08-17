@@ -25,6 +25,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// The epoch identifies this process's Bus. It travels ahead of any
+	// replay so the SPA can detect a restart: nextID resets to 1 on every
+	// process start, so a client's lastId from a previous process looks
+	// like a valid-but-stale cursor rather than an obviously wrong one, and
+	// the stream would otherwise deliver nothing at or below it -- silently.
+	// It is named ("event: epoch") so EventSource routes it to a dedicated
+	// listener instead of onmessage, where run data lands, and it carries no
+	// id: field -- assigning one would advance the very cursor the epoch
+	// exists to let the client correct.
+	fmt.Fprintf(w, "event: epoch\ndata: {\"epoch\":%q}\n\n", s.bus.Epoch())
+	flusher.Flush()
+
 	ch, cancel := s.bus.Subscribe(lastEventID(r))
 	defer cancel()
 
@@ -46,9 +58,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			// id + data only. Naming an `event:` type would route frames away
-			// from the browser's onmessage handler, which is where the SPA
-			// listens; Kind already travels inside the JSON payload.
+			// id + data only, no event: type -- unlike the epoch frame above,
+			// run data must land in the browser's onmessage handler, which is
+			// where the SPA listens; Kind already travels inside the JSON
+			// payload, so there's nothing an event: name would add here.
 			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", ev.ID, payload)
 			flusher.Flush()
 		}

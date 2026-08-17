@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -17,6 +18,16 @@ import (
 // use the (now-dead) step context -- but it also cannot block shutdown
 // indefinitely against an unreachable API server.
 const terminalSaveTimeout = 5 * time.Second
+
+// decideSaveTimeout bounds the checkpoint write Decide issues before
+// acknowledging an operator's decision. Decide takes the caller's context
+// (Task 7) but must not let that context's cancellation govern this write:
+// an operator's decision that already returned 200 must never be silently
+// undone because a browser tab closed mid-save. So Decide detaches the
+// cancellation (context.WithoutCancel) while keeping the context's values,
+// and bounds the write with this timeout instead -- the same shape finish's
+// own detached terminal write already uses.
+const decideSaveTimeout = 5 * time.Second
 
 // canceledByShutdownMsg is Run.Err's message when the run is canceled by
 // console shutdown, whether mid-step or parked at a decision gate. Both
@@ -47,7 +58,18 @@ type Step interface {
 // Engine executes steps in order for a single run. One run at a time: this is
 // a single-replica demo console, not a scheduler.
 type Engine struct {
-	bus   *bus.Bus
+	bus *bus.Bus
+	// store persists run state. Set once in New for the engine's life, with
+	// one exception: Recover's markStoreUnreadable reassigns it under e.mu
+	// when a persisted record cannot be trusted. Every other read of this
+	// field (Start, Retry, Get, runStep, finish, ...) happens without
+	// holding e.mu -- safe only because that reassignment happens exactly
+	// once, during Recover, before any goroutine that could read store
+	// concurrently exists (Recover runs before the HTTP server starts
+	// serving). A future caller reassigning store after startup -- a
+	// "reload from store" action, say -- would need real synchronization
+	// here, not just the lock around the write, or -race would only catch
+	// it intermittently.
 	store Store
 	steps []Step
 
@@ -75,6 +97,22 @@ type Engine struct {
 	// gates the outer mux, so a POST /api/runs that clears the check
 	// microseconds before Drain() still reaches Start.
 	draining bool
+
+	// storeUnreadable is set by Recover when a persisted run existed but
+	// could not be read or failed validation. Recover itself has already
+	// done the half of the work that matters -- swapping store for a fresh
+	// memory store in the same call, so nothing this process subsequently
+	// does can overwrite the record it could not read. This flag exists
+	// purely so main can log the degradation; StoreUnreadable() is its
+	// accessor.
+	storeUnreadable bool
+
+	// recoveredPending is set by Recover when it installs a persisted run as
+	// the current one, and cleared only by an explicit operator action
+	// (Retry, or a discard). While set, the SPA's automatic POST /api/runs
+	// on load must not be allowed to silently replace the recovered run --
+	// Task 4 is where Start and Retry read this flag; Recover only sets it.
+	recoveredPending bool
 
 	// cancel stops the in-flight run's step context; done closes once its
 	// execute goroutine has exited AND persisted a terminal state. A cancel
@@ -109,6 +147,14 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		e.mu.Unlock()
 		return nil, ErrDraining
 	}
+	// Checked before isLive: a recovered run lands StateFailed, which is not
+	// live, so without this the SPA's automatic POST /api/runs on load would
+	// silently replace it before the operator ever saw it.
+	if e.recoveredPending {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"a recovered run is waiting for retry or discard")
+	}
 	if e.current != nil && isLive(e.current.State) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "a run is already in progress")
@@ -122,6 +168,22 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		Artifacts: map[string][]byte{},
 		StartedAt: now,
 		UpdatedAt: now,
+	}
+	// Name the phase here rather than leaving it to the first step's own
+	// runStep/awaitDecisions call. Without this, the very first Save below
+	// -- which happens before any step has run -- persists Phase: "", and a
+	// crash in that window leaves a perfectly normal record that
+	// Recover's validateLoaded cannot tell apart from a corrupt one. Since
+	// that record is then never overwritten (the unreadable path swaps to a
+	// memory store precisely so it never is), the mistake would be
+	// permanent and silent: persistence disabled for the rest of the
+	// process, repeated on every subsequent restart. An engine built with no
+	// steps has nothing to derive a phase from; that construction is
+	// test-only (main.go always assembles a real step slice) and already
+	// completes immediately via execute's own i >= len(e.steps) branch, so
+	// it is left as the zero value rather than indexing into an empty slice.
+	if len(e.steps) > 0 {
+		r.Phase = e.steps[0].Phase()
 	}
 	e.current = r
 	e.resume = make(chan struct{}, 1)
@@ -218,14 +280,28 @@ func (e *Engine) CancelAndWait(ctx context.Context) error {
 }
 
 // Decide supplies user decisions and unparks a run waiting on them.
-func (e *Engine) Decide(runID string, decisions map[string]string) error {
+//
+// It persists before acknowledging: mutate and validate under e.mu, snapshot,
+// unlock, Save, and only then either roll back (on failure) or signal resume
+// (on success), re-acquiring the lock for that last step alone. Store I/O
+// never happens while e.mu is held -- the observer's scope accessor calls
+// CurrentID and Artifact on a per-watch-event path, and both take this same
+// lock, so holding it across a ConfigMap round trip would stall every
+// observer publish for the length of an API call. Start and Retry already
+// use this exact shape.
+//
+// ctx is the caller's request context, but only its values travel into the
+// save -- see decideSaveTimeout for why its cancellation is deliberately not
+// allowed to reach the save that persists the operator's decision.
+func (e *Engine) Decide(ctx context.Context, runID string, decisions map[string]string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if e.current == nil || e.current.ID != runID {
+		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
 	}
 	if e.current.State != StateAwaitingDecision {
+		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not awaiting a decision")
 	}
 	// Reject any key the client sends that this gate did not ask for.
@@ -244,25 +320,72 @@ func (e *Engine) Decide(runID string, decisions map[string]string) error {
 	}
 	for key := range decisions {
 		if !pending[key] {
+			e.mu.Unlock()
 			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "decision not currently requested: "+key)
 		}
 	}
 	for _, key := range e.current.Pending {
 		if _, ok := decisions[key]; !ok {
+			e.mu.Unlock()
 			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "missing required decision: "+key)
 		}
 	}
+
+	// prev captures every field this call is about to mutate -- Decisions,
+	// Pending, State, and UpdatedAt -- so a failed Save can restore all four.
+	// Task 4's rollback bug was restoring two of three mutated fields and
+	// silently reopening the wedge that rollback existed to close; cloning
+	// the whole run rather than hand-picking fields is what keeps a future
+	// mutation added here from repeating it.
+	prev := e.current.Clone()
+	epoch := e.epoch
+
 	for k, v := range decisions {
 		e.current.Decisions[k] = v
 	}
 	e.current.Pending = nil
 	e.current.State = StateRunning
 	e.current.UpdatedAt = time.Now().UTC()
+	snapshot := e.current.Clone()
+	e.mu.Unlock()
 
-	select {
-	case e.resume <- struct{}{}:
-	default:
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), decideSaveTimeout)
+	defer cancel()
+	if err := e.store.Save(saveCtx, snapshot); err != nil {
+		// Guarded the same way Start's and Retry's rollbacks are: identity
+		// plus epoch-aliveness, so this cannot stomp a run that has since
+		// legitimately superseded this one. isLive additionally guards a
+		// window unique to Decide: awaitDecisions is still blocked on
+		// <-resume while this Save is in flight (resume is not sent until
+		// Save succeeds), so a shutdown landing in that window cancels the
+		// run's context, awaitDecisions takes the ctx.Done() branch, and
+		// finish sets StateFailed -- via this SAME epoch, since only Start
+		// and Retry bump it. Without the isLive check, this rollback would
+		// overwrite that terminal state with StateAwaitingDecision, leaving
+		// a live state with no goroutine behind it: exactly the wedge this
+		// whole discipline exists to prevent.
+		e.mu.Lock()
+		if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) && isLive(e.current.State) {
+			e.current.Decisions = prev.Decisions
+			e.current.Pending = prev.Pending
+			e.current.State = prev.State
+			e.current.UpdatedAt = prev.UpdatedAt
+		}
+		e.mu.Unlock()
+		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "persisting the decision failed", err)
 	}
+
+	// The resume signal must not be sent until the save above has actually
+	// succeeded, or the parked step proceeds on a decision that was never
+	// durably recorded.
+	e.mu.Lock()
+	if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) {
+		select {
+		case e.resume <- struct{}{}:
+		default:
+		}
+	}
+	e.mu.Unlock()
 	return nil
 }
 
@@ -321,8 +444,11 @@ func (e *Engine) Artifact(runID, key string) ([]byte, bool) {
 	return append([]byte(nil), v...), true
 }
 
-// Get returns a copy of the run's current state.
-func (e *Engine) Get(runID string) (*Run, error) {
+// Get returns a copy of the run's current state. ctx governs only the
+// store.Load fallback below (a run this process didn't start, e.g. after a
+// restart before the SPA's next poll lands): the in-memory branch above
+// never touches the store, so ctx is unused on that path.
+func (e *Engine) Get(ctx context.Context, runID string) (*Run, error) {
 	e.mu.Lock()
 	if e.current != nil && e.current.ID == runID {
 		out := e.current.Clone()
@@ -330,7 +456,7 @@ func (e *Engine) Get(runID string) (*Run, error) {
 		return out, nil
 	}
 	e.mu.Unlock()
-	return e.store.Load(context.Background(), runID)
+	return e.store.Load(ctx, runID)
 }
 
 func (e *Engine) execute(ctx context.Context, epoch uint64) {
@@ -351,17 +477,9 @@ func (e *Engine) execute(ctx context.Context, epoch uint64) {
 		if !e.awaitDecisions(ctx, epoch, step) {
 			return
 		}
-		if err := e.runStep(ctx, epoch, step); err != nil {
+		if err := e.runStep(ctx, epoch, i, step); err != nil {
 			return
 		}
-
-		e.mu.Lock()
-		if !e.aliveLocked(epoch) {
-			e.mu.Unlock()
-			return
-		}
-		e.current.StepIndex = i + 1
-		e.mu.Unlock()
 	}
 	e.finish(ctx, epoch, StateDone, "")
 }
@@ -395,7 +513,13 @@ func (e *Engine) awaitDecisions(ctx context.Context, epoch uint64, step Step) bo
 		snapshot := e.current.Clone()
 		e.mu.Unlock()
 
-		_ = e.store.Save(ctx, snapshot)
+		// Best-effort: losing this checkpoint degrades recovery granularity,
+		// which is preferable to failing a live run over it, but it must
+		// never be silent -- this warning is the only signal an operator has
+		// that recovery has quietly stopped working.
+		if err := e.store.Save(ctx, snapshot); err != nil {
+			slog.Warn("run checkpoint failed", "run", runID, "error", err)
+		}
 		e.bus.Publish(bus.Event{
 			RunID: runID, Kind: bus.KindDecision, Phase: string(step.Phase()),
 			Message: "awaiting decision",
@@ -413,7 +537,7 @@ func (e *Engine) awaitDecisions(ctx context.Context, epoch uint64, step Step) bo
 	}
 }
 
-func (e *Engine) runStep(ctx context.Context, epoch uint64, step Step) error {
+func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) error {
 	e.mu.Lock()
 	if !e.aliveLocked(epoch) {
 		e.mu.Unlock()
@@ -431,7 +555,11 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, step Step) error {
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
 
-	_ = e.store.Save(ctx, snapshot)
+	// Best-effort, same as awaitDecisions' checkpoint: never fails the run,
+	// never silent.
+	if err := e.store.Save(ctx, snapshot); err != nil {
+		slog.Warn("run checkpoint failed", "run", runID, "error", err)
+	}
 	e.bus.Publish(bus.Event{
 		RunID: runID, Kind: bus.KindPhase, Phase: string(step.Phase()),
 		Message: "phase started",
@@ -458,15 +586,34 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, step Step) error {
 			RunID: runID, Kind: bus.KindError, Phase: string(step.Phase()),
 			Level: bus.LevelError, Message: msg,
 		})
+
+		// Ruling 14: Components merges here too, unlike Artifacts and
+		// Decisions. Those two are step OUTPUTS -- a step that errors
+		// partway through may leave them inconsistent, which is exactly why
+		// merging them only on success is correct. Components is progress
+		// NARRATION, not an output: its partial value on a failing Apply
+		// (a few components installed, one failed) is precisely what
+		// recovery needs to redraw the pipeline instead of a bare failure.
+		// It is the one field whose half-written state is meaningful, so it
+		// is the one field that survives a failed step. Same epoch/identity
+		// guard as the success-path merge below, and it must land before
+		// finish's terminal save, or that save persists the pre-Apply rows.
+		e.mu.Lock()
+		if e.aliveLocked(epoch) {
+			e.current.Components = scratch.Components
+		}
+		e.mu.Unlock()
+
 		e.finish(ctx, epoch, StateFailed, msg)
 		return err
 	}
 
-	// Merge the step's writes back under the lock. Artifacts and Decisions are
-	// the only fields a step may add to; the engine owns everything else. A
-	// step can run for up to twenty minutes (Apply), which is precisely the
-	// window in which this run can be superseded by a retry -- re-check here,
-	// not just at the top of the function.
+	// Merge the step's writes back under the lock. Artifacts, Decisions, and
+	// Components (Task 6: Apply's per-component projection) are the only
+	// fields a step may add to; the engine owns everything else. A step can
+	// run for up to twenty minutes (Apply), which is precisely the window in
+	// which this run can be superseded by a retry -- re-check here, not just
+	// at the top of the function.
 	e.mu.Lock()
 	if !e.aliveLocked(epoch) {
 		e.mu.Unlock()
@@ -478,10 +625,25 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, step Step) error {
 	for k, v := range scratch.Decisions {
 		e.current.Decisions[k] = v
 	}
+	// scratch.Components started as a full clone of e.current.Components
+	// (see the Clone call above) and the step only ever upserts rows in
+	// place, so it is already the complete, current projection -- unlike
+	// Artifacts and Decisions, there is nothing to merge key-by-key.
+	e.current.Components = scratch.Components
+	// Advance the cursor before this checkpoint is taken, not after: the
+	// save below must carry the advanced StepIndex, and it must complete
+	// before the next step begins (it does, trivially -- this call is
+	// synchronous and execute's loop does not start the next step until
+	// runStep returns). Otherwise a crash between step success and this
+	// checkpoint replays a completed step on Retry.
+	e.current.StepIndex = i + 1
 	e.current.UpdatedAt = time.Now().UTC()
 	merged := e.current.Clone()
 	e.mu.Unlock()
-	_ = e.store.Save(ctx, merged)
+
+	if err := e.store.Save(ctx, merged); err != nil {
+		slog.Warn("run checkpoint failed", "run", runID, "error", err)
+	}
 
 	e.bus.Publish(bus.Event{
 		RunID: runID, Kind: bus.KindPhase, Phase: string(step.Phase()),
@@ -504,7 +666,21 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 
 	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), terminalSaveTimeout)
 	defer saveCancel()
-	_ = e.store.Save(saveCtx, snapshot)
+	if err := e.store.Save(saveCtx, snapshot); err != nil {
+		// Unrecoverable, not silent: the run is already terminal, so there
+		// is nothing left to roll back to. The real consequence is precise
+		// and worth stating plainly -- the persisted record is not absent,
+		// it is a stale earlier checkpoint. The next startup's recovery will
+		// find that older record, treat it as an interrupted run, and mark
+		// it failed, which is a more confusing outcome for an operator than
+		// finding nothing at all.
+		slog.Error("terminal run checkpoint failed; the next startup will recover a stale earlier record instead of this one",
+			"run", snapshot.ID, "state", state, "error", err)
+		e.bus.Publish(bus.Event{
+			RunID: snapshot.ID, Kind: bus.KindError, Level: bus.LevelError,
+			Message: "run finished but its checkpoint could not be saved; a restart will recover a stale earlier state",
+		})
+	}
 	e.bus.Publish(bus.Event{
 		RunID: snapshot.ID, Kind: bus.KindPhase,
 		Level: levelFor(state), Message: "run " + string(state),
@@ -518,7 +694,14 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 // `helm upgrade --install`, which is idempotent, and deploy.sh's own
 // preflight and stale-hook-Job cleanup run again on the retry. Components
 // that already installed are no-ops on the second pass.
-func (e *Engine) Retry(runID string) (*Run, error) {
+//
+// ctx is the caller's request context, already detached by the handler
+// (context.WithoutCancel) before it reaches here -- Retry can relaunch a
+// step that runs for up to 20 minutes (Apply), same as Start, so the run
+// must survive the request that kicked it off. Both the relaunched
+// execution's context and the checkpoint Save below derive from it, mirroring
+// Start's identical shape.
+func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 	e.mu.Lock()
 	if e.draining {
 		e.mu.Unlock()
@@ -533,20 +716,24 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not in a failed state")
 	}
 	prevErr := e.current.Err
+	prevRecoveredPending := e.recoveredPending
+	// Retry is the intended resume path for a recovered run: accepting it
+	// here is the operator action that clears the bootstrap gate in Start.
+	e.recoveredPending = false
 	e.current.State = StateRunning
 	e.current.Err = ""
 	e.current.UpdatedAt = time.Now().UTC()
 	e.resume = make(chan struct{}, 1)
 	e.epoch++
 	epoch := e.epoch
-	runCtx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	e.cancel = cancel
 	e.done = make(chan struct{})
 	done := e.done
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
 
-	if err := e.store.Save(context.Background(), snapshot); err != nil {
+	if err := e.store.Save(ctx, snapshot); err != nil {
 		// Undo the flip to StateRunning so the run is not left wedged: with
 		// no goroutine launched (that only happens below, after Save
 		// succeeds) and State no longer StateFailed, neither Start
@@ -559,6 +746,14 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 			e.current.State = StateFailed
 			e.current.Err = prevErr
 			e.current.UpdatedAt = time.Now().UTC()
+			// recoveredPending is part of the state this rollback restores,
+			// same as State and Err: without it, a Save failure here silently
+			// re-opens the bootstrap gate this task closed -- Start would stop
+			// 409ing and the SPA's automatic POST /api/runs would destroy the
+			// run on its next load. Guarded by the same aliveLocked check as
+			// the rest of the block so this cannot stomp a run that has since
+			// legitimately superseded this one.
+			e.recoveredPending = prevRecoveredPending
 		}
 		e.mu.Unlock()
 		// See Start's identical rationale: no goroutine will ever run for
@@ -574,6 +769,75 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 		e.execute(runCtx, epoch)
 	}()
 	return snapshot, nil
+}
+
+// Discard drops a recovered run and its persisted record, freeing the
+// console to start fresh. Without it, a recovered run would block Start
+// forever -- a worse wedge than the one the block exists to prevent.
+func (e *Engine) Discard(ctx context.Context, runID string) error {
+	e.mu.Lock()
+	if e.draining {
+		e.mu.Unlock()
+		return ErrDraining
+	}
+	if e.current == nil || e.current.ID != runID {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
+	}
+	// A live run has an execute goroutine driving it, and every one of that
+	// goroutine's e.current dereferences (execute, awaitDecisions, runStep,
+	// finish) is guarded only by an aliveLocked(epoch) check, never by a
+	// nil check on e.current itself -- nilling it here while that goroutine
+	// still owns the epoch crashes the whole process on its next
+	// checkpoint, not just this caller. This is deliberately not "bump
+	// epoch instead": every guarded dereference above sits in the same
+	// lock hold as its check today, so a bump would also close the gap
+	// right now, but that safety is an incidental property of the current
+	// code, not a structural guarantee -- a future dereference added
+	// between a checkpoint and its use would silently reopen it. Never
+	// nilling a live run holds regardless of that pairing, so it is the
+	// only guard this method relies on.
+	if isLive(e.current.State) {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run is live; retry, wait for it to finish, or cancel before discarding")
+	}
+	previous := e.current
+	previousRecoveredPending := e.recoveredPending
+	epoch := e.epoch
+	e.current = nil
+	e.recoveredPending = false
+	e.mu.Unlock()
+
+	// Store I/O deliberately outside the lock: the observer's scope accessor
+	// calls CurrentID and Artifact on a per-watch-event path, and both take
+	// e.mu.
+	if err := e.store.Delete(ctx); err != nil {
+		// Put the run back. The record still exists, so the state this call
+		// cleared no longer describes the store -- and the console now offers
+		// the operator a Discard button whose second press would answer 404
+		// ("run not found") against a checkpoint that is still there, and
+		// which the next restart will recover all over again. Restoring makes
+		// the retry the SPA already invites actually retry the delete.
+		//
+		// This deliberately reverses the earlier "clear regardless so a store
+		// outage can never block Start" semantics: that reasoning predates
+		// Discard having a caller, and it traded a wedge nobody could reach
+		// for a lie the operator now can. recoveredPending comes back with
+		// it, because the record it gates on is still on the cluster.
+		//
+		// Guarded like every other rollback in this file: only restore if
+		// nothing has since claimed the slot. A Start landing in this window
+		// installs its own run and bumps the epoch, and that run must win --
+		// it is live and this one is not.
+		e.mu.Lock()
+		if e.current == nil && e.aliveLocked(epoch) {
+			e.current = previous
+			e.recoveredPending = previousRecoveredPending
+		}
+		e.mu.Unlock()
+		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "deleting the persisted run failed", err)
+	}
+	return nil
 }
 
 func levelFor(s State) bus.Level {

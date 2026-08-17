@@ -1,6 +1,8 @@
 package bus
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"sync"
 	"time"
 )
@@ -22,6 +24,7 @@ type Bus struct {
 	subs     map[int]chan Event
 	nextSub  int
 	now      func() time.Time
+	epoch    string
 }
 
 // New returns a Bus retaining the most recent capacity events for replay.
@@ -34,7 +37,28 @@ func New(capacity int) *Bus {
 		capacity: capacity,
 		subs:     make(map[int]chan Event),
 		now:      time.Now,
+		epoch:    newEpoch(),
 	}
+}
+
+// newEpoch returns an opaque per-process identifier. It uses the same
+// crypto/rand approach as internal/engine's run IDs rather than a timestamp,
+// so two processes started within the same wall-clock second (a container
+// restarting in a crash loop, for instance) still get distinct epochs.
+func newEpoch() string {
+	var buf [8]byte
+	_, _ = rand.Read(buf[:])
+	return hex.EncodeToString(buf[:])
+}
+
+// Epoch identifies this Bus instance's process lifetime. nextID resets to 1
+// on every restart, so a client's cursor from a previous process looks like
+// a valid-but-stale ID rather than an obviously wrong one; the SPA compares
+// Epoch across reconnects to tell the two apart and knows to reconnect from
+// scratch rather than trust a cursor the current process never issued.
+// Constant for the life of the Bus, so safe to read without b.mu.
+func (b *Bus) Epoch() string {
+	return b.epoch
 }
 
 // Publish stamps e with the next ID and current time, retains it for replay,
@@ -79,8 +103,16 @@ func (b *Bus) retain(e Event) {
 }
 
 // since returns retained events with ID greater than since, oldest first.
+// A since above nextID is an impossible cursor -- no live process could have
+// issued an ID the current process hasn't reached yet -- so it is treated as
+// 0 and replays everything, rather than (the pre-fix behavior) filtering out
+// every retained event. That case is what a process restart produces: the
+// client's cursor was handed out by a process that no longer exists.
 // Callers must hold b.mu for reading.
 func (b *Bus) since(since uint64) []Event {
+	if since > b.nextID {
+		since = 0
+	}
 	var out []Event
 	for i := 0; i < b.count; i++ {
 		e := b.ring[(b.head+i)%b.capacity]

@@ -1,0 +1,253 @@
+package engine
+
+import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"time"
+
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// envelopeVersion is the persisted schema version. It exists so a future
+// format change is safe to roll out against a ConfigMap written by a previous
+// image: an unrecognized version is refused rather than partially decoded.
+const envelopeVersion = 1
+
+// maxPayload bounds the encoded record. Kubernetes caps a ConfigMap at
+// roughly 1MiB; stopping at 800KiB beats letting the API server reject an
+// oversized object with something opaque, and leaves room for the object's
+// own metadata.
+//
+// Exceeding it sheds artifacts rather than failing the write (see
+// encodeRun). It used to fail closed, and that turned a large cluster into
+// an unusable product: Decide is the one checkpoint that is mandatory rather
+// than best-effort, so an oversized snapshot made it fail deterministically,
+// roll the run back to awaiting_decision, and leave Discard refusing on
+// "run is live" -- no operator action anywhere reached a working console,
+// and a restart only replayed the same oversized artifact. Shedding keeps
+// every write path succeeding; what degrades is durability, loudly and in
+// one named place, instead of the product.
+const maxPayload = 800 << 10
+
+// maxDecompressed bounds what decodeRun will expand. A small stored payload
+// can inflate without limit, and the pod runs under a 512Mi cap, so an
+// unbounded reader turns a malformed record into an OOM kill instead of an
+// error.
+const maxDecompressed = 8 << 20
+
+// ephemeralArtifacts are dropped on encode. bundle.path points into the
+// chart's emptyDir, which does not survive a restart -- persisting it would
+// hand a recovered Apply a path to a directory that no longer exists, which
+// is strictly worse than the key being absent.
+var ephemeralArtifacts = map[string]bool{"bundle.path": true}
+
+// envelope is the persisted projection of a Run. It exists rather than
+// reusing the API's json tags because Run.Artifacts is json:"-" -- that tag
+// is load-bearing (it keeps snapshot.yaml out of HTTP responses) and must
+// stay, so the store carries artifacts deliberately instead.
+type envelope struct {
+	Version    int               `json:"version"`
+	ID         string            `json:"id"`
+	State      State             `json:"state"`
+	Phase      Phase             `json:"phase"`
+	Decisions  map[string]string `json:"decisions,omitempty"`
+	Pending    []string          `json:"pending,omitempty"`
+	Components []ComponentState  `json:"components,omitempty"`
+	StepIndex  int               `json:"stepIndex"`
+	Err        string            `json:"error,omitempty"`
+	StartedAt  time.Time         `json:"startedAt"`
+	UpdatedAt  time.Time         `json:"updatedAt"`
+	Artifacts  map[string][]byte `json:"artifacts,omitempty"`
+	// Truncated names the artifacts encodeRun dropped to fit maxPayload, so
+	// the record says what is missing rather than looking complete. Added
+	// without bumping envelopeVersion on purpose: it is optional on both
+	// sides, so a record written by this build still decodes in a build
+	// rolled back to the previous image, and bumping the version would turn
+	// a rollback into an unreadable-record degradation for no gain.
+	Truncated []string `json:"truncated,omitempty"`
+}
+
+func gzipJSON(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func gunzipJSON(blob []byte, v any) error {
+	zr, err := gzip.NewReader(bytes.NewReader(blob))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = zr.Close() }()
+	// LimitReader + 1 so a record exactly at the bound is distinguishable
+	// from one that exceeds it.
+	raw, err := io.ReadAll(io.LimitReader(zr, maxDecompressed+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxDecompressed {
+		return fmt.Errorf("decompressed record exceeds %d bytes", maxDecompressed)
+	}
+	return json.Unmarshal(raw, v)
+}
+
+// encodeRun projects a Run into a compressed envelope. It never mutates the
+// caller's run.
+//
+// A record over maxPayload sheds artifacts, largest first, until it fits,
+// naming each dropped key in envelope.Truncated. Every other checkpoint in
+// this engine is best-effort-with-a-warning; this makes the size guard behave
+// the same way, because the alternative is a run no operator action can free
+// (see maxPayload).
+//
+// Largest-first minimizes HOW MUCH IS LOST -- the fewest artifacts shed to get
+// under the cap -- and nothing more than that. It does NOT preserve
+// retryability, and an earlier version of this comment claimed it did, on the
+// reasoning that recovery rewinds to Bundle and Bundle reads only the small
+// recipe.json. That is wrong: internal/steps/bundle.go reads recipe.json AND
+// decodeSnapshot(run.Artifacts["snapshot.yaml"]), so wherever shedding fires
+// at all, snapshot.yaml is the first thing to go and the rewound retry fails
+// immediately at decodeSnapshot. Truncation is a one-way door for this run.
+//
+// What survives is the state machine itself: ID, state, phase, StepIndex,
+// decisions, and the component projection. That is enough to recover the run
+// as a record an operator can see and discard, which is the point -- a worse
+// outcome than a complete record, and a far better one than a console with no
+// reachable action at all. Run.Truncated carries the loss out of the store so
+// the console can say so instead of offering a retry that cannot work.
+//
+// It still fails closed when there is nothing left to shed: a record whose
+// decisions and component rows alone exceed the limit is not a large
+// cluster, it is a bug, and silently persisting a record with fields
+// dropped from the state machine would be worse than refusing.
+func encodeRun(r *Run) ([]byte, error) {
+	env := envelope{
+		Version:    envelopeVersion,
+		ID:         r.ID,
+		State:      r.State,
+		Phase:      r.Phase,
+		Decisions:  r.Decisions,
+		Pending:    r.Pending,
+		Components: r.Components,
+		StepIndex:  r.StepIndex,
+		Err:        r.Err,
+		StartedAt:  r.StartedAt,
+		UpdatedAt:  r.UpdatedAt,
+		Artifacts:  make(map[string][]byte, len(r.Artifacts)),
+		// Carried forward, not recomputed. A run recovered from a truncated
+		// record no longer HAS the shed artifact, so re-encoding it would fit
+		// on the first try and produce a record claiming completeness while
+		// still missing everything the first truncation dropped. A shed key
+		// is absent from r.Artifacts by definition, so the loop below can
+		// never append a duplicate.
+		Truncated: append([]string(nil), r.Truncated...),
+	}
+	for k, v := range r.Artifacts {
+		if ephemeralArtifacts[k] {
+			continue
+		}
+		env.Artifacts[k] = v
+	}
+	blob, err := gzipJSON(env)
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "encoding run failed", err)
+	}
+	if len(blob) <= maxPayload {
+		return blob, nil
+	}
+
+	shedBytes := 0
+	for len(env.Artifacts) > 0 && len(blob) > maxPayload {
+		key := largestArtifact(env.Artifacts)
+		shedBytes += len(env.Artifacts[key])
+		delete(env.Artifacts, key)
+		env.Truncated = append(env.Truncated, key)
+		if blob, err = gzipJSON(env); err != nil {
+			return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "encoding run failed", err)
+		}
+	}
+	if len(blob) > maxPayload {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("run state too large to checkpoint: %d bytes compressed, limit %d", len(blob), maxPayload))
+	}
+
+	slog.Warn("run checkpoint exceeded the ConfigMap payload limit; artifacts were dropped so the record could still be written. "+
+		"Durability is degraded: this run is still recoverable as a state machine, but a retry that reads one of the dropped artifacts will fail and the operator will have to discard and start over",
+		"run", r.ID, "dropped", env.Truncated, "droppedBytes", shedBytes,
+		"compressedBytes", len(blob), "limit", maxPayload)
+	return blob, nil
+}
+
+// largestArtifact returns the key of the biggest artifact. Ties break on the
+// key name so the same run always sheds in the same order -- a checkpoint
+// that dropped a different artifact on each save would make a recovered
+// record's contents depend on map iteration order.
+func largestArtifact(artifacts map[string][]byte) string {
+	best := ""
+	found := false
+	for k, v := range artifacts {
+		switch {
+		case !found, len(v) > len(artifacts[best]):
+			best, found = k, true
+		case len(v) == len(artifacts[best]) && k < best:
+			best = k
+		}
+	}
+	return best
+}
+
+// decodeRun reverses encodeRun. An unrecognized version is refused rather
+// than partially decoded: guessing at a format written by a different image
+// is how a newer record gets silently downgraded.
+func decodeRun(blob []byte) (*Run, error) {
+	var env envelope
+	if err := gunzipJSON(blob, &env); err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, "decoding run failed", err)
+	}
+	if env.Version != envelopeVersion {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("unsupported run schema version %d (this build writes %d)", env.Version, envelopeVersion))
+	}
+	r := &Run{
+		ID:         env.ID,
+		State:      env.State,
+		Phase:      env.Phase,
+		Decisions:  env.Decisions,
+		Pending:    env.Pending,
+		Components: env.Components,
+		StepIndex:  env.StepIndex,
+		Err:        env.Err,
+		StartedAt:  env.StartedAt,
+		UpdatedAt:  env.UpdatedAt,
+		Artifacts:  env.Artifacts,
+		Truncated:  env.Truncated,
+	}
+	if r.Decisions == nil {
+		r.Decisions = map[string]string{}
+	}
+	if r.Artifacts == nil {
+		r.Artifacts = map[string][]byte{}
+	}
+	// The write side already warned once, in the process that shed them. This
+	// is the read side saying the same thing to whoever is looking at the
+	// startup log of the process that has to live with the consequence.
+	if len(env.Truncated) > 0 {
+		slog.Warn("run checkpoint was written truncated; these artifacts are absent, so a retry that reads one of them will fail and the run has to be discarded instead",
+			"run", env.ID, "dropped", env.Truncated)
+	}
+	return r, nil
+}

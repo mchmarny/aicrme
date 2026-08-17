@@ -52,6 +52,9 @@ type Run struct {
 	Decisions map[string]string `json:"decisions"`
 	Artifacts map[string][]byte `json:"-"`
 	Pending   []string          `json:"pending,omitempty"`
+	// Components is the latest known state of each component the bundle
+	// installs.
+	Components []ComponentState `json:"components,omitempty"`
 	// StepIndex is the index of the next step to execute. It exists so a
 	// failed run can be retried from the step that failed rather than from
 	// the top: re-running Discover would redeploy the snapshot agent Job
@@ -62,6 +65,29 @@ type Run struct {
 	Err       string    `json:"error,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// Truncated names artifacts the store dropped to fit its size limit (see
+	// encodeRun). It is read-mostly state about the RECORD, not the run: the
+	// engine never sets it, decodeRun populates it on load, and encodeRun
+	// carries it forward so a record that has already lost an artifact keeps
+	// saying so on every subsequent save.
+	//
+	// It exists because a truncated record cannot be retried -- Bundle reads
+	// snapshot.yaml, which is the first artifact shed -- so a console that
+	// only knew the record was recoverable would offer a Retry guaranteed to
+	// fail at the step it resumes on. The record was honest about the loss;
+	// this is what makes the console honest too.
+	Truncated []string `json:"truncated,omitempty"`
+}
+
+// ComponentState is the latest known state of one component the bundle
+// installs. It is a projection, not a log: exactly one row per component,
+// overwritten in place. Persisting this is what lets a recovered run redraw
+// the pipeline, without persisting the event stream that produced it.
+type ComponentState struct {
+	Name   string `json:"name"`
+	Index  int    `json:"index"`
+	Total  int    `json:"total"`
+	Status string `json:"status"`
 }
 
 // Clone returns a deep copy safe to hand to callers outside the engine lock.
@@ -76,5 +102,7 @@ func (r *Run) Clone() *Run {
 		out.Artifacts[k] = append([]byte(nil), v...)
 	}
 	out.Pending = append([]string(nil), r.Pending...)
+	out.Components = append([]ComponentState(nil), r.Components...)
+	out.Truncated = append([]string(nil), r.Truncated...)
 	return &out
 }

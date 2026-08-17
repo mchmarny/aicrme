@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { deriveRunState, MAX_PROVISIONAL_OPTIONS_RETRIES, Wizard } from './Wizard'
 import type { AicrEvent } from '../useEvents'
@@ -222,5 +222,252 @@ describe('Wizard', () => {
     expect(fetchMock.mock.calls.length).toBe(MAX_PROVISIONAL_OPTIONS_RETRIES + 1)
     expect(screen.getByText(/could not be verified/)).toBeDefined()
     expect(screen.getAllByRole('radiogroup')).toHaveLength(2)
+  })
+})
+
+// RECOVERED_RUN_ID is the 16-hex-character shape engine.newID produces and
+// internal/engine's recover tests seed, so the URLs asserted below are the
+// ones a real recovered run would produce.
+const RECOVERED_RUN_ID = '0123456789abcdef'
+
+/**
+ * recoveryEvents reproduces, in order, exactly what
+ * internal/engine/recover.go's publishRecoveryBootstrap emits for a recovered
+ * run: the KindRecovered marker, one KindComponent per persisted component
+ * row, the run's error as a KindError when it carries one, and the
+ * "run <state>" KindPhase event last. Hand-built rather than sliced from
+ * kwok-run.json because no recorded stream contains a restart -- but every
+ * field here is pinned on the producing side by
+ * TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState and
+ * TestRecoverPublishesBootstrapEvents.
+ */
+function recoveryEvents(
+  phase: string,
+  state: string,
+  error?: string,
+  components: Array<{ name: string; status: string }> = [],
+  truncated?: string[],
+): AicrEvent[] {
+  const out: AicrEvent[] = [{
+    id: 1, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:00:00Z', kind: 'recovered', level: 'warn',
+    phase, message: 'recovered a previous run; retry or discard it before starting a new one',
+    // internal/engine/recover.go omits Data entirely for an intact record,
+    // so its absence is meaningful and this mirrors that.
+    ...(truncated ? { data: { truncated } } : {}),
+  }]
+  components.forEach((c, i) => {
+    out.push({
+      id: out.length + 1, runId: RECOVERED_RUN_ID, at: `2026-08-17T00:00:0${i + 1}Z`,
+      kind: 'component', level: 'info', phase, component: c.name,
+      message: `${c.name} ${c.status}`, data: { name: c.name, status: c.status },
+    })
+  })
+  if (error) {
+    out.push({
+      id: out.length + 1, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:00:08Z',
+      kind: 'error', level: 'error', phase, message: error,
+    })
+  }
+  out.push({
+    id: out.length + 1, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:00:09Z',
+    kind: 'phase', level: state === 'failed' ? 'error' : 'info', phase, message: `run ${state}`,
+  })
+  return out
+}
+
+/**
+ * The Critical finding: a recovered run had no reachable operator action
+ * outside bundle/apply, because the only Retry button lived inside Cockpit
+ * and Wizard renders Cockpit only for those two phases. Discard had no caller
+ * anywhere in the SPA, so a run recovered in a state Retry refuses -- `done`,
+ * which every `helm upgrade` of a release that has completed a demo recovers
+ * -- had no exit at all: POST /api/runs 409s by design, and POST .../retry
+ * answers "run is not in a failed state".
+ *
+ * The matrix below is the shape of that miss. The Go-side test meant to cover
+ * this exercised PhaseApply alone.
+ */
+describe('Wizard: a recovered run', () => {
+  beforeEach(() => {
+    mockFetch()
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
+  const phases = ['discover', 'recommend', 'bundle', 'apply']
+  const recoveredStates: Array<{ label: string; state: string; error?: string; retryable: boolean }> = [
+    // engine.Recover flips every non-terminal state it finds to `failed` with
+    // this exact error, so this covers a discover/recommend interruption and
+    // a mid-Apply crash alike.
+    { label: 'interrupted', state: 'failed', error: 'interrupted by a console restart', retryable: true },
+    // A run that had already failed on its own before the pod went away.
+    { label: 'already failed', state: 'failed', error: 'network-operator failed: no matches for kind "NodeFeatureRule"', retryable: true },
+    // Scenario B: nothing interrupted it, and engine.Retry refuses it.
+    { label: 'done', state: 'done', retryable: false },
+    // StateActive derives to 'running' client-side -- "run active" is not a
+    // message deriveRunState recognizes -- and Retry refuses it too, so
+    // discard has to be reachable from a state that does not look terminal.
+    { label: 'active', state: 'active', retryable: false },
+  ]
+
+  for (const phase of phases) {
+    for (const { label, state, error, retryable } of recoveredStates) {
+      it(`offers discard in ${phase}/${label}, and retry only when the run is retryable`, () => {
+        render(<Wizard events={recoveryEvents(phase, state, error)} />)
+
+        expect(screen.getByTestId('recovered-run')).toBeDefined()
+        expect(screen.getByTestId('recovery-discard')).toBeDefined()
+        if (retryable) {
+          expect(screen.getByTestId('recovery-retry')).toBeDefined()
+        } else {
+          expect(screen.queryByTestId('recovery-retry')).toBeNull()
+        }
+
+        // No ordinary phase body may render underneath: a run recovered on
+        // `recommend` used to show "Resolving the recipe for the answers you
+        // gave…" forever, with no step running and none coming.
+        expect(screen.queryByText(/Resolving the recipe/)).toBeNull()
+        expect(screen.queryByText(/Discovering the cluster…/)).toBeNull()
+        expect(screen.queryByTestId('cockpit-success')).toBeNull()
+      })
+    }
+  }
+
+  it('tells an interruption apart from a failure the run reached on its own', () => {
+    const { unmount } = render(
+      <Wizard events={recoveryEvents('apply', 'failed', 'interrupted by a console restart')} />)
+    expect(screen.getByText(/The console restarted while this run was in the apply phase/)).toBeDefined()
+    unmount()
+
+    render(<Wizard events={recoveryEvents('apply', 'failed', 'helm upgrade --install failed')} />)
+    expect(screen.getByText(/had already failed during the apply phase/)).toBeDefined()
+    // The run's own error is still shown: it is what the operator needs to
+    // judge whether retrying is worth anything. Scoped to the panel, since
+    // the timeline rail legitimately renders the same message as a log line.
+    const panel = within(screen.getByTestId('recovered-run'))
+    expect(panel.getByText('helm upgrade --install failed')).toBeDefined()
+  })
+
+  it('says a completed run finished rather than claiming it was interrupted', () => {
+    render(<Wizard events={recoveryEvents('apply', 'done')} />)
+    expect(screen.getByText(/finished before the console restarted/)).toBeDefined()
+    expect(screen.queryByText(/interrupted/i)).toBeNull()
+  })
+
+  it('redraws the persisted component rows the bootstrap replayed', () => {
+    render(<Wizard events={recoveryEvents('apply', 'failed', 'interrupted by a console restart', [
+      { name: 'gpu-operator', status: 'installed' },
+      { name: 'kai-scheduler', status: 'failed' },
+    ])} />)
+
+    expect(screen.getByTestId('recovered-component-gpu-operator').textContent).toMatch(/installed/i)
+    expect(screen.getByTestId('recovered-component-kai-scheduler').textContent).toMatch(/failed/i)
+  })
+
+  it('does not fetch /api/options for a run recovered on the recommend phase', () => {
+    const fetchMock = mockFetch()
+    render(<Wizard events={recoveryEvents('recommend', 'failed', 'interrupted by a console restart')} />)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('discards through DELETE and lets the console start a new run without a reload', async () => {
+    const fetchMock = mockFetch(url => {
+      if (url !== `/api/runs/${RECOVERED_RUN_ID}`) throw new Error(`unexpected fetch: ${url}`)
+      return new Response(null, { status: 204 })
+    })
+    const onDiscarded = vi.fn()
+
+    render(<Wizard events={recoveryEvents('apply', 'done')} onDiscarded={onDiscarded} />)
+    fireEvent.click(screen.getByTestId('recovery-discard'))
+
+    await waitFor(() => expect(onDiscarded).toHaveBeenCalled())
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/api/runs/${RECOVERED_RUN_ID}`)
+    expect(init?.method).toBe('DELETE')
+
+    // The stream still ends on the discarded run until its replacement
+    // publishes a first event, so the panel must not re-offer buttons that
+    // would now 404.
+    await waitFor(() => expect(screen.queryByTestId('recovery-discard')).toBeNull())
+    expect(screen.getByText(/Starting a new run/)).toBeDefined()
+  })
+
+  it('surfaces a failed discard instead of pretending the run is gone', async () => {
+    mockFetch(url => {
+      if (url !== `/api/runs/${RECOVERED_RUN_ID}`) throw new Error(`unexpected fetch: ${url}`)
+      return new Response(JSON.stringify({ error: 'deleting the persisted run failed' }), { status: 503 })
+    })
+    const onDiscarded = vi.fn()
+
+    render(<Wizard events={recoveryEvents('apply', 'done')} onDiscarded={onDiscarded} />)
+    fireEvent.click(screen.getByTestId('recovery-discard'))
+
+    await waitFor(() => expect(screen.getByText(/Failed to discard the run/)).toBeDefined())
+    expect(onDiscarded).not.toHaveBeenCalled()
+    expect(screen.getByTestId('recovery-discard')).toBeDefined()
+  })
+
+  it('retries through POST and stops offering recovery actions once the retry starts', async () => {
+    const fetchMock = mockFetch(url => {
+      if (url !== `/api/runs/${RECOVERED_RUN_ID}/retry`) throw new Error(`unexpected fetch: ${url}`)
+      return new Response(JSON.stringify({ id: RECOVERED_RUN_ID, state: 'running' }), { status: 200 })
+    })
+
+    const recovered = recoveryEvents('bundle', 'failed', 'interrupted by a console restart')
+    const { rerender } = render(<Wizard events={recovered} />)
+    fireEvent.click(screen.getByTestId('recovery-retry'))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/runs/${RECOVERED_RUN_ID}/retry`, { method: 'POST' }))
+
+    // engine.Retry publishes this before relaunching execute, and it is the
+    // moment the gate clears server-side -- the console must follow.
+    rerender(<Wizard events={[...recovered, {
+      id: 99, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:01:00Z',
+      kind: 'phase', level: 'info', message: 'run retrying',
+    }]} />)
+
+    expect(screen.queryByTestId('recovered-run')).toBeNull()
+    expect(screen.queryByTestId('recovery-discard')).toBeNull()
+  })
+
+  // A truncated checkpoint cannot be retried: recovery rewinds to Bundle, and
+  // internal/steps/bundle.go reads snapshot.yaml, which is the first artifact
+  // the size guard sheds. The record has always named the loss; without this
+  // the console offered "Retry this run" for a record whose retry is a dead
+  // end -- honest storage, dishonest UI.
+  it('warns that a truncated checkpoint cannot be retried, naming what was dropped', () => {
+    render(<Wizard events={recoveryEvents(
+      'apply', 'failed', 'interrupted by a console restart', [], ['snapshot.yaml'])} />)
+
+    const note = screen.getByTestId('recovery-truncated')
+    expect(note.textContent).toMatch(/snapshot\.yaml/)
+    expect(note.textContent).toMatch(/too large to store in full/)
+    expect(note.textContent).toMatch(/discarding and starting over/i)
+    // Retry stays reachable rather than hidden: suppressing it would rest on
+    // the current step slice happening to guarantee failure, which is an
+    // accident of today's steps, not a structural property.
+    expect(screen.getByTestId('recovery-retry')).toBeDefined()
+    expect(screen.getByTestId('recovery-discard')).toBeDefined()
+  })
+
+  it('shows no truncation warning for an intact recovered record', () => {
+    render(<Wizard events={recoveryEvents('apply', 'failed', 'interrupted by a console restart')} />)
+    expect(screen.queryByTestId('recovery-truncated')).toBeNull()
+  })
+
+  it('leaves an ordinary failure on the cockpit rather than the recovery panel', () => {
+    const ordinary: AicrEvent[] = [
+      { id: 1, runId: 'runY', at: '2026-08-17T00:00:00Z', kind: 'phase', level: 'info', phase: 'apply', message: 'phase started' },
+      { id: 2, runId: 'runY', at: '2026-08-17T00:00:01Z', kind: 'error', level: 'error', phase: 'apply', message: 'deploy.sh failed: exit status 1' },
+      { id: 3, runId: 'runY', at: '2026-08-17T00:00:02Z', kind: 'phase', level: 'error', phase: 'apply', message: 'run failed' },
+    ]
+    render(<Wizard events={ordinary} />)
+
+    expect(screen.queryByTestId('recovered-run')).toBeNull()
+    expect(screen.queryByTestId('recovery-discard')).toBeNull()
+    expect(screen.getByRole('heading', { name: /install failed/i })).toBeDefined()
   })
 })

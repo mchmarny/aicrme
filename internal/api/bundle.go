@@ -20,9 +20,7 @@ import (
 // can inspect exactly what they are about to approve.
 func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
-	// engine.Get takes no context parameter for the same reason as
-	// handleGetRun in runs.go.
-	run, err := s.engine.Get(runID) //nolint:contextcheck // see handleGetRun in runs.go
+	run, err := s.engine.Get(r.Context(), runID)
 	if err != nil {
 		writeErr(w, err)
 		return

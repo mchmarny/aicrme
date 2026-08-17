@@ -18,6 +18,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -175,6 +176,85 @@ func newRunScopeFn(eng runReader) func() observer.RunScope {
 	}
 }
 
+// runStoreSuffix distinguishes the run store's ConfigMap from the chart's
+// own {{ include "aicrme.fullname" . }} ConfigMap (AICRME_TLS /
+// AICRME_NAMESPACE -- charts/aicrme/templates/configmap.yaml), following the
+// naming convention charts/aicrme/templates/secret.yaml already uses for the
+// auth Secret ("<fullname>-auth"). It must be a distinct, runtime-created
+// object: a templated one would revert to the chart's rendered content on
+// every helm upgrade, wiping state an in-flight Apply is actively
+// checkpointing (docs/superpowers/specs/2026-08-17-aicrme-phase-2b-ii-design.md,
+// "It must not be the chart's ConfigMap, and must not be templated at all").
+const runStoreSuffix = "-run"
+
+// deploymentLookupTimeout bounds the one-time Deployment Get newRunStore
+// issues to resolve the run ConfigMap's ownerReference. Everything the
+// resulting store does afterward is self-bounded by cmStoreCallTimeout
+// (internal/engine/cmstore.go), but this call happens before that store
+// exists, so it has to bound itself: a wedged API server here must degrade
+// to the in-memory store, not hang startup indefinitely the way 2b-i's
+// unbounded WaitForCacheSync did.
+const deploymentLookupTimeout = 10 * time.Second
+
+// resolveDeploymentOwner returns an ownerReference to the named Deployment,
+// so the run ConfigMap survives every pod and ReplicaSet churn along a
+// rollout but is garbage-collected the moment the release itself is
+// uninstalled. The chart sets AICRME_DEPLOYMENT_NAME to the exact
+// {{ include "aicrme.fullname" . }} value it names the Deployment object
+// with (charts/aicrme/templates/deployment.yaml), so one Get resolves the
+// object this pod actually belongs to. Deliberately not a walk of the pod's
+// own ownerReferences chain (Pod -> ReplicaSet -> Deployment): that would
+// cost a second API call for the ReplicaSet -- itself transient and reaped
+// on every rollout, exactly the object this reference must never target --
+// for no benefit over asking for the Deployment directly.
+func resolveDeploymentOwner(ctx context.Context, kube kubernetes.Interface, namespace, name string) (metav1.OwnerReference, error) {
+	dep, err := kube.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return metav1.OwnerReference{}, err
+	}
+	return metav1.OwnerReference{
+		APIVersion: "apps/v1",
+		Kind:       "Deployment",
+		Name:       dep.Name,
+		UID:        dep.UID,
+	}, nil
+}
+
+// newRunStore resolves the ConfigMap-backed run store, or falls back to an
+// in-memory one. kube is nil outside a cluster (rest.InClusterConfig fails
+// on a developer laptop) -- `make build && ./bin/aicrme` outside a cluster
+// stays a supported development path, so this is expected and logs at Warn
+// (the kube client construction above already explains why kube is nil for
+// the telemetry side; this is the persistence-specific consequence, not a
+// second diagnosis of the same cause).
+//
+// A resolution error with a live client is a different animal and logs at
+// Error, not Warn: it means a pod holding cluster-admin cannot look up its
+// own Deployment (RBAC, a control-plane blip, an unusual install order that
+// starts the pod before the Deployment object is visible to its own API
+// server), and /healthz reports identically healthy either way -- this log
+// line is the only signal an operator gets that the durability this whole
+// phase exists to provide has silently gone missing.
+//
+// Per Ruling 4, this is the only place that ever chooses the store;
+// Engine.store is set once in New and, on the unreadable-record path,
+// reassigned only by Recover itself.
+func newRunStore(ctx context.Context, kube kubernetes.Interface, namespace, deploymentName string) engine.Store {
+	if kube == nil {
+		slog.Warn("no cluster client; run state will not survive a pod restart")
+		return engine.NewMemoryStore()
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, deploymentLookupTimeout)
+	defer cancel()
+	owner, err := resolveDeploymentOwner(lookupCtx, kube, namespace, deploymentName)
+	if err != nil {
+		slog.Error("resolving the console Deployment for the run store's owner reference failed despite a live cluster client; run state will not survive a pod restart",
+			"deployment", deploymentName, "namespace", namespace, "error", err)
+		return engine.NewMemoryStore()
+	}
+	return engine.NewConfigMapStore(kube, namespace, deploymentName+runStoreSuffix, owner)
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
@@ -182,6 +262,16 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 	slog.Info("starting aicrme", "version", version.String())
+
+	// Created before any of the fatal startup checks below, so the run
+	// store's Deployment lookup and eng.Recover (both later, once the
+	// engine exists) share shutdown's own cancellation. defer stop() is
+	// deliberately not called here: every other startup check in this
+	// function follows the same rule (see the kube client construction
+	// below) -- a defer registered before a later os.Exit would never run,
+	// which is exactly what gocritic's exitAfterDefer flags. stop() is
+	// deferred once every fatal check has passed.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
 	workDir := envOr("AICRME_WORK_DIR", defaultWorkDir)
 	if err := ensureWorkDirs(workDir); err != nil {
@@ -202,9 +292,34 @@ func main() {
 	}
 
 	b := bus.New(replayCapacity)
-	eng := engine.New(b, engine.NewMemoryStore(),
+
+	// A failure here must not stop the console: the entire Discover-to-Apply
+	// arc works without cluster telemetry, and `make build && ./bin/aicrme`
+	// outside a cluster is a supported development path. Same degrade-with-a-
+	// warning posture as parseNodeSelector. No defer is registered by this
+	// block, so its position relative to the fatal checks above and below it
+	// does not matter the way it would for one that did. This warns about
+	// telemetry only -- newRunStore below logs its own, more specific
+	// warning about persistence for the same nil kube, so this does not
+	// repeat that half of the consequence.
+	var kube kubernetes.Interface
+	// rest.InClusterConfig does no network I/O -- env vars and two file
+	// reads -- so inside a pod kube is essentially always non-nil here; it
+	// is Start below, not this block, that first talks to the API server.
+	if cfg, cfgErr := rest.InClusterConfig(); cfgErr != nil {
+		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
+	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
+		slog.Warn("kubernetes client init failed; live cluster telemetry disabled", "error", clientErr)
+	} else {
+		kube = c
+	}
+
+	namespace := envOr("AICRME_NAMESPACE", "aicrme")
+	runStore := newRunStore(ctx, kube, namespace, envOr("AICRME_DEPLOYMENT_NAME", "aicrme"))
+
+	eng := engine.New(b, runStore,
 		steps.NewDiscover(client, steps.DiscoverConfig{
-			Namespace: envOr("AICRME_NAMESPACE", "aicrme"),
+			Namespace: namespace,
 			// aicr.Client.CollectSnapshot forwards Image verbatim to the Job
 			// spec's container -- unlike the `aicr` CLI, the Go client applies
 			// no fallback of its own (verified against pkg/client/v1 and
@@ -259,26 +374,36 @@ func main() {
 		slog.Error("server configuration invalid", "error", err)
 		os.Exit(1)
 	}
-	defer func() { _ = client.Close() }()
 
-	// A failure here must not stop the console: the entire Discover-to-Apply
-	// arc works without cluster telemetry, and `make build && ./bin/aicrme`
-	// outside a cluster is a supported development path. Same degrade-with-a-
-	// warning posture as parseNodeSelector. Placed after every remaining
-	// os.Exit in main: `defer close(obsStop)` below would not run if an
-	// exit happened after it (gocritic's exitAfterDefer), and every startup
-	// failure that still exits is checked above this point.
-	var kube kubernetes.Interface
-	// rest.InClusterConfig does no network I/O -- env vars and two file
-	// reads -- so inside a pod kube is essentially always non-nil here; it
-	// is Start below, not this block, that first talks to the API server.
-	if cfg, cfgErr := rest.InClusterConfig(); cfgErr != nil {
-		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
-	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
-		slog.Warn("kubernetes client init failed; live cluster telemetry disabled", "error", clientErr)
-	} else {
-		kube = c
+	// Recovery must complete before httpSrv.ListenAndServe below: a window
+	// in which the console answers requests while a recovered run is not yet
+	// installed is a window in which the SPA's automatic POST /api/runs on
+	// load wins the race and silently replaces it. This does not reintroduce
+	// 2b-i's startup-hang class -- every ConfigMap call Recover makes is
+	// bounded by cmStoreCallTimeout (internal/engine/cmstore.go) and its own
+	// load retry is bounded and ctx-aware (internal/engine/recover.go) -- so
+	// this call always returns. ErrStepConfig is the one error it returns:
+	// a step slice recovery cannot make sense of, which is a programming
+	// error in this binary's own wiring above, not a runtime condition, so
+	// it is fatal rather than degraded. Everything else Recover handles
+	// internally and falls through to a degraded start; StoreUnreadable()
+	// exists purely so this can log that, per Ruling 4 -- Recover already
+	// performed the only corrective action available (swapping to a fresh
+	// memory store) by the time this returns.
+	if err := eng.Recover(ctx); err != nil {
+		slog.Error("engine step configuration cannot be recovered against", "error", err)
+		os.Exit(1)
 	}
+	if eng.StoreUnreadable() {
+		slog.Warn("persisted run checkpoint was unreadable or failed validation; starting without it")
+	}
+
+	// Every fatal startup check is above this point; only degrade-and-warn
+	// paths remain below. Deferring stop() and client.Close() only now is
+	// what keeps this function clean under gocritic's exitAfterDefer -- a
+	// defer registered before a later os.Exit would silently never run.
+	defer stop()
+	defer func() { _ = client.Close() }()
 
 	// Started in a goroutine, not called inline: Start ends by blocking on
 	// the informer factory's WaitForCacheSync, which carries no deadline of
@@ -286,11 +411,19 @@ func main() {
 	// obsStop closes, and obsStop closes only when main returns (the defer
 	// above). A synchronous call here would mean an unreachable, partitioned,
 	// or merely slow API server blocks httpSrv.ListenAndServe() from ever
-	// running, so the chart's liveness probe (initialDelaySeconds: 5,
-	// periodSeconds: 10, default failureThreshold: 3 --
-	// charts/aicrme/templates/deployment.yaml) kills the pod roughly every
-	// 35s: a permanent CrashLoopBackOff of the whole console, caused by the
-	// one subsystem that is supposed to be optional. Handlers are registered
+	// running -- and the chart's probes are already counting against that.
+	// The startupProbe governs until it first succeeds (initialDelaySeconds:
+	// 5, periodSeconds: 5, failureThreshold: 11 --
+	// charts/aicrme/templates/deployment.yaml), which kills the pod at 55s;
+	// once startup has succeeded the livenessProbe takes over and kills on
+	// its third consecutive failure, at 25s. Either way the result of
+	// blocking here is a permanent CrashLoopBackOff of the whole console,
+	// caused by the one subsystem that is supposed to be optional. (A pod
+	// dies on the failureThreshold-th CONSECUTIVE failure, so the last probe
+	// that can still save it fires at initialDelaySeconds + periodSeconds x
+	// (failureThreshold - 1) -- one period earlier than the arithmetic an
+	// earlier version of this comment used, which named a fourth liveness
+	// probe that never runs.) Handlers are registered
 	// before the informer factory starts, so events flow whether or not this
 	// goroutine's Start call has returned yet; its return value is consumed
 	// only for this warning.
@@ -309,9 +442,6 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: SSE streams are long-lived by design.
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		slog.Info("listening", "addr", *addr)

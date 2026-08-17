@@ -117,10 +117,16 @@ func (b *bundle) Run(ctx context.Context, run *engine.Run, emit engine.Emit) err
 // them today. A catalog change that moves a component to a different
 // namespace, or repoints its Chart/Source at a different registry while
 // holding the version string, must not slip past this guard. The recipe's
-// own identity (Name/Version) is compared too -- Recommend writes all of
-// these fields from the same result Bundle re-resolves, so there is no old-
-// record compatibility gap yet (see the AICR bump checklist in
-// docs/phase-2-handoff.md for what changes once recipe.json is persisted).
+// own identity (Name/Version) is compared too. Within one process's
+// lifetime, with no restart in between, this is comparing a result against
+// itself -- Recommend writes every one of these fields from the same result
+// Bundle re-resolves, so there is no drift to catch. 2b-ii's ConfigMap store
+// removed that guarantee: recipe.json now survives a restart, so a Retry
+// after an image upgrade can re-resolve against a catalog embedded by a
+// different image than the one that wrote the approved recipe.json. This
+// guard is what makes that safe -- see the AICR bump checklist in
+// docs/phase-2-handoff.md, whose assertMatchesApproved row now covers this
+// case too.
 func assertMatchesApproved(result *aicr.RecipeResult, approved []byte) error {
 	var summary RecipeSummary
 	if err := json.Unmarshal(approved, &summary); err != nil {

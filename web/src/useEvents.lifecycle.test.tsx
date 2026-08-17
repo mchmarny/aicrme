@@ -14,10 +14,15 @@ class MockEventSource {
   onopen: (() => void) | null = null
   onerror: (() => void) | null = null
   onmessage: ((msg: MessageEvent<string>) => void) | null = null
+  private listeners: Record<string, Array<(msg: MessageEvent<string>) => void>> = {}
 
   constructor(url: string) {
     this.url = url
     MockEventSource.instances.push(this)
+  }
+
+  addEventListener(type: string, handler: (msg: MessageEvent<string>) => void) {
+    (this.listeners[type] ??= []).push(handler)
   }
 
   close() {
@@ -26,6 +31,16 @@ class MockEventSource {
 
   emit(data: unknown) {
     this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent<string>)
+  }
+
+  // emitNamed simulates a named SSE frame (`event: <type>`), which
+  // EventSource dispatches to addEventListener(type, ...) rather than
+  // onmessage. The epoch control frame is the only named event the server
+  // sends today.
+  emitNamed(type: string, data: unknown) {
+    for (const handler of this.listeners[type] ?? []) {
+      handler({ data: JSON.stringify(data) } as MessageEvent<string>)
+    }
   }
 }
 
@@ -254,5 +269,89 @@ describe('useEvents connection lifecycle', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/session')
     expect(onUnauthorized).not.toHaveBeenCalled()
+  })
+
+  // The epoch is a named, id-less SSE control frame: nextID resets to 1 on
+  // every process restart, so a lastId issued by a prior process looks like
+  // a valid-but-stale cursor rather than an obviously wrong one, and the
+  // server would otherwise filter out everything at or below it -- a live,
+  // healthy-looking connection that delivers nothing. The epoch lets the
+  // client tell "same process, ordinary reconnect" apart from "different
+  // process, my cursor is meaningless" and react only to the latter.
+  describe('epoch handling', () => {
+    it('records the epoch from the very first connection without reconnecting', () => {
+      renderHook(() => useEvents())
+      const first = MockEventSource.instances[0]
+
+      act(() => {
+        first.emitNamed('epoch', { epoch: 'epoch-a' })
+      })
+
+      // Nothing to correct on a fresh connection -- lastId is already 0, so
+      // treating the first epoch seen as a "change" would reconnect on every
+      // single mount for no reason.
+      expect(MockEventSource.instances.length).toBe(1)
+      expect(first.closed).toBe(false)
+    })
+
+    // This is the property the brief calls out as the one most likely to be
+    // implemented plausibly and wrongly: resetting lastId in place does NOT
+    // work, because the server already chose its backlog from the original
+    // (stale) cursor when the connection opened. Proven by bite-proofing in
+    // task-9-report.md -- a reset-only implementation makes this test fail
+    // while leaving the ordinary-streaming tests above green.
+    it('tears down the connection and reopens at since=0 when the epoch changes, discarding accumulated state', () => {
+      const { result } = renderHook(() => useEvents())
+      const first = MockEventSource.instances[0]
+
+      act(() => {
+        first.emitNamed('epoch', { epoch: 'epoch-a' })
+      })
+      act(() => {
+        first.emit(ev(50))
+      })
+      expect(result.current.events.map(e => e.id)).toEqual([50])
+
+      // A different epoch on the same connection: the process behind it
+      // restarted mid-stream (or the client mistook a fresh process for a
+      // continuation of the one it last saw).
+      act(() => {
+        first.emitNamed('epoch', { epoch: 'epoch-b' })
+      })
+
+      expect(first.closed).toBe(true)
+      expect(MockEventSource.instances.length).toBe(2)
+      expect(MockEventSource.instances[1].url).toContain('since=0')
+      // The event from the superseded process is gone, not merged with
+      // whatever the new process goes on to replay.
+      expect(result.current.events).toEqual([])
+    })
+
+    it('ignores frames still queued from the stale source after an epoch change', () => {
+      const { result } = renderHook(() => useEvents())
+      const first = MockEventSource.instances[0]
+
+      act(() => {
+        first.emitNamed('epoch', { epoch: 'epoch-a' })
+      })
+      act(() => {
+        first.emitNamed('epoch', { epoch: 'epoch-b' })
+      })
+      const second = MockEventSource.instances[1]
+
+      // The old source delivers a frame it had already selected under the
+      // stale cursor before the epoch fired. It must not land in the
+      // freshly cleared timeline.
+      act(() => {
+        first.emit(ev(50))
+      })
+      expect(result.current.events).toEqual([])
+
+      // The new connection's own events still land normally.
+      act(() => {
+        second.emit(ev(1))
+      })
+      expect(result.current.events.map(e => e.id)).toEqual([1])
+    })
   })
 })
