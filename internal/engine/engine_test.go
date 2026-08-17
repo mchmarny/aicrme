@@ -1081,3 +1081,82 @@ func TestStartIsNormalWithoutRecovery(t *testing.T) {
 		t.Fatalf("Start() error = %v, want nil -- recoveredPending must default false on a cold start", err)
 	}
 }
+
+// TestRetrySaveFailureRestoresRecoveryPending is the regression test for
+// Ruling 11. Retry's rollback restores State and Err when its post-accept
+// Save fails, but previously left recoveredPending cleared -- so a Save
+// failure during Retry (an API blip is exactly the moment an operator is
+// hitting Retry after a restart, per Task 8's ConfigMap store) silently
+// reopened the bug this whole task exists to close: Start would stop
+// returning 409, and the SPA's automatic POST /api/runs on the next load
+// would destroy the recovered run.
+func TestRetrySaveFailureRestoresRecoveryPending(t *testing.T) {
+	inner := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateRunning, engine.PhaseApply, 3)
+	if err := inner.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	store := &saveFailingStore{Store: inner}
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	store.setFail(true)
+	if _, err := e.Retry(testRunID); err == nil {
+		t.Fatal("Retry() error = nil, want the manufactured Save failure to surface")
+	}
+	store.setFail(false)
+
+	_, err := e.Start(context.Background())
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+		t.Fatalf("Start() error = %v, want ErrCodeConflict -- Retry's rollback must restore recoveredPending along with State", err)
+	}
+}
+
+// deleteFailingStore wraps a Store and fails every Delete call, to exercise
+// Discard's error path. Per Ruling 1 it embeds a real store rather than
+// leaving engine.Store nil, since Save/Load/LoadCurrent all fall through
+// unmodified.
+type deleteFailingStore struct {
+	engine.Store
+}
+
+func (s *deleteFailingStore) Delete(context.Context) error {
+	return errors.New("delete failed")
+}
+
+// TestDiscardSurfacesStoreDeleteFailure covers concern 2: Discard is the
+// only release valve on Start's recoveredPending gate, so a Delete failure
+// nobody has exercised is exactly the kind of gap that could leave the
+// console wedged with no way out. It also pins the chosen failure semantics
+// (see the Fix round 1 report): e.current and recoveredPending are cleared
+// before the store I/O and stay cleared even when Delete fails, so Start is
+// never blocked by a store outage -- the error still surfaces to the caller.
+func TestDiscardSurfacesStoreDeleteFailure(t *testing.T) {
+	inner := engine.NewMemoryStore()
+	seed := baseRun(testRunID, engine.StateFailed, engine.PhaseDiscover, 0)
+	if err := inner.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	store := &deleteFailingStore{Store: inner}
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	err := e.Discard(context.Background(), testRunID)
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeUnavailable {
+		t.Fatalf("Discard() error = %v, want a StructuredError with ErrCodeUnavailable when Delete fails", err)
+	}
+	if got := e.Current(); got != nil {
+		t.Errorf("Current() = %+v, want nil even though Delete failed -- a store outage must not leave the run wedged in place", got)
+	}
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Errorf("Start() error = %v, want nil -- a failed Delete must not permanently block Start", err)
+	}
+}

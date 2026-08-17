@@ -584,6 +584,7 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not in a failed state")
 	}
 	prevErr := e.current.Err
+	prevRecoveredPending := e.recoveredPending
 	// Retry is the intended resume path for a recovered run: accepting it
 	// here is the operator action that clears the bootstrap gate in Start.
 	e.recoveredPending = false
@@ -613,6 +614,14 @@ func (e *Engine) Retry(runID string) (*Run, error) {
 			e.current.State = StateFailed
 			e.current.Err = prevErr
 			e.current.UpdatedAt = time.Now().UTC()
+			// recoveredPending is part of the state this rollback restores,
+			// same as State and Err: without it, a Save failure here silently
+			// re-opens the bootstrap gate this task closed -- Start would stop
+			// 409ing and the SPA's automatic POST /api/runs would destroy the
+			// run on its next load. Guarded by the same aliveLocked check as
+			// the rest of the block so this cannot stomp a run that has since
+			// legitimately superseded this one.
+			e.recoveredPending = prevRecoveredPending
 		}
 		e.mu.Unlock()
 		// See Start's identical rationale: no goroutine will ever run for

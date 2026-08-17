@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -63,5 +64,62 @@ func TestSupersededGoroutineCannotWriteState(t *testing.T) {
 	}
 	if _, ok := got.Artifacts["late"]; ok {
 		t.Error("merge-back wrote Artifacts after supersession -- the epoch check did not stop it")
+	}
+}
+
+// supersedingFailStore fails every Save, but first bumps e.epoch directly --
+// manufacturing, from inside the Save call itself, the same "no longer the
+// live goroutine" condition slowStep manufactures from outside. This is the
+// only way this package can reach Retry's rollback with aliveLocked(epoch)
+// false: the public Retry API has no legal way to launch a second live run
+// for the same ID while a first Retry's Save call is still in flight, for
+// the identical reason TestSupersededGoroutineCannotWriteState's doc comment
+// gives for runStep's merge-back.
+type supersedingFailStore struct {
+	Store
+	e *Engine
+}
+
+func (s *supersedingFailStore) Save(context.Context, *Run) error {
+	s.e.mu.Lock()
+	s.e.epoch++
+	s.e.mu.Unlock()
+	return errors.New("save failed")
+}
+
+// TestRetryRollbackDoesNotRestoreRecoveryPendingAgainstASupersededRun pins
+// Ruling 11's guard requirement: restoring recoveredPending on a failed
+// Retry Save must happen inside the same aliveLocked-guarded block that
+// restores State and Err, not unconditionally. An unguarded restore would
+// set recoveredPending against whatever run has since taken over the ID --
+// possibly one that legitimately superseded it -- and 409 that run's Start
+// calls forever, trading the bug this task fixes for a permanent one.
+func TestRetryRollbackDoesNotRestoreRecoveryPendingAgainstASupersededRun(t *testing.T) {
+	store := &supersedingFailStore{Store: NewMemoryStore()}
+	e := New(bus.New(8), store)
+	store.e = e
+
+	run := &Run{
+		ID:        "0123456789abcdef",
+		State:     StateFailed,
+		Decisions: map[string]string{},
+		Artifacts: map[string][]byte{},
+		StartedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	e.mu.Lock()
+	e.current = run
+	e.recoveredPending = true
+	e.mu.Unlock()
+
+	if _, err := e.Retry(run.ID); err == nil {
+		t.Fatal("Retry() error = nil, want the manufactured Save failure to surface")
+	}
+
+	e.mu.Lock()
+	got := e.recoveredPending
+	e.mu.Unlock()
+	if got {
+		t.Error("recoveredPending restored true after the run was superseded mid-Save -- the rollback's aliveLocked guard did not cover it")
 	}
 }
