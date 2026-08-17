@@ -53,14 +53,20 @@ const defaultWorkDir = "/var/lib/aicrme"
 const defaultApplyRetries = 5
 
 // runShutdownTimeout bounds how long shutdown waits for an in-flight run to
-// stop. One cancellation can spend two of the applier's killGrace windows
-// back to back (internal/applier/exec.go): 10s for the process-group SIGTERM
-// -> SIGKILL escalation, then up to another 10s of cmd.WaitDelay if a
-// descendant that escaped the process group is still holding the stdout pipe
-// open. 15s did not cover that. 30s does, and still fits inside the chart's
-// terminationGracePeriodSeconds of 45 alongside the concurrent HTTP drain --
-// test/chart/contract.sh pins the two against each other so they cannot
-// drift apart silently.
+// stop. The worst case is killGrace (internal/applier/exec.go, 10s: the
+// process-group SIGTERM -> SIGKILL escalation) plus terminalSaveTimeout
+// (internal/engine/engine.go, 5s: the detached terminal-state write once the
+// step returns) -- roughly 15s. cmd.WaitDelay does not add a second window on
+// top of that: os/exec starts its timer the instant cmd.Cancel returns, the
+// same moment the escalation goroutine starts its own, so the two race
+// concurrently rather than run back to back (see os/exec's watchCtx and the
+// WaitDelay doc comment: "starts when either the associated Context is done
+// or a call to Wait observes that the child process has exited, whichever
+// occurs first"). 15s was the right estimate but zero slack; 30s gives real
+// headroom and still fits inside the chart's terminationGracePeriodSeconds of
+// 45 alongside the concurrent HTTP drain -- test/chart/contract.sh pins
+// runShutdownTimeout against killGrace + terminalSaveTimeout, and both
+// against the grace period, so they cannot drift apart silently.
 const runShutdownTimeout = 30 * time.Second
 
 // httpShutdownTimeout bounds the HTTP drain. Runs concurrently with the

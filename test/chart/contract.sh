@@ -265,18 +265,23 @@ else
       "process waits up to ${process_budget}s (max of runShutdownTimeout=${run_budget}s, httpShutdownTimeout=${http_budget}s) but the chart allows only ${grace_default}s before SIGKILL"
   fi
 
-  # The run budget must also cover the applier's worst case: killGrace for the
-  # process-group SIGTERM -> SIGKILL escalation, then another killGrace of
-  # cmd.WaitDelay if a descendant that escaped the group still holds the
-  # stdout pipe open.
+  # The run budget must also cover the engine's worst case: killGrace for the
+  # applier's process-group SIGTERM -> SIGKILL escalation, plus
+  # terminalSaveTimeout for the detached terminal-state write once the step
+  # returns. cmd.WaitDelay is not a third window: os/exec starts that timer
+  # the instant cmd.Cancel returns, the same moment the escalation goroutine
+  # starts its own, so the two race concurrently rather than run back to
+  # back -- see the WaitDelay doc comment in os/exec.
   kill_grace=$(sed -n 's/^var killGrace = \([0-9][0-9]*\) \* time.Second$/\1/p' internal/applier/exec.go | head -1)
-  if [[ -z "${kill_grace}" ]]; then
-    fail "killGrace readable" "could not read killGrace as whole seconds from internal/applier/exec.go"
-  elif (( run_budget >= 2 * kill_grace )); then
-    pass "runShutdownTimeout ${run_budget}s covers two killGrace windows (2 x ${kill_grace}s)"
+  terminal_save=$(sed -n 's/^const terminalSaveTimeout = \([0-9][0-9]*\) \* time.Second$/\1/p' internal/engine/engine.go | head -1)
+  if [[ -z "${kill_grace}" || -z "${terminal_save}" ]]; then
+    fail "killGrace/terminalSaveTimeout readable" \
+      "could not read killGrace from internal/applier/exec.go and terminalSaveTimeout from internal/engine/engine.go as whole seconds"
+  elif (( run_budget >= kill_grace + terminal_save )); then
+    pass "runShutdownTimeout ${run_budget}s covers killGrace + terminalSaveTimeout (${kill_grace}s + ${terminal_save}s)"
   else
-    fail "runShutdownTimeout covers the applier's worst case" \
-      "runShutdownTimeout=${run_budget}s but one cancellation can spend 2 x killGrace=${kill_grace}s (escalation, then cmd.WaitDelay)"
+    fail "runShutdownTimeout covers the engine's worst case" \
+      "runShutdownTimeout=${run_budget}s but cancellation can take killGrace=${kill_grace}s + terminalSaveTimeout=${terminal_save}s"
   fi
 fi
 
