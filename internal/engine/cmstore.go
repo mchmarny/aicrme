@@ -175,8 +175,7 @@ func (s *configMapStore) save(ctx context.Context, blob []byte) error {
 			return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "reading run checkpoint failed", getErr)
 
 		case foreignOwner(existing.OwnerReferences, s.owner.UID):
-			return aicrerrors.New(aicrerrors.ErrCodeConflict,
-				"run checkpoint "+s.namespace+"/"+s.name+" is owned by a different install; refusing to overwrite")
+			return s.foreignOwnerErr("overwrite it")
 
 		default:
 			if existing.BinaryData == nil {
@@ -209,6 +208,23 @@ func foreignOwner(existing []metav1.OwnerReference, want types.UID) bool {
 	return false
 }
 
+// foreignOwnerErr is the one error shape every operation returns for a record
+// another install owns; verb names what this call refused to do.
+//
+// ErrCodeConflict, deliberately not ErrCodeNotFound: Recover keys "cold
+// start" off NotFound alone, so returning that here would tell recovery the
+// other install's record does not exist -- and the very next Start would
+// overwrite it. Conflict instead lands recovery on markStoreUnreadable: the
+// console degrades to an in-memory store, leaves the foreign record exactly
+// as it found it, and says so at error level. It is also outside
+// loadCurrentRetryable's ErrCodeInternal set, so it fails on the first
+// attempt rather than spending the startup budget on an answer that cannot
+// change.
+func (s *configMapStore) foreignOwnerErr(verb string) error {
+	return aicrerrors.New(aicrerrors.ErrCodeConflict,
+		"run checkpoint "+s.namespace+"/"+s.name+" is owned by a different install; refusing to "+verb)
+}
+
 // LoadCurrent reads the ConfigMap and decodes its payload. A missing
 // ConfigMap is the only case mapped to ErrCodeNotFound: a present-but-broken
 // record (missing key, undecodable payload) is deliberately a different
@@ -227,6 +243,18 @@ func (s *configMapStore) loadCurrent(ctx context.Context) (*Run, error) {
 	}
 	if err != nil {
 		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "reading run checkpoint failed", err)
+	}
+	// The same check save performs, for the same reason and one step earlier.
+	// `helm uninstall && helm install` gives the Deployment a new UID, but
+	// ownerReference garbage collection is asynchronous, so a pod starting in
+	// that window finds the PREVIOUS install's record still present. Without
+	// this, recovery installs it as the current run: Start then 409s on the
+	// recovery gate, Retry 409s on save's own foreign-owner check, and the
+	// console stays wedged even after GC finally reaps the ConfigMap --
+	// strictly worse than the unreadable path, which degrades cleanly. With
+	// it, recovery takes exactly that unreadable path instead.
+	if foreignOwner(cm.OwnerReferences, s.owner.UID) {
+		return nil, s.foreignOwnerErr("read it")
 	}
 	blob, ok := cm.BinaryData[payloadKey]
 	if !ok {
@@ -265,11 +293,28 @@ func (s *configMapStore) Delete(ctx context.Context) error {
 // delete is Delete's body, split out for the same reason save is: s.mu.Lock
 // must happen inside the goroutine withCallTimeout races against the bound,
 // not before it is spawned.
+//
+// It reads before it deletes so a discard cannot reap another install's
+// record -- the same asymmetry loadCurrent closes, in the other direction.
+// The gap between the Get and the Delete is not a race worth closing with a
+// UID precondition: the chart pins strategy: Recreate, so this process is the
+// only writer, and the case being defended against is a leftover record from
+// an install that is already gone, not one being written concurrently.
 func (s *configMapStore) delete(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	err := s.client.CoreV1().ConfigMaps(s.namespace).Delete(ctx, s.name, metav1.DeleteOptions{})
+	existing, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.name, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return nil // already absent: the caller's intent is satisfied
+	case err != nil:
+		return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "reading run checkpoint before deleting it failed", err)
+	case foreignOwner(existing.OwnerReferences, s.owner.UID):
+		return s.foreignOwnerErr("delete it")
+	}
+
+	err = s.client.CoreV1().ConfigMaps(s.namespace).Delete(ctx, s.name, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "deleting run checkpoint failed", err)
 	}

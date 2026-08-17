@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -388,6 +389,127 @@ func TestConfigMapStoreRejectsForeignOwner(t *testing.T) {
 	}
 }
 
+// foreignOwnedClient returns a fake clientset holding a run checkpoint owned
+// by a different install -- what `helm uninstall && helm install` leaves
+// behind for the window before ownerReference garbage collection reaps it,
+// since the new Deployment gets a new UID while the old object is still
+// present.
+//
+// The record is written through a store owned by that other install rather
+// than hand-stuffed with a placeholder byte string, and that detail is the
+// whole test. A garbage payload fails decodeRun on its own, so every
+// assertion below would have passed with no owner check in loadCurrent at
+// all -- verified by writing it the lazy way first and watching the mutation
+// run stay green. Only a genuinely decodable envelope leaves the ownership
+// check as the sole reason a read can fail.
+//
+// It also returns the encoded bytes, so a caller can assert the record came
+// back byte-identical instead of merely "not the string I typed."
+func foreignOwnedClient(t *testing.T) (*fake.Clientset, []byte) {
+	t.Helper()
+	foreign := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "other-install", UID: "foreign-uid"}
+	client := fake.NewSimpleClientset()
+
+	other := engine.NewConfigMapStore(client, testNamespace, testName, foreign)
+	if err := other.Save(context.Background(), baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 2)); err != nil {
+		t.Fatalf("seeding the other install's record failed: %v", err)
+	}
+
+	cm, err := client.CoreV1().ConfigMaps(testNamespace).Get(context.Background(), testName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading back the seeded record failed: %v", err)
+	}
+	return client, append([]byte(nil), cm.BinaryData[payloadKey]...)
+}
+
+// assertRecordUntouched reports whether the seeded foreign-owned payload is
+// still byte-for-byte what foreignOwnedClient wrote.
+func assertRecordUntouched(t *testing.T, client *fake.Clientset, want []byte) {
+	t.Helper()
+	got, err := client.CoreV1().ConfigMaps(testNamespace).Get(context.Background(), testName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get() error = %v, want the foreign-owned record still present", err)
+	}
+	if !bytes.Equal(got.BinaryData[payloadKey], want) {
+		t.Errorf("BinaryData[%s] changed, want the other install's record left byte-identical", payloadKey)
+	}
+}
+
+// LoadCurrent must refuse a record another install owns, and must refuse it
+// as something other than NotFound: recovery keys "cold start" off NotFound
+// alone, so collapsing the two would hand the previous install's ConfigMap to
+// the next Start to overwrite. Save has always checked this; LoadCurrent did
+// not, which made the read path strictly worse than the unreadable one --
+// the record got installed as the current run, Start 409'd on the recovery
+// gate, and Retry 409'd on Save's own check.
+func TestConfigMapStoreLoadCurrentRejectsForeignOwner(t *testing.T) {
+	client, seeded := foreignOwnedClient(t)
+	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+
+	_, err := s.LoadCurrent(context.Background())
+	if err == nil {
+		t.Fatal("LoadCurrent() error = nil, want a foreign-owned record refused rather than installed")
+	}
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) {
+		t.Fatalf("error = %v, want a StructuredError", err)
+	}
+	if se.Code == aicrerrors.ErrCodeNotFound {
+		t.Errorf("Code = %v, want anything but ErrCodeNotFound -- a foreign-owned record must not look like a cold start", se.Code)
+	}
+	// The seeded record decodes cleanly, so "refused" must mean the owner
+	// check refused it, not that decodeRun choked on the payload.
+	if se.Code == aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("Code = %v, want the ownership refusal -- ErrCodeInvalidRequest means the payload failed to decode and the owner check never ran", se.Code)
+	}
+
+	assertRecordUntouched(t, client, seeded)
+}
+
+// Delete needs the same check for the mirror-image reason: a discard is an
+// operator action, and it must not reap a record this install does not own.
+func TestConfigMapStoreDeleteRefusesForeignOwner(t *testing.T) {
+	client, seeded := foreignOwnedClient(t)
+	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+
+	if err := s.Delete(context.Background()); err == nil {
+		t.Fatal("Delete() error = nil, want a foreign-owned record refused rather than reaped")
+	}
+
+	assertRecordUntouched(t, client, seeded)
+}
+
+// The end-to-end consequence I3 is actually about: a pod starting inside the
+// reinstall window must degrade cleanly (in-memory store, nothing installed,
+// Start works) instead of wedging on a record it can neither retry nor
+// discard. Driven through a real configMapStore rather than a Store double,
+// because the whole finding is that the store's own read path disagreed with
+// its write path.
+func TestRecoverDegradesAgainstAForeignOwnedRecord(t *testing.T) {
+	client, seeded := foreignOwnedClient(t)
+	store := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v, want nil", err)
+	}
+	if got := e.Current(); got != nil {
+		t.Errorf("Current() = %+v, want nil -- another install's run must not be installed", got)
+	}
+	if !e.StoreUnreadable() {
+		t.Error("StoreUnreadable() = false, want true -- a foreign-owned record must degrade the store, not be adopted")
+	}
+
+	// The gate is clear, so the SPA's automatic POST /api/runs works rather
+	// than 409ing forever against a run the operator can neither retry nor
+	// discard.
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v, want nil after degrading", err)
+	}
+
+	assertRecordUntouched(t, client, seeded)
+}
+
 func TestConfigMapStoreDelete(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
@@ -416,15 +538,43 @@ func TestConfigMapStoreDelete(t *testing.T) {
 
 // A non-NotFound Delete failure must surface rather than be swallowed as
 // success -- only absence means the caller's intent is already satisfied.
+// The store must actually reach its Delete call for that to be under test, so
+// the fixture seeds a record this install owns: delete now reads before it
+// deletes (see delete's own doc comment on why), and an absent record short-
+// circuits to success before any Delete is issued.
 func TestConfigMapStoreDeleteNonNotFoundErrorSurfaces(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	owner := testOwner()
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       testNamespace,
+			Name:            testName,
+			OwnerReferences: []metav1.OwnerReference{owner},
+		},
+		BinaryData: map[string][]byte{payloadKey: []byte("placeholder")},
+	})
 	client.PrependReactor("delete", "configmaps", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(corev1.Resource("configmaps"), testName, errors.New("no access"))
+	})
+
+	s := engine.NewConfigMapStore(client, testNamespace, testName, owner)
+	if err := s.Delete(context.Background()); err == nil {
+		t.Fatal("Delete() error = nil, want the Forbidden error to surface")
+	}
+}
+
+// The ownership read delete performs first has its own failure mode: a
+// non-NotFound Get error must surface rather than be mistaken for "already
+// absent, nothing to do" -- which would report a discard as successful while
+// the record is still there.
+func TestConfigMapStoreDeleteOwnershipReadErrorSurfaces(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("get", "configmaps", func(_ k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewForbidden(corev1.Resource("configmaps"), testName, errors.New("no access"))
 	})
 
 	s := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
 	if err := s.Delete(context.Background()); err == nil {
-		t.Fatal("Delete() error = nil, want the Forbidden error to surface")
+		t.Fatal("Delete() error = nil, want the Forbidden Get error to surface rather than read as absence")
 	}
 }
 
