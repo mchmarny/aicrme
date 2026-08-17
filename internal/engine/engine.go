@@ -47,7 +47,18 @@ type Step interface {
 // Engine executes steps in order for a single run. One run at a time: this is
 // a single-replica demo console, not a scheduler.
 type Engine struct {
-	bus   *bus.Bus
+	bus *bus.Bus
+	// store persists run state. Set once in New for the engine's life, with
+	// one exception: Recover's markStoreUnreadable reassigns it under e.mu
+	// when a persisted record cannot be trusted. Every other read of this
+	// field (Start, Retry, Get, runStep, finish, ...) happens without
+	// holding e.mu -- safe only because that reassignment happens exactly
+	// once, during Recover, before any goroutine that could read store
+	// concurrently exists (Recover runs before the HTTP server starts
+	// serving). A future caller reassigning store after startup -- a
+	// "reload from store" action, say -- would need real synchronization
+	// here, not just the lock around the write, or -race would only catch
+	// it intermittently.
 	store Store
 	steps []Step
 

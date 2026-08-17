@@ -2,12 +2,31 @@ package engine
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 )
+
+// maxLoadAttempts bounds LoadCurrent's retry loop. A pod restarting and the
+// API server being briefly unreachable are plausibly the same event -- node
+// pressure, a control-plane blip -- so the spec treats that as the load
+// path's common failure and asks for a short bounded retry rather than
+// degrading on the first blip. Kept small deliberately: this runs before
+// :8080 binds, so startup latency is a real cost, not a free variable.
+const maxLoadAttempts = 3
+
+// loadRetryBackoff is the pause between load attempts. Short and fixed --
+// this is absorbing a blip, not competing for a contended resource the way
+// cmstore's Save conflict-retry loop is.
+const loadRetryBackoff = 50 * time.Millisecond
+
+// runIDLength is newID's output format: hex.EncodeToString of 8 random
+// bytes is always 16 characters.
+const runIDLength = 16
 
 // ErrStepConfig reports a step slice this engine cannot recover against. It
 // is a programming error, not a runtime condition: main treats it as fatal
@@ -46,6 +65,18 @@ func (e *Engine) bundleStepIndex() (int, error) {
 	}
 }
 
+// validRunID reports whether id matches the format Start's newID always
+// produces: 16 hex characters. Spec says "ID format" is part of what a
+// loaded record is checked against; this is cheap, and the format checked
+// is exactly what the only producer emits.
+func validRunID(id string) bool {
+	if len(id) != runIDLength {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
+}
+
 // validState reports whether s is one of the engine's declared State
 // constants. A record that decodes cleanly is not automatically one this
 // engine defines -- a future build's new State, or plain corruption that
@@ -77,8 +108,8 @@ func validPhase(p Phase) bool {
 // failing this check takes the unreadable path -- it is not partially
 // installed.
 func (e *Engine) validateLoaded(r *Run) error {
-	if r.ID == "" {
-		return errors.New("recovered run has an empty ID")
+	if !validRunID(r.ID) {
+		return fmt.Errorf("recovered run has an invalid ID %q", r.ID)
 	}
 	if !validState(r.State) {
 		return fmt.Errorf("recovered run has an unrecognized state %q", r.State)
@@ -92,13 +123,68 @@ func (e *Engine) validateLoaded(r *Run) error {
 	if r.StartedAt.IsZero() {
 		return errors.New("recovered run has a zero StartedAt")
 	}
+	// UpdatedAt is written by every producer that ever touches a Run (Start,
+	// Decide, every step transition, finish, ...), so it is exactly as safe
+	// to require as StartedAt -- the spec says "timestamps," plural.
+	if r.UpdatedAt.IsZero() {
+		return errors.New("recovered run has a zero UpdatedAt")
+	}
 	return nil
+}
+
+// loadCurrentRetryable reports whether err is the plausibly-transient
+// subset of LoadCurrent's failures worth retrying. cmstore wraps a failed
+// Get as ErrCodeInternal; that is the only shape a control-plane blip
+// produces. A decode failure, an unsupported schema version, or a missing
+// payload key -- all ErrCodeInvalidRequest -- fail identically on every
+// attempt, so retrying them only delays startup for no chance of a
+// different answer.
+//
+// aicrerrors.IsTransient does not fit here: it keys on ErrCodeTimeout and
+// context-based causes, not ErrCodeInternal, so it would silently treat
+// this case as non-retryable. The code is gated explicitly instead, the
+// same way the rest of this file inspects StructuredError.
+func loadCurrentRetryable(err error) bool {
+	var se *aicrerrors.StructuredError
+	return errors.As(err, &se) && se.Code == aicrerrors.ErrCodeInternal
+}
+
+// loadCurrentWithRetry wraps Store.LoadCurrent with a short bounded retry
+// for the plausibly-transient failure class (see loadCurrentRetryable).
+// NotFound and deterministic failures (decode, version, missing key) return
+// on the first attempt -- retrying a failure that cannot change outcome
+// only costs startup latency. The backoff is bounded by ctx, same as every
+// other wait in this call path.
+func (e *Engine) loadCurrentWithRetry(ctx context.Context) (*Run, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxLoadAttempts; attempt++ {
+		r, err := e.store.LoadCurrent(ctx)
+		if err == nil {
+			return r, nil
+		}
+		lastErr = err
+		if !loadCurrentRetryable(err) {
+			return nil, err
+		}
+		if attempt == maxLoadAttempts-1 {
+			break
+		}
+		select {
+		case <-time.After(loadRetryBackoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
 }
 
 // Recover loads any persisted run and installs it as the current run. It
 // must be called before the HTTP server starts serving: the SPA's automatic
 // POST /api/runs on load must never win a race against a run this call is
-// still installing.
+// still installing. That ordering also protects store itself (see the field
+// comment on Engine.store): the one post-construction reassignment this
+// engine ever makes to store happens here, before any goroutine exists that
+// could read it concurrently.
 //
 // It returns an error only for a configuration fault the process cannot run
 // with (see ErrStepConfig). Store failures are handled here and reported as
@@ -112,7 +198,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 		return err
 	}
 
-	r, err := e.store.LoadCurrent(ctx)
+	r, err := e.loadCurrentWithRetry(ctx)
 	if err != nil {
 		// aicr@v0.19.0's errors package exposes no Code(err) helper -- New,
 		// Wrap, IsTransient and friends only -- so the code is reached
@@ -139,20 +225,32 @@ func (e *Engine) Recover(ctx context.Context) error {
 	if isLive(r.State) || r.State == StateIdle {
 		r.State = StateFailed
 		r.Err = recoveredErr
+		// Pending named the decisions a now-nonexistent awaitDecisions
+		// goroutine was blocked on. Leaving it set alongside StateFailed
+		// would be a self-inconsistent record -- Pending implies
+		// StateAwaitingDecision -- for Task 4/6 to have to reason about.
+		r.Pending = nil
 	}
 
 	// Rewind on retryability, not on how the run reached its state. The
 	// bundle directory died with the emptyDir regardless of whether the run
 	// was interrupted or had already failed, so a run that failed during
 	// Apply before the crash needs the same rewind as one cut off mid-step.
+	rewound := false
 	if r.State == StateFailed && r.StepIndex > bundleIdx {
 		r.StepIndex = bundleIdx
+		rewound = true
 	}
 
 	e.mu.Lock()
 	e.current = r
 	e.recoveredPending = true
 	e.mu.Unlock()
+
+	// This only ever fires after an unplanned restart, so it is the single
+	// most useful startup line the console can emit -- the bus events Task 6
+	// adds reach the SPA, not the pod's own logs.
+	slog.Info("recovered a persisted run", "run", r.ID, "state", r.State, "step", r.StepIndex, "rewound", rewound)
 	return nil
 }
 

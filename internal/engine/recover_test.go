@@ -24,7 +24,13 @@ type recoverStore struct {
 	mu          sync.Mutex
 	loadCurrent *engine.Run
 	loadErr     error
-	saveCalls   int
+	// loadErrLimit caps how many LoadCurrent calls return loadErr before
+	// falling through to the loadCurrent/NotFound path: 0 means "every
+	// call" (a deterministic failure fixture), 1 means "fail once, then
+	// succeed" (a transient-blip fixture), and so on.
+	loadErrLimit int
+	loadCalls    int
+	saveCalls    int
 }
 
 func newRecoverStore() *recoverStore {
@@ -34,13 +40,20 @@ func newRecoverStore() *recoverStore {
 func (s *recoverStore) LoadCurrent(context.Context) (*engine.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.loadErr != nil {
+	s.loadCalls++
+	if s.loadErr != nil && (s.loadErrLimit == 0 || s.loadCalls <= s.loadErrLimit) {
 		return nil, s.loadErr
 	}
 	if s.loadCurrent == nil {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeNotFound, "no current run")
 	}
 	return s.loadCurrent.Clone(), nil
+}
+
+func (s *recoverStore) LoadCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadCalls
 }
 
 func (s *recoverStore) Save(ctx context.Context, r *engine.Run) error {
@@ -69,6 +82,11 @@ func fourStepEngine(store engine.Store) *engine.Engine {
 	)
 }
 
+// testRunID matches validRunID's format (16 hex characters, mirroring
+// newID's real output) so fixtures exercising other validateLoaded checks
+// don't also, incidentally, fail the ID check.
+const testRunID = "0123456789abcdef"
+
 func baseRun(id string, state engine.State, phase engine.Phase, stepIndex int) *engine.Run {
 	return &engine.Run{
 		ID:        id,
@@ -89,7 +107,7 @@ func TestRecoverLandsNonTerminalRunsFailed(t *testing.T) {
 	for _, state := range []engine.State{engine.StateIdle, engine.StateRunning, engine.StateAwaitingDecision} {
 		t.Run(string(state), func(t *testing.T) {
 			store := newRecoverStore()
-			store.loadCurrent = baseRun("run-a", state, engine.PhaseDiscover, 0)
+			store.loadCurrent = baseRun(testRunID, state, engine.PhaseDiscover, 0)
 			e := fourStepEngine(store)
 
 			if err := e.Recover(context.Background()); err != nil {
@@ -109,6 +127,35 @@ func TestRecoverLandsNonTerminalRunsFailed(t *testing.T) {
 	}
 }
 
+// TestRecoverClearsPendingOnInterruptedRun pins the Minor fix alongside the
+// State flip: awaitDecisions writes Pending and StateAwaitingDecision
+// together, so a recovered run landing StateFailed with Pending still
+// populated is self-inconsistent -- Pending implies a decision gate is
+// still open, and after a restart no awaitDecisions goroutine exists to
+// read an answer. Left uncleared, Task 4/6 would have to reason about a
+// combination the state machine never otherwise produces.
+func TestRecoverClearsPendingOnInterruptedRun(t *testing.T) {
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateAwaitingDecision, engine.PhaseRecommend, 1)
+	run.Pending = []string{"intent", "platform"}
+	store.loadCurrent = run
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	got := e.Current()
+	if got == nil {
+		t.Fatal("Current() = nil, want the recovered run installed")
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
+	}
+	if len(got.Pending) != 0 {
+		t.Errorf("Pending = %v, want empty -- no awaitDecisions goroutine exists to read an answer after a restart", got.Pending)
+	}
+}
+
 // TestRecoverLeavesTerminalRunsAlone pins that StateDone and StateActive
 // restore as-is -- neither implies a dead goroutine the way the non-terminal
 // states do.
@@ -116,7 +163,7 @@ func TestRecoverLeavesTerminalRunsAlone(t *testing.T) {
 	for _, state := range []engine.State{engine.StateDone, engine.StateActive} {
 		t.Run(string(state), func(t *testing.T) {
 			store := newRecoverStore()
-			store.loadCurrent = baseRun("run-a", state, engine.PhaseRecommend, 1)
+			store.loadCurrent = baseRun(testRunID, state, engine.PhaseRecommend, 1)
 			e := fourStepEngine(store)
 
 			if err := e.Recover(context.Background()); err != nil {
@@ -144,7 +191,7 @@ func TestRecoverLeavesTerminalRunsAlone(t *testing.T) {
 // dead on arrival against a bundle.path that no longer exists.
 func TestRecoverRewindsAlreadyFailedRunAtApply(t *testing.T) {
 	store := newRecoverStore()
-	run := baseRun("run-a", engine.StateFailed, engine.PhaseApply, 3)
+	run := baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 3)
 	run.Err = "helm upgrade --install failed: some component"
 	store.loadCurrent = run
 	e := fourStepEngine(store)
@@ -168,7 +215,7 @@ func TestRecoverRewindsAlreadyFailedRunAtApply(t *testing.T) {
 // was StateRunning (mid-Apply) when the pod died must rewind the same way.
 func TestRecoverRewindsInterruptedRunAtApply(t *testing.T) {
 	store := newRecoverStore()
-	store.loadCurrent = baseRun("run-a", engine.StateRunning, engine.PhaseApply, 3)
+	store.loadCurrent = baseRun(testRunID, engine.StateRunning, engine.PhaseApply, 3)
 	e := fourStepEngine(store)
 
 	if err := e.Recover(context.Background()); err != nil {
@@ -190,7 +237,7 @@ func TestRecoverRewindsInterruptedRunAtApply(t *testing.T) {
 // that never reached Bundle has nothing to rewind.
 func TestRecoverDoesNotRewindBeforeBundle(t *testing.T) {
 	store := newRecoverStore()
-	store.loadCurrent = baseRun("run-a", engine.StateFailed, engine.PhaseDiscover, 0)
+	store.loadCurrent = baseRun(testRunID, engine.StateFailed, engine.PhaseDiscover, 0)
 	e := fourStepEngine(store)
 
 	if err := e.Recover(context.Background()); err != nil {
@@ -209,7 +256,7 @@ func TestRecoverDoesNotRewindBeforeBundle(t *testing.T) {
 // keeps its StepIndex -- rewind is exclusively a StateFailed concern.
 func TestRecoverDoesNotRewindTerminalRuns(t *testing.T) {
 	store := newRecoverStore()
-	store.loadCurrent = baseRun("run-a", engine.StateDone, engine.PhaseApply, 4)
+	store.loadCurrent = baseRun(testRunID, engine.StateDone, engine.PhaseApply, 4)
 	e := fourStepEngine(store)
 
 	if err := e.Recover(context.Background()); err != nil {
@@ -246,8 +293,12 @@ func TestRecoverNotFoundIsACleanStart(t *testing.T) {
 
 // TestRecoverUnreadableRecordDoesNotInstallOrOverwrite is the other half of
 // "unreadable is not absent": a non-NotFound load failure must not look like
-// a cold start. Recover must not install the (nonexistent, since it could not
-// be read) run, AND it must swap the engine's store so that nothing this
+// a cold start. This fixture fails EVERY attempt with ErrCodeInternal --
+// the plausibly-transient class loadCurrentWithRetry retries -- so getting
+// here means retries were exhausted, not that the first error degraded
+// immediately (see TestRecoverDoesNotRetryDeterministicLoadFailure for that
+// case). Recover must not install the (nonexistent, since it could not be
+// read) run, AND it must swap the engine's store so that nothing this
 // process subsequently does -- proved here with a real Start -- writes
 // through the original, unreadable store. A transient blip must not let a
 // new run overwrite a record that was merely unreadable at that moment.
@@ -265,6 +316,9 @@ func TestRecoverUnreadableRecordDoesNotInstallOrOverwrite(t *testing.T) {
 	if !e.StoreUnreadable() {
 		t.Error("StoreUnreadable() = false, want true")
 	}
+	if calls := store.LoadCalls(); calls <= 1 {
+		t.Errorf("LoadCurrent was called %d time(s), want more than 1 -- an always-ErrCodeInternal failure should exhaust the retry budget, not degrade on the first attempt", calls)
+	}
 
 	if _, err := e.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -274,16 +328,107 @@ func TestRecoverUnreadableRecordDoesNotInstallOrOverwrite(t *testing.T) {
 	}
 }
 
+// TestRecoverRetriesTransientLoadFailure pins Ruling 10: a LoadCurrent
+// failure that fails once with ErrCodeInternal -- the shape cmstore
+// produces for a failed Get, plausibly a control-plane blip sharing an
+// origin with the pod restart itself -- then succeeds, must recover the run
+// rather than degrading on the first error.
+func TestRecoverRetriesTransientLoadFailure(t *testing.T) {
+	store := newRecoverStore()
+	store.loadErr = aicrerrors.New(aicrerrors.ErrCodeInternal, "api server unreachable")
+	store.loadErrLimit = 1 // fails once, then the loadCurrent below is returned
+	store.loadCurrent = baseRun(testRunID, engine.StateRunning, engine.PhaseDiscover, 0)
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v, want nil", err)
+	}
+	if e.StoreUnreadable() {
+		t.Error("StoreUnreadable() = true, want false -- a transient blip that resolves within the retry budget must not degrade")
+	}
+	got := e.Current()
+	if got == nil {
+		t.Fatal("Current() = nil, want the run installed after the retry succeeded")
+	}
+	if got.State != engine.StateFailed {
+		t.Errorf("State = %q, want %q", got.State, engine.StateFailed)
+	}
+	if calls := store.LoadCalls(); calls != 2 {
+		t.Errorf("LoadCurrent was called %d time(s), want 2 (one failure, one success)", calls)
+	}
+}
+
+// TestRecoverDoesNotRetryDeterministicLoadFailure pins the other half of
+// Ruling 10: a load failure that is not the plausibly-transient
+// ErrCodeInternal shape -- ErrCodeInvalidRequest here, representing a
+// decode failure, an unsupported schema version, or a missing payload key
+// -- fails identically on every attempt, so Recover must not retry it. The
+// call count is the assertion that matters: without it, a broken "retry
+// everything" implementation would pass the degraded-outcome check too.
+func TestRecoverDoesNotRetryDeterministicLoadFailure(t *testing.T) {
+	store := newRecoverStore()
+	store.loadErr = aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "run checkpoint is missing its payload key")
+	e := fourStepEngine(store)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v, want nil", err)
+	}
+	if !e.StoreUnreadable() {
+		t.Error("StoreUnreadable() = false, want true")
+	}
+	if calls := store.LoadCalls(); calls != 1 {
+		t.Errorf("LoadCurrent was called %d time(s), want exactly 1 -- a deterministic failure must not be retried", calls)
+	}
+}
+
+// TestRecoverLoadRetryRespectsContextCancellation pins that the retry
+// backoff is genuinely bounded by the caller's context, not a fixed sleep:
+// an already-canceled context must stop the retry loop immediately rather
+// than waiting out the backoff, and Recover must still degrade cleanly
+// (never hang, never panic) rather than treating the cancellation as some
+// third outcome.
+func TestRecoverLoadRetryRespectsContextCancellation(t *testing.T) {
+	store := newRecoverStore()
+	store.loadErr = aicrerrors.New(aicrerrors.ErrCodeInternal, "api server unreachable")
+	e := fourStepEngine(store)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before Recover ever calls LoadCurrent
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := e.Recover(ctx); err != nil {
+			t.Errorf("Recover() error = %v, want nil", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Recover did not return promptly against an already-canceled context")
+	}
+
+	if !e.StoreUnreadable() {
+		t.Error("StoreUnreadable() = false, want true -- a canceled retry must still degrade rather than install nothing silently")
+	}
+	if calls := store.LoadCalls(); calls != 1 {
+		t.Errorf("LoadCurrent was called %d time(s), want exactly 1 -- cancellation during backoff must stop before a second attempt", calls)
+	}
+}
+
 // TestRecoverRejectsInvalidRecord pins that a record which decodes cleanly is
 // not automatically trustworthy: each case below takes the same unreadable
 // path as a load failure, not a partial install. Beyond the brief's required
 // three (empty ID, unknown state, out-of-range StepIndex), this also covers
-// the other two validateLoaded checks the brief and spec both name (an
-// unrecognized Phase, a zero StartedAt) so the whole validation contract has
-// direct coverage rather than half of it riding on the required cases alone.
+// the rest of validateLoaded's contract per the spec and Ruling 9/10's
+// follow-up: an unrecognized Phase, a zero StartedAt, a malformed (wrong
+// length or non-hex) ID, and a zero UpdatedAt.
 func TestRecoverRejectsInvalidRecord(t *testing.T) {
-	zeroStarted := baseRun("run-a", engine.StateFailed, engine.PhaseApply, 0)
+	zeroStarted := baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 0)
 	zeroStarted.StartedAt = time.Time{}
+
+	zeroUpdated := baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 0)
+	zeroUpdated.UpdatedAt = time.Time{}
 
 	cases := []struct {
 		name string
@@ -294,20 +439,30 @@ func TestRecoverRejectsInvalidRecord(t *testing.T) {
 			run:  baseRun("", engine.StateFailed, engine.PhaseApply, 0),
 		},
 		{
+			// Not empty, not 16 hex characters -- validRunID must reject the
+			// shape as well as the empty case, since newID never produces this.
+			name: "malformed ID",
+			run:  baseRun("not-a-valid-run-id", engine.StateFailed, engine.PhaseApply, 0),
+		},
+		{
 			name: "unknown state",
-			run:  baseRun("run-a", engine.State("bogus"), engine.PhaseApply, 0),
+			run:  baseRun(testRunID, engine.State("bogus"), engine.PhaseApply, 0),
 		},
 		{
 			name: "step index beyond the step slice",
-			run:  baseRun("run-a", engine.StateFailed, engine.PhaseApply, 99),
+			run:  baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 99),
 		},
 		{
 			name: "unknown phase",
-			run:  baseRun("run-a", engine.StateFailed, engine.Phase("bogus"), 0),
+			run:  baseRun(testRunID, engine.StateFailed, engine.Phase("bogus"), 0),
 		},
 		{
 			name: "zero StartedAt",
 			run:  zeroStarted,
+		},
+		{
+			name: "zero UpdatedAt",
+			run:  zeroUpdated,
 		},
 	}
 	for _, tc := range cases {
