@@ -155,7 +155,7 @@ func TestBundleFailsClosedOnNamespaceDrift(t *testing.T) {
 }
 
 // TestBundleFailsClosedOnComponentCountLengthMismatch pins a narrower drift
-// shape than the two tests above: a persisted recipe.json (Phase 2b's
+// shape than the two tests above: a persisted recipe.json (2b-ii's
 // kubectl-editable ConfigMap store) whose self-reported componentCount
 // agrees with the re-resolved recipe's real component count, but whose
 // components array actually has fewer entries. assertMatchesApproved used

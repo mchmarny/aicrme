@@ -443,7 +443,7 @@ func (s *saveFailingStore) setFail(v bool) {
 // the process -- Start refuses because isLive(StateRunning) is true, and
 // Retry refuses because it requires StateFailed. This is currently inert
 // (memoryStore.Save never errors) but docs/phase-2-handoff.md's
-// ConfigMap-backed store, landing in Phase 2b, is precisely where Save
+// ConfigMap-backed store, landing in 2b-ii, is precisely where Save
 // starts failing for real.
 func TestRetryFailedSaveLeavesRunRetryable(t *testing.T) {
 	b := bus.New(64)
