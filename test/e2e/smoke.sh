@@ -39,8 +39,13 @@ kubectl -n "${NS}" port-forward svc/aicrme 18080:8080 >/dev/null 2>&1 &
 PF_PID=$!
 sleep 3
 
+# Body captured before matching, not piped into `grep -q`: under pipefail,
+# grep exiting early on a match closes the pipe and curl fails with EPIPE
+# (exit 23), turning a passing assertion into a failing script. Small bodies
+# fit the pipe buffer and hide it; a larger SPA would not.
 echo "--- GET / serves the SPA"
-curl -fsS http://localhost:18080/ | grep -q "aicrme"
+SPA_BODY="$(curl -fsS http://localhost:18080/)"
+grep -q "aicrme" <<<"${SPA_BODY}"
 
 echo "--- GET /healthz is public"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/healthz)" == "200" ]]
@@ -50,6 +55,7 @@ echo "--- GET /api/events is 401 without a session"
 
 echo "--- login then POST /api/runs succeeds"
 e2e_login "localhost:18080" "${JAR}" "${NS}"
-curl -fsS -b "${JAR}" -X POST http://localhost:18080/api/runs | grep -q '"id"'
+RUN_BODY="$(curl -fsS -b "${JAR}" -X POST http://localhost:18080/api/runs)"
+grep -q '"id"' <<<"${RUN_BODY}"
 
 echo "PASS: smoke test green"

@@ -230,7 +230,20 @@ CONTENT_TYPE="$(curl -fsS -b "${JAR}" -o "${TARBALL}" -w '%{content_type}' "http
   echo "bundle Content-Type was '${CONTENT_TYPE}', expected application/gzip" >&2
   exit 1
 }
-tar -tzf "${TARBALL}" | grep -qx 'deploy.sh' || {
+# Capture tar's listing before matching it, rather than piping into
+# `grep -q`. Under `set -o pipefail`, `writer | grep -q` is unsound whenever
+# the writer keeps producing after the match: grep -q exits at the first hit
+# and closes the pipe, the writer takes SIGPIPE/EPIPE, and pipefail then
+# reports the WRITER's failure -- so a SUCCESSFUL assertion fails the script.
+# Reproduced directly: `seq 1 500000 | grep -qx 3` exits 141 under pipefail.
+#
+# This is not a timing race, which is why it looked machine-specific. macOS
+# ships bsdtar, which tolerates the truncated write and exits 0; GNU tar, on
+# the Linux CI runner, reports "tar: stdout: write error" and exits non-zero.
+# So it passed on every developer laptop and failed on the very first CI run,
+# claiming the bundle did not contain deploy.sh about a tarball that did.
+BUNDLE_ENTRIES="$(tar -tzf "${TARBALL}")"
+grep -qx 'deploy.sh' <<<"${BUNDLE_ENTRIES}" || {
   echo "bundle tarball does not contain deploy.sh" >&2
   exit 1
 }
@@ -296,7 +309,7 @@ echo "component statuses observed: $(echo "${COMPONENT_STATUSES}" | tr '\n' ' ')
 # the marker parser end to end, not just that the run reached some
 # terminal state with no error -- same reasoning as discover-recommend.sh's
 # componentCount check.
-echo "${COMPONENT_STATUSES}" | grep -qx 'installed' || {
+grep -qx 'installed' <<<"${COMPONENT_STATUSES}" || {
   echo "no component reached status=installed in the SSE stream" >&2
   fail_run "${RUN_JSON}"
 }
@@ -365,7 +378,7 @@ FAILED_INDEX="$(echo "${EVENTS}" | jq -r --arg c "${EXPECTED_FAILING_COMPONENT}"
 }
 
 ERROR_TAIL="$(echo "${EVENTS}" | jq -r 'select(.kind=="error" and .data.tail != null) | .data.tail[]')"
-echo "${ERROR_TAIL}" | grep -q 'no matches for kind "NodeFeatureRule"' || {
+grep -q 'no matches for kind "NodeFeatureRule"' <<<"${ERROR_TAIL}" || {
   echo "${EXPECTED_FAILING_COMPONENT} failed, but not with the known nfd CRD-ordering error -- a different, unverified failure mode; investigate before touching this assertion" >&2
   fail_run "${RUN_JSON}"
 }
