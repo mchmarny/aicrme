@@ -40,7 +40,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// locked): it only reaches context.Background() on its store.Load
 	// fallback for a run this process didn't start, not a call this
 	// request's cancellation should govern today. That stops being true once
-	// Phase 2b's store rewrite makes Load/Save real ConfigMap API calls --
+	// 2b-ii's store rewrite makes Load/Save real ConfigMap API calls --
 	// at that point context.Background() here starts ignoring genuine
 	// caller cancellation instead of hitting an in-memory map, and
 	// Engine.Get/Retry will need a context.Context parameter threaded

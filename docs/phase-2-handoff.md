@@ -1,6 +1,6 @@
 # Phase 2 handoff
 
-**Status:** Phases 0, 1, and 2a are complete and merged to `main`. Phase 2b has not started.
+**Status:** Phases 0, 1, and 2a are complete and merged to `main`. Phase 2b-i (cancellation with a real completion contract, graceful shutdown, and the observer) is complete on this branch (`phase-2b-i`, not yet merged). Phase 2b-ii has not started.
 **Spec:** `approach.md`. **Phase 2a plan:** `docs/superpowers/plans/2026-08-15-aicrme-phase-2a.md`. **Phase 2a design:** `docs/superpowers/specs/2026-08-15-aicrme-phase-2a-design.md` — its "Roadmap" and "Open questions" sections carry inputs 2b needs. **Phase 0-1 plan:** `docs/superpowers/plans/2026-08-13-aicrme-phase-0-1.md`.
 
 This document records what the Phase 2a build learned that the code and the plan do not already state. It exists because the working ledger those findings lived in (`.superpowers/sdd/2026-08-15-aicrme-phase-2a/progress.md`) was scratch and is deleted at the end of the run. `docs/phase-2a-task-1-findings.md` was a second scratch document created mid-phase for the same reason this one exists; its durable content is folded in below and the file itself has been deleted — git is the record, not a second markdown file.
@@ -74,7 +74,7 @@ Mid-run, an external reviewer raised four findings against the in-progress build
 
 ### Finding 1 — restart recovery is not fully designed; 2a should stay a dry-run/demo milestone
 
-Accurate. `approach.md` promises ConfigMap checkpointing; only `NewMemoryStore` exists (see "Constraints 2b inherits" below). Nothing was built against this finding in 2a — what was missing was the *written* exit criterion, which is now stated explicitly above, backed by the dry-run ceiling.
+Accurate. `approach.md` promises ConfigMap checkpointing; only `NewMemoryStore` exists (see "Constraints 2b-ii inherits" below). Nothing was built against this finding in 2a — what was missing was the *written* exit criterion, which is now stated explicitly above, backed by the dry-run ceiling.
 
 **Disposition: deferred to 2b.** The reviewer's own required-contract list is more complete than anything previously written down and is carried verbatim so 2b does not have to reconstruct it. A restart-recovery implementation must provide:
 
@@ -84,7 +84,7 @@ Accurate. `approach.md` promises ConfigMap checkpointing; only `NewMemoryStore` 
 - Persisting component/deploy-step state — an in-memory SSE ring cannot replay across a restart, so the store must carry enough state (not just the terminal Run state) to redraw the pipeline UI faithfully after reconnecting.
 - Failed checkpoint writes — a `store.Save` failure must not silently wedge the run (see Ruling 13 below, which fixed exactly this class of bug for the in-memory store's callers, but the ConfigMap store introduces a store that can genuinely fail to write).
 - ConfigMap size limits — Kubernetes ConfigMaps cap at ~1MiB; a long-running Apply's accumulated event/state history must be bounded or externalized before it can hit that ceiling.
-- Graceful in-flight Apply termination on SIGTERM — today nothing cancels a run at all (see "Constraints 2b inherits" below): `engine.execute` runs under a detached context, `Engine` exposes no `Cancel`, and `main`'s shutdown path never touches it. `internal/applier/exec.go`'s process-group SIGTERM→SIGKILL mechanism (Finding 4 below) already exists and is proven correct by test — what is missing is wiring a process signal through to it, which restart recovery needs anyway to avoid stranding a Helm release in `pending-install` mid-Apply.
+- Graceful in-flight Apply termination on SIGTERM — at the time this finding was raised, nothing canceled a run at all (see "Resolved in 2b-i" below: this is now closed by `Engine.CancelAndWait`). `internal/applier/exec.go`'s process-group SIGTERM→SIGKILL mechanism (Finding 4 below), built in 2a and proven correct by test, is what `CancelAndWait` reaches.
 
 ### Finding 2 — 13/14 needs a real data model, not just careful wording
 
@@ -106,19 +106,21 @@ Verified, and was a live bug in already-committed code at the time it was raised
 
 ---
 
-## Constraints 2b inherits
-
-**Nothing cancels a run today, and shutdown is ungraceful.** `engine.Start` launches `go e.execute(context.WithoutCancel(ctx), epoch)` and `engine.Retry` launches `go e.execute(context.Background(), epoch)` (`internal/engine/engine.go`) — both deliberately detach `execute` from the HTTP request context, and `Engine` exposes no `Cancel` method at all. `cmd/aicrme/main.go`'s shutdown path confirms the gap end to end: on SIGINT/SIGTERM it calls `httpSrv.Shutdown(shutdownCtx)` and returns — it never touches `eng` or the in-flight run. The practical result: `internal/applier/exec.go`'s `BashExec.Run` process-group SIGTERM→SIGKILL path — the most intricate code Task 5b produced (Finding 4 above) — is correct, well-tested, and **currently unreachable in production**, because nothing in this phase ever calls the `cmd.Cancel` it implements outside of a test-driven `context.Cancel`. Consequence for a real (non-dry-run) Apply: a pod delete mid-install hard-kills `helm` without `deploy.sh`'s `trap 'rm -rf "${HELM_WORKDIR}"; exit 130' INT TERM` (`deploy.sh.tmpl:36`) ever running, which can strand a Helm release in `pending-install` — a state the next `helm upgrade --install` refuses to proceed against, and that `deploy.sh`'s own preflight (terminating-namespace, stale-webhook, orphaned-CRD, and stale-taint checks; `deploy.sh.tmpl:190-305`) does not check for or clean up. Add "graceful in-flight Apply termination on SIGTERM" to Finding 1's restart-recovery contract list below — it belongs there and is not currently in it. Wiring it is comparatively cheap precisely because Task 5b already built and proved the cancellation mechanism; what is missing is only the plumbing from a process signal to `Engine`, plus a `Cancel` method to plumb it into.
+## Constraints 2b-ii inherits
 
 **The ConfigMap-backed `engine.Store` is still unimplemented.** The interface exists (`internal/engine/store.go`) with only `NewMemoryStore`. Apply takes 10-20 minutes on real hardware, which is when restart survival starts to matter. This is Feedback 1's whole subject above — read its required-contract list before starting the store.
+
+**The observer narrates a timeline, not a per-component sub-status.** `approach.md`'s §Apply(cockpit) promises a live line like `waiting on rollout: nvidia-driver-daemonset 3/8 ready` attached to the *active* component's row in the cockpit — not just present somewhere in the event stream. 2b-i is timeline-only: `internal/observer`'s events land in `bus` as `bus.KindCluster` events with no association to a specific recipe component, and nothing in the cockpit UI reads them per-row. Deferred deliberately, not by oversight: namespace is the only reliable join key between a workload (a DaemonSet, a Deployment) and the recipe component whose install created it, and that join is not one-to-one — a namespace can hold objects from more than one component, and `RunScope.Namespaces` (`internal/observer/observer.go`) is a set, not a per-component map. The events themselves are already in the bus with enough information (namespace, kind, name) to correlate later; 2b-ii can build the per-component association and the cockpit wiring without touching the observer itself.
+
+**The observer covers 3 of the 5 informer kinds `approach.md` names.** `approach.md:95` and `approach.md:283` both describe shared informers over Pods, Events, Nodes, DaemonSets, and Deployments. `internal/observer/observer.go:87,92,97` register DaemonSets, Deployments, and Nodes only — Pods and Events were never in the 2b-i spec. `approach.md` is not being edited to match: it is the north-star design, and rewriting it to match what shipped would erase the gap instead of recording it. Pod-level events (a container stuck in `ImagePullBackOff`, a crash loop) and cluster Events (`Warning FailedScheduling`) are exactly the kind of message `approach.md`'s own Live feedback design section uses as its examples — 2b-ii inherits building them.
 
 **The bus's `nextID` epoch problem is still open.** A server restart resets `bus.nextID` to 1 while a connected browser keeps a high `lastId`, so `?since=` would filter out an entire new run's events after a restart. This is unrelated to `internal/engine`'s epoch guard (below, closed in 2a) despite the shared name — the engine's epoch detects a superseded goroutine within one process's lifetime; the bus's epoch problem is about `nextID` surviving (or not) a process restart. Needs an epoch or a run-scoped cursor, designed together with the ConfigMap store, since both activate together.
 
 **`StateActive` is declared but unreachable.** `engine.execute()` unconditionally finishes at `StateDone`; no `Step`/engine hook lets a Prove step park in the terminal-but-active state the spec's §6 requires. Nothing in 2a revisits this. Phase 3 must add the hook.
 
-**The training workload does not exist.** `demos/workloads/training/` in the AICR repo holds only `gke-nccl-test-tcpxo.yaml`. The spec's "Training + Kubeflow → TrainJob NCCL all-reduce" finale has no source material and must be authored in Phase 3. Inference is well covered (`vllm-agg.yaml`, `nimservice-llama-3-2-1b.yaml`, `chat-server.sh`, `chat.html`).
+**Phase 3's Reset must route through `finish` before bumping the epoch.** `Engine.execute`'s two epoch-guard early returns (`internal/engine/engine.go`, immediately after each `aliveLocked` check) are dead code today — `epoch` only advances via `Retry`, which is gated on `StateFailed`, a state only the same goroutine's own `finish` call sets, so no goroutine can currently observe a supersession mid-flight. Reset is exactly the feature that makes them reachable: if Reset bumps `epoch` without first driving the superseded run through `finish`, the superseded goroutine's next `aliveLocked` check fails, it returns without ever calling `finish`, and `done` closes with no terminal state ever persisted — the same completion-contract gap `CancelAndWait` was built to close (below), reopened by a different caller. Reset's implementation must call, or otherwise guarantee, `finish` before it increments `epoch`, not after.
 
-**The observer is unstarted.** `internal/observer` (shared informers over Pods, Events, Nodes, DaemonSets, Deployments feeding typed events into `bus`, per `approach.md`) does not exist as a directory. Whatever live per-component sub-status the cockpit eventually wants beyond `deploy.sh`'s own marker stream depends on this being built.
+**The training workload does not exist.** `demos/workloads/training/` in the AICR repo holds only `gke-nccl-test-tcpxo.yaml`. The spec's "Training + Kubeflow → TrainJob NCCL all-reduce" finale has no source material and must be authored in Phase 3. Inference is well covered (`vllm-agg.yaml`, `nimservice-llama-3-2-1b.yaml`, `chat-server.sh`, `chat.html`).
 
 **`aicrclient` has headroom.** `MakeBundle`, `BundleComponents`, and `ValidateState` all exist on `*aicr.Client`; `MakeBundle` is now consumed (Task 2), `ValidateState` is not yet. The single-method interface decomposition accommodates a `Validator` additively with no restructuring, same as it did for the `Bundler` Phase 2a added.
 
@@ -138,11 +140,23 @@ The following five items, carried forward from the Phase 0-1 handoff as things P
 
 ---
 
+## Resolved in 2b-i — removed from the inherited deferred list
+
+`make qualify` is green on this branch at aggregate coverage 85.7% (floor 80%, `.settings.yaml`'s `quality.coverage_threshold`). The following three items, carried in this document's own "Constraints 2b-ii inherits" list (formerly "Constraints 2b inherits"), are closed. Do not re-open them without a new finding.
+
+- **Nothing canceled a run, and shutdown was ungraceful.** Fixed. `Engine.CancelAndWait(ctx) error` (`internal/engine/engine.go`) is the real completion contract this constraint was missing: it cancels the in-flight run's step context and blocks until its `execute` goroutine has exited *and* persisted a terminal state, or `ctx` expires — idempotent, and a no-op with no run in flight. `cmd/aicrme/main.go`'s shutdown path calls it: mutating endpoints drain first (`srv.Drain()`, so an unguarded `POST /api/runs` cannot start a run that shutdown then kills mid-flight), then HTTP shutdown and `eng.CancelAndWait` run concurrently under a `sync.WaitGroup` — not sequentially, because the invariant is "do not return before the `deploy.sh` process tree is reaped," not "finish HTTP first." `internal/applier/exec.go`'s process-group SIGTERM→SIGKILL mechanism — built in 2a, proven correct by test, but unreachable in production (Finding 4's disposition, above) — is reachable now: a pod delete or a SIGTERM on `aicrme` reaches `cmd.Cancel` for real.
+- **The observer's non-existence.** `internal/observer` now exists, is wired into `cmd/aicrme/main.go`, and runs from pod start: shared informers over DaemonSets, Deployments, and Nodes, converting watch events into typed `bus.KindCluster` events scoped to the active run's resolved recipe namespaces. It ships short of `approach.md`'s design and short of the cockpit's eventual needs — see "Constraints 2b-ii inherits" above for what is left open.
+- **The pre-existing `gopkg.in/yaml.v3 v3.0.1 // indirect` mismarking.** Closed as a side effect of Task 5's `go mod tidy` (run to promote `k8s.io/client-go` and friends out of the indirect block for `internal/observer`'s new imports): `yaml.v3`, `k8s.io/api`, `k8s.io/apimachinery`, and `k8s.io/client-go` all moved from the `// indirect` block to the direct `require` block in `go.mod`. No version number changed anywhere in the diff — `github.com/NVIDIA/aicr` stays pinned at `v0.19.0` — and `go.sum` has a zero-line diff, since all four promoted modules' checksums were already recorded as indirect-dependency entries.
+
+---
+
 ## New for 2b
 
 **The applier's marker parser (`internal/applier/parse.go`) is a maintenance liability, pinned only by `TestDeployTemplateUnchanged`.** It transcribes `deploy.sh.tmpl`'s `printf` output formats into seven hand-written regexes; nothing in the Go type system connects the two. `TestDeployTemplateUnchanged` (`internal/applier/template_test.go`) pins the upstream template's sha256 (`df919af7e46d565d38fbf12927881ebeec1172227efac8962e4c00f035a8b519`) via `go list -m -f '{{.Dir}}' github.com/NVIDIA/aicr` against the local module cache, so any upstream edit to that template fails this test loudly instead of silently drifting. The freed-up upstream-PR budget from an earlier resolved risk should go toward adding an opt-in machine-readable event stream (`AICR_DEPLOY_EVENTS=jsonl` or similar) to that template — that is what retires the parser and this whole maintenance surface, rather than deepening it. See the AICR bump checklist below for what to actually do when this test fires.
 
-**Image size: unchanged, still ~55 MB compressed.** `Dockerfile` was not touched anywhere in Phase 2a (verified: `git diff 460f7b4..cfe5daf -- Dockerfile` is empty) — 2a added no new binaries or base-image layers to the shipped image; Task 1's `cmd/probe` that pulled in AICR's Go module graph was a throwaway, deleted before its own commit. The image remains the first thing a cluster pulls; watch it in 2b, since the ConfigMap store, the observer, and any Prove/Reset tooling are all candidates to grow it.
+**Image size: watched in 2b-i, no step change.** `Dockerfile` was not touched anywhere in Phase 2a (verified: `git diff 460f7b4..cfe5daf -- Dockerfile` is empty) — 2a added no new binaries or base-image layers to the shipped image; Task 1's `cmd/probe` that pulled in AICR's Go module graph was a throwaway, deleted before its own commit. This section used to say "watch it in 2b," flagging that linking `client-go`'s informer and typed-client machinery for the observer was a plausible step change. It was watched: Task 5 measured a `git stash`-isolated before/after image pair directly. Uncompressed (`docker inspect --format '{{.Size}}'`): 203,642,237 → 203,707,773 bytes (+64 KiB, +0.03%). Compressed (`docker save | gzip | wc -c`): 55.6 MB → 55.6 MB (+12.5 KB). No step change — `k8s.io/client-go`, `k8s.io/api`, and `k8s.io/apimachinery` were already linked into the binary via `github.com/NVIDIA/aicr`'s own Job/ServiceAccount/RoleBinding management (`pkg/k8s/agent`) before this phase, so `internal/observer`'s additional imports (`informers`, `tools/cache`, three typed listers) were incremental on already-linked code, not a fresh pull of the whole dependency tree. The ~55 MB compressed figure holds. The ConfigMap store and any Prove/Reset tooling in 2b-ii are still candidates to grow it — watch it again then.
+
+**The observer's two open calibration questions, both Phase 4 measurements.** Change-detection — comparing each object's computed summary against its cached previous value before publishing — is the only volume control 2b-i built. Whether that alone bounds event volume on a real 8-node driver rollout, as opposed to the KWOK/fake-clientset scale every 2b-i test runs at, is unmeasured. Separately, `internal/observer/handlers.go`'s `gpuResource` constant tracks only `nvidia.com/gpu`; whether MIG-partitioned nodes' resource names (e.g. `nvidia.com/mig-1g.10gb`) need the same allocatable-diff treatment is open, because no MIG-partitioned node exists in KWOK to exercise it. Neither blocks 2b-ii; both need real GPU hardware to answer.
 
 **`workDir.sizeLimit` is `1Gi`** (`charts/aicrme/values.yaml`'s `workDir.sizeLimit` key), chosen deliberately generous against Task 1's measured 352K real bundle — the reasoning documented at the site is that helm's own chart cache for 14 charts, not the bundle itself, is expected to be the larger consumer of that emptyDir in practice. Override via `--set workDir.sizeLimit=<value>`; verified to flow through to the rendered emptyDir.
 
@@ -170,11 +184,8 @@ The following five items, carried forward from the Phase 0-1 handoff as things P
 
 Every per-task review's minors, triaged as acceptable to defer past 2a. Grouped by where they bite.
 
-### Pre-existing, predates this branch
-- `go.mod:194` marks `gopkg.in/yaml.v3 v3.0.1 // indirect`, but `internal/steps/recommend.go` imports it directly, so a real `go mod tidy` would rewrite `go.mod`. Verified identical on `main` before this branch (`git show main:go.mod`). `make qualify` does not run `go mod tidy`, which is why CI has never caught it. Out of any single task's scope to fix opportunistically; a controller-side fix mid-run would have skipped review and raced a running implementer.
-
 ### Activated by 2b's ConfigMap store / restart-recovery work
-- The `bus.nextID` epoch reset on restart (above, "Constraints 2b inherits").
+- The `bus.nextID` epoch reset on restart (above, "Constraints 2b-ii inherits").
 - `StateActive` unreachability (above).
 - Everything in Finding 1's required-contract list above.
 
@@ -251,7 +262,7 @@ Air-gapped operation, private registries, and registry mirroring are spec non-go
 
 ---
 
-## How to start Phase 2b
+## How to start Phase 2b-ii
 
 Write a plan first — `superpowers:writing-plans`, informed by this document and the "Roadmap" section of the Phase 2a design spec. Then execute it; `superpowers:subagent-driven-development` was used for both Phase 0-1 and Phase 2a and worked well both times. Phase 2a stayed serial from Task 7 onward rather than parallelizing the one genuinely-parallel pair (Tasks 9 and 10) because per-task review packages are `BASE..HEAD` diffs — two implementers on one branch interleave commits, and each review would then see the other task's changes and be unable to attribute findings to the right task. Worktree isolation fixes that but costs a second `npm ci` and a merge with likely frontend conflicts; weigh that trade-off explicitly rather than defaulting either way.
 
