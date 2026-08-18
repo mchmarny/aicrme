@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -347,6 +348,44 @@ func (s *scopedInformers) withNamespaceLive(ns string, fn func()) {
 	if _, ok := s.entries[ns]; ok {
 		fn()
 	}
+}
+
+// currentPod looks up ns/name directly in that namespace's own live Pod
+// informer's cache -- a PULL, not the PUSH delivery every other Pod-related
+// read in this package relies on. Ruling 26 (Task 6 fix round 2): the
+// re-review probed a Warning narrating for a pod whose ONLY Pod-informer
+// delivery was an initial-list Add that seedPodBaseline skips entirely for
+// an already-healthy pod (podTrouble returns !ok, so seedPodBaseline's own
+// `if !ok { return }` records nothing) -- o.pods then has no entry for that
+// pod at all, indistinguishable from "never observed". A PUSH-only design
+// has no way to tell those apart; a direct cache read does, because
+// client-go's informer maintains the current object regardless of whether
+// this package's own handlers chose to record anything about it.
+//
+// ok is false if the namespace is not currently live or the pod is not (or
+// not yet) in the cache -- callers must treat that as "unknown", never as
+// "healthy": resolving on an unknown is the false-positive direction this
+// package's own comments elsewhere (podCondition.narrated,
+// clearNamespacePods) already treat as the worse mistake to make.
+func (s *scopedInformers) currentPod(ns, name string) (*corev1.Pod, bool) {
+	s.mu.Lock()
+	entry, live := s.entries[ns]
+	s.mu.Unlock()
+	// entry.pod is nil for a bare *factoryEntry a test seeds directly to
+	// exercise handlers without a real informer (handlers_internal_test.go's
+	// newTestObserver, and this package's own newTestObserver in
+	// pods_test.go) -- calling GetIndexer() on a nil
+	// cache.SharedIndexInformer panics, so this is treated the same as
+	// "not live": unknown, never "healthy".
+	if !live || entry.pod == nil {
+		return nil, false
+	}
+	obj, exists, err := entry.pod.GetIndexer().GetByKey(ns + "/" + name)
+	if err != nil || !exists {
+		return nil, false
+	}
+	pod, ok := obj.(*corev1.Pod)
+	return pod, ok
 }
 
 // stop tears down every namespace's factory unconditionally. Used on process

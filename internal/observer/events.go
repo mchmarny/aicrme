@@ -148,6 +148,25 @@ func eventClusterData(ev *corev1.Event) bus.ClusterData {
 	}
 }
 
+// eventDedupe is ONE Warning Reason this observer has already recorded for a
+// resource, tracked in Observer.events (observer.go) -- the Event
+// counterpart of podCondition, at the smaller granularity resolveEventsLocked
+// needs: narrated distinguishes a seeded-only entry (an informer's initial
+// list, seedEventBaseline) from one onEventChange actually published as
+// arising (Important 1(new), Task 6 fix round 2) -- the exact bit
+// podCondition.narrated carries for Pods, restoring the SAME
+// resolved-vs-removed asymmetry on the Event side that Ruling 19 already
+// established and this file had stopped honoring. container is
+// eventContainer's result, captured once at arising/seed time and echoed
+// back on resolution (Minor 3, same round) so a row does not lose which
+// container failed the moment the condition clears -- resolveEventsLocked
+// has no *corev1.Event left to recompute it from by the time either of its
+// callers reaches it (see that function's own doc comment).
+type eventDedupe struct {
+	narrated  bool
+	container string
+}
+
 // onEventChange is the shared path for a genuinely new watch delivery: either
 // a later Add (onEventAdd's isInInitialList == false case -- Kubernetes
 // creates an Event once and never updates it for its FIRST occurrence, so
@@ -197,15 +216,51 @@ func (o *Observer) onEventChange(ev *corev1.Event) {
 		}
 		set := o.events[key]
 		if set == nil {
-			set = make(map[string]struct{})
+			set = make(map[string]eventDedupe)
 			o.events[key] = set
 		}
-		set[ev.Reason] = struct{}{}
+		// About to publish below -- narrated: true (Important 1(new)).
+		set[ev.Reason] = eventDedupe{narrated: true, container: eventContainer(ev.InvolvedObject.FieldPath)}
 		arising = true
 	})
 
-	if arising {
-		o.publish(ev.Namespace, eventMessage(ev), eventClusterData(ev))
+	if !arising {
+		return
+	}
+	o.publish(ev.Namespace, eventMessage(ev), eventClusterData(ev))
+
+	// Ruling 26 (Task 6 fix round 2): LEVEL-triggered, not just EDGE-triggered.
+	// Everything above resolves an Event-sourced Warning only when a FUTURE
+	// Pod transition delivers the recovery (onPodChange's own sweep,
+	// Ruling 23) -- but a Warning can narrate for a pod that is ALREADY
+	// healthy right now, with no future transition ever coming to clear it
+	// (the re-review's own probe: a pod whose only Pod-informer delivery was
+	// an initial-list Add seedPodBaseline skips entirely for an
+	// already-healthy pod, so o.pods never even gets an entry to prove the
+	// pod was ever observed). scopedInformers.currentPod reads the Pod
+	// informer's cache directly -- a PULL that answers "is this pod healthy
+	// RIGHT NOW", not a memory of the last PUSH this process happened to
+	// receive -- so this closes the gap without waiting on a transition that
+	// may never arrive. Gated on Kind == Pod: this is the one signal an
+	// Event-only informer can independently corroborate against, matching
+	// Ruling 23's own Pod-only scope (a DaemonSet/Deployment/Node-involved
+	// Warning has no informer cache this package can consult the same way --
+	// out of scope, carried to the whole-branch review as Mn1).
+	if key.kind != kindPod {
+		return
+	}
+	pod, ok := o.scoped.currentPod(key.namespace, key.name)
+	if !ok {
+		return
+	}
+	if _, _, _, troubled := podTrouble(pod); troubled {
+		return
+	}
+	o.mu.Lock()
+	resolvedEvents := o.resolveEventsLocked(key, false)
+	o.mu.Unlock()
+	for _, cd := range resolvedEvents {
+		o.publish(ev.Namespace, eventResolutionMessage(cd, "resolved"), cd)
 	}
 }
 
@@ -224,6 +279,13 @@ func (o *Observer) onEventChange(ev *corev1.Event) {
 // seeding, that Update would find no dedupe entry and narrate a Warning that
 // (from an operator's perspective) has been sitting there the whole time.
 //
+// Recorded as narrated: false (Important 1(new), Task 6 fix round 2): a
+// silently-seeded entry has not been shown to any consumer, so
+// resolveEventsLocked's narratedOnly filter must be able to tell it apart
+// from one onEventChange actually published -- see the Observer.events field
+// doc comment for the full asymmetry this restores (podCondition.narrated's
+// own rule, now honored on the Event side too instead of diverging from it).
+//
 // Gated by withNamespaceLive for the same race seedPodBaseline documents: an
 // informer's initial list can still be draining when its namespace tears
 // down.
@@ -237,10 +299,10 @@ func (o *Observer) seedEventBaseline(ev *corev1.Event) {
 		defer o.mu.Unlock()
 		set := o.events[key]
 		if set == nil {
-			set = make(map[string]struct{})
+			set = make(map[string]eventDedupe)
 			o.events[key] = set
 		}
-		set[ev.Reason] = struct{}{}
+		set[ev.Reason] = eventDedupe{narrated: false, container: eventContainer(ev.InvolvedObject.FieldPath)}
 	})
 }
 
@@ -280,25 +342,45 @@ func (o *Observer) onEventUpdate(_, newObj any) {
 }
 
 // resolveEventsLocked is Ruling 23's (Task 6 fix round 1, Important 1)
-// cross-boundary resolution: it returns Resolved: true ClusterData for every
-// Warning Reason this observer has narrated about key, then evicts them from
-// o.events -- key is expected to be podKey(pod)'s value, since the only
-// caller-known genuine "this resource is better/gone now" signal an
-// Event-only informer never gets on its own is the SAME pod's own recovery
-// (pods.go's onPodChange, full recovery) or deletion (handlers.go's onDelete
-// Pod case) -- eventInvolvedKey(ev) is byte-identical to podKey(pod) for a
-// pod-involved Event, so a Pod-side signal can speak for both.
+// cross-boundary resolution: it returns Resolved: true ClusterData for
+// Warning Reasons this observer has recorded about key, then unconditionally
+// evicts the WHOLE key from o.events -- key is expected to be podKey(pod)'s
+// value, since the only caller-known genuine "this resource is better/gone
+// now" signal an Event-only informer never gets on its own is the SAME pod's
+// own recovery (pods.go's onPodChange, full recovery) or deletion
+// (handlers.go's onDelete Pod case) -- eventInvolvedKey(ev) is byte-identical
+// to podKey(pod) for a pod-involved Event, so a Pod-side signal can speak for
+// both.
 //
-// Built directly from key/reason, NOT by re-deriving a *corev1.Event: by the
-// time either caller reaches here, the original Event object (Message,
-// FieldPath, etc.) is long gone from the code path that triggered this --
-// onPodChange has a *corev1.Pod, onDelete's Pod case has a *corev1.Pod being
-// deleted, neither has the Event that narrated the arising condition. Only
-// what eventClusterData's own arising payload already carried on Kind/
-// Namespace/Name/UID/Reason survives to be echoed back on the resolution,
-// which is exactly what ClusterData.Supersedes needs to match against (same
-// UID, same Reason) -- Severity is fixed at Warn on arising (eventClusterData's
-// own doc comment), so pinning it here again is consistent, not a guess.
+// narratedOnly reproduces, on the Event side, the SAME asymmetry
+// podCondition.narrated's own doc comment establishes for Pods (Task 6 fix
+// round 2, Important 1(new) -- the phantom-resolution defect this restores
+// against): onPodChange's full recovery path passes false, because "the pod
+// genuinely got better" is a claim this observer CAN back even for an entry
+// seedEventBaseline only ever recorded silently (Ruling 19/Minor C) -- every
+// entry resolves, narrated or not. handlers.go's onDelete Pod case passes
+// true, because a delete cannot make that same claim: the pod did not get
+// better, it is gone, and publishing "removed" for a Warning no consumer was
+// ever shown would be inventing a claim this observer cannot back either way
+// (the exact failure Important 3, Task 5 fix round 1, already fixed for
+// o.pods -- this is that fix's Event-side counterpart, not a new rule).
+// narratedOnly only filters what is RETURNED for publishing; eviction from
+// o.events is unconditional either way, matching onDelete's existing Pod
+// case (`delete(o.pods, key)` runs before its own narrated filter too) --
+// once the resource is resolved or gone, a seeded-only entry has nothing
+// left to serve either.
+//
+// Built directly from key/reason/eventDedupe, NOT by re-deriving a
+// *corev1.Event: by the time either caller reaches here, the original Event
+// object (Message, etc.) is long gone from the code path that triggered
+// this -- onPodChange has a *corev1.Pod, onDelete's Pod case has a
+// *corev1.Pod being deleted, neither has the Event that narrated the arising
+// condition. Kind/Namespace/Name/UID come from key, Container from the
+// retained eventDedupe (Minor 3, same round) -- together with Reason,
+// exactly what ClusterData.Supersedes needs to match against (same UID, same
+// Reason) plus what a row would otherwise lose on resolution. Severity is
+// fixed at Warn on arising (eventClusterData's own doc comment), so pinning
+// it here again is consistent, not a guess.
 //
 // "Locked": callers must already hold o.mu, matching this codebase's
 // existing convention (stopNamespaceLocked, aliveLocked) for a function whose
@@ -314,18 +396,22 @@ func (o *Observer) onEventUpdate(_, newObj any) {
 // this only ever DELETES entries, never writes a new one, so a stray call
 // racing a torn-down namespace's own sweep costs at most a redundant delete
 // against an already-absent key.
-func (o *Observer) resolveEventsLocked(key stateKey) []bus.ClusterData {
+func (o *Observer) resolveEventsLocked(key stateKey, narratedOnly bool) []bus.ClusterData {
 	set := o.events[key]
 	if len(set) == 0 {
 		return nil
 	}
 	out := make([]bus.ClusterData, 0, len(set))
-	for reason := range set {
+	for reason, cond := range set {
+		if narratedOnly && !cond.narrated {
+			continue
+		}
 		out = append(out, bus.ClusterData{
 			Kind:      key.kind,
 			Namespace: key.namespace,
 			Name:      key.name,
 			UID:       string(key.uid),
+			Container: cond.container,
 			Reason:    reason,
 			Severity:  bus.SeverityWarn,
 			Resolved:  true,

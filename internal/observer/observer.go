@@ -123,17 +123,27 @@ type Observer struct {
 	// -- callers range over it directly rather than checking for nil first.
 	pods map[stateKey]map[string]podCondition
 	// events holds every (resource, Reason) pair this observer has already
-	// narrated from the Event informer, keyed the same way pods above is --
+	// recorded from the Event informer, keyed the same way pods above is --
 	// eventInvolvedKey (events.go) reads ev.InvolvedObject, not the Event API
 	// object's own identity, so a FailedScheduling Warning and a Pod trouble
 	// condition on the SAME Pod are keyed identically even though they come
-	// from two different informers. The inner map's VALUE is struct{}, not
-	// podCondition: unlike a Pod's tracked trouble, an Event dedupe entry
-	// carries no severity/container/detail of its own to recompute later --
-	// its only job is "has this (resource, Reason) already been told to the
-	// operator", cleared by handlers.go's onDelete (Event case, per-entry) or
+	// from two different informers. The inner map's VALUE is eventDedupe
+	// (events.go), a smaller cousin of podCondition: unlike a Pod's tracked
+	// trouble, an Event dedupe entry carries no severity/detail of its own to
+	// recompute later, but it DOES need the two things resolveEventsLocked
+	// requires -- narrated (Task 6 fix round 2, Important 1(new)): true if
+	// onEventChange actually published this reason as arising, false if
+	// seedEventBaseline only recorded it silently from an informer's initial
+	// list, read by resolveEventsLocked's narratedOnly parameter to
+	// reproduce onPodChange/onDelete's own narrated-filtering asymmetry
+	// (podCondition's doc comment) on the Event side instead of diverging
+	// from it -- a delete must not manufacture a "removed" event for a
+	// Warning no consumer was ever shown; and container, echoed back on
+	// resolution so a row doesn't lose which container failed when the
+	// condition clears. Cleared by handlers.go's onDelete (Event case,
+	// per-entry, on the Event API object's own TTL eviction) or
 	// clearNamespaceEvents (per-namespace, on informer teardown).
-	events map[stateKey]map[string]struct{}
+	events map[stateKey]map[string]eventDedupe
 }
 
 // New returns an Observer. A nil client yields a no-op: the console's whole
@@ -154,7 +164,7 @@ func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observ
 		workload: make(map[stateKey]string),
 		gpuQty:   make(map[stateKey]resource.Quantity),
 		pods:     make(map[stateKey]map[string]podCondition),
-		events:   make(map[stateKey]map[string]struct{}),
+		events:   make(map[stateKey]map[string]eventDedupe),
 	}
 	o.scoped = newScopedInformers(client, scopedHandlers{
 		pod: cache.ResourceEventHandlerDetailedFuncs{

@@ -406,22 +406,35 @@ func TestEventDedupeDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 			}
 		}
 
-		// M5 (Task 6 fix round 1): before the immediate teardown below,
-		// prove this attempt actually wrote SOMETHING into o.events -- an
-		// implementation that never wrote at all (e.g. onEventChange gutted
-		// entirely) would otherwise pass len(o.events) == 0 after teardown
-		// just as easily as a correctly-gated one does, and nothing else in
-		// this test would catch that. Not gated on ALL eventCount having
-		// landed -- only that the write path fired at least once -- so this
-		// still leaves the race the rest of the test exists to probe
-		// (whether EVERY delivery, including ones still in flight, survives
-		// the immediate reconcile below) genuinely open.
-		o.mu.Lock()
-		mid := len(o.events)
-		o.mu.Unlock()
-		if mid == 0 {
-			t.Fatalf("attempt %d: o.events == 0 immediately after creating %d events and before teardown -- this run cannot prove anything was ever written, so a never-writes implementation would pass this test vacuously", attempt, eventCount)
-		}
+		// M5 (Task 6 fix round 1), fixed under C1 (Task 6 fix round 2): before
+		// the immediate teardown below, prove this attempt actually wrote
+		// SOMETHING into o.events -- an implementation that never wrote at
+		// all (e.g. onEventChange gutted entirely) would otherwise pass
+		// len(o.events) == 0 after teardown just as easily as a
+		// correctly-gated one does, and nothing else in this test would
+		// catch that. Not gated on ALL eventCount having landed -- only that
+		// the write path fired at least once -- so this still leaves the
+		// race the rest of the test exists to probe (whether EVERY
+		// delivery, including ones still in flight, survives the immediate
+		// reconcile below) genuinely open.
+		//
+		// spinUntil, not a bare read: the original M5 fix read len(o.events)
+		// exactly once, with no wait, immediately after the 40 Create()
+		// calls above return. Those calls only enqueue work for the
+		// informer's own watch-delivery goroutine -- they do not wait for
+		// it -- so "zero deliveries have landed yet" was a routine, frequent
+		// outcome on entirely correct code, not just a rare edge: measured
+		// at 26/30 failures without -race and 7/30 with -race on shipped,
+		// unmutated code (Task 6 fix round 2 re-review). spinUntil returns
+		// the INSTANT the first entry lands rather than sampling once, which
+		// is exactly the fix already applied to this file's two seed-strand
+		// tests -- this was the one write-proof check in the package that
+		// hadn't been converted.
+		spinUntil(t, "TestEventDedupeDoesNotStrandUnderConcurrentTeardown: waiting for the first delivered entry", func() bool {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			return len(o.events) > 0
+		})
 
 		// No synchronization point here -- this IS the shape that bites: an
 		// immediate terminal reconcile with event creation still (possibly)
@@ -435,7 +448,7 @@ func TestEventDedupeDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 
 		o.mu.Lock()
 		after := len(o.events)
-		stranded := make(map[stateKey]map[string]struct{}, len(o.events))
+		stranded := make(map[stateKey]map[string]eventDedupe, len(o.events))
 		for k, v := range o.events {
 			stranded[k] = v
 		}
@@ -464,11 +477,11 @@ func TestEventDedupeDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 //  3. The pod fully recovers -- a single onPodUpdate call.
 //
 // The mutation this fails under: removing the
-// `resolvedEvents = o.resolveEventsLocked(key)` call from onPodChange's
-// full-recovery branch (pods.go). Without it, step 3 publishes only the
-// Unschedulable resolution; the second decodeClusterData call below would
-// hit "no event published" and fail, and o.events would still hold the
-// FailedScheduling entry afterward.
+// `resolvedEvents = o.resolveEventsLocked(key, false)` call from
+// onPodChange's full-recovery branch (pods.go). Without it, step 3 publishes
+// only the Unschedulable resolution; the second decodeClusterData call below
+// would hit "no event published" and fail, and o.events would still hold
+// the FailedScheduling entry afterward.
 func TestEventSourcedWarningResolvesWhenThePodRecovers(t *testing.T) {
 	o, sub := newTestObserver(t)
 
@@ -559,6 +572,172 @@ func TestEventSourcedWarningResolvesWhenThePodIsDeleted(t *testing.T) {
 	o.mu.Unlock()
 	if remaining != 0 {
 		t.Errorf("o.events after pod deletion = %d entries, want 0, spec Section 3's \"cleaned on resource deletion\"", remaining)
+	}
+}
+
+// TestEventDeleteOfASeededButNeverNarratedTroublePublishesNothing is
+// Important 1(new)'s required sibling (Task 6 fix round 2, re-review): the
+// Event-side counterpart of pods_test.go's
+// TestPodDeleteOfASeededButNeverNarratedTroublePublishesNothing (Ruling
+// 15/Important 3, Task 5 fix round 1) -- the SAME rule, now needed on the
+// Event side too since Ruling 23's resolveEventsLocked reintroduced the
+// phantom-resolution defect that rule exists to close. A Warning seeded
+// silently from an informer's initial list (isInInitialList == true) was
+// never shown to any consumer; the pod it is about being deleted afterward
+// must not manufacture a "removed" event for it -- reachable on every
+// process start against a cluster with pre-existing Warnings, and on every
+// engine.Retry (whose restarted informer re-seeds a still-present Event
+// object's initial list, per the round-1 review's own real-informer probe).
+//
+// o.events IS still evicted (map hygiene, unconditional in
+// resolveEventsLocked) even though nothing publishes -- asserted directly,
+// not just inferred from the absence of a published event.
+func TestEventDeleteOfASeededButNeverNarratedTroublePublishesNothing(t *testing.T) {
+	o, sub := newTestObserver(t)
+	pod := testPod("pod-uid")
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+
+	o.onEventAdd(ev, true) // initial list: seeds the baseline, does not narrate
+	assertNoEvent(t, sub)
+
+	o.onDelete(pod)
+
+	assertNoEvent(t, sub)
+
+	o.mu.Lock()
+	remaining := len(o.events)
+	o.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("o.events after pod deletion = %d entries, want 0 -- a seeded-only entry must still be evicted, just never published", remaining)
+	}
+}
+
+// TestEventSourcedWarningSeededOnlyStillResolvesOnPodRecovery pins the OTHER
+// half of the asymmetry TestEventDeleteOfASeededButNeverNarratedTroublePublishesNothing
+// just pinned (Task 6 fix round 2, re-review's own distinction, upholding
+// Ruling 19/Minor C): unlike delete, a pod's own recovery MAY resolve a
+// seeded-only (never narrated) Event-sourced Warning -- "the thing I never
+// mentioned is fixed now" is a claim this observer can back for an Event
+// entry exactly as it already can for a seeded-only podCondition
+// (onPodChange's own recovery sweep deliberately does not filter on
+// narrated either). A test that only exercised delete's side of this
+// asymmetry could not tell a correct narratedOnly=false at the recovery call
+// site apart from an accidentally-also-true one -- this is that check.
+//
+// Also walks the case the re-review named as untested: a pod with NO
+// tracked o.pods trouble at all (no Unschedulable, nothing) whose ONLY
+// signal is a seeded FailedScheduling -- the common real shape, and the
+// `!ok` branch in onPodChange already runs unconditionally for it.
+func TestEventSourcedWarningSeededOnlyStillResolvesOnPodRecovery(t *testing.T) {
+	o, sub := newTestObserver(t)
+
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	o.onEventAdd(ev, true) // initial list: seeds the baseline, does not narrate
+	assertNoEvent(t, sub)
+
+	o.onPodUpdate(nil, withRunning(testPod("pod-uid"))) // full recovery, no prior o.pods entry
+
+	cd := decodeClusterData(t, sub)
+	if cd.Reason != reasonFailedScheduling {
+		t.Errorf("Reason = %q, want %q", cd.Reason, reasonFailedScheduling)
+	}
+	if !cd.Resolved {
+		t.Error("Resolved = false, want true -- a seeded-only entry must still resolve on genuine recovery")
+	}
+	assertNoEvent(t, sub)
+
+	o.mu.Lock()
+	remaining := len(o.events)
+	o.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("o.events after full recovery = %d entries, want 0", remaining)
+	}
+}
+
+// TestEventResolutionCarriesContainer pins Minor 3 (Task 6 fix round 2,
+// re-review): resolveEventsLocked used to drop Container entirely on
+// resolution (arose with "trainer", resolved with ""), which Supersedes
+// tolerates (it matches on UID/Reason only) but a row rendering Container
+// would silently lose which container failed the instant the condition
+// cleared. eventDedupe now carries container alongside narrated, captured
+// once at arising/seed time and echoed back here.
+func TestEventResolutionCarriesContainer(t *testing.T) {
+	o, sub := newTestObserver(t)
+
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	ev.InvolvedObject.FieldPath = "spec.containers{trainer}"
+	o.onEventAdd(ev, false) // later Add -- narrates
+	arose := decodeClusterData(t, sub)
+	if arose.Container != "trainer" {
+		t.Fatalf("setup: arising Container = %q, want %q", arose.Container, "trainer")
+	}
+
+	pod := testPod("pod-uid")
+	o.onDelete(pod)
+
+	resolved := decodeClusterData(t, sub)
+	if resolved.Container != "trainer" {
+		t.Errorf("resolved Container = %q, want %q -- dropped on resolution", resolved.Container, "trainer")
+	}
+	if !resolved.Resolved {
+		t.Error("Resolved = false, want true")
+	}
+}
+
+// TestEventNarratedForAnAlreadyHealthyPodResolvesImmediately pins Ruling 26
+// (Task 6 fix round 2, re-review's Minor 2): resolution used to be purely
+// EDGE-triggered -- it only fired off a FUTURE Pod transition (onPodChange's
+// recovery sweep, Ruling 23) -- so a Warning that narrates for a pod that is
+// ALREADY healthy, with no future transition ever coming to deliver the
+// edge, stranded forever. The re-review's own probe: a pod whose only
+// Pod-informer delivery was an initial-list Add for an already-healthy pod
+// (seedPodBaseline's own `if !ok { return }` records nothing for it, so
+// o.pods gets no entry proving the pod was ever observed) followed by a
+// later Event Add -- narrated Resolved:false, nothing left to ever clear it.
+//
+// Drives REAL Pod and Event informers (unlike most of this file's tests,
+// which call handlers directly): the fix reads the Pod informer's cache
+// directly (scopedInformers.currentPod), so it needs a real
+// cache.SharedIndexInformer behind entry.pod, not the bare *factoryEntry
+// newTestObserver seeds. The healthy pod is pre-loaded into the fake
+// clientset BEFORE reconcile starts the namespace, so it arrives via the
+// Pod informer's initial list and is fully synced (waited for explicitly,
+// unlike newScopedEventTestObserver's helper, which only waits on the Event
+// informer) before the Warning Event is created.
+func TestEventNarratedForAnAlreadyHealthyPodResolvesImmediately(t *testing.T) {
+	client := fake.NewSimpleClientset(withRunning(testPod("pod-uid")))
+	o, sub := newScopedEventTestObserver(t, client)
+	waitFor(t, o.scoped.entries[podTestNamespace].pod.HasSynced)
+
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	if _, err := client.CoreV1().Events(podTestNamespace).Create(context.Background(), ev, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	arose := waitForClusterData(t, sub)
+	if arose.Reason != reasonFailedScheduling {
+		t.Fatalf("setup: arising Reason = %q, want %q", arose.Reason, reasonFailedScheduling)
+	}
+	if arose.Resolved {
+		t.Fatal("setup: arising Resolved = true, want false")
+	}
+
+	resolved := waitForClusterData(t, sub)
+	if resolved.Reason != reasonFailedScheduling {
+		t.Errorf("resolved Reason = %q, want %q", resolved.Reason, reasonFailedScheduling)
+	}
+	if resolved.UID != "pod-uid" {
+		t.Errorf("resolved UID = %q, want %q", resolved.UID, "pod-uid")
+	}
+	if !resolved.Resolved {
+		t.Error("resolved Resolved = false, want true -- the pod is already healthy, nothing should be left to strand")
+	}
+
+	o.mu.Lock()
+	remaining := len(o.events)
+	o.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("o.events after immediate resolution = %d entries, want 0", remaining)
 	}
 }
 
@@ -669,7 +848,7 @@ func TestEventSeedDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 		// mid-flight, closing the race this test exists to probe. This
 		// doubles as this test's M5 proof-of-write check (Task 6 fix
 		// round 1).
-		spinUntil(t, func() bool {
+		spinUntil(t, "TestEventSeedDoesNotStrandUnderConcurrentTeardown: waiting for the first seeded entry", func() bool {
 			o.mu.Lock()
 			defer o.mu.Unlock()
 			return len(o.events) > 0
@@ -680,7 +859,7 @@ func TestEventSeedDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 
 		o.mu.Lock()
 		after := len(o.events)
-		stranded := make(map[stateKey]map[string]struct{}, len(o.events))
+		stranded := make(map[stateKey]map[string]eventDedupe, len(o.events))
 		for k, v := range o.events {
 			stranded[k] = v
 		}

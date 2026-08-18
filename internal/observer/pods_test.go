@@ -820,7 +820,7 @@ func TestPodSeedDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 		// what keeps the rest of the burst genuinely in flight when
 		// teardown hits -- this IS this test's M5 proof-of-write check
 		// (Task 6 fix round 1) and its race-preserving timing in one.
-		spinUntil(t, func() bool {
+		spinUntil(t, "TestPodSeedDoesNotStrandUnderConcurrentTeardown: waiting for the first seeded entry", func() bool {
 			o.mu.Lock()
 			defer o.mu.Unlock()
 			return len(o.pods) > 0
@@ -868,17 +868,29 @@ func newScopedPodTestObserverWithoutSync(t *testing.T, client *fake.Clientset) (
 
 // spinUntil busy-polls cond with NO sleep between checks, until it returns
 // true or a 2s deadline passes. Used instead of scoped_test.go's waitFor
-// (a 10ms-ticker poll, fine for every other caller in this package) by
-// TestPodSeedDoesNotStrandUnderConcurrentTeardown and its Event counterpart
-// (events_test.go): empirically, an entire several-hundred-object
-// initial-list delivery burst can finish in well under 10ms, so a
-// 10ms-spaced check reliably observes "the whole batch already landed"
-// rather than "the batch just started landing" -- closing the exact race
-// those two tests exist to probe. A sleep-free loop still lets the OS
-// scheduler run the informer's reflector goroutine on another thread
-// (GOMAXPROCS permitting) without this goroutine explicitly yielding; the
-// mutex acquisition inside cond is itself a scheduling point.
-func spinUntil(t *testing.T, cond func() bool) {
+// (a 10ms-ticker poll, fine for every other caller in this package) by every
+// test in this package that needs to observe "at least one delivery has
+// landed" without also giving the race it's probing time to close:
+// empirically, even a several-hundred-object initial-list delivery burst, or
+// forty individual live Create() calls, can finish well under 10ms, so a
+// 10ms-spaced check reliably observes "everything already landed" rather
+// than "delivery just started" -- closing the exact race those tests exist
+// to probe. A sleep-free loop still lets the OS scheduler run the
+// informer's reflector goroutine on another thread (GOMAXPROCS permitting)
+// without this goroutine explicitly yielding; the mutex acquisition inside
+// cond is itself a scheduling point. Measured at GOMAXPROCS=1 under -race
+// (Task 6 fix round 2 re-review): ~2ms of spin per attempt against this 2s
+// deadline, three orders of magnitude of headroom -- a runtime.Gosched()
+// call would be harmless but is not needed.
+//
+// what names the caller in the deadline-exceeded failure message: this is a
+// SHARED helper with multiple call sites (as of fix round 2: two seed-strand
+// tests plus TestEventDedupeDoesNotStrandUnderConcurrentTeardown's own
+// proof-of-write check), and a bare "condition not met within 2s" from
+// inside spinUntil's own frame (t.Helper() attributes the FILE:LINE to the
+// caller, but not which condition) is hard to place in a CI failure list
+// with more than one caller.
+func spinUntil(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -886,7 +898,7 @@ func spinUntil(t *testing.T, cond func() bool) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("condition not met within 2s")
+			t.Fatalf("%s: condition not met within 2s", what)
 		}
 	}
 }

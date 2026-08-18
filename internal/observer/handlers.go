@@ -173,8 +173,16 @@ func (o *Observer) onDelete(obj any) {
 		// INVOLVED resource, only for the Event record itself. Falls out of
 		// Ruling 23's resolveEventsLocked (added for Important 1/onPodChange)
 		// rather than needing its own logic -- same key, same helper, same
-		// already-held o.mu.
-		resolvedEvents := o.resolveEventsLocked(key)
+		// already-held o.mu. narratedOnly: true (Task 6 fix round 2,
+		// Important 1(new)) -- matches the SAME filter the Pod loop below
+		// already applies to o.pods' own set: a delete cannot claim a
+		// seeded-only Warning "resolved/removed" any more than it can for a
+		// seeded-only podCondition. Passing false here (as onPodChange's
+		// recovery branch correctly does) is exactly the phantom-resolution
+		// defect the re-review found: a pre-existing Warning re-seeded on
+		// every process start or Retry would publish "removed" for a
+		// condition no consumer was ever shown.
+		resolvedEvents := o.resolveEventsLocked(key, true)
 		o.mu.Unlock()
 		// Ruling 20 (Task 5 fix round 3): resolve EVERY narrated reason in
 		// the pod's set, not just whichever was tracked most recently --

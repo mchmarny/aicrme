@@ -342,7 +342,12 @@ func (o *Observer) onPodChange(pod *corev1.Pod) {
 				toResolve = append(toResolve, cond)
 			}
 			delete(o.pods, key)
-			resolvedEvents = o.resolveEventsLocked(key) // Ruling 23
+			// narratedOnly: false -- matches this branch's own "does NOT
+			// filter on narrated" rule three lines up (Minor C/Ruling 19):
+			// the pod genuinely got better, a claim this observer can back
+			// for a seeded-only Event entry exactly as it can for a
+			// seeded-only podCondition (Task 6 fix round 2, Important 1(new)).
+			resolvedEvents = o.resolveEventsLocked(key, false) // Ruling 23
 			return
 		}
 
