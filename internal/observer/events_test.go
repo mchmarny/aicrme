@@ -3,11 +3,13 @@ package observer
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -208,8 +210,16 @@ func TestEventDedupeIsClearedOnResourceDeletion(t *testing.T) {
 	}
 }
 
-// TestEventDedupeIsBoundedByGeneration is the brief's test 6: a new run does
-// not inherit the previous run's dedupe state.
+// TestEventDedupeDoesNotSurviveARunBoundary is the brief's test 6: a new run
+// does not inherit the previous run's dedupe state. Renamed from
+// TestEventDedupeIsBoundedByGeneration (M3, Task 6 fix round 1, review's
+// finding): the original name promised a mechanism this test does not
+// exercise -- it reads no Generation anywhere. Keeping a name that traces
+// back to a requirement the review (and the coordinator, upheld above)
+// confirmed was itself wrong would mislead a CI failure list or a
+// Generation grep even though the 28-line comment below it (unchanged from
+// before the rename) already explains the divergence honestly to anyone who
+// opens the file.
 //
 // This drives the run boundary through scoped.reconcile with a CHANGED
 // RunID, not by constructing a RunScope with a different Generation value
@@ -228,7 +238,7 @@ func TestEventDedupeIsClearedOnResourceDeletion(t *testing.T) {
 // clearNamespaceEvents' own doc comment (observer.go) for the full
 // reasoning, including why this diverges from a literal reading of the
 // brief's "RunScope carries Generation for this".
-func TestEventDedupeIsBoundedByGeneration(t *testing.T) {
+func TestEventDedupeDoesNotSurviveARunBoundary(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	b := bus.New(64)
 	o := New(client, b, func() RunScope {
@@ -396,6 +406,23 @@ func TestEventDedupeDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 			}
 		}
 
+		// M5 (Task 6 fix round 1): before the immediate teardown below,
+		// prove this attempt actually wrote SOMETHING into o.events -- an
+		// implementation that never wrote at all (e.g. onEventChange gutted
+		// entirely) would otherwise pass len(o.events) == 0 after teardown
+		// just as easily as a correctly-gated one does, and nothing else in
+		// this test would catch that. Not gated on ALL eventCount having
+		// landed -- only that the write path fired at least once -- so this
+		// still leaves the race the rest of the test exists to probe
+		// (whether EVERY delivery, including ones still in flight, survives
+		// the immediate reconcile below) genuinely open.
+		o.mu.Lock()
+		mid := len(o.events)
+		o.mu.Unlock()
+		if mid == 0 {
+			t.Fatalf("attempt %d: o.events == 0 immediately after creating %d events and before teardown -- this run cannot prove anything was ever written, so a never-writes implementation would pass this test vacuously", attempt, eventCount)
+		}
+
 		// No synchronization point here -- this IS the shape that bites: an
 		// immediate terminal reconcile with event creation still (possibly)
 		// in flight through the informer.
@@ -416,5 +443,277 @@ func TestEventDedupeDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 		if after != 0 {
 			t.Fatalf("attempt %d: o.events after concurrent teardown = %d entries, want 0 -- stranded: %+v", attempt, after, stranded)
 		}
+	}
+}
+
+// TestEventSourcedWarningResolvesWhenThePodRecovers is Important 1 / Ruling
+// 23 (Task 6 fix round 1): a Warning this observer narrated from the Event
+// informer must resolve when the pod it is about fully recovers, the same
+// way a podCondition does -- otherwise transient FailedScheduling, the norm
+// while a GPU cluster scales rather than an edge case, pins a permanent
+// Warn-severity row on a pod that went on to become fully healthy.
+//
+// Walks the full SEQUENCE the coordinator asked for, not a single condition
+// in isolation -- this stranding class (a condition tracked under one
+// identity, resolved only through a signal that arrives under a DIFFERENT
+// identity) has now surfaced four times, and every prior time a test that
+// exercised only one condition in isolation missed it:
+//  1. Unschedulable arises via the Pod informer (pods.go).
+//  2. FailedScheduling arises via the Event informer (events.go) for the
+//     SAME resource identity (eventInvolvedKey(ev) == podKey(pod)).
+//  3. The pod fully recovers -- a single onPodUpdate call.
+//
+// The mutation this fails under: removing the
+// `resolvedEvents = o.resolveEventsLocked(key)` call from onPodChange's
+// full-recovery branch (pods.go). Without it, step 3 publishes only the
+// Unschedulable resolution; the second decodeClusterData call below would
+// hit "no event published" and fail, and o.events would still hold the
+// FailedScheduling entry afterward.
+func TestEventSourcedWarningResolvesWhenThePodRecovers(t *testing.T) {
+	o, sub := newTestObserver(t)
+
+	o.onPodUpdate(nil, withUnschedulable(testPod("pod-uid")))
+	podArose := decodeClusterData(t, sub)
+	if podArose.Reason != reasonUnschedulable || podArose.Resolved {
+		t.Fatalf("setup: Unschedulable arising = %+v, want Reason=%q Resolved=false", podArose, reasonUnschedulable)
+	}
+
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	o.onEventAdd(ev, false)
+	eventArose := decodeClusterData(t, sub)
+	if eventArose.Reason != reasonFailedScheduling || eventArose.Resolved {
+		t.Fatalf("setup: FailedScheduling arising = %+v, want Reason=%q Resolved=false", eventArose, reasonFailedScheduling)
+	}
+
+	o.onPodUpdate(nil, withRunning(testPod("pod-uid"))) // full recovery
+
+	resolved := map[string]bus.ClusterData{}
+	for range 2 {
+		cd := decodeClusterData(t, sub)
+		resolved[cd.Reason] = cd
+	}
+	assertNoEvent(t, sub) // exactly two resolves, nothing more
+
+	for _, reason := range []string{reasonUnschedulable, reasonFailedScheduling} {
+		cd, ok := resolved[reason]
+		if !ok {
+			t.Errorf("no resolve event published for %q -- stranded across the Pod/Event boundary", reason)
+			continue
+		}
+		if !cd.Resolved {
+			t.Errorf("%q Resolved = false, want true", reason)
+		}
+		if cd.UID != "pod-uid" {
+			t.Errorf("%q UID = %q, want %q", reason, cd.UID, "pod-uid")
+		}
+	}
+
+	o.mu.Lock()
+	remaining := len(o.events)
+	o.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("o.events after full recovery = %d entries, want 0 -- the FailedScheduling entry was left stranded", remaining)
+	}
+}
+
+// TestEventSourcedWarningResolvesWhenThePodIsDeleted is M2 (Task 6 fix round
+// 1): the deleted-Pod signal is exactly as valid a "clear this Event-sourced
+// Warning" trigger as the Pod's own recovery is (both route through
+// resolveEventsLocked keyed identically), but the VERB differs -- "removed",
+// not "resolved", matching podClusterData/podMessage's own removed-vs-
+// resolved distinction for the identical reason (the pod did not get
+// better, it is gone).
+func TestEventSourcedWarningResolvesWhenThePodIsDeleted(t *testing.T) {
+	o, sub := newTestObserver(t)
+
+	pod := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
+	o.onPodAdd(pod, false) // later Add -- narrates
+	decodeClusterData(t, sub)
+
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	o.onEventAdd(ev, false)
+	decodeClusterData(t, sub)
+
+	o.onDelete(pod)
+
+	removed := map[string]bus.ClusterData{}
+	for range 2 {
+		cd := decodeClusterData(t, sub)
+		removed[cd.Reason] = cd
+	}
+	assertNoEvent(t, sub)
+
+	for _, reason := range []string{reasonImagePullBackOff, reasonFailedScheduling} {
+		cd, ok := removed[reason]
+		if !ok {
+			t.Errorf("delete did not publish a removal for %q -- stranded", reason)
+			continue
+		}
+		if !cd.Resolved {
+			t.Errorf("%q Resolved = false, want true", reason)
+		}
+	}
+
+	o.mu.Lock()
+	remaining := len(o.events)
+	o.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("o.events after pod deletion = %d entries, want 0, spec Section 3's \"cleaned on resource deletion\"", remaining)
+	}
+}
+
+// TestEventAboutAClusterScopedResourceDoesNotStrand pins M1 (Task 6 fix
+// round 1): a Warning about a cluster-scoped InvolvedObject (a Node --
+// io.Namespace == "") is still delivered as an Event API OBJECT that lives
+// in a real namespace ("default", per client-go's own event.go substituting
+// NamespaceDefault for an empty ref.Namespace) -- ev.Namespace, not
+// io.Namespace. eventInvolvedKey's namespace field must track ev.Namespace
+// so the SAME namespace value the write gate admitted the entry under is
+// also what clearNamespaceEvents' sweep later matches it against; keying on
+// io.Namespace ("") instead left an entry the sweep could never reach, since
+// no namespace name is ever the empty string.
+//
+// Not reachable in production today (no shipped recipe names "default" as a
+// component namespace), but exercised directly here at the unit level
+// rather than left latent.
+func TestEventAboutAClusterScopedResourceDoesNotStrand(t *testing.T) {
+	const clusterEventNamespace = "default"
+
+	b := bus.New(64)
+	o := New(nil, b, func() RunScope {
+		return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{clusterEventNamespace: {}}}
+	})
+	sub, unsub := b.Subscribe(0)
+	t.Cleanup(unsub)
+	o.scoped.entries[clusterEventNamespace] = &factoryEntry{stop: make(chan struct{})}
+
+	ev := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Namespace: clusterEventNamespace, Name: "gpu-node-1.a"},
+		InvolvedObject: corev1.ObjectReference{
+			Kind: kindNode,
+			Name: "gpu-node-1",
+			UID:  "node-uid",
+		},
+		Reason: "NodeNotReady",
+		Type:   corev1.EventTypeWarning,
+	}
+
+	o.onEventAdd(ev, false)
+	decodeClusterData(t, sub)
+
+	o.mu.Lock()
+	before := len(o.events)
+	o.mu.Unlock()
+	if before != 1 {
+		t.Fatalf("o.events before teardown = %d, want 1; test setup failure", before)
+	}
+
+	o.scoped.reconcile(terminalScope(clusterEventNamespace))
+
+	o.mu.Lock()
+	after := len(o.events)
+	o.mu.Unlock()
+	if after != 0 {
+		t.Errorf("o.events after the namespace's informer tore down = %d, want 0 -- a cluster-scoped resource's Event strands permanently", after)
+	}
+}
+
+// TestEventSeedDoesNotStrandUnderConcurrentTeardown is Important 2's Event
+// half (Task 6 fix round 1, review's control probe): seedEventBaseline's
+// withNamespaceLive gate was entirely unpinned -- removing it (numstat
+// `2 2`) left the whole package green, because
+// TestEventDedupeDoesNotStrandUnderConcurrentTeardown creates every Event
+// AFTER HasSynced, so only onEventChange (a later Add) is ever exercised,
+// never the initial-list seed path.
+//
+// This pre-loads the fake clientset BEFORE reconcile ever starts the
+// namespace, so every Event arrives via the informer's INITIAL list
+// (seedEventBaseline, isInInitialList == true), then tears down immediately
+// with no wait for HasSynced at all -- the initial list's own delivery
+// goroutine can still be draining when the sweep runs.
+func TestEventSeedDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
+	// 500, not 40 -- see TestPodSeedDoesNotStrandUnderConcurrentTeardown's
+	// doc comment (pods_test.go) for why the seed path needs a much larger
+	// count than the live-Add stress tests: every object here is pre-loaded
+	// before the informer starts, so the whole initial list is one delivery
+	// burst with no caller-side pacing, and a short list can finish that
+	// burst before this goroutine is even scheduled again.
+	const eventCount = 500
+	const attempts = 25
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		preexisting := make([]runtime.Object, 0, eventCount)
+		for i := 0; i < eventCount; i++ {
+			ev := testEvent(
+				types.UID(fmt.Sprintf("seed-pod-uid-%d-%d", attempt, i)),
+				fmt.Sprintf("seed-worker-%d.a", i),
+				corev1.EventTypeWarning)
+			ev.InvolvedObject.Name = fmt.Sprintf("seed-worker-%d", i)
+			preexisting = append(preexisting, ev)
+		}
+		client := fake.NewSimpleClientset(preexisting...)
+		b := bus.New(64)
+		o := New(client, b, func() RunScope {
+			return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{podTestNamespace: {}}}
+		})
+
+		o.scoped.reconcile(scopeWith("run-1", podTestNamespace))
+		// Waits for the FIRST entry to land, then races the terminal
+		// reconcile immediately -- via spinUntil (pods_test.go), not
+		// waitFor. See TestPodSeedDoesNotStrandUnderConcurrentTeardown's
+		// identical pattern for why waitFor's own 10ms-ticker poll
+		// (fine for every other caller in this package) is too coarse
+		// here: an entire several-hundred-object initial-list delivery
+		// burst can finish in well under 10ms, so a 10ms-spaced check
+		// reliably observes the whole batch already landed rather than
+		// mid-flight, closing the race this test exists to probe. This
+		// doubles as this test's M5 proof-of-write check (Task 6 fix
+		// round 1).
+		spinUntil(t, func() bool {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			return len(o.events) > 0
+		})
+		o.scoped.reconcile(terminalScope(podTestNamespace))
+
+		time.Sleep(20 * time.Millisecond)
+
+		o.mu.Lock()
+		after := len(o.events)
+		stranded := make(map[stateKey]map[string]struct{}, len(o.events))
+		for k, v := range o.events {
+			stranded[k] = v
+		}
+		o.mu.Unlock()
+		if after != 0 {
+			t.Fatalf("attempt %d: o.events after concurrent initial-list teardown = %d entries, want 0 -- stranded: %+v", attempt, after, stranded)
+		}
+	}
+}
+
+// TestEventMessageIsTruncated pins M6 (Task 6 fix round 1):
+// ev.Message -- free-form text from the reporting component, not something
+// this observer controls the shape of -- is bounded before it reaches a bus
+// payload the way no other handler in this package needs to bound its own
+// interpolated strings.
+func TestEventMessageIsTruncated(t *testing.T) {
+	o, sub := newTestObserver(t)
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	ev.Message = strings.Repeat("x", eventMessageMaxLen*2)
+
+	o.onEventAdd(ev, false)
+
+	e := waitForEvent(t, sub)
+	// Well under the untruncated length (2x eventMessageMaxLen, ev.Message
+	// alone) rather than a tight arithmetic bound on top of
+	// eventMessageMaxLen: the subject/reason/separator prefix around the
+	// truncated ev.Message is this observer's own formatting, not part of
+	// what M6 bounds, and pinning its exact byte count here would make this
+	// test fragile to an unrelated eventMessage format change.
+	if len(e.Message) >= eventMessageMaxLen*2 {
+		t.Errorf("Message length = %d, want it truncated well below the untruncated length (%d); got %q", len(e.Message), eventMessageMaxLen*2, e.Message)
+	}
+	if !strings.Contains(e.Message, "…") {
+		t.Errorf("Message = %q, want a truncation marker for an oversized ev.Message", e.Message)
 	}
 }

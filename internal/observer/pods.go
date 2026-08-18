@@ -288,6 +288,24 @@ func (o *Observer) seedPodBaseline(pod *corev1.Pod) {
 // set with what looks like two reasons for one stuck pull, each needing its
 // own arise/resolve pair, exactly the noise Ruling 17 exists to collapse.
 //
+// Ruling 23 (Task 6 fix round 1, Important 1): full recovery ALSO resolves
+// any o.events entries keyed identically to this pod (events.go's
+// resolveEventsLocked) -- eventInvolvedKey(ev) is byte-identical to
+// podKey(pod) for a pod-involved Event, so a Warning this observer narrated
+// from the Event informer (e.g. FailedScheduling) is exactly as resolvable
+// on this pod's recovery as a podCondition is. Without this, transient
+// FailedScheduling -- the norm while a GPU cluster scales, not an edge case
+// -- pins a permanent Warn-severity row on a pod that went on to become
+// fully healthy: ClusterData.Supersedes never compares across Reasons, so
+// nothing else could ever clear it. This is Ruling 20's stranding class
+// (a condition tracked by one identity, resolved only through a DIFFERENT
+// identity's signal) surfacing a fourth time, now across the Pod/Event
+// informer boundary rather than within a single Pod's reason set.
+// TestEventSourcedWarningResolvesWhenThePodRecovers walks the full
+// arise/arise/recover SEQUENCE, not a single condition in isolation --
+// every earlier occurrence of this class was missed by a test that only
+// exercised one.
+//
 // The map read, compare, and write all happen inside the closure passed to
 // o.scoped.withNamespaceLive (Important B, Task 5 fix round 2), which holds
 // s.mu for the closure's entire duration -- the same lock
@@ -297,12 +315,15 @@ func (o *Observer) seedPodBaseline(pod *corev1.Pod) {
 // a live one and declines to write, rather than racing the sweep that
 // already ran. Publishing happens OUTSIDE that closure, after both s.mu and
 // o.mu have been released, matching this package's existing rule that a
-// publish must never run under either lock.
+// publish must never run under either lock. resolveEventsLocked is called
+// INSIDE the closure, under the SAME already-held o.mu (not a second
+// acquisition -- see its own doc comment for why that would deadlock).
 func (o *Observer) onPodChange(pod *corev1.Pod) {
 	reason, detail, container, ok := podTrouble(pod)
 
 	key := podKey(pod)
 	var toResolve []podCondition // every reason in the set, only populated on full recovery
+	var resolvedEvents []bus.ClusterData
 	var arose podCondition
 	var arising bool
 
@@ -321,6 +342,7 @@ func (o *Observer) onPodChange(pod *corev1.Pod) {
 				toResolve = append(toResolve, cond)
 			}
 			delete(o.pods, key)
+			resolvedEvents = o.resolveEventsLocked(key) // Ruling 23
 			return
 		}
 
@@ -344,6 +366,9 @@ func (o *Observer) onPodChange(pod *corev1.Pod) {
 
 	for _, cond := range toResolve {
 		o.publish(pod.Namespace, podMessage(pod, cond, true), podClusterData(pod, cond, true))
+	}
+	for _, cd := range resolvedEvents {
+		o.publish(pod.Namespace, eventResolutionMessage(cd, "resolved"), cd)
 	}
 	if arising {
 		o.publish(pod.Namespace, podMessage(pod, arose, false), podClusterData(pod, arose, false))

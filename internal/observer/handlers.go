@@ -164,6 +164,17 @@ func (o *Observer) onDelete(obj any) {
 		o.mu.Lock()
 		set := o.pods[key]
 		delete(o.pods, key)
+		// M2 (Task 6 fix round 1): a deleted Pod is also the ONLY genuine
+		// "this resource is gone" signal any Event-sourced Warning about it
+		// will ever get -- eventInvolvedKey(ev) is byte-identical to
+		// podKey(pod) (events.go), and spec Section 3 says the dedupe map is
+		// "cleaned on resource deletion", which the Event-object-TTL path
+		// (the *corev1.Event case just below) cannot speak to for the
+		// INVOLVED resource, only for the Event record itself. Falls out of
+		// Ruling 23's resolveEventsLocked (added for Important 1/onPodChange)
+		// rather than needing its own logic -- same key, same helper, same
+		// already-held o.mu.
+		resolvedEvents := o.resolveEventsLocked(key)
 		o.mu.Unlock()
 		// Ruling 20 (Task 5 fix round 3): resolve EVERY narrated reason in
 		// the pod's set, not just whichever was tracked most recently --
@@ -183,6 +194,11 @@ func (o *Observer) onDelete(obj any) {
 			// for the identical reason.
 			o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), podClusterData(t, cond, true))
 		}
+		for _, cd := range resolvedEvents {
+			// "removed", matching the Pod loop just above: the pod did not
+			// recover, it (and whatever it was reporting) is gone.
+			o.publish(t.Namespace, eventResolutionMessage(cd, "removed"), cd)
+		}
 	case *corev1.Event:
 		// Not gated by withNamespaceLive, matching the Pod case just above:
 		// a delete only ever REMOVES an o.events entry, never writes a new
@@ -196,13 +212,18 @@ func (o *Observer) onDelete(obj any) {
 		// TTL-based garbage collection (--event-ttl, 1h by default), not the
 		// resource t.InvolvedObject describes being deleted -- Events carry
 		// no owner reference back to that resource, so this is the only
-		// deletion signal an Event-only informer ever receives. Deliberately
-		// publishes nothing: unlike a DaemonSet/Deployment/Node/Pod going
-		// away, an old Event record aging out of etcd says nothing about
-		// whether t.Reason is still happening -- inventing a "resolved" here
-		// would be exactly the claim Important 3/clearNamespacePods' own
-		// comment already warns against manufacturing elsewhere in this
-		// file. This is what bounds o.events across the process lifetime
+		// deletion signal THIS INFORMER, watching only Events, ever receives
+		// for it. (M2, Task 6 fix round 1: that used to overstate the
+		// OBSERVER's position, not just this informer's -- the Pod case
+		// three cases above delivers the involved-resource-deleted signal
+		// under an identical key, via resolveEventsLocked, for the common
+		// case where InvolvedObject is a Pod.) Deliberately publishes
+		// nothing here: unlike a DaemonSet/Deployment/Node/Pod going away, an
+		// old Event record aging out of etcd says nothing about whether
+		// t.Reason is still happening -- inventing a "resolved" here would be
+		// exactly the claim Important 3/clearNamespacePods' own comment
+		// already warns against manufacturing elsewhere in this file. This is
+		// what bounds o.events across the process lifetime
 		// (TestEventDedupeIsClearedOnResourceDeletion): without it, a
 		// resource that keeps generating the SAME reason indefinitely, with
 		// each occurrence's Event object eventually TTL-evicted and

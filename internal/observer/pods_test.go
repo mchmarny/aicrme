@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -130,10 +131,15 @@ func withContainerWaiting(pod *corev1.Pod, container, reason string) *corev1.Pod
 	return pod
 }
 
-func withRunning(pod *corev1.Pod, container string) *corev1.Pod {
+// withRunning's container is always "app" -- no test in this package (as of
+// Task 6 fix round 1, when a new call site made golangci-lint's unparam
+// notice) needs a healthy pod's container to be named anything else, so the
+// name is a constant rather than a parameter every call site would
+// otherwise repeat identically.
+func withRunning(pod *corev1.Pod) *corev1.Pod {
 	pod.Status.Phase = corev1.PodRunning
 	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
-		{Name: container, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, Ready: true},
+		{Name: "app", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, Ready: true},
 	}
 	return pod
 }
@@ -247,7 +253,7 @@ func TestPodDoesNotNarrateHealthyTransitions(t *testing.T) {
 	client := fake.NewSimpleClientset(initial)
 	_, sub := newScopedPodTestObserver(t, client)
 
-	running := withRunning(testPod("pod-uid"), "app")
+	running := withRunning(testPod("pod-uid"))
 	if _, err := client.CoreV1().Pods(podTestNamespace).Update(context.Background(), running, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
@@ -267,7 +273,7 @@ func TestPodConditionResolves(t *testing.T) {
 	client := fake.NewSimpleClientset(broken)
 	_, sub := newScopedPodTestObserver(t, client)
 
-	healthy := withRunning(testPod("pod-uid"), "app")
+	healthy := withRunning(testPod("pod-uid"))
 	if _, err := client.CoreV1().Pods(podTestNamespace).Update(context.Background(), healthy, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
@@ -583,7 +589,7 @@ func TestPodMultiReasonRecoveryResolvesEveryNarratedReason(t *testing.T) {
 	}
 
 	// Full recovery.
-	o.onPodUpdate(nil, withRunning(testPod("pod-uid"), "app"))
+	o.onPodUpdate(nil, withRunning(testPod("pod-uid")))
 
 	resolved := map[string]bus.ClusterData{}
 	for range 2 {
@@ -750,6 +756,137 @@ func TestPodTroubleDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 		o.mu.Unlock()
 		if after != 0 {
 			t.Fatalf("attempt %d: o.pods after concurrent teardown = %d entries, want 0 -- stranded: %+v", attempt, after, stranded)
+		}
+	}
+}
+
+// TestPodSeedDoesNotStrandUnderConcurrentTeardown is Important 2's Pod half
+// (Task 6 fix round 1, review's control probe): removing seedPodBaseline's
+// withNamespaceLive gate (numstat `2 2`) left the whole package green,
+// because TestPodTroubleDoesNotStrandUnderConcurrentTeardown creates every
+// pod AFTER HasSynced, so only onPodChange (a later Add) is ever exercised
+// -- never the initial-list seed path seedPodBaseline is. The gap is
+// inherited from Task 5, not introduced there; this closes it alongside the
+// identical gap on the Event side (events_test.go's
+// TestEventSeedDoesNotStrandUnderConcurrentTeardown), since both share the
+// same root cause and the same fix shape.
+//
+// Pre-loads the fake clientset BEFORE reconcile ever starts the namespace,
+// so every pod arrives via the informer's INITIAL list (seedPodBaseline,
+// isInInitialList == true), then tears down immediately with no wait for
+// HasSynced at all -- the initial list's own delivery goroutine can still be
+// draining when the sweep runs.
+func TestPodSeedDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
+	// 500, not Task 5's 40: unlike the live-Add stress test (which gets
+	// natural pacing for free from 40 sequential Create() calls, each real
+	// work on the calling goroutine while the informer's own goroutine
+	// processes concurrently), every object here is pre-loaded before the
+	// informer starts at all, so its ENTIRE initial list is one delivery
+	// burst with no caller-side pacing. A short list can finish that whole
+	// burst before this goroutine even gets scheduled again after starting
+	// it -- empirically true at 40 -- so the count needs to be large enough
+	// that SOME deliveries are still outstanding at the moment this test
+	// deliberately races them against teardown below.
+	const podCount = 500
+	const attempts = 25
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		preexisting := make([]runtime.Object, 0, podCount)
+		for i := 0; i < podCount; i++ {
+			pod := withContainerWaiting(
+				testPod(types.UID(fmt.Sprintf("seed-pod-uid-%d-%d", attempt, i))),
+				"app", reasonImagePullBackOff)
+			pod.Name = fmt.Sprintf("seed-worker-%d", i)
+			preexisting = append(preexisting, pod)
+		}
+		client := fake.NewSimpleClientset(preexisting...)
+		o, _ := newScopedPodTestObserverWithoutSync(t, client)
+
+		// Waits for the FIRST entry to land, then races the terminal
+		// reconcile immediately -- via spinUntil, not waitFor. A fixed
+		// sleep, or waitFor's own 10ms-ticker poll, either undershoots
+		// (close(stop) can race the reflector goroutine's own first
+		// scheduling, sometimes preventing it from ever starting a single
+		// delivery, which would pass this test under a broken
+		// seedPodBaseline for the wrong reason: nothing to strand, not
+		// nothing stranded) or overshoots -- empirically, even a 500-object
+		// batch can finish its ENTIRE initial-list delivery in well under
+		// waitFor's 10ms poll granularity, so by the time a 10ms-spaced
+		// check first observes len(o.pods) > 0, the whole batch has
+		// typically already landed, closing the race. spinUntil's
+		// sleep-free busy-poll is what catches the batch mid-flight instead
+		// of only ever observing its beginning or its end. Waiting for
+		// exactly "delivery has started" and then proceeding immediately is
+		// what keeps the rest of the burst genuinely in flight when
+		// teardown hits -- this IS this test's M5 proof-of-write check
+		// (Task 6 fix round 1) and its race-preserving timing in one.
+		spinUntil(t, func() bool {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			return len(o.pods) > 0
+		})
+
+		o.scoped.reconcile(terminalScope(podTestNamespace))
+
+		time.Sleep(20 * time.Millisecond)
+
+		o.mu.Lock()
+		after := len(o.pods)
+		stranded := make(map[stateKey]map[string]podCondition, len(o.pods))
+		for k, v := range o.pods {
+			stranded[k] = v
+		}
+		o.mu.Unlock()
+		if after != 0 {
+			t.Fatalf("attempt %d: o.pods after concurrent initial-list teardown = %d entries, want 0 -- stranded: %+v", attempt, after, stranded)
+		}
+	}
+}
+
+// newScopedPodTestObserverWithoutSync is newScopedPodTestObserver
+// (top of this file) without the waitFor(t, entry.pod.HasSynced) call --
+// TestPodSeedDoesNotStrandUnderConcurrentTeardown needs reconcile to start
+// the namespace WITHOUT waiting for its initial list to finish draining, so
+// the immediate terminal reconcile that follows can race it. Kept as its own
+// function rather than a parameter on the existing helper: every OTHER
+// caller of newScopedPodTestObserver wants the sync, and threading an
+// unused-everywhere-else bool through it would obscure that.
+func newScopedPodTestObserverWithoutSync(t *testing.T, client *fake.Clientset) (*Observer, <-chan bus.Event) {
+	t.Helper()
+	b := bus.New(64)
+	sub, unsub := b.Subscribe(0)
+	t.Cleanup(unsub)
+
+	o := New(client, b, func() RunScope {
+		return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{podTestNamespace: {}}}
+	})
+	o.scoped.reconcile(scopeWith("run-1", podTestNamespace))
+	t.Cleanup(o.scoped.stop)
+
+	return o, sub
+}
+
+// spinUntil busy-polls cond with NO sleep between checks, until it returns
+// true or a 2s deadline passes. Used instead of scoped_test.go's waitFor
+// (a 10ms-ticker poll, fine for every other caller in this package) by
+// TestPodSeedDoesNotStrandUnderConcurrentTeardown and its Event counterpart
+// (events_test.go): empirically, an entire several-hundred-object
+// initial-list delivery burst can finish in well under 10ms, so a
+// 10ms-spaced check reliably observes "the whole batch already landed"
+// rather than "the batch just started landing" -- closing the exact race
+// those two tests exist to probe. A sleep-free loop still lets the OS
+// scheduler run the informer's reflector goroutine on another thread
+// (GOMAXPROCS permitting) without this goroutine explicitly yielding; the
+// mutex acquisition inside cond is itself a scheduling point.
+func spinUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 2s")
 		}
 	}
 }

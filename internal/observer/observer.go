@@ -205,10 +205,22 @@ func (o *Observer) clearNamespacePods(ns string) {
 // This is also what bounds o.events across a RUN boundary (spec Section 3's
 // "bounded by run generation" requirement, Task 6): scoped.reconcile tears
 // down every namespace under the OLD run (stopAllLocked) before starting the
-// new run's namespaces, whenever RunScope.RunID changes (scoped.go) -- so
-// this sweep always runs, for every namespace, strictly between an old run's
-// dedupe state and a new run's first Event notification for that namespace.
-// engine.Attribution.Generation itself is NOT what this reads: it advances on
+// new run's namespaces, on EITHER of the two branches that reach it (M4,
+// Task 6 fix round 1) -- whenever RunScope.RunID changes to a DIFFERENT run
+// (scoped.go:183), or whenever RunScope.Terminal is true, meaning no run is
+// current at all (scoped.go:177). The Terminal branch is not a redundant
+// restatement of the RunID one: engine.Retry (internal/engine/engine.go)
+// reuses the SAME RunID after a failure, so a retry's teardown-then-restart
+// is driven by Terminal flipping true and then back to false for that
+// identical RunID, never by RunID changing -- the earlier version of this
+// comment named only the RunID branch, which is incomplete for exactly the
+// Retry case a reader of this package's doc comment (scoped.go, which
+// discusses Retry directly above this file) will already be thinking about.
+// Both branches reach this sweep before startNamespace builds any new
+// factory for the namespace, within the SAME reconcile call -- so this sweep
+// always runs, for every namespace, strictly between an old run's dedupe
+// state and a new (or retried) run's first Event notification for that
+// namespace. engine.Attribution.Generation itself is NOT what this reads: it advances on
 // every ActiveAction transition WITHIN a run (internal/engine/attribution.go,
 // setActiveAction/clearActiveAction), roughly twice per deployment action --
 // keying eviction off it directly would clear o.events ~28 times over one
