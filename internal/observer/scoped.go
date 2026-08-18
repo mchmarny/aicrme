@@ -137,6 +137,25 @@ type scopedInformers struct {
 	// decided by sc.Terminal, never by anything stored here.
 	runID   string
 	entries map[string]*factoryEntry
+	// everTornDown records every namespace this PROCESS has torn down at
+	// least once (Ruling 32, Task 6 fix round 3) -- the signal
+	// onPodAdd/onEventAdd need to tell a console's first-ever sighting of a
+	// namespace (an informer's initial list is a snapshot that predates this
+	// process -- suppress, TestPodInitialListDoesNotNarrate's case) from a
+	// RESUMPTION after this SAME process already discarded whatever it knew
+	// about that namespace (clearNamespacePods/clearNamespaceEvents, wired
+	// as onNamespaceStop below) -- narrate instead, because the prior
+	// narration is genuinely gone on both sides, not because anything is
+	// newly happening. engine.Retry (internal/engine/engine.go) reusing the
+	// SAME RunID is the motivating case, but a brand-new run reusing a
+	// namespace name qualifies identically: either way this process already
+	// told the operator "I no longer know anything about this namespace",
+	// so a still-broken resource in it deserves to be re-told, not silently
+	// re-swallowed. Set in stopNamespaceLocked; read via isRestart. Never
+	// cleared -- "has this process ever discarded state for ns" only grows
+	// more true over the process's lifetime, never reverts, so a namespace
+	// that qualifies once qualifies for the rest of the process's life.
+	everTornDown map[string]bool
 }
 
 func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers, onNamespaceStop func(ns string)) *scopedInformers {
@@ -145,6 +164,7 @@ func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers, on
 		handlers:        handlers,
 		onNamespaceStop: onNamespaceStop,
 		entries:         make(map[string]*factoryEntry),
+		everTornDown:    make(map[string]bool),
 	}
 }
 
@@ -268,13 +288,15 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 	return &factoryEntry{podFactory: podFactory, eventFactory: eventFactory, pod: pod, event: event, stop: stop}
 }
 
-// stopNamespaceLocked closes ns's factories, evicts its entry, and -- if the
-// caller supplied one -- notifies onNamespaceStop so namespace-scoped state
-// Task 5/6's handlers accumulate outside this package (Observer.pods) can be
-// cleared in step with the informer that used to feed it (Important 4, Task
-// 5 fix round 1). Callers must hold s.mu; onNamespaceStop runs synchronously
-// on this call's goroutine, same posture as everything else reconcile does
-// under lock -- it is expected to be cheap in-memory bookkeeping, not I/O.
+// stopNamespaceLocked closes ns's factories, evicts its entry, marks ns as
+// having been torn down (Ruling 32, Task 6 fix round 3 -- see everTornDown's
+// own doc comment), and -- if the caller supplied one -- notifies
+// onNamespaceStop so namespace-scoped state Task 5/6's handlers accumulate
+// outside this package (Observer.pods) can be cleared in step with the
+// informer that used to feed it (Important 4, Task 5 fix round 1). Callers
+// must hold s.mu; onNamespaceStop runs synchronously on this call's
+// goroutine, same posture as everything else reconcile does under lock --
+// it is expected to be cheap in-memory bookkeeping, not I/O.
 //
 // This sweep alone is NOT sufficient to prevent Observer.pods from
 // re-accumulating stale entries after teardown (Important B, Task 5 fix
@@ -291,6 +313,7 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 func (s *scopedInformers) stopNamespaceLocked(ns string, e *factoryEntry) {
 	close(e.stop)
 	delete(s.entries, ns)
+	s.everTornDown[ns] = true
 	if s.onNamespaceStop != nil {
 		s.onNamespaceStop(ns)
 	}
@@ -348,6 +371,24 @@ func (s *scopedInformers) withNamespaceLive(ns string, fn func()) {
 	if _, ok := s.entries[ns]; ok {
 		fn()
 	}
+}
+
+// isRestart reports whether ns has been torn down by this process at least
+// once before (Ruling 32, Task 6 fix round 3 -- see everTornDown's own doc
+// comment for the full reasoning). onPodAdd/onEventAdd call this to decide
+// whether an informer's initial-list Add is a console's first-ever sighting
+// of ns (false: suppress, seed silently) or a resumption after this SAME
+// process already discarded whatever it knew about ns (true: narrate --
+// the prior state is genuinely gone on both sides, not just newly quiet).
+//
+// Locked like every other read of scopedInformers' own state, and safe to
+// call from a handler that does not otherwise hold s.mu: it takes and
+// releases the lock itself for exactly this one read, the same shape
+// currentPod uses for its own s.entries lookup above.
+func (s *scopedInformers) isRestart(ns string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.everTornDown[ns]
 }
 
 // currentPod looks up ns/name directly in that namespace's own live Pod

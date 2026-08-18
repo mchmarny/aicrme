@@ -320,8 +320,77 @@ func TestEventInitialListDoesNotNarrate(t *testing.T) {
 
 	_, sub := newScopedEventTestObserver(t, client)
 
-	if events := collectPodEvents(sub, time.Second); len(events) != 0 {
+	if events := collectPodEvents(sub); len(events) != 0 {
 		t.Fatalf("published %d events for the initial list, want 0: %+v", len(events), events)
+	}
+}
+
+// TestEventStillPresentAcrossRetryIsReNarrated is Ruling 32's (Task 6 fix
+// round 3) Event-side counterpart to pods_test.go's
+// TestPodStillBrokenAcrossRetryIsReNarrated -- the coordinator's explicit
+// requirement that seedEventBaseline, which has the identical
+// isInInitialList shape as seedPodBaseline, gets the identical fix and the
+// identical test rather than being assumed to work by analogy.
+//
+// Walks the same full sequence: a Warning predates this process's
+// first-ever sighting of the namespace (silent seed, matching
+// TestEventInitialListDoesNotNarrate exactly) -> the run fails and tears the
+// namespace down (o.events cleared, namespace marked as torn down) -> retry
+// with the SAME RunID restarts the informers fresh -> the Event API object
+// is UNCHANGED in the fake clientset, so the restarted informer's initial
+// list is this process's only remaining opportunity to learn about it -> it
+// narrates instead of being silently re-seeded. Also confirms the round-2
+// narrated bookkeeping: deleting the involved pod afterward publishes
+// "removed" for it, which onDelete's Pod case only does (via
+// resolveEventsLocked's narratedOnly filter) for an entry recorded with
+// narrated: true -- so onEventChange, not seedEventBaseline, must be what
+// recorded this one.
+func TestEventStillPresentAcrossRetryIsReNarrated(t *testing.T) {
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	client := fake.NewSimpleClientset(ev)
+	o, sub := newScopedEventTestObserver(t, client)
+
+	// First-ever start: matches TestEventInitialListDoesNotNarrate exactly
+	// -- this must stay silent.
+	if events := collectPodEvents(sub); len(events) != 0 {
+		t.Fatalf("published %d events on the first-ever start, want 0 (silent seed): %+v", len(events), events)
+	}
+
+	// The run fails: teardown clears o.events and marks the namespace as
+	// having been torn down.
+	o.scoped.reconcile(terminalScope(podTestNamespace))
+
+	// Retry: same RunID, Terminal now false -- restarts the namespace's
+	// informers fresh. The Event object in the fake clientset is untouched,
+	// so the new informer's initial list delivers the SAME still-present
+	// Warning again.
+	o.scoped.reconcile(scopeWith("run-1", podTestNamespace))
+	entry, ok := o.scoped.entries[podTestNamespace]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after retry reconcile", podTestNamespace)
+	}
+	waitFor(t, entry.event.HasSynced)
+
+	cd := waitForClusterData(t, sub)
+	if cd.Reason != reasonFailedScheduling {
+		t.Errorf("Reason = %q, want %q", cd.Reason, reasonFailedScheduling)
+	}
+	if cd.UID != "pod-uid" {
+		t.Errorf("UID = %q, want %q", cd.UID, "pod-uid")
+	}
+	if cd.Resolved {
+		t.Error("Resolved = true, want false: this is a re-arising, not a resolution")
+	}
+
+	// narrated bookkeeping (Task 6 fix round 2): the re-narrated entry must
+	// be marked narrated, or this delete would publish nothing for it.
+	o.onDelete(testPod("pod-uid"))
+	removed := waitForClusterData(t, sub)
+	if removed.Reason != reasonFailedScheduling {
+		t.Errorf("removed Reason = %q, want %q", removed.Reason, reasonFailedScheduling)
+	}
+	if !removed.Resolved {
+		t.Error("removed Resolved = false, want true")
 	}
 }
 

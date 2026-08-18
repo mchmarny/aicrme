@@ -384,19 +384,39 @@ func (o *Observer) onPodChange(pod *corev1.Pod) {
 // ResourceEventHandlerDetailedFuncs (not the plain ResourceEventHandlerFuncs
 // Observer.register uses for the three cluster-scoped kinds) precisely for
 // isInInitialList: an initial-list Add is a snapshot of state that predates
-// this process, seeded silently via seedPodBaseline. A LATER Add -- a pod
-// genuinely created after this namespace's informer was already watching --
-// is not a snapshot of anything; it is routed through the same onPodChange
-// an Update would use, so a pod that is already broken the moment it is
-// first observed (say, a bad image reference from the start) is narrated
-// without waiting for a subsequent Update that might arrive much later, or
-// -- for a pod that never changes state again -- might not arrive at all.
+// this process's FIRST-EVER sighting of the namespace, seeded silently via
+// seedPodBaseline. A LATER Add -- a pod genuinely created after this
+// namespace's informer was already watching -- is not a snapshot of
+// anything; it is routed through the same onPodChange an Update would use,
+// so a pod that is already broken the moment it is first observed (say, a
+// bad image reference from the start) is narrated without waiting for a
+// subsequent Update that might arrive much later, or -- for a pod that
+// never changes state again -- might not arrive at all.
+//
+// Ruling 32 (Task 6 fix round 3): "predates this process's first-ever
+// sighting" is the operative phrase above, and it stopped being universally
+// true once Task 6 gave namespaces a restart lifecycle. o.scoped.isRestart
+// tells the two initial-list cases apart: a genuine first sighting (this
+// process has never torn ns down) still seeds silently, but an initial list
+// delivered on a RESTARTED informer -- after this SAME process already
+// discarded whatever it knew about ns (clearNamespacePods, wired as
+// onNamespaceStop) -- is routed through onPodChange instead, the same as a
+// later Add. engine.Retry reusing the SAME RunID is the motivating case: the
+// SPA clears its condition state on "run retrying" and expects to be
+// re-told the truth, but without this check a pod still wedged on the
+// identical reason across the retry published nothing for the entire
+// retried attempt (bus/cluster.go's own comment: a clean row hiding a live
+// failure is the worse direction). Routing through onPodChange also means
+// the re-narrated condition is correctly marked narrated (podCondition's own
+// bookkeeping), so the delete path's resolved-vs-removed asymmetry still
+// holds for it -- no separate plumbing needed, onPodChange already does this
+// for every condition it records.
 func (o *Observer) onPodAdd(obj any, isInInitialList bool) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return
 	}
-	if isInInitialList {
+	if isInInitialList && !o.scoped.isRestart(pod.Namespace) {
 		o.seedPodBaseline(pod)
 		return
 	}

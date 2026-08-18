@@ -315,12 +315,22 @@ func (o *Observer) seedEventBaseline(ev *corev1.Event) {
 // it for a first occurrence (spec Section 3) -- a later Add IS the narration
 // opportunity, not a baseline-only snapshot the way a Pod's later Add
 // sometimes still is.
+//
+// Ruling 32 (Task 6 fix round 3): the SAME reasoning pods.go's onPodAdd doc
+// comment states applies here identically -- an initial-list Add is a
+// snapshot that predates this process's FIRST-EVER sighting of ns, not
+// necessarily this process's only sighting of it. o.scoped.isRestart tells a
+// genuine first sighting (still seed silently) from an initial list
+// delivered on a namespace this SAME process already tore down before
+// (route through onEventChange instead, narrating a Warning that is still
+// present after a Retry the exact way a later Add would). See
+// pods.go:onPodAdd for the full reasoning shared between both call sites.
 func (o *Observer) onEventAdd(obj any, isInInitialList bool) {
 	ev, ok := obj.(*corev1.Event)
 	if !ok {
 		return
 	}
-	if isInInitialList {
+	if isInInitialList && !o.scoped.isRestart(ev.Namespace) {
 		o.seedEventBaseline(ev)
 		return
 	}

@@ -96,13 +96,17 @@ func waitForEventAndClusterData(t *testing.T, sub <-chan bus.Event) (bus.Event, 
 	return e, cd
 }
 
-// collectPodEvents drains sub for the full duration, so a "nothing published"
+// collectPodEvents drains sub for a full second, so a "nothing published"
 // assertion actually waited long enough to mean something rather than
 // sampling the channel once before an async informer had a chance to
-// deliver.
-func collectPodEvents(sub <-chan bus.Event, within time.Duration) []bus.Event {
+// deliver. Every call site (Task 6 fix round 3: now five, across both this
+// file and events_test.go) wants the same second, so it is a constant
+// rather than a threaded-through parameter -- see waitForEvent's own
+// podEventWait const for the identical reasoning applied to a bound instead
+// of a duration.
+func collectPodEvents(sub <-chan bus.Event) []bus.Event {
 	var out []bus.Event
-	deadline := time.After(within)
+	deadline := time.After(time.Second)
 	for {
 		select {
 		case e := <-sub:
@@ -258,7 +262,7 @@ func TestPodDoesNotNarrateHealthyTransitions(t *testing.T) {
 		t.Fatalf("Update() error = %v", err)
 	}
 
-	if events := collectPodEvents(sub, time.Second); len(events) != 0 {
+	if events := collectPodEvents(sub); len(events) != 0 {
 		t.Fatalf("published %d events for a healthy Pending -> Running transition, want 0: %+v", len(events), events)
 	}
 }
@@ -299,8 +303,90 @@ func TestPodInitialListDoesNotNarrate(t *testing.T) {
 	client := fake.NewSimpleClientset(broken)
 	_, sub := newScopedPodTestObserver(t, client)
 
-	if events := collectPodEvents(sub, time.Second); len(events) != 0 {
+	if events := collectPodEvents(sub); len(events) != 0 {
 		t.Fatalf("published %d events for the initial list, want 0: %+v", len(events), events)
+	}
+}
+
+// TestPodStillBrokenAcrossRetryIsReNarrated pins Ruling 32 (Task 6 fix round
+// 3): engine.Retry reuses the SAME RunID, and the SPA clears its condition
+// state on the "run retrying" phase event -- correct, a retried attempt
+// should start from a clean slate and be re-told the truth. Before this fix
+// the Go side never re-told it: onPodAdd's isInInitialList branch always
+// routed to seedPodBaseline (silent), with no way to tell a console's
+// first-ever sighting of a namespace from a resumption after this SAME
+// process already discarded (clearNamespacePods) whatever it knew. A pod
+// still wedged on the identical reason across the retry published nothing
+// for the entire retried attempt -- a clean row hiding a live failure, the
+// worse of the two directions per bus/cluster.go's own Resolved comment.
+//
+// Walks the full SEQUENCE, not a restart in isolation -- a test that only
+// restarts informers without the fail-and-retry around it cannot distinguish
+// this from TestPodInitialListDoesNotNarrate's first-ever-start case, which
+// looks identical from the informer's own side and MUST stay suppressed:
+//  1. A pod predates this process's first-ever sighting of the namespace --
+//     seeded silently, exactly like TestPodInitialListDoesNotNarrate.
+//  2. The run fails: reconcile(terminalScope(...)) tears the namespace
+//     down -- o.pods is cleared (clearNamespacePods) and the namespace is
+//     marked as torn down at least once by this process.
+//  3. Retry: reconcile(scopeWith("run-1", ...)) again -- the SAME RunID,
+//     Terminal now false, restarting the namespace's informers fresh.
+//  4. The pod object in the fake clientset is UNCHANGED -- still
+//     CrashLoopBackOff, same UID -- so the restarted informer's initial
+//     list is this process's only remaining opportunity to learn about it.
+//  5. It narrates -- NOT silently seeded -- because this is a
+//     restart-after-teardown, not a first-ever start.
+//
+// Also confirms the round-2 narrated bookkeeping still holds for the
+// re-narrated condition: deleting the pod afterward publishes "removed",
+// which onDelete only does for entries recorded with narrated: true
+// (Important 3, Task 5 fix round 1) -- so onPodChange, not seedPodBaseline,
+// must be what recorded this one.
+func TestPodStillBrokenAcrossRetryIsReNarrated(t *testing.T) {
+	pod := withContainerWaiting(testPod("pod-uid"), "app", reasonCrashLoopBackOff)
+	client := fake.NewSimpleClientset(pod)
+	o, sub := newScopedPodTestObserver(t, client)
+
+	// First-ever start: matches TestPodInitialListDoesNotNarrate exactly --
+	// this must stay silent.
+	if events := collectPodEvents(sub); len(events) != 0 {
+		t.Fatalf("published %d events on the first-ever start, want 0 (silent seed): %+v", len(events), events)
+	}
+
+	// The run fails: teardown clears o.pods and marks the namespace as
+	// having been torn down.
+	o.scoped.reconcile(terminalScope(podTestNamespace))
+
+	// Retry: same RunID, Terminal now false -- restarts the namespace's
+	// informers fresh. The pod in the fake clientset is untouched, so the
+	// new informer's initial list delivers the SAME still-broken pod again.
+	o.scoped.reconcile(scopeWith("run-1", podTestNamespace))
+	entry, ok := o.scoped.entries[podTestNamespace]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after retry reconcile", podTestNamespace)
+	}
+	waitFor(t, entry.pod.HasSynced)
+
+	cd := waitForClusterData(t, sub)
+	if cd.Reason != reasonCrashLoopBackOff {
+		t.Errorf("Reason = %q, want %q", cd.Reason, reasonCrashLoopBackOff)
+	}
+	if cd.UID != "pod-uid" {
+		t.Errorf("UID = %q, want %q", cd.UID, "pod-uid")
+	}
+	if cd.Resolved {
+		t.Error("Resolved = true, want false: the pod is still broken, this is a re-arising, not a resolution")
+	}
+
+	// narrated bookkeeping (Task 6 fix round 2): the re-narrated condition
+	// must be marked narrated, or this delete would publish nothing.
+	o.onDelete(pod)
+	removed := waitForClusterData(t, sub)
+	if removed.Reason != reasonCrashLoopBackOff {
+		t.Errorf("removed Reason = %q, want %q", removed.Reason, reasonCrashLoopBackOff)
+	}
+	if !removed.Resolved {
+		t.Error("removed Resolved = false, want true")
 	}
 }
 
