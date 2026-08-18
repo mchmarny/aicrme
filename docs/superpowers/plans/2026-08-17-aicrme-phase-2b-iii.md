@@ -173,7 +173,7 @@ which is the rule that lets a row recover."
 
 **Files:**
 - Create: `internal/engine/attribution.go`, `internal/engine/attribution_test.go`
-- Modify: `internal/engine/engine.go`, `internal/steps/apply.go`
+- Modify: `internal/engine/engine.go` (only — see Ruling 1)
 
 **Interfaces:**
 - Produces: `engine.Attribution`, `Engine.Attribution() Attribution`, `Engine.setActiveAction(...)`.
@@ -216,9 +216,15 @@ package engine
 // duration of Apply, which is exactly the window this feature exists to
 // narrate.
 type Attribution struct {
-	RunID      string
-	Namespaces map[string]struct{}
-	Phase      Phase
+	RunID string
+	// NOTE (Ruling 2): Namespaces deliberately does NOT live here. They come
+	// from parsing recipe.json into steps.RecipeSummary, and internal/steps
+	// imports internal/engine -- so the engine deriving them is an import
+	// cycle. main composes instead: it already holds both the engine and
+	// 2b-ii's cached namespace parsing, and hands the observer ONE accessor
+	// returning the combined view. Do not "simplify" the two sources
+	// together here; that is the cycle.
+	Phase Phase
 	// ActiveAction is the deployment action deploy.sh is currently installing,
 	// or empty between actions and outside Apply. It is a TEMPORAL cursor, not
 	// a claim of ownership: deploy.sh's own note warns that convergence
@@ -243,7 +249,15 @@ func (e *Engine) Attribution() Attribution {
 
 - [ ] **Step 5: Wire it to marker transitions, in the required order**
 
-`trackComponents` calls `setActiveAction` when it sees a component's `started` marker — **after** forwarding the event to `emit`, never before.
+**Ruling 1 (corrected after pre-flight): the update goes in the engine, not the step.**
+`trackComponents(run *engine.Run, emit engine.Emit)` has no `Engine` reference and cannot call
+`setActiveAction`. The engine builds the `Emit` it hands each step itself, in `runStep` — a
+closure with `e` and `step.Phase()` in scope. Put the update there, immediately **after**
+`e.bus.Publish(ev)`.
+
+That placement is not a workaround, it is the point: the ordering contract stops being a rule
+someone has to remember and becomes structural, because the update physically follows the
+publish in the same closure. `internal/steps/apply.go` needs no change at all.
 
 That ordering is the contract: a cluster event must not cite a row whose header has not yet reached the bus, or the SPA receives an event referencing an action it has never heard of. Write the reason at the call site.
 
