@@ -20,14 +20,14 @@ const (
 	reasonGPUAllocatable = "GPUAllocatable"
 )
 
-// rolloutSeverity flags a readiness shortfall as the state worth watching; a
-// workload at or above its desired count is informational.
-func rolloutSeverity(ready, desired int32) bus.Severity {
-	if ready < desired {
-		return bus.SeverityWarn
-	}
-	return bus.SeverityInfo
-}
+// rolloutSeverityInfo is RolloutProgress's Severity, always: Supersedes only
+// orders conditions sharing a Reason, and RolloutProgress at Warn would rank
+// equal to an unrelated Reason -- say ImagePullBackOff -- also at Warn, so a
+// row picking the worse of the conditions it holds could no longer tell
+// "still installing" from "actually stuck". Warn/Error are reserved for
+// Reasons that describe a fault requiring operator action; a readiness
+// shortfall mid-rollout is expected, not that.
+const rolloutSeverityInfo = bus.SeverityInfo
 
 // allocatableSeverity flags a GPU capacity drop as the state worth watching;
 // a rise back to or above the prior value is the condition clearing.
@@ -116,7 +116,7 @@ func (o *Observer) onDaemonSet(obj any) {
 		Reason:    reasonRollout,
 		Ready:     ds.Status.NumberReady,
 		Desired:   ds.Status.DesiredNumberScheduled,
-		Severity:  rolloutSeverity(ds.Status.NumberReady, ds.Status.DesiredNumberScheduled),
+		Severity:  rolloutSeverityInfo,
 		Resolved:  ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled,
 	}
 
@@ -177,7 +177,7 @@ func (o *Observer) onDeployment(obj any) {
 		Reason:    reasonRollout,
 		Ready:     d.Status.ReadyReplicas,
 		Desired:   desired,
-		Severity:  rolloutSeverity(d.Status.ReadyReplicas, desired),
+		Severity:  rolloutSeverityInfo,
 		Resolved:  d.Status.ReadyReplicas >= desired,
 	}
 

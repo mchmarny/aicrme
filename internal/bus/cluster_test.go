@@ -93,6 +93,33 @@ func TestSupersedesIsNotTransitiveAcrossResources(t *testing.T) {
 	}
 }
 
+// Breaks if the Reason equality check is dropped from Supersedes' guard.
+// Same resource, two distinct conditions (RolloutProgress and
+// ImagePullBackOff): failure has both a later At and, being unresolved
+// against rollout's resolved state, the Resolved-mismatch branch's
+// tie-break in its favor too, so without the Reason check the fall-through
+// comparisons alone would make failure supersede rollout -- collapsing two
+// conditions a row must hold side by side into one. See ClusterData.Supersedes'
+// doc comment: this is the boundary between "newer version of the same
+// condition" and "a different condition entirely".
+func TestSupersedesRequiresMatchingReason(t *testing.T) {
+	rollout := bus.ClusterData{
+		UID: "ds-uid", Reason: "RolloutProgress",
+		Severity: bus.SeverityInfo, Resolved: true, At: time.Unix(100, 0),
+	}
+	failure := bus.ClusterData{
+		UID: "ds-uid", Reason: "ImagePullBackOff",
+		Severity: bus.SeverityError, Resolved: false, At: time.Unix(200, 0),
+	}
+
+	if failure.Supersedes(rollout) {
+		t.Errorf("failure.Supersedes(rollout) = true, want false: different Reasons on the same resource must never supersede")
+	}
+	if rollout.Supersedes(failure) {
+		t.Errorf("rollout.Supersedes(failure) = true, want false: different Reasons on the same resource must never supersede")
+	}
+}
+
 // Breaks if any ClusterData field loses its json tag, gets renamed on one
 // side, or if Event.Data stops carrying an opaque json.RawMessage faithfully
 // (e.g. double-encoding or truncating it) -- this is the path a real

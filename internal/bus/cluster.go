@@ -38,7 +38,14 @@ type ClusterData struct {
 	At       time.Time `json:"at"`
 }
 
-// Supersedes reports whether d should replace prev on a component row.
+// Supersedes reports whether d is a newer version of prev's own condition --
+// same resource (UID), same Reason -- and should replace it. This is NOT the
+// same question as what a row displays: a row holds one ClusterData per
+// distinct (UID, Reason) it has seen and separately picks the
+// highest-severity unresolved one across those to show. Supersedes never
+// compares across Reasons; two different Reasons on the same resource (say
+// RolloutProgress and ImagePullBackOff) are two distinct conditions that
+// coexist, not two versions of one condition racing to replace each other.
 func (d ClusterData) Supersedes(prev ClusterData) bool {
 	if d.UID != prev.UID || d.Reason != prev.Reason {
 		return false
