@@ -445,12 +445,12 @@ func (f *fakeAttributionReader) Attribution() engine.Attribution {
 
 // TestNewObserverScopeFnComposesNamespacesAndAttribution pins the
 // composition this task exists to build: Namespaces come from the cached
-// recipe parsing (nsScope, i.e. newRunScopeFn), RunID/Component/Generation
-// come from the engine's attribution snapshot -- and both land in the one
-// RunScope the observer actually reads, despite coming from two separate
-// accessors that cannot be merged on the engine side (Ruling 2: Namespaces
-// would require internal/engine to import internal/steps, which already
-// imports internal/engine).
+// recipe parsing (nsScope, i.e. newRunScopeFn), RunID/Component/Generation/
+// Terminal come from the engine's attribution snapshot -- and both land in
+// the one RunScope the observer actually reads, despite coming from two
+// separate accessors that cannot be merged on the engine side (Ruling 2:
+// Namespaces would require internal/engine to import internal/steps, which
+// already imports internal/engine).
 //
 // This also doubles as the "matching RunIDs compose normally" case for
 // Ruling 6's disagreement check (nsFake.id and attrFake.a.RunID are both
@@ -469,6 +469,7 @@ func TestNewObserverScopeFnComposesNamespacesAndAttribution(t *testing.T) {
 		RunID:        "run-1",
 		ActiveAction: "gpu-operator",
 		Generation:   7,
+		Terminal:     true,
 	}}
 
 	scope := newObserverScopeFn(attrFake, newRunScopeFn(nsFake))
@@ -485,6 +486,9 @@ func TestNewObserverScopeFnComposesNamespacesAndAttribution(t *testing.T) {
 	}
 	if sc.Generation != 7 {
 		t.Errorf("Generation = %d, want 7 from Attribution().Generation", sc.Generation)
+	}
+	if !sc.Terminal {
+		t.Error("Terminal = false, want true from Attribution().Terminal (Ruling 8)")
 	}
 	if attrFake.calls != 1 {
 		t.Errorf("Attribution() called %d times by one scope() call, want exactly 1", attrFake.calls)

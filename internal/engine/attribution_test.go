@@ -426,6 +426,79 @@ func TestAttributionUpdateFollowsThePublish(t *testing.T) {
 	}
 }
 
+// TestAttributionTerminalMatchesIsTerminalExactly pins Attribution.Terminal
+// against every State value, not just the two finish() reaches: it must
+// track isTerminal's exact definition (StateDone, StateFailed) and nothing
+// broader. StateActive is the case that matters most -- it is reserved for
+// the Prove workload (run.go) and no path sets it via finish() today, but a
+// consumer keyed off "not live" instead of "actually terminal" would tear
+// down live state the day that path is wired up. StateIdle is included for
+// the same reason: it is never observed on e.current after Start (which
+// always writes StateRunning), but Terminal must still be exactly false for
+// it, not merely false today by accident of who calls this.
+func TestAttributionTerminalMatchesIsTerminalExactly(t *testing.T) {
+	tests := []struct {
+		state State
+		want  bool
+	}{
+		{StateIdle, false},
+		{StateRunning, false},
+		{StateAwaitingDecision, false},
+		{StateFailed, true},
+		{StateActive, false},
+		{StateDone, true},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.state), func(t *testing.T) {
+			e := New(bus.New(8), NewMemoryStore())
+			e.mu.Lock()
+			e.current = &Run{ID: "run-1", State: tc.state}
+			e.mu.Unlock()
+
+			if got := e.Attribution().Terminal; got != tc.want {
+				t.Errorf("Attribution().Terminal for State=%s = %v, want %v", tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAttributionTerminalClearsWhenRetryReusesTheRunID is the engine-side
+// half of the fix for the observer's Critical 1 (informers wedged after a
+// retry): Retry (engine.go) flips e.current.State back to StateRunning,
+// under e.mu, for the SAME RunID a prior failure already reported Terminal
+// for. Attribution() must report Terminal: false the instant that happens,
+// with no memory of the earlier terminal read -- it recomputes
+// isTerminal(e.current.State) fresh on every call rather than latching
+// anything. Drives the state transition directly (StateFailed -> StateRunning)
+// rather than through a live Retry() call, since the property under test is
+// specifically Attribution()'s statelessness, not Retry's own locking, which
+// TestSupersededGoroutineCannotWriteAttribution and engine_test.go's Retry
+// tests already cover.
+func TestAttributionTerminalClearsWhenRetryReusesTheRunID(t *testing.T) {
+	e := New(bus.New(8), NewMemoryStore())
+	e.mu.Lock()
+	e.current = &Run{ID: "run-1", State: StateFailed}
+	e.mu.Unlock()
+
+	if got := e.Attribution(); got.RunID != "run-1" || !got.Terminal {
+		t.Fatalf("Attribution() = %+v, want RunID=run-1 Terminal=true after a failure (test setup)", got)
+	}
+
+	// Retry's own first act under e.mu (engine.go:769): flip State back to
+	// StateRunning for the same run, before anything else changes.
+	e.mu.Lock()
+	e.current.State = StateRunning
+	e.mu.Unlock()
+
+	got := e.Attribution()
+	if got.RunID != "run-1" {
+		t.Fatalf("Attribution().RunID = %q after retry, want run-1 (same ID reused)", got.RunID)
+	}
+	if got.Terminal {
+		t.Error("Attribution().Terminal = true after Retry reused the same RunID and moved it back to StateRunning, want false")
+	}
+}
+
 // TestSupersededGoroutineCannotWriteAttribution pins setActiveAction's and
 // clearActiveAction's epoch guard (Fix round 1): a write carrying an epoch
 // that is no longer the live one must be a silent no-op, not a mutation of

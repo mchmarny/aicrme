@@ -65,6 +65,19 @@ type RunScope struct {
 	// needs to detect a stale read can, without a second call into the
 	// engine.
 	Generation uint64
+	// Terminal mirrors engine.Attribution.Terminal (Ruling 8): RunID's run
+	// has reached a state Engine.finish actually sets (StateDone or
+	// StateFailed). It is read fresh off engine.Attribution() on every scope
+	// call, so it can never disagree with RunID -- unlike RunID and
+	// Namespaces going empty (which happens only on Discard or a new Start,
+	// see scoped.go's package doc), Terminal is how a consumer of RunScope
+	// learns a specific run is over without waiting for the run to be
+	// replaced or discarded. scopedInformers (scoped.go) is that consumer:
+	// it treats Terminal as authoritative and re-derives it on every
+	// reconcile, rather than remembering a past terminal read, which is what
+	// lets a retried run (same RunID, Terminal flips back to false) resume
+	// being watched instead of staying wedged.
+	Terminal bool
 }
 
 type stateKey struct {
@@ -122,7 +135,7 @@ func (o *Observer) Start(stopCh <-chan struct{}) error {
 	// down the moment a run reaches a terminal state (scoped.go, Ruling 3).
 	// It never blocks this call -- see scopedInformers.reconcile's own doc
 	// comment for why.
-	go o.scoped.run(o.scope, o.bus, stopCh)
+	go o.scoped.run(o.scope, o.bus, stopCh, reconcileInterval)
 
 	factory := informers.NewSharedInformerFactory(o.client, resyncPeriod)
 

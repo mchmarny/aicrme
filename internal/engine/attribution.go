@@ -50,6 +50,29 @@ type Attribution struct {
 	// Generation advances on every ActiveAction transition, so a consumer can
 	// tell a stale read from a current one without comparing every field.
 	Generation uint64
+
+	// Terminal reports whether RunID's run has reached a state finish()
+	// actually sets -- isTerminal(e.current.State), StateDone or StateFailed
+	// (engine.go). It is read fresh from e.current.State on every
+	// Attribution() call, under the SAME lock acquisition that produces
+	// RunID, so the two can never describe different runs (Ruling 6's
+	// composition property, extended to this field rather than left for a
+	// caller to accidentally violate by reading state through a second
+	// accessor).
+	//
+	// This exists because RunID and Namespaces alone cannot say "this run is
+	// over": e.current is not nilled by finish() -- only Discard or a new
+	// Start replace it -- so a caller deriving "terminal" from RunID/
+	// Namespaces changing would see nothing change for as long as the
+	// operator leaves a finished run sitting there. It is also why Terminal
+	// must be read live rather than latched anywhere: Retry (engine.go) flips
+	// e.current.State back to StateRunning, under e.mu, before publishing
+	// "run retrying" -- reusing the SAME RunID -- so the very next
+	// Attribution() call for that RunID reports Terminal: false again. A
+	// consumer that remembered "RunID X was terminal" as a fact about the ID
+	// rather than re-deriving it from current State every time would treat a
+	// retried run as permanently over.
+	Terminal bool
 }
 
 // componentMarker decodes the subset of applier.ComponentData
@@ -83,6 +106,7 @@ func (e *Engine) Attribution() Attribution {
 	if e.current != nil {
 		a.RunID = e.current.ID
 		a.Phase = e.current.Phase
+		a.Terminal = isTerminal(e.current.State)
 	}
 	return a
 }

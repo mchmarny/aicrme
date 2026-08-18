@@ -239,6 +239,21 @@ func isLive(s State) bool {
 	return s == StateRunning || s == StateAwaitingDecision
 }
 
+// isTerminal reports whether s is a state finish() actually reaches. Only
+// two call sites ever call finish today (:495 StateDone, :545 and :636
+// StateFailed), so this matches finish's real coverage exactly.
+//
+// Deliberately not "!isLive(s)": that would also be true for StateIdle
+// (never observed on e.current after Start, which always sets StateRunning)
+// and StateActive (run.go's own comment reserves it for the Prove workload;
+// no path sets it today). A consumer keyed off "not live" instead of
+// "actually terminal" -- internal/observer's scoped informer teardown is
+// exactly this shape -- would tear down the day StateActive is wired up,
+// mid-Prove, which is the opposite of what that state exists to mean.
+func isTerminal(s State) bool {
+	return s == StateDone || s == StateFailed
+}
+
 // aliveLocked reports whether the goroutine holding this epoch is still the
 // one driving the current run. Callers must already hold e.mu.
 //

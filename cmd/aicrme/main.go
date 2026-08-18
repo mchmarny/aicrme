@@ -233,6 +233,19 @@ type attributionReader interface {
 // one call by the observer into this func. The disagreement check compares
 // values already in hand (sc.RunID, a.RunID); it must never justify a third
 // call into eng to "double check".
+//
+// sc.Terminal is copied from a.Terminal for the same reason Component is:
+// Attribution() computes it fresh from e.current.State under the engine's
+// one lock (isTerminal(e.current.State), internal/engine/attribution.go), so
+// it can never disagree with the RunID it travels with here (Ruling 8). This
+// is what lets the scoped Pod/Event informer lifecycle
+// (internal/observer/scoped.go) treat RunScope as the single, authoritative
+// answer to "is this run over" -- no separate at-most-once signal, no
+// per-run memory of a prior terminal read, so a retried run (same RunID,
+// State back to StateRunning) is simply not terminal on the very next read.
+// The disagreement branch above still means "tear down" for that lifecycle
+// without needing Terminal set: it returns RunID == "", which
+// scopedInformers.reconcile already treats as no scope.
 func newObserverScopeFn(eng attributionReader, nsScope func() observer.RunScope) func() observer.RunScope {
 	return func() observer.RunScope {
 		sc := nsScope()
@@ -243,6 +256,7 @@ func newObserverScopeFn(eng attributionReader, nsScope func() observer.RunScope)
 		sc.RunID = a.RunID
 		sc.Component = a.ActiveAction
 		sc.Generation = a.Generation
+		sc.Terminal = a.Terminal
 		return sc
 	}
 }

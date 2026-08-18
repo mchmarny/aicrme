@@ -3,6 +3,7 @@ package observer
 import (
 	"log/slog"
 	"sync"
+	"time"
 
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -24,6 +25,29 @@ import (
 // namespace" is a single field, last write wins, not a set), so following a
 // multi-namespace recipe means one SharedInformerFactory per namespace,
 // roughly ten for the current recipe, not one namespace-filtered factory.
+//
+// reconcile is driven purely by RunScope.Terminal (Ruling 8), re-derived by
+// main from engine.Attribution() on every call
+// (cmd/aicrme/main.go:newObserverScopeFn) -- never by anything this package
+// remembers about a run across calls. An earlier version of this file
+// inferred "the run just ended" from a terminal KindPhase bus message and
+// latched that fact in a `terminated` field keyed by run ID. That was wrong
+// two independent ways, both structural rather than fixable by patching the
+// inference:
+//   - engine.Retry (internal/engine/engine.go) reuses the SAME run ID after a
+//     failure. The latch, once set for that ID, had no path back to false
+//     for it -- a retried run's informers stayed permanently wedged off.
+//   - internal/bus drops live events for a subscriber more than
+//     subscriberBuffer behind (bus.go), and this listener neither replays
+//     nor reconnects. If the DROPPED event was the run's terminal one -- its
+//     LAST event -- nothing else ever signaled termination, so teardown
+//     never happened.
+//
+// Making the scope itself say "is this run over" (RunScope.Terminal) removes
+// the need to infer or remember anything: reconcile reads it fresh every
+// time, so a retried run (same ID, Terminal now false) simply is not
+// terminal, and a dropped bus event costs one missed wakeup, not permanent
+// divergence -- see run's doc comment for what bounds that cost.
 
 // factoryEntry is one namespace's Pod/Event watch: its own
 // SharedInformerFactory plus the two informers materialized on it, and the
@@ -40,29 +64,18 @@ type factoryEntry struct {
 
 // scopedInformers owns the Pod/Event factories for whichever run is
 // currently in scope. mu guards every field below it: reconcile can run
-// concurrently with itself in production, since run() re-reconciles on every
-// KindPhase event and nothing serializes those against each other beyond
-// this lock.
+// concurrently with itself in production, since run() calls it from both the
+// bus subscription and the ticker with nothing else serializing the two.
 type scopedInformers struct {
 	client kubernetes.Interface
 
 	mu sync.Mutex
 	// runID is the run these entries belong to, or "" when nothing is
-	// scoped.
-	runID string
-	// terminated is the last runID stopIfRunID tore down. main's RunScope
-	// composition (cmd/aicrme/main.go's newObserverScopeFn) has no way to
-	// say "this run is over" -- engine.Attribution and CurrentID keep
-	// reporting a terminated run's own RunID and Namespaces unchanged until
-	// a new run starts or the old one is discarded (internal/engine's
-	// Engine.Start replaces e.current; Discard sets it nil; nothing else
-	// does). Without this guard, any later reconcile call that still
-	// observes the just-terminated run's scope would restart the very
-	// factories stopIfRunID just closed. Cleared the moment a genuinely
-	// different RunID is reconciled, since the guard exists only to keep a
-	// terminated run's OWN scope from reviving.
-	terminated string
-	entries    map[string]*factoryEntry
+	// scoped. Compared only to decide whether an incoming scope names a
+	// DIFFERENT run (tear down and restart fresh) -- termination itself is
+	// decided by sc.Terminal, never by anything stored here.
+	runID   string
+	entries map[string]*factoryEntry
 }
 
 func newScopedInformers(client kubernetes.Interface) *scopedInformers {
@@ -77,17 +90,24 @@ func newScopedInformers(client kubernetes.Interface) *scopedInformers {
 // rather than once at process start, so no caller can be trusted to
 // remember to wrap it in a goroutine itself.
 //
-// A RunID change -- including the zero RunScope an unresolved or
-// disagreeing read produces (Ruling 6, observer.go's RunScope doc comment)
-// -- tears down every existing factory before applying the new set:
-// namespaces are only meaningful within the run that resolved them, so
-// carrying a prior run's factory forward under a different RunID would watch
-// namespaces that run's recipe never named.
+// Idempotent and safe to call from multiple goroutines (run below does, from
+// both the bus fast path and the ticker floor) or with an unchanged sc:
+// namespaces already present are left alone, so a repeated identical scope
+// never restarts a factory that is already watching.
+//
+// Tears down every existing factory when sc says there is nothing (or
+// nothing further) to watch -- sc.RunID == "" (no run, or the two composed
+// sources disagree, Ruling 6), sc.Namespaces is empty, or sc.Terminal is
+// true -- and when sc names a DIFFERENT run than the one currently tracked,
+// since a prior run's factories are never valid for a new run's namespaces.
+// sc.Terminal is re-read on every call, never cached: see the package doc
+// comment above for why that -- not a remembered fact about a run ID -- is
+// what makes a retried run (same ID, Terminal now false) resume watching.
 func (s *scopedInformers) reconcile(sc RunScope) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if sc.RunID == "" || len(sc.Namespaces) == 0 || sc.RunID == s.terminated {
+	if sc.RunID == "" || len(sc.Namespaces) == 0 || sc.Terminal {
 		s.stopAllLocked()
 		s.runID = ""
 		return
@@ -96,7 +116,6 @@ func (s *scopedInformers) reconcile(sc RunScope) {
 	if s.runID != sc.RunID {
 		s.stopAllLocked()
 		s.runID = sc.RunID
-		s.terminated = ""
 	}
 
 	for ns, e := range s.entries {
@@ -140,7 +159,7 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 
 // stopAllLocked closes and releases every tracked namespace's factory.
 // Callers must hold s.mu and are responsible for what the teardown means for
-// s.runID/s.terminated afterward -- this only empties s.entries.
+// s.runID afterward -- this only empties s.entries.
 func (s *scopedInformers) stopAllLocked() {
 	for ns, e := range s.entries {
 		close(e.stop)
@@ -149,8 +168,9 @@ func (s *scopedInformers) stopAllLocked() {
 }
 
 // stop tears down every namespace's factory unconditionally. Used on process
-// shutdown (run()'s stopCh closing), where there is no specific run to
-// compare against.
+// shutdown (run()'s stopCh closing), where there is no specific run's scope
+// to reconcile against -- the process is exiting regardless of what any run
+// is doing.
 func (s *scopedInformers) stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -158,71 +178,51 @@ func (s *scopedInformers) stop() {
 	s.runID = ""
 }
 
-// stopIfRunID tears down every factory only if runID is still the run this
-// instance has scoped -- Ruling 3's "stop the moment a run reaches a
-// terminal state" (docs/superpowers/sdd/2026-08-17-aicrme-phase-2b-iii/progress.md),
-// with no grace window. The comparison mirrors internal/engine's
-// epoch-guard pattern: a terminal signal for a run this instance has already
-// moved on from (reconcile already tore down and started a different run's
-// factories) must be a no-op, not a destructive one -- see
-// TestStopIfRunIDIgnoresAStaleRunID.
-func (s *scopedInformers) stopIfRunID(runID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runID != runID {
-		return
-	}
-	s.stopAllLocked()
-	s.runID = ""
-	s.terminated = runID
-}
-
-// phaseRunDone, phaseRunFailed and phaseRunActive are the KindPhase messages
-// internal/engine's Engine.finish publishes ("run " + string(state)) for
-// every state finish is ever called with (engine.go). Duplicated as string
-// literals rather than importing internal/engine.State, the same shape
-// handlers.go's componentStatusStarted already uses to avoid coupling this
-// package to the engine's types -- and not a new contract, since
-// web/src/components/Wizard.tsx's deriveRunState already keys UI state off
-// these exact same literals. phaseRunActive has no caller in engine.go today
-// (run.go's own doc comment reserves StateActive for the Prove workload the
-// engine does not yet drive to finish with), but is matched here anyway: the
-// cost of matching an unreachable state is zero, and the cost of silently
-// missing it the day that path is wired up is a Pod/Event watch that never
-// tears down.
-const (
-	phaseRunDone   = "run done"
-	phaseRunFailed = "run failed"
-	phaseRunActive = "run active"
-)
-
-func isTerminalRunMessage(msg string) bool {
-	switch msg {
-	case phaseRunDone, phaseRunFailed, phaseRunActive:
-		return true
-	default:
-		return false
-	}
-}
-
-// run drives the scoped lifecycle for the observer's whole process lifetime.
-// It subscribes to the SAME bus the observer publishes cluster telemetry to
-// -- Engine.finish publishes a run's terminal KindPhase event on that same
-// bus, synchronously under Publish's own lock (internal/bus/bus.go), so this
-// goroutine observes it as soon as any other subscriber does. That is what
-// makes teardown immediate rather than bounded by a poll interval: main's
-// RunScope alone cannot signal "this run just ended" (see s.terminated's doc
-// comment), so this listens for the one signal that actually fires at that
-// instant instead of inferring it from RunScope's other fields.
+// reconcileInterval is run's correctness floor, not its normal cadence: the
+// bus subscription below is the fast path and fires on every KindPhase
+// event, so in the common case teardown happens within microseconds of
+// Engine.finish's Publish call, same as before this fix. The floor exists
+// because internal/bus drops live events for a subscriber more than
+// subscriberBuffer behind (bus.go) with no replay and no reconnect for this
+// internal listener -- unlike an SSE client, which resumes with
+// Last-Event-ID. If the DROPPED event is a run's terminal KindPhase -- its
+// LAST event, since nothing publishes after finish() -- no later bus event
+// for that run will ever arrive to trigger a reconcile, and the scope stays
+// stuck reporting that run's now-stale Terminal:false understanding until a
+// DIFFERENT run's first KindPhase happens to fire (unbounded if the operator
+// never starts another run). The ticker guarantees this goroutine re-reads
+// scope() -- which recomputes Terminal fresh from engine state, not from
+// anything this goroutine remembered -- at least once per interval
+// regardless of what the bus delivered.
 //
-// Every non-terminal KindPhase event triggers a reconcile against the
-// current scope -- cheap and idempotent if nothing changed -- because
+// reconcile is a handful of map operations against already-in-memory state;
+// the only I/O it can trigger (a per-namespace factory (re)start) runs off
+// its own goroutine (startNamespace), so ticking is cheap. 2s bounds the
+// worst-case teardown lag from "instant" to "still well under
+// human-perceptible" for a console whose shortest phase (Discover) runs
+// minutes, without generating meaningful lock contention or CPU churn over a
+// run's lifetime.
+const reconcileInterval = 2 * time.Second
+
+// run drives the scoped lifecycle for the observer's whole process lifetime:
+// a level-triggered reconcile against the CURRENT scope, woken by two
+// independent sources that both converge on the same reconcile(scope()) call
+// -- the observer's own bus, as the fast path, and a ticker at the given
+// interval, as the correctness floor (see reconcileInterval's doc comment
+// for why the floor is necessary; Observer.Start passes that constant as
+// interval, and tests pass their own to exercise one path at a time without
+// waiting out the production period). Neither source is trusted alone: every
+// KindPhase event triggers a reconcile, not just a terminal one, because
 // namespaces resolve partway through a run (Recommend writing recipe.json)
-// with no dedicated event marking that moment; the next phase-complete
-// marker is what wakes this goroutine to notice.
-func (s *scopedInformers) run(scope func() RunScope, b *bus.Bus, stopCh <-chan struct{}) {
+// with no dedicated event marking that moment -- the next phase-complete
+// marker is what wakes this goroutine to notice a newly resolved scope.
+func (s *scopedInformers) run(scope func() RunScope, b *bus.Bus, stopCh <-chan struct{}, interval time.Duration) {
 	sub, unsub := b.Subscribe(0)
 	defer unsub()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-stopCh:
@@ -236,10 +236,8 @@ func (s *scopedInformers) run(scope func() RunScope, b *bus.Bus, stopCh <-chan s
 			if e.Kind != bus.KindPhase {
 				continue
 			}
-			if isTerminalRunMessage(e.Message) {
-				s.stopIfRunID(e.RunID)
-				continue
-			}
+			s.reconcile(scope())
+		case <-ticker.C:
 			s.reconcile(scope())
 		}
 	}
