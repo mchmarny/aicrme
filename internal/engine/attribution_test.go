@@ -33,6 +33,18 @@ func waitForAttributionState(t *testing.T, e *Engine, pred func(Attribution) boo
 	}
 }
 
+// currentEpoch reads e.epoch under lock. Tests below that call
+// setActiveAction/clearActiveAction directly (rather than through a real
+// Start/Retry-driven run) rely on New's zero-value epoch, but reading it
+// explicitly here -- instead of passing a bare 0 at every call site -- keeps
+// that an asserted fact rather than an assumption baked in six separate
+// places.
+func currentEpoch(e *Engine) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.epoch
+}
+
 func waitForRunState(t *testing.T, e *Engine, id string, want State) *Run {
 	t.Helper()
 	deadline := time.After(20 * time.Second)
@@ -98,7 +110,7 @@ func TestAttributionCarriesTheActiveAction(t *testing.T) {
 	e.current = &Run{ID: "run-1", Phase: PhaseApply}
 	e.mu.Unlock()
 
-	e.setActiveAction("nvidia-driver-daemonset", 3, 14)
+	e.setActiveAction(currentEpoch(e), "nvidia-driver-daemonset", 3, 14)
 
 	got := e.Attribution()
 	got.Generation = 0 // excluded -- see doc comment
@@ -125,13 +137,13 @@ func TestAttributionGenerationAdvancesOnEveryTransition(t *testing.T) {
 	e.current = &Run{ID: "run-1"}
 	e.mu.Unlock()
 
-	e.setActiveAction("a", 1, 3)
+	e.setActiveAction(currentEpoch(e), "a", 1, 3)
 	g1 := e.Attribution().Generation
 
-	e.setActiveAction("b", 2, 3)
+	e.setActiveAction(currentEpoch(e), "b", 2, 3)
 	g2 := e.Attribution().Generation
 
-	e.setActiveAction("c", 3, 3)
+	e.setActiveAction(currentEpoch(e), "c", 3, 3)
 	g3 := e.Attribution().Generation
 
 	if g1 == 0 {
@@ -239,7 +251,7 @@ func TestAttributionIsReadAtomically(t *testing.T) {
 		defer wg.Done()
 		defer close(stop)
 		for i := 0; i < transitions; i++ {
-			e.setActiveAction(fmt.Sprintf("component-%d", i), i, transitions)
+			e.setActiveAction(currentEpoch(e), fmt.Sprintf("component-%d", i), i, transitions)
 		}
 	}()
 
@@ -283,7 +295,7 @@ func TestAttributionDoesNotCloneArtifacts(t *testing.T) {
 		Decisions: map[string]string{},
 	}
 	e.mu.Unlock()
-	e.setActiveAction("driver", 1, 1)
+	e.setActiveAction(currentEpoch(e), "driver", 1, 1)
 
 	const calls = 500
 	var before, after runtime.MemStats
@@ -358,7 +370,16 @@ func TestAttributionUpdateFollowsThePublish(t *testing.T) {
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 
-	readers := runtime.NumCPU()
+	// GOMAXPROCS(0), not NumCPU(): NumCPU reports HOST cores regardless of
+	// any CPU quota the process is actually scheduled under. Under a
+	// cgroup-throttled container (e.g. GOMAXPROCS=2 on an 11-core host),
+	// NumCPU spawns one busy-polling reader per host core, and that many
+	// readers contending for two threads starves the writer driving 8000
+	// synchronous transitions -- a deterministic false failure via
+	// waitForRunState's timeout, not a flake. GOMAXPROCS(0) reports what the
+	// runtime will actually schedule, which is what reader parallelism
+	// should track.
+	readers := runtime.GOMAXPROCS(0)
 	if readers < 4 {
 		readers = 4
 	}
@@ -402,5 +423,46 @@ func TestAttributionUpdateFollowsThePublish(t *testing.T) {
 	defer mu.Unlock()
 	if violation != "" {
 		t.Error(violation)
+	}
+}
+
+// TestSupersededGoroutineCannotWriteAttribution pins setActiveAction's and
+// clearActiveAction's epoch guard (Fix round 1): a write carrying an epoch
+// that is no longer the live one must be a silent no-op, not a mutation of
+// whatever run has since taken over e.attribution. Unreachable today through
+// any public API -- Start and Retry both refuse to launch while a run is
+// live, so two goroutines never legitimately hold different epochs for the
+// same Engine at once -- so, like
+// TestSupersededGoroutineCannotWriteState (engine_internal_test.go), this
+// manufactures the condition directly by bumping e.epoch out from under a
+// captured, now-stale epoch value, rather than relying on a race that no
+// black-box test could produce.
+func TestSupersededGoroutineCannotWriteAttribution(t *testing.T) {
+	e := New(bus.New(8), NewMemoryStore())
+	e.mu.Lock()
+	e.current = &Run{ID: "run-1"}
+	staleEpoch := e.epoch
+	e.epoch++ // manufacture supersession; no public API can do this today
+	liveEpoch := e.epoch
+	e.mu.Unlock()
+
+	e.setActiveAction(staleEpoch, "component-1", 1, 1)
+	if got := e.Attribution(); got.ActiveAction != "" {
+		t.Errorf("setActiveAction with a superseded epoch wrote ActiveAction = %q, want no-op", got.ActiveAction)
+	}
+
+	e.setActiveAction(liveEpoch, "component-2", 2, 2)
+	if got := e.Attribution(); got.ActiveAction != "component-2" {
+		t.Fatalf("setActiveAction with the live epoch = %+v, want ActiveAction = component-2 (test setup failure, not the guard under test)", got)
+	}
+
+	e.clearActiveAction(staleEpoch)
+	if got := e.Attribution(); got.ActiveAction != "component-2" {
+		t.Errorf("clearActiveAction with a superseded epoch = %+v, want no-op (ActiveAction still component-2)", got)
+	}
+
+	e.clearActiveAction(liveEpoch)
+	if got := e.Attribution(); got.ActiveAction != "" {
+		t.Errorf("clearActiveAction with the live epoch left ActiveAction = %q, want cleared", got.ActiveAction)
 	}
 }

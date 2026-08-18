@@ -591,7 +591,7 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		// handed to the bus -- the SPA would then receive an event citing a
 		// row it has never heard of.
 		if ev.Kind == bus.KindComponent {
-			applyComponentMarker(e, ev.Data)
+			applyComponentMarker(e, epoch, ev.Data)
 		}
 	}
 
@@ -630,7 +630,7 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		// retry (or the terminal state finish is about to record) does not
 		// keep pointing at an action that stopped installing.
 		if step.Phase() == PhaseApply {
-			e.clearActiveAction()
+			e.clearActiveAction(epoch)
 		}
 
 		e.finish(ctx, epoch, StateFailed, msg)
@@ -674,7 +674,7 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// once nothing in this step is installing, and the next step (if any)
 	// will set its own Phase before any new marker can arrive.
 	if step.Phase() == PhaseApply {
-		e.clearActiveAction()
+		e.clearActiveAction(epoch)
 	}
 
 	if err := e.store.Save(ctx, merged); err != nil {
@@ -704,8 +704,11 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 	// clear the active action on every path that leaves Apply, but a
 	// terminal state is where that guarantee must hold regardless of how it
 	// was reached -- nothing this run does from here on should ever again be
-	// read as "an action is installing".
-	e.clearActiveAction()
+	// read as "an action is installing". epoch-guarded like the two runStep
+	// call sites, which also closes the window between the e.mu.Unlock()
+	// above and this call, where a new Start could in principle have already
+	// landed.
+	e.clearActiveAction(epoch)
 
 	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), terminalSaveTimeout)
 	defer saveCancel()

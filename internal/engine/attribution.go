@@ -93,9 +93,23 @@ func (e *Engine) Attribution() Attribution {
 // is the contract, not an incidental consequence of statement order: update
 // this any earlier and a concurrent reader of Attribution() could label a
 // cluster event with an action whose header has not reached the bus yet.
-func (e *Engine) setActiveAction(name string, index, total int) {
+//
+// epoch guards this the same way every other e.current-adjacent mutation in
+// engine.go does: a caller passes the epoch it captured at launch, and a
+// write from a goroutine whose run has since been superseded (e.g. Retry
+// relaunching execute for a run this goroutine no longer owns) is silently
+// dropped rather than clobbering the current run's snapshot. No public API
+// can force this goroutine to still be calling setActiveAction after its
+// epoch is stale -- see aliveLocked's doc comment for why the guard stays
+// anyway, and TestSupersededGoroutineCannotWriteAttribution for the same
+// "manufacture the condition directly" technique
+// TestSupersededGoroutineCannotWriteState already uses to pin it.
+func (e *Engine) setActiveAction(epoch uint64, name string, index, total int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if !e.aliveLocked(epoch) {
+		return
+	}
 	e.attribution.ActiveAction = name
 	e.attribution.ActiveIndex = index
 	e.attribution.ActiveTotal = total
@@ -108,9 +122,19 @@ func (e *Engine) setActiveAction(name string, index, total int) {
 // defensively once more at every terminal state (finish), so the snapshot
 // never keeps claiming cluster activity is attributable once nothing is
 // actively installing.
-func (e *Engine) clearActiveAction() {
+//
+// epoch-guarded for the same reason setActiveAction is: it additionally
+// closes a narrow window in finish's defensive call, where a new Start could
+// in principle land between finish's e.mu.Unlock() and this call -- without
+// the guard, this call would clear whatever the NEW run's snapshot happens
+// to hold at that instant instead of being a no-op against a run that is no
+// longer this goroutine's.
+func (e *Engine) clearActiveAction(epoch uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if !e.aliveLocked(epoch) {
+		return
+	}
 	e.attribution.ActiveAction = ""
 	e.attribution.ActiveIndex = 0
 	e.attribution.ActiveTotal = 0
@@ -126,10 +150,10 @@ func (e *Engine) clearActiveAction() {
 // non-header payload is silently ignored: this path runs on every Apply
 // marker, and a parse miss here must not fail the run over an attribution
 // nicety.
-func applyComponentMarker(e *Engine, data json.RawMessage) {
+func applyComponentMarker(e *Engine, epoch uint64, data json.RawMessage) {
 	var m componentMarker
 	if err := json.Unmarshal(data, &m); err != nil || m.Name == "" || m.Status != componentStatusStarted {
 		return
 	}
-	e.setActiveAction(m.Name, m.Index, m.Total)
+	e.setActiveAction(epoch, m.Name, m.Index, m.Total)
 }
