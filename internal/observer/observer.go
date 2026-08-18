@@ -122,6 +122,18 @@ type Observer struct {
 	// entry for a Pod at all) and an absent key both mean "nothing tracked"
 	// -- callers range over it directly rather than checking for nil first.
 	pods map[stateKey]map[string]podCondition
+	// events holds every (resource, Reason) pair this observer has already
+	// narrated from the Event informer, keyed the same way pods above is --
+	// eventInvolvedKey (events.go) reads ev.InvolvedObject, not the Event API
+	// object's own identity, so a FailedScheduling Warning and a Pod trouble
+	// condition on the SAME Pod are keyed identically even though they come
+	// from two different informers. The inner map's VALUE is struct{}, not
+	// podCondition: unlike a Pod's tracked trouble, an Event dedupe entry
+	// carries no severity/container/detail of its own to recompute later --
+	// its only job is "has this (resource, Reason) already been told to the
+	// operator", cleared by handlers.go's onDelete (Event case, per-entry) or
+	// clearNamespaceEvents (per-namespace, on informer teardown).
+	events map[stateKey]map[string]struct{}
 }
 
 // New returns an Observer. A nil client yields a no-op: the console's whole
@@ -131,9 +143,9 @@ type Observer struct {
 // o is built as a variable, not returned directly from one struct literal,
 // because scopedHandlers.pod below needs bound method values (o.onPodAdd
 // etc.) that close over o itself -- those can only be taken once o exists as
-// an addressable value. o.pods is initialized before that point, in the same
-// literal as workload/gpuQty, so the handlers never see a nil map once the
-// informers they are registered on start delivering.
+// an addressable value. o.pods/o.events are initialized before that point, in
+// the same literal as workload/gpuQty, so the handlers never see a nil map
+// once the informers they are registered on start delivering.
 func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observer {
 	o := &Observer{
 		client:   client,
@@ -142,6 +154,7 @@ func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observ
 		workload: make(map[stateKey]string),
 		gpuQty:   make(map[stateKey]resource.Quantity),
 		pods:     make(map[stateKey]map[string]podCondition),
+		events:   make(map[stateKey]map[string]struct{}),
 	}
 	o.scoped = newScopedInformers(client, scopedHandlers{
 		pod: cache.ResourceEventHandlerDetailedFuncs{
@@ -149,13 +162,12 @@ func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observ
 			UpdateFunc: o.onPodUpdate,
 			DeleteFunc: o.onDelete,
 		},
-		// event is Task 6's: the identical ResourceEventHandlerDetailedFuncs
-		// hook, left at its zero value (every field nil) until then.
-		// AddEventHandler accepts a handler with nil funcs without error --
-		// ResourceEventHandlerDetailedFuncs.OnAdd/OnUpdate/OnDelete each
-		// check for nil before calling through -- so registering it now
-		// costs nothing and needs no follow-up change to scoped.go.
-	}, o.clearNamespacePods)
+		event: cache.ResourceEventHandlerDetailedFuncs{
+			AddFunc:    o.onEventAdd,
+			UpdateFunc: o.onEventUpdate,
+			DeleteFunc: o.onDelete,
+		},
+	}, o.clearNamespaceState)
 	return o
 }
 
@@ -182,6 +194,52 @@ func (o *Observer) clearNamespacePods(ns string) {
 			delete(o.pods, key)
 		}
 	}
+}
+
+// clearNamespaceEvents drops every tracked Event dedupe entry in ns -- the
+// Event-informer counterpart to clearNamespacePods immediately above, wired
+// into the same onNamespaceStop callback (clearNamespaceState) so a
+// namespace's Pod and Event state clear together whenever its factories tear
+// down.
+//
+// This is also what bounds o.events across a RUN boundary (spec Section 3's
+// "bounded by run generation" requirement, Task 6): scoped.reconcile tears
+// down every namespace under the OLD run (stopAllLocked) before starting the
+// new run's namespaces, whenever RunScope.RunID changes (scoped.go) -- so
+// this sweep always runs, for every namespace, strictly between an old run's
+// dedupe state and a new run's first Event notification for that namespace.
+// engine.Attribution.Generation itself is NOT what this reads: it advances on
+// every ActiveAction transition WITHIN a run (internal/engine/attribution.go,
+// setActiveAction/clearActiveAction), roughly twice per deployment action --
+// keying eviction off it directly would clear o.events ~28 times over one
+// ordinary 14-action run, discarding dedupe state the run's own later actions
+// still needed and defeating the coalescing this map exists to respect.
+// RunID is the field that actually marks a run boundary (Ruling 6/8,
+// scoped.go's package doc), and scoped.go's own reconcile already tears down
+// and rebuilds on exactly that signal -- riding it here, rather than reading
+// Generation a second way, is what makes "a new run does not inherit the
+// previous run's dedupe state" hold without also making dedupe reset mid-run.
+//
+// Deliberately does not publish anything, matching clearNamespacePods: a
+// torn-down informer means this process can no longer speak to whether an
+// already-narrated Warning is still happening, not that it resolved.
+func (o *Observer) clearNamespaceEvents(ns string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for key := range o.events {
+		if key.namespace == ns {
+			delete(o.events, key)
+		}
+	}
+}
+
+// clearNamespaceState composes clearNamespacePods and clearNamespaceEvents
+// into the single onNamespaceStop callback newScopedInformers accepts
+// (scoped.go) -- one namespace tearing down clears both kinds of
+// namespace-scoped state it was feeding, not just one.
+func (o *Observer) clearNamespaceState(ns string) {
+	o.clearNamespacePods(ns)
+	o.clearNamespaceEvents(ns)
 }
 
 // Start registers handlers and starts the informers. It returns once caches

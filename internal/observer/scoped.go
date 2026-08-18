@@ -225,8 +225,15 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 	// Two factories, not one -- see factoryEntry's doc comment (Important 2,
 	// Task 5 fix round 1) for why sharing one between Pod and Event would
 	// make Task 6's Event-only field selector apply to the Pod ListWatch too.
+	// eventWarningListOptions (events.go) is applied ONLY to eventFactory --
+	// podFactory carries no WithTweakListOptions call at all, which is what
+	// keeps `type=Warning` off the Pod ListWatch (TestScopedInformersWatchOnlyTheirOwnNamespace's
+	// sibling, TestEventFieldSelectorAppliesOnlyToTheEventFactory, asserts
+	// this against client.Actions() directly, not just against these two
+	// calls looking different here).
 	podFactory := informers.NewSharedInformerFactoryWithOptions(s.client, resyncPeriod, informers.WithNamespace(ns))
-	eventFactory := informers.NewSharedInformerFactoryWithOptions(s.client, resyncPeriod, informers.WithNamespace(ns))
+	eventFactory := informers.NewSharedInformerFactoryWithOptions(s.client, resyncPeriod,
+		informers.WithNamespace(ns), informers.WithTweakListOptions(eventWarningListOptions))
 	pod := podFactory.Core().V1().Pods().Informer()
 	event := eventFactory.Core().V1().Events().Informer()
 

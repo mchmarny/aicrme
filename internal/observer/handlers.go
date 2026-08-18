@@ -183,6 +183,40 @@ func (o *Observer) onDelete(obj any) {
 			// for the identical reason.
 			o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), podClusterData(t, cond, true))
 		}
+	case *corev1.Event:
+		// Not gated by withNamespaceLive, matching the Pod case just above:
+		// a delete only ever REMOVES an o.events entry, never writes a new
+		// one, so a stray delivery racing a torn-down namespace's teardown
+		// sweep costs at most a redundant delete(map, key) against an
+		// already-absent key -- harmless, unlike onEventChange/
+		// seedEventBaseline's writes, which withNamespaceLive genuinely
+		// must gate (events.go).
+		//
+		// This is the Event API object itself aging out of Kubernetes'
+		// TTL-based garbage collection (--event-ttl, 1h by default), not the
+		// resource t.InvolvedObject describes being deleted -- Events carry
+		// no owner reference back to that resource, so this is the only
+		// deletion signal an Event-only informer ever receives. Deliberately
+		// publishes nothing: unlike a DaemonSet/Deployment/Node/Pod going
+		// away, an old Event record aging out of etcd says nothing about
+		// whether t.Reason is still happening -- inventing a "resolved" here
+		// would be exactly the claim Important 3/clearNamespacePods' own
+		// comment already warns against manufacturing elsewhere in this
+		// file. This is what bounds o.events across the process lifetime
+		// (TestEventDedupeIsClearedOnResourceDeletion): without it, a
+		// resource that keeps generating the SAME reason indefinitely, with
+		// each occurrence's Event object eventually TTL-evicted and
+		// replaced by a fresh one, would leave the ORIGINAL dedupe entry
+		// pinned forever under a key nothing ever revisits.
+		key := eventInvolvedKey(t)
+		o.mu.Lock()
+		if set := o.events[key]; set != nil {
+			delete(set, t.Reason)
+			if len(set) == 0 {
+				delete(o.events, key)
+			}
+		}
+		o.mu.Unlock()
 	}
 }
 
