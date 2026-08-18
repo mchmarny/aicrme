@@ -427,6 +427,61 @@ func TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning(t *testing.T) {
 	}
 }
 
+// fakeAttributionReader is an attributionReader test double, letting the
+// composition test drive engine.Attribution() independently of
+// fakeRunReader's namespace-cache behavior -- the two are separate
+// interfaces precisely because they are separate sources (Ruling 2).
+type fakeAttributionReader struct {
+	a     engine.Attribution
+	calls int
+}
+
+func (f *fakeAttributionReader) Attribution() engine.Attribution {
+	f.calls++
+	return f.a
+}
+
+// TestNewObserverScopeFnComposesNamespacesAndAttribution pins the
+// composition this task exists to build: Namespaces come from the cached
+// recipe parsing (nsScope, i.e. newRunScopeFn), RunID/Component/Generation
+// come from the engine's attribution snapshot -- and both land in the one
+// RunScope the observer actually reads, despite coming from two separate
+// accessors that cannot be merged on the engine side (Ruling 2: Namespaces
+// would require internal/engine to import internal/steps, which already
+// imports internal/engine).
+func TestNewObserverScopeFnComposesNamespacesAndAttribution(t *testing.T) {
+	nsFake := &fakeRunReader{
+		id: "run-1", ok: true,
+		run: &engine.Run{ID: "run-1", Artifacts: map[string][]byte{
+			"recipe.json": recipeFixture(t, steps.ComponentSummary{Name: "a", Namespace: "gpu-operator"}),
+		}},
+	}
+	attrFake := &fakeAttributionReader{a: engine.Attribution{
+		RunID:        "run-1",
+		ActiveAction: "gpu-operator",
+		Generation:   7,
+	}}
+
+	scope := newObserverScopeFn(attrFake, newRunScopeFn(nsFake))
+	sc := scope()
+
+	if sc.RunID != "run-1" {
+		t.Errorf("RunID = %q, want run-1", sc.RunID)
+	}
+	if _, ok := sc.Namespaces["gpu-operator"]; !ok {
+		t.Errorf("Namespaces = %v, want gpu-operator from the cached recipe parsing", sc.Namespaces)
+	}
+	if sc.Component != "gpu-operator" {
+		t.Errorf("Component = %q, want gpu-operator from Attribution().ActiveAction", sc.Component)
+	}
+	if sc.Generation != 7 {
+		t.Errorf("Generation = %d, want 7 from Attribution().Generation", sc.Generation)
+	}
+	if attrFake.calls != 1 {
+		t.Errorf("Attribution() called %d times by one scope() call, want exactly 1", attrFake.calls)
+	}
+}
+
 func TestParseResourceRequests(t *testing.T) {
 	tests := []struct {
 		name string

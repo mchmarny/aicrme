@@ -32,12 +32,39 @@ const resyncPeriod = 0
 // RunScope is the engine state the observer needs, taken as one atomic
 // snapshot. Reading the run ID and the namespaces separately would let
 // attribution and filtering come from different runs across a race.
+//
+// Component and Generation mirror engine.Attribution's own fields (Task 2,
+// internal/engine/attribution.go) rather than being fetched through a second
+// accessor. main is what combines the two sources into this one struct
+// (see cmd/aicrme/main.go's newObserverScopeFn): Namespaces from 2b-ii's
+// cached recipe parsing, RunID/Component/Generation from Engine.Attribution().
+// They cannot be combined on the engine side -- Namespaces come from parsing
+// recipe.json into steps.RecipeSummary, and internal/steps imports
+// internal/engine, so an engine accessor that also returned Namespaces would
+// be an import cycle (Ruling 2,
+// docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md Section 2).
+// Folding both into one struct here, composed by one func in main, is what
+// lets publish still call its scope accessor exactly once per event despite
+// the two underlying sources.
 type RunScope struct {
 	RunID string
 	// Namespaces are the resolved recipe's namespaces. Empty means no run
 	// has resolved one yet, and namespaced workloads are filtered out
 	// entirely -- Nodes are cluster-scoped and always pass.
 	Namespaces map[string]struct{}
+	// Component is the deployment action currently installing, straight from
+	// engine.Attribution.ActiveAction: a TEMPORAL cursor, not a claim of
+	// ownership. A cluster event stamped with it means "observed while
+	// Component installs", never "belongs to Component" -- deploy.sh.tmpl's
+	// own note (~line 488) warns that cluster convergence continues
+	// asynchronously after the script exits. Empty outside Apply, between
+	// actions, or once the run reaches a terminal state; that is a
+	// first-class outcome (spec Section 1), not an error.
+	Component string
+	// Generation mirrors engine.Attribution.Generation, so a consumer that
+	// needs to detect a stale read can, without a second call into the
+	// engine.
+	Generation uint64
 }
 
 type stateKey struct {
@@ -129,6 +156,14 @@ func (o *Observer) register(inf cache.SharedIndexInformer, onUpdate func(any)) e
 // publish attaches cd to the event as its typed Data payload, stamping both
 // Event.At and ClusterData.At from the same now() call so the two never
 // disagree about when the transition happened.
+//
+// o.scope() is called exactly ONCE here and used for both the namespace
+// filter and the RunID/Component stamp. Reading it a second time -- once for
+// the filter, once for the stamp -- is the natural-looking way to write this
+// and the wrong one: a second read can land on the far side of a run or
+// active-action transition, filtering an event against one snapshot's
+// namespaces while stamping it with a different snapshot's action. See
+// TestPublishDoesNotStampAcrossARunTransition.
 func (o *Observer) publish(ns, msg string, cd bus.ClusterData) {
 	sc := o.scope()
 	if ns != "" {
@@ -141,11 +176,12 @@ func (o *Observer) publish(ns, msg string, cd bus.ClusterData) {
 	// cannot fail.
 	data, _ := json.Marshal(cd)
 	o.bus.Publish(bus.Event{
-		RunID:   sc.RunID,
-		Kind:    bus.KindCluster,
-		Level:   bus.LevelInfo,
-		At:      cd.At,
-		Message: msg,
-		Data:    data,
+		RunID:     sc.RunID,
+		Kind:      bus.KindCluster,
+		Level:     bus.LevelInfo,
+		At:        cd.At,
+		Component: sc.Component,
+		Message:   msg,
+		Data:      data,
 	})
 }

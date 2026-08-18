@@ -129,7 +129,10 @@ type runReader interface {
 	Artifact(runID, key string) ([]byte, bool)
 }
 
-// newRunScopeFn returns an accessor the observer calls on every watch event.
+// newRunScopeFn returns the namespace half of the observer's accessor --
+// newObserverScopeFn composes it with the engine's attribution cursor into
+// the single func the observer actually calls (see newObserverScopeFn's doc
+// comment for why they stay two sources composed once, rather than one).
 // It caches by run ID and refreshes only when that changes. Neither the
 // cached path nor the miss path may call Engine.Current(), which deep-copies
 // every artifact including the raw snapshot (tens of KB): observer.publish
@@ -172,6 +175,51 @@ func newRunScopeFn(eng runReader) func() observer.RunScope {
 		}
 		sc.Namespaces = recipeNamespaces(raw)
 		cached = sc
+		return sc
+	}
+}
+
+// attributionReader narrows *engine.Engine to the one cheap accessor
+// newObserverScopeFn needs: one lock acquisition over a handful of scalars,
+// no artifact clone, no store I/O (internal/engine/attribution.go).
+type attributionReader interface {
+	Attribution() engine.Attribution
+}
+
+// newObserverScopeFn composes nsScope (built by newRunScopeFn) with eng's
+// attribution snapshot into the single accessor observer.New takes. This is
+// the composition Task 3 exists to build, and it is composed here -- in
+// main, not in either internal/observer or internal/engine -- for a reason
+// that is a hard constraint, not a preference:
+//
+// engine.Attribution deliberately does NOT carry Namespaces. Namespaces come
+// from parsing recipe.json into steps.RecipeSummary, and internal/steps
+// imports internal/engine -- so an engine-side accessor that also returned
+// Namespaces would be an import cycle (Ruling 2,
+// docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md Section
+// 2). main already holds both the engine and 2b-ii's cached namespace
+// parsing (newRunScopeFn), so it is the one place that can see both without
+// creating that cycle. Do not "simplify" this into a single engine-side
+// snapshot later; that is the cycle this shape exists to avoid.
+//
+// RunID and Component are taken from eng.Attribution() together, not from
+// nsScope's own (cached) RunID: Attribution() reads RunID and ActiveAction
+// under the engine's one lock, so the two always describe the same instant.
+// Pairing Component with nsScope's RunID instead would let them describe two
+// different reads taken microseconds apart across a run transition -- narrow,
+// but avoidable for free by picking the read that is already atomic.
+//
+// The result is called by the observer exactly once per watch event
+// (observer.Observer.publish), so eng.Attribution() -- itself cheap by
+// construction -- is also called exactly once per event: one call in here,
+// one call by the observer into this func.
+func newObserverScopeFn(eng attributionReader, nsScope func() observer.RunScope) func() observer.RunScope {
+	return func() observer.RunScope {
+		sc := nsScope()
+		a := eng.Attribution()
+		sc.RunID = a.RunID
+		sc.Component = a.ActiveAction
+		sc.Generation = a.Generation
 		return sc
 	}
 }
@@ -429,7 +477,7 @@ func main() {
 	// only for this warning.
 	obsStop := make(chan struct{})
 	defer close(obsStop)
-	obs := observer.New(kube, b, newRunScopeFn(eng))
+	obs := observer.New(kube, b, newObserverScopeFn(eng, newRunScopeFn(eng)))
 	go func() {
 		if startErr := obs.Start(obsStop); startErr != nil {
 			slog.Warn("observer failed to start; continuing without cluster telemetry", "error", startErr)

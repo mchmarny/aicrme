@@ -489,3 +489,150 @@ func TestOnDeletePublishesWithoutHoldingTheLock(t *testing.T) {
 		t.Error("Resolved = false, want true")
 	}
 }
+
+// newAttributionTestObserver mirrors newTestObserver but takes the scope func
+// directly, so these tests can supply a fake that varies Component,
+// Generation, or counts calls -- properties newTestObserver's fixed RunScope
+// cannot exercise.
+func newAttributionTestObserver(t *testing.T, scope func() RunScope) (*Observer, <-chan bus.Event) {
+	t.Helper()
+	b := bus.New(64)
+	sub, unsub := b.Subscribe(0)
+	t.Cleanup(unsub)
+	o := New(nil, b, scope)
+	return o, sub
+}
+
+// TestPublishStampsTheActiveAction pins the whole point of this task: a
+// cluster event observed while action 7 ("gpu-operator") is active carries
+// that action's name in Component, so the cockpit can show cluster activity
+// against the row currently installing. It would fail if publish stopped
+// setting Event.Component from the scope's Component field.
+func TestPublishStampsTheActiveAction(t *testing.T) {
+	scope := func() RunScope {
+		return RunScope{
+			RunID:      "run-1",
+			Namespaces: map[string]struct{}{"gpu-operator": {}},
+			Component:  "gpu-operator",
+			Generation: 7,
+		}
+	}
+	o, sub := newAttributionTestObserver(t, scope)
+
+	o.onDaemonSet(testDaemonSet("ds-real-uid", 3, 8))
+
+	select {
+	case e := <-sub:
+		if e.Component != "gpu-operator" {
+			t.Errorf("Component = %q, want %q", e.Component, "gpu-operator")
+		}
+	default:
+		t.Fatal("no event published")
+	}
+}
+
+// TestPublishLeavesComponentEmptyWhenNoActiveAction pins the outside-Apply
+// case: no action is installing, so a cluster event must still publish --
+// unattributed is a first-class outcome (spec Section 1), not an error --
+// but Component must stay empty rather than carry a stale or hardcoded
+// action name. It would fail if publish stamped a non-empty Component
+// regardless of what the scope actually reported.
+func TestPublishLeavesComponentEmptyWhenNoActiveAction(t *testing.T) {
+	scope := func() RunScope {
+		return RunScope{
+			RunID:      "run-1",
+			Namespaces: map[string]struct{}{"gpu-operator": {}},
+			// Component and Generation left at their zero values,
+			// matching engine.Attribution outside Apply.
+		}
+	}
+	o, sub := newAttributionTestObserver(t, scope)
+
+	o.onDaemonSet(testDaemonSet("ds-real-uid", 3, 8))
+
+	select {
+	case e := <-sub:
+		if e.Component != "" {
+			t.Errorf("Component = %q, want empty outside Apply", e.Component)
+		}
+	default:
+		t.Fatal("no event published")
+	}
+}
+
+// TestPublishReadsAttributionOncePerEvent is the required bite-proof's
+// counterpart: a counting fake proves publish reads the scope exactly once
+// per event, not once for the namespace filter and again for the RunID/
+// Component stamp. Reading twice is the natural-looking way to write publish
+// and the wrong one -- see TestPublishDoesNotStampAcrossARunTransition for
+// why it matters, not just that it costs an extra call.
+func TestPublishReadsAttributionOncePerEvent(t *testing.T) {
+	var calls int
+	scope := func() RunScope {
+		calls++
+		return RunScope{
+			RunID:      "run-1",
+			Namespaces: map[string]struct{}{"gpu-operator": {}},
+			Component:  "gpu-operator",
+			Generation: 7,
+		}
+	}
+	o, sub := newAttributionTestObserver(t, scope)
+
+	o.onDaemonSet(testDaemonSet("ds-real-uid", 3, 8))
+
+	select {
+	case <-sub:
+	default:
+		t.Fatal("no event published")
+	}
+	if calls != 1 {
+		t.Errorf("scope() called %d times for one published event, want exactly 1", calls)
+	}
+}
+
+// TestPublishDoesNotStampAcrossARunTransition is the bite-proof from the
+// task brief, made concrete: the fake scope answers a DIFFERENT snapshot on
+// its second call than its first, simulating an active-action transition
+// landing between two reads. If publish read the scope once (correct), only
+// the first call is ever made, and the event is entirely the pre-transition
+// snapshot -- namespace and Component agree with each other. If publish read
+// the scope twice -- once to filter, once to stamp -- the filter would pass
+// using the FIRST call's Namespaces (still gpu-operator) while the stamp
+// would carry the SECOND call's Component ("kai-scheduler"), producing an
+// event whose Component names an action that was never active for the
+// namespace that triggered it: a mix of the old and new snapshot, not
+// either one cleanly.
+func TestPublishDoesNotStampAcrossARunTransition(t *testing.T) {
+	var calls int
+	scope := func() RunScope {
+		calls++
+		if calls == 1 {
+			return RunScope{
+				RunID:      "run-1",
+				Namespaces: map[string]struct{}{"gpu-operator": {}},
+				Component:  "gpu-operator",
+				Generation: 7,
+			}
+		}
+		return RunScope{
+			RunID:      "run-1",
+			Namespaces: map[string]struct{}{"kai-scheduler-ns": {}},
+			Component:  "kai-scheduler",
+			Generation: 8,
+		}
+	}
+	o, sub := newAttributionTestObserver(t, scope)
+
+	o.onDaemonSet(testDaemonSet("ds-real-uid", 3, 8))
+
+	select {
+	case e := <-sub:
+		if e.Component != "gpu-operator" {
+			t.Errorf("Component = %q, want %q (the pre-transition snapshot read once, not a mix with the post-transition one)",
+				e.Component, "gpu-operator")
+		}
+	default:
+		t.Fatal("no event published; the pre-transition snapshot's namespace should have passed the filter")
+	}
+}
