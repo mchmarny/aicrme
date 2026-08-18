@@ -123,11 +123,29 @@ const AT_PATTERN = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z$/
  *
  * Fixed by comparing the two parts separately: the whole-second prefix
  * first (fixed width, safe to compare as a string), then the fractional
- * digits, both sides right-padded with `'0'` to the same width before
- * comparing -- padding is what makes Go's trimming safe to compare at all:
- * `"5"` (500,000,000ns) padded to `"500000000"` correctly outranks
- * `"050000000"` (50,000,000ns), where comparing the raw, unpadded strings
- * `"5"` vs `"05"` would not.
+ * digits AS WRITTEN, with no padding (M-2, Task 7 final fix wave -- an
+ * earlier version of this function right-padded both fractions to 9 digits
+ * before comparing, on the claim that padding was what made the comparison
+ * correct. That claim doesn't hold, and the whole-branch review proved it
+ * two ways: mutating `padEnd` away left every test green (unfalsifiable,
+ * so nothing in this file depended on it), and its own justifying example
+ * was wrong on inspection -- `'5' < '05'` is `false`, i.e. unpadded
+ * comparison already ranks 500ms above 50ms correctly).
+ *
+ * The real reason unpadded comparison works: RFC3339Nano trims TRAILING
+ * zeros, so a fraction string Go actually produces never ends in `'0'`
+ * (the all-zero case is represented by omitting the fraction entirely, not
+ * by a string of zeros). Comparing two such strings left-to-right already
+ * matches decimal magnitude at the first digit where they differ -- that's
+ * true of any two digit strings compared position by position, padding or
+ * not. The only case padding could matter is when one string is a strict
+ * PREFIX of the other (e.g. `"5"` vs `"500000001"`), and there JS's native
+ * string ordering already treats the shorter one as smaller -- which is
+ * exactly correct here, because the longer string, never ending in a
+ * trimmed zero, is GUARANTEED to carry a nonzero digit somewhere past the
+ * shorter one's length, so it really is the larger value. Padding would
+ * reproduce that same answer, never a different one, for any pair Go's
+ * marshaler can actually produce.
  *
  * A value that doesn't match RFC3339 UTC returns 0 rather than NaN: this
  * path is unreachable on the observer's live output (`ClusterData.At` is
@@ -141,8 +159,8 @@ export function compareAt(a: string, b: string): number {
   const mb = AT_PATTERN.exec(b)
   if (!ma || !mb) return 0
   if (ma[1] !== mb[1]) return ma[1] < mb[1] ? -1 : 1
-  const fa = (ma[2] ?? '').padEnd(9, '0')
-  const fb = (mb[2] ?? '').padEnd(9, '0')
+  const fa = ma[2] ?? ''
+  const fb = mb[2] ?? ''
   if (fa === fb) return 0
   return fa < fb ? -1 : 1
 }

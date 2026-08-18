@@ -57,19 +57,28 @@ describe('ComponentConditions', () => {
     expect(el.textContent).toContain('3/8 ready')
   })
 
-  it('renders past tense when tense="past" (Minor 2, fix round 2 -- the Done screen)', () => {
+  // Ruling 38 (Task 7 final fix wave): after a terminal state, the observer
+  // has torn down and nothing can ever publish a resolution again -- the
+  // console knows "this was true when we stopped watching," not "this is
+  // true." The label must say so, not just switch verb tense: this is the
+  // one property a reviewer cannot verify by reading behavior, the same
+  // class as the temporal-not-ownership assertion above, so it's pinned as
+  // a literal string here too.
+  it('labels a terminal-state condition "last observed", not a live claim', () => {
     const error = condition({ reason: 'ImagePullBackOff' })
-    render(<ComponentConditions name="gpu-operator" conditions={[error]} tense="past" />)
+    render(<ComponentConditions name="gpu-operator" conditions={[error]} terminal />)
     const el = screen.getByTestId('condition-gpu-operator')
-    expect(el.textContent).toMatch(/while gpu-operator installed\)/i)
-    expect(el.textContent).not.toMatch(/while gpu-operator installs/i)
+    expect(el.textContent).toMatch(/last observed while gpu-operator installed\)/i)
+    expect(el.textContent).not.toMatch(/while gpu-operator installs\)/i)
+    expect(el.textContent).not.toMatch(/cluster activity/i)
   })
 
-  it('defaults to present tense when tense is omitted', () => {
+  it('defaults to the live, present-tense caption when terminal is omitted', () => {
     const error = condition({ reason: 'ImagePullBackOff' })
     render(<ComponentConditions name="gpu-operator" conditions={[error]} />)
     const el = screen.getByTestId('condition-gpu-operator')
-    expect(el.textContent).toMatch(/while gpu-operator installs\)/i)
+    expect(el.textContent).toMatch(/cluster activity while gpu-operator installs\)/i)
+    expect(el.textContent).not.toMatch(/last observed/i)
   })
 
   it('renders nothing once every condition on the row has resolved', () => {

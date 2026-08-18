@@ -26,15 +26,28 @@ const severityClass: Record<number, string> = {
  * installing. See
  * docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md, Section 1.
  *
- * `tense` (Minor 2, Task 7 fix round 2): "installs" is present tense,
- * correct while the run is still going -- but Ruling 27 means a condition
- * can survive to the Done screen (a still-open pod condition beside "every
- * component installed successfully" is the exact case this feature exists
- * to surface, not to hide). Cockpit.tsx's Done passes `tense="past"` so the
- * caption reads "installed" there instead of describing a run that is
- * already over as still in progress.
+ * `terminal` (Ruling 38, Task 7 final fix wave, replacing fix round 2's
+ * `tense` prop). Teardown stops the observer's informers the instant a run
+ * reaches a terminal state (StateDone or StateFailed) -- deliberately, and
+ * that is not being revisited here. The consequence for THIS component:
+ * after teardown, nothing can ever publish a resolution for a condition
+ * still open at that instant, and `tracked` (pipeline.ts) never expires it
+ * either -- by design, since a genuinely broken component is exactly what
+ * an operator needs to keep seeing (see deriveComponents's doc comment on
+ * `tracked`). So a condition surviving to a terminal screen is not stale
+ * information the console failed to update; it is the LAST thing the
+ * observer ever saw, permanently, because nothing is watching anymore.
+ * "(cluster activity while gpu-operator installs)" on that screen claims a
+ * present fact the console has no way to still know. `terminal` swaps the
+ * caption to "(last observed while gpu-operator installed)" -- the same
+ * copy discipline that governs the temporal-correlation label itself: the
+ * console states only what it actually knows, and post-teardown that is
+ * "this was true when we stopped watching," not "this is true."
+ * Cockpit.tsx passes `terminal` for both Done and Failed (both terminal
+ * states that tear down the observer identically); Running leaves it at
+ * its default `false`.
  */
-export function ComponentConditions({ name, conditions, tense = 'present' }: { name: string; conditions: ClusterCondition[]; tense?: 'present' | 'past' }) {
+export function ComponentConditions({ name, conditions, terminal = false }: { name: string; conditions: ClusterCondition[]; terminal?: boolean }) {
   const active = activeCondition(conditions)
   if (!active) return null
 
@@ -47,11 +60,13 @@ export function ComponentConditions({ name, conditions, tense = 'present' }: { n
   // fix round 1).
   const reasonInMessage = active.message.includes(active.reason)
 
+  const note = terminal ? `last observed while ${name} installed` : `cluster activity while ${name} installs`
+
   return (
     <p data-testid={`condition-${name}`} className={`mt-1 max-w-2xl text-xs ${severityClass[active.severity] ?? 'text-slate-400'}`}>
       {!reasonInMessage && <span className="font-mono">{active.reason}</span>}
       {active.message && <span className={`text-slate-500 ${reasonInMessage ? '' : 'ml-1'}`}>{active.message}</span>}
-      <span className="ml-1 text-slate-600">(cluster activity while {name} {tense === 'past' ? 'installed' : 'installs'})</span>
+      <span className="ml-1 text-slate-600">({note})</span>
     </p>
   )
 }
