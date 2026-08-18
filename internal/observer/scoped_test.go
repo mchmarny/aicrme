@@ -603,6 +603,15 @@ func waitFor(t *testing.T, cond func() bool) {
 //     though B is still live (len(s.entries) > 0 is true purely because of
 //     B) -- and that it still ADMITS a write for B, so the test cannot pass
 //     by a mutation that simply refuses everything (kills M14).
+//  3. Asserts isRestart(A) is true (A was genuinely torn down) while
+//     isRestart(B) is false (B never was) -- Minor 1, closing re-review:
+//     isRestart was the one namespace-keyed predicate this test's original
+//     version didn't reach, and `return len(s.everTornDown) > 0` (namespace-
+//     blind, mirroring M14's own shape one field over) survived all 82
+//     tests as a result. Both directions matter here for the identical
+//     reason M14's two withNamespaceLive assertions do: asserting only
+//     isRestart(A) would pass under "always true" just as easily as under
+//     the correct per-namespace check.
 func TestObserverDiscriminatesBetweenNamespacesOnPartialTeardown(t *testing.T) {
 	const nsA = "gpu-operator"
 	const nsB = "kai-scheduler"
@@ -707,5 +716,17 @@ func TestObserverDiscriminatesBetweenNamespacesOnPartialTeardown(t *testing.T) {
 	o.scoped.withNamespaceLive(nsB, func() { wroteB = true })
 	if !wroteB {
 		t.Error("withNamespaceLive refused a write for the still-live namespace B -- setup/regression failure")
+	}
+
+	// isRestart discrimination (Minor 1, closing re-review): A was
+	// genuinely torn down and must report true; B was never torn down --
+	// it is still live -- and must report false. A namespace-blind
+	// `len(s.everTornDown) > 0` mutation would report true for BOTH, since
+	// A's teardown alone already makes the map non-empty.
+	if !o.scoped.isRestart(nsA) {
+		t.Error("isRestart(A) = false, want true -- A was genuinely torn down (Minor 1)")
+	}
+	if o.scoped.isRestart(nsB) {
+		t.Error("isRestart(B) = true, want false -- B was never torn down, only A was (Minor 1)")
 	}
 }

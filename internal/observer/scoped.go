@@ -166,7 +166,10 @@ type scopedInformers struct {
 	// (see everTornDownRunID) exactly when it detects the incoming scope
 	// names a genuinely DIFFERENT run, which preserves Ruling 32's
 	// motivating Retry case (the SAME RunID after a failure) exactly while
-	// dropping the cross-run carry-over.
+	// dropping the cross-run carry-over. That clear runs AFTER reconcile's
+	// own stopAllLocked for the SAME reason (Minor 2, Task 6 pre-merge fix)
+	// -- see reconcile's own doc comment for why the order is load-bearing,
+	// not incidental.
 	everTornDown map[string]bool
 	// everTornDownRunID is the RunID everTornDown's current contents belong
 	// to. reconcile compares an incoming sc.RunID against THIS, not against
@@ -218,13 +221,32 @@ func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers, on
 // Ruling 37 (Task 6 fix round 4): also clears everTornDown, but ONLY when
 // sc.RunID differs from everTornDownRunID -- the run whose teardown history
 // that map currently reflects -- which is deliberately NOT the same
-// condition as the s.runID check three lines below. runID is already ""
+// condition as the s.runID check immediately above it. runID is already ""
 // here on every call that follows a terminal transition (this function's
 // own first branch just reset it, on THIS call or an earlier one), so
 // comparing sc.RunID against runID cannot tell a Retry (same RunID resuming
 // after Terminal) from a genuinely new run (different RunID) -- both look
 // like "runID changed from blank". everTornDownRunID survives that gap
 // (see its own doc comment) specifically so this comparison can.
+//
+// Minor 2 (Task 6 pre-merge fix, closing re-review): the everTornDown clear
+// runs AFTER the s.runID != sc.RunID block, not before it, and that order is
+// load-bearing, not incidental. stopAllLocked (inside that block) calls
+// stopNamespaceLocked for every still-live entry from whatever run was
+// previously tracked, and stopNamespaceLocked unconditionally sets
+// s.everTornDown[ns] = true -- if the clear ran first, those writes would
+// land in the FRESH map, re-attributing the OLD run's teardown history to
+// the NEW run inside this same call (a direct live-run-1 -> live-run-2
+// transition would hand run-2 run-1's everTornDown entries, reintroducing
+// Ruling 37's own defect from a different angle). Ordering the clear last
+// means it always has the final word for this call, discarding anything
+// stopAllLocked just wrote under the old attribution along with everything
+// else. Not reachable in production today -- RunScope.Namespaces is nil
+// until Recommend resolves a recipe, so every reconcile between two runs
+// takes the sc.Namespaces-empty branch above and empties s.entries first,
+// making stopAllLocked here a no-op by the time a new run's first non-empty
+// scope arrives -- but the ordering now makes that a structural guarantee
+// rather than a fact that happens to be true of a different code path.
 func (s *scopedInformers) reconcile(sc RunScope) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,14 +257,14 @@ func (s *scopedInformers) reconcile(sc RunScope) {
 		return
 	}
 
-	if sc.RunID != s.everTornDownRunID {
-		s.everTornDown = make(map[string]bool)
-		s.everTornDownRunID = sc.RunID
-	}
-
 	if s.runID != sc.RunID {
 		s.stopAllLocked()
 		s.runID = sc.RunID
+	}
+
+	if sc.RunID != s.everTornDownRunID {
+		s.everTornDown = make(map[string]bool)
+		s.everTornDownRunID = sc.RunID
 	}
 
 	for ns, e := range s.entries {

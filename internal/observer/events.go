@@ -403,13 +403,17 @@ func (o *Observer) onEventUpdate(_, newObj any) {
 //
 // "Locked": callers must already hold o.mu, matching this codebase's
 // existing convention (stopNamespaceLocked, aliveLocked) for a function whose
-// contract requires a lock the caller -- not this function -- acquires. Both
-// call sites already hold o.mu for their OWN reasons (onPodChange's
-// withNamespaceLive+o.mu closure, onDelete's Pod case's lock/unlock around
-// o.pods) before this is reached, so taking a second lock here would either
-// deadlock (sync.Mutex is not reentrant) or, if it were a different mutex,
-// still be pointless serialization for state (o.events) this same lock
-// already protects everywhere else in the package.
+// contract requires a lock the caller -- not this function -- acquires. All
+// THREE call sites already hold o.mu for their OWN reasons (Minor 4,
+// pre-merge fix: this paragraph had the identical "both" miscount the
+// Namespace-field comment above did) -- pods.go's onPodChange, inside its
+// withNamespaceLive+o.mu closure; handlers.go's onDelete Pod case, inside
+// its own lock/unlock around o.pods; and events.go's onEventChange, inside
+// the plain o.mu.Lock()/Unlock() pair immediately around its own call
+// (Ruling 26) -- before any of them reaches here, so taking a second lock
+// here would either deadlock (sync.Mutex is not reentrant) or, if it were a
+// different mutex, still be pointless serialization for state (o.events)
+// this same lock already protects everywhere else in the package.
 //
 // Not gated by withNamespaceLive: like the Event onDelete case (handlers.go),
 // this only ever DELETES entries, never writes a new one, so a stray call
@@ -434,14 +438,26 @@ func (o *Observer) resolveEventsLocked(key stateKey, narratedOnly bool) []bus.Cl
 			// off ev.Namespace (the Event API object's own namespace), not
 			// io.Namespace, so the sweep and the write gate agree (M1's own
 			// doc comment). The two sources AGREE for every key this
-			// function is ever actually called with today: both call sites
-			// pass podKey(pod), and for a namespaced Pod ev.Namespace ==
-			// io.Namespace always. They would diverge only if this were
-			// ever called with a cluster-scoped resource's key (io.Namespace
-			// == "" but ev.Namespace is a real namespace, M1's whole
-			// point) -- unreachable today because onEventChange's own
-			// key.kind != kindPod guard (Ruling 26) means only Pod keys
-			// ever reach here.
+			// function is ever actually called with today, across all
+			// THREE call sites (Minor 4, pre-merge fix: an earlier version
+			// of this comment said "both" and named podKey(pod) for the one
+			// that matters least): pods.go's onPodChange and handlers.go's
+			// onDelete Pod case both construct key via podKey(pod) directly
+			// (kind: kindPod by definition); events.go's onEventChange
+			// passes key itself -- eventInvolvedKey(ev), the very source
+			// this comment exists to explain, NOT podKey(pod) -- but only
+			// after its own `if key.kind != kindPod { return }` guard three
+			// lines above the call (Ruling 26) has already ensured
+			// key.kind == kindPod for whatever reaches here. eventInvolvedKey
+			// takes kind from io.Kind and namespace from ev.Namespace, so
+			// key.kind == kindPod (true at all three sites, by construction
+			// or by that guard) implies io was a NAMESPACED Pod, which by
+			// Kubernetes convention implies ev.Namespace == io.Namespace --
+			// so the two sources cannot actually diverge at any key this
+			// function ever sees. They would diverge only for a
+			// cluster-scoped resource's key (io.Namespace == "" but
+			// ev.Namespace real, M1's whole point) -- unreachable here
+			// specifically because of that guard.
 			Namespace: key.namespace,
 			Name:      key.name,
 			UID:       string(key.uid),
@@ -457,10 +473,14 @@ func (o *Observer) resolveEventsLocked(key stateKey, narratedOnly bool) []bus.Cl
 
 // eventResolutionMessage narrates cd's resolution or removal for a caller
 // that only has the retained ClusterData, not the original *corev1.Event
-// (resolveEventsLocked's own doc comment explains why neither of its two
-// callers still has one). verb is "resolved" (onPodChange's recovery path --
-// the pod got better) or "removed" (onDelete's Pod case -- the pod is gone,
-// it did not recover), matching podMessage/podClusterData's own
+// (resolveEventsLocked's own doc comment explains why none of its THREE
+// callers still has one -- Minor 4, pre-merge fix: this comment previously
+// said "two", the same miscount resolveEventsLocked's own doc comment had).
+// verb is "resolved" for the two callers reporting a genuine improvement --
+// pods.go's onPodChange (the pod's own recovery) and events.go's
+// onEventChange (Ruling 26's pull-based corroboration that the pod is
+// already healthy) -- or "removed" for handlers.go's onDelete Pod case (the
+// pod is gone, it did not recover), matching podMessage/podClusterData's own
 // resolved-vs-removed distinction for the identical reason.
 func eventResolutionMessage(cd bus.ClusterData, verb string) string {
 	subject := cd.Name
