@@ -78,6 +78,17 @@ type Engine struct {
 	resume  chan struct{}
 	newID   func() string
 
+	// attribution is the small, cheap snapshot Engine.Attribution() serves --
+	// see attribution.go. It holds only ActiveAction/ActiveIndex/ActiveTotal/
+	// Generation; RunID and Phase are composed from e.current at read time
+	// instead of mirrored here, because e.current.ID never changes after
+	// Start and e.current.Phase is set eagerly at the top of runStep --
+	// unlike e.current.Components, which is exactly why this snapshot exists
+	// at all. Keeping RunID/Phase out of this field means there is nothing
+	// about them to keep in sync across Start/Retry/finish; only
+	// ActiveAction's own transitions need a mutator.
+	attribution Attribution
+
 	// epoch increments on every Start and Retry. Each execute goroutine
 	// captures the value current when it launched and re-checks it before
 	// every state write. Start's isLive check alone cannot cover this:
@@ -571,6 +582,17 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 			ev.Phase = string(step.Phase())
 		}
 		e.bus.Publish(ev)
+		// Attribution updates AFTER the marker reaches the bus, never
+		// before: that ordering is the contract (design doc §2, "Marker
+		// ordering is part of the contract"), not an incidental consequence
+		// of statement order. Update it any earlier and a concurrent reader
+		// of Attribution() (the observer, on its own goroutine) could label
+		// a cluster event with an action whose header this line has not yet
+		// handed to the bus -- the SPA would then receive an event citing a
+		// row it has never heard of.
+		if ev.Kind == bus.KindComponent {
+			applyComponentMarker(e, ev.Data)
+		}
 	}
 
 	if err := step.Run(ctx, scratch, emit); err != nil {
@@ -603,6 +625,13 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 			e.current.Components = scratch.Components
 		}
 		e.mu.Unlock()
+
+		// The run is leaving Apply on a failure -- clear the cursor so a
+		// retry (or the terminal state finish is about to record) does not
+		// keep pointing at an action that stopped installing.
+		if step.Phase() == PhaseApply {
+			e.clearActiveAction()
+		}
 
 		e.finish(ctx, epoch, StateFailed, msg)
 		return err
@@ -641,6 +670,13 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	merged := e.current.Clone()
 	e.mu.Unlock()
 
+	// The run is leaving Apply on success -- the action cursor is meaningless
+	// once nothing in this step is installing, and the next step (if any)
+	// will set its own Phase before any new marker can arrive.
+	if step.Phase() == PhaseApply {
+		e.clearActiveAction()
+	}
+
 	if err := e.store.Save(ctx, merged); err != nil {
 		slog.Warn("run checkpoint failed", "run", runID, "error", err)
 	}
@@ -663,6 +699,13 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 	e.current.UpdatedAt = time.Now().UTC()
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
+
+	// Defensive backstop: runStep's success and failure branches already
+	// clear the active action on every path that leaves Apply, but a
+	// terminal state is where that guarantee must hold regardless of how it
+	// was reached -- nothing this run does from here on should ever again be
+	// read as "an action is installing".
+	e.clearActiveAction()
 
 	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), terminalSaveTimeout)
 	defer saveCancel()
