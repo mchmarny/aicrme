@@ -79,6 +79,11 @@ type Observer struct {
 	client kubernetes.Interface
 	bus    *bus.Bus
 	scope  func() RunScope
+	// scoped owns the Pod/Event informers, which -- unlike DaemonSets,
+	// Deployments and Nodes below -- cannot be built once at Start: they are
+	// namespace-scoped to a recipe that has not resolved yet when Start runs
+	// (scoped.go).
+	scoped *scopedInformers
 
 	mu sync.Mutex
 	// workload holds DaemonSet/Deployment readiness summaries.
@@ -97,6 +102,7 @@ func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observ
 		client:   client,
 		bus:      b,
 		scope:    scope,
+		scoped:   newScopedInformers(client),
 		workload: make(map[stateKey]string),
 		gpuQty:   make(map[stateKey]resource.Quantity),
 	}
@@ -109,6 +115,14 @@ func (o *Observer) Start(stopCh <-chan struct{}) error {
 		slog.Warn("observer disabled: no Kubernetes client available")
 		return nil
 	}
+
+	// Independent of the cluster-wide factory below: scoped.run drives its
+	// own goroutine for the process's lifetime, reconciling Pod/Event
+	// factories against o.scope() as runs come and go, and tearing them
+	// down the moment a run reaches a terminal state (scoped.go, Ruling 3).
+	// It never blocks this call -- see scopedInformers.reconcile's own doc
+	// comment for why.
+	go o.scoped.run(o.scope, o.bus, stopCh)
 
 	factory := informers.NewSharedInformerFactory(o.client, resyncPeriod)
 
