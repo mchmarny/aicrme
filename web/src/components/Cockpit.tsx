@@ -2,6 +2,7 @@ import { bundleUrl } from '../api'
 import { deriveComponents, deriveFailure, deploymentActionsTotal, type ComponentState } from '../pipeline'
 import { slowStepNote } from '../slowSteps'
 import type { AicrEvent } from '../useEvents'
+import { ComponentConditions } from './ComponentConditions'
 import type { RunState } from './Wizard'
 
 const statusClass: Record<ComponentState['status'], string> = {
@@ -31,6 +32,7 @@ function ComponentRow({ c }: { c: ComponentState }) {
         )}
       </div>
       {note && <p className="mt-1 max-w-2xl text-xs text-slate-500">{note}</p>}
+      <ComponentConditions name={c.name} conditions={c.conditions} />
     </li>
   )
 }

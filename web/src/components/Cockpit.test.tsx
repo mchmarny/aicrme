@@ -72,6 +72,28 @@ describe('Cockpit', () => {
     expect(screen.getByTestId('component-cert-manager').textContent).not.toMatch(/driver DaemonSet compiles/)
   })
 
+  it('renders an attributed cluster condition inside its own row and nowhere else', () => {
+    const events: AicrEvent[] = [
+      componentEvent(1, 'cert-manager', { index: 1, total: 4, status: 'started' }),
+      componentEvent(2, 'gpu-operator', { index: 2, total: 4, status: 'started' }),
+      {
+        id: 3, runId: 'run1', at: '2026-08-15T09:03:00Z', kind: 'cluster', level: 'info', phase: 'apply',
+        component: 'gpu-operator', message: 'gpu-operator/nvidia-driver-daemonset-abc ImagePullBackOff',
+        data: {
+          kind: 'Pod', namespace: 'gpu-operator', name: 'nvidia-driver-daemonset-abc', uid: 'uid-1',
+          reason: 'ImagePullBackOff', severity: 2, resolved: false, at: '2026-08-15T09:03:00Z',
+        },
+      },
+    ]
+    const run = baseRun({ state: 'running' })
+    render(<Cockpit events={events} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    const gpuRow = screen.getByTestId('component-gpu-operator')
+    expect(gpuRow.textContent).toMatch(/ImagePullBackOff/)
+    expect(gpuRow.textContent).toMatch(/while installing/i)
+    expect(screen.getByTestId('component-cert-manager').textContent).not.toMatch(/ImagePullBackOff/)
+  })
+
   it('failed: renders the failing component, exit error, and tail, and Retry calls onRetry', () => {
     const events: AicrEvent[] = [
       componentEvent(1, 'cert-manager', { index: 1, total: 4, status: 'started' }),

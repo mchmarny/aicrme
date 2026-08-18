@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { deriveComponents, deriveFailure, deploymentActionsTotal } from './pipeline'
+import { activeCondition, deriveComponents, deriveFailure, deploymentActionsTotal, type ClusterCondition } from './pipeline'
 import type { AicrEvent } from './useEvents'
 import applyRun from './fixtures/apply-run.json'
 
@@ -135,5 +135,147 @@ describe('deriveFailure', () => {
   it('returns null when there is no error event', () => {
     const noError = events.filter(e => e.kind !== 'error')
     expect(deriveFailure(noError)).toBeNull()
+  })
+})
+
+/**
+ * clusterEvent builds a KindCluster AicrEvent whose Data mirrors Go's
+ * bus.ClusterData (internal/bus/cluster.go) field-for-field. component is
+ * Event.Component -- the attribution stamp, deliberately a top-level
+ * parameter rather than folded into data, because it answers a different
+ * question than the resource fields do: which row the observer's snapshot
+ * says was active, not what the resource is.
+ */
+function clusterEvent(
+  id: number,
+  component: string | undefined,
+  data: { uid: string; reason: string; severity: number; resolved?: boolean; at: string; name?: string },
+  message = 'cluster event',
+): AicrEvent {
+  return {
+    id,
+    runId: 'run1',
+    at: data.at,
+    kind: 'cluster',
+    level: 'info',
+    phase: 'apply',
+    component,
+    message,
+    data: { kind: 'Pod', namespace: 'gpu-operator', name: data.name ?? 'a-pod', ...data },
+  }
+}
+
+describe('deriveComponents cluster conditions', () => {
+  const headers: AicrEvent[] = [
+    { id: 1, runId: 'run1', at: '2026-08-15T09:00:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'cert-manager', message: 'installing cert-manager', data: { name: 'cert-manager', index: 1, total: 2, status: 'started' } },
+    { id: 2, runId: 'run1', at: '2026-08-15T09:00:01Z', kind: 'component', level: 'info', phase: 'apply', component: 'cert-manager', message: 'cert-manager installed', data: { name: 'cert-manager', status: 'installed' } },
+    { id: 3, runId: 'run1', at: '2026-08-15T09:00:02Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'installing gpu-operator', data: { name: 'gpu-operator', index: 2, total: 2, status: 'started' } },
+  ]
+
+  it('folds an attributed cluster event into the matching row, keyed on Component', () => {
+    const withEvents: AicrEvent[] = [
+      ...headers,
+      clusterEvent(4, 'cert-manager', { uid: 'uid-cm', reason: 'Warning', severity: 1, at: '2026-08-15T09:00:03Z' }),
+      clusterEvent(5, 'gpu-operator', { uid: 'uid-gpu', reason: 'ImagePullBackOff', severity: 2, at: '2026-08-15T09:00:04Z' }),
+    ]
+    const got = deriveComponents(withEvents, undefined)
+    const certManager = got.find(c => c.name === 'cert-manager')!
+    const gpuOperator = got.find(c => c.name === 'gpu-operator')!
+
+    expect(certManager.conditions.map(c => c.reason)).toEqual(['Warning'])
+    expect(gpuOperator.conditions.map(c => c.reason)).toEqual(['ImagePullBackOff'])
+  })
+
+  it('leaves an unattributed cluster event unattached to any row and still present in the timeline', () => {
+    const unattributed = clusterEvent(4, undefined, { uid: 'uid-x', reason: 'Warning', severity: 1, at: '2026-08-15T09:00:03Z' })
+    const withEvents: AicrEvent[] = [...headers, unattributed]
+
+    const got = deriveComponents(withEvents, undefined)
+    for (const row of got) expect(row.conditions).toHaveLength(0)
+    expect(withEvents).toContain(unattributed)
+  })
+
+  // The stranded-entry pattern named in the phase's standing instruction: a
+  // condition arising, a second coexisting on a different UID, both
+  // resolving, and the first recurring is ONE sequence, asserted at each
+  // step by re-deriving against a growing prefix of the same event log --
+  // not three isolated single-condition tests, each of which would only
+  // ever see one entry in play and could not catch a fold that quietly
+  // grows a stray third entry instead of reusing the (UID, Reason) slot.
+  it('coexists across UIDs, supersedes within a UID, clears on full resolution, and re-arms on recurrence -- without stranding an entry', () => {
+    const podA = 'uid-pod-a'
+    const podB = 'uid-pod-b'
+    // Deliberately the SAME reason on both pods: two different Pods hitting
+    // the same failure mode are two distinct conditions on two distinct
+    // resources, not one condition racing to replace the other. This is
+    // also what makes the required bite-proof (drop the UID half of the
+    // fold key, keep only Reason) a real falsifier -- a fixture using two
+    // different Reasons would still separate by Reason alone and the
+    // mutation would pass unnoticed.
+    const reason = 'ImagePullBackOff'
+
+    const timeline: AicrEvent[] = [
+      ...headers,
+      clusterEvent(4, 'gpu-operator', { uid: podA, reason, severity: 1, at: '2026-08-15T09:01:00Z' }, 'pod a image pull backoff'),
+      clusterEvent(5, 'gpu-operator', { uid: podB, reason, severity: 2, at: '2026-08-15T09:02:00Z' }, 'pod b image pull backoff'),
+      clusterEvent(6, 'gpu-operator', { uid: podA, reason, severity: 1, resolved: true, at: '2026-08-15T09:03:00Z' }, 'pod a recovered'),
+      clusterEvent(7, 'gpu-operator', { uid: podB, reason, severity: 2, resolved: true, at: '2026-08-15T09:04:00Z' }, 'pod b recovered'),
+      clusterEvent(8, 'gpu-operator', { uid: podA, reason, severity: 1, at: '2026-08-15T09:05:00Z' }, 'pod a image pull backoff again'),
+    ]
+
+    const rowAfter = (n: number) => deriveComponents(timeline.slice(0, n), undefined).find(c => c.name === 'gpu-operator')!
+
+    // Step 1: only pod A's condition exists.
+    const afterA = rowAfter(4)
+    expect(afterA.conditions).toHaveLength(1)
+    expect(activeCondition(afterA.conditions)?.uid).toBe(podA)
+
+    // Step 2: pod B coexists alongside pod A (different UID), and the row
+    // surfaces B because it is the higher severity of the two.
+    const afterB = rowAfter(5)
+    expect(afterB.conditions).toHaveLength(2)
+    expect(new Set(afterB.conditions.map(c => c.uid))).toEqual(new Set([podA, podB]))
+    expect(activeCondition(afterB.conditions)?.uid).toBe(podB)
+
+    // Step 3: pod A resolves. Still two entries -- resolution updates A's
+    // slot, it does not remove it -- and B, still unresolved, keeps showing.
+    const afterAResolved = rowAfter(6)
+    expect(afterAResolved.conditions).toHaveLength(2)
+    expect(activeCondition(afterAResolved.conditions)?.uid).toBe(podB)
+
+    // Step 4: pod B also resolves. Nothing unresolved remains -- the row
+    // genuinely clears.
+    const afterBResolved = rowAfter(7)
+    expect(afterBResolved.conditions).toHaveLength(2)
+    expect(activeCondition(afterBResolved.conditions)).toBeUndefined()
+
+    // Step 5: pod A recurs on the SAME (UID, Reason). Supersedes re-arms its
+    // existing slot rather than appending a new one -- still exactly two
+    // entries, not three -- and the row shows it again.
+    const afterRecurrence = rowAfter(8)
+    expect(afterRecurrence.conditions).toHaveLength(2)
+    expect(activeCondition(afterRecurrence.conditions)?.uid).toBe(podA)
+    expect(activeCondition(afterRecurrence.conditions)?.resolved).toBeFalsy()
+  })
+})
+
+describe('activeCondition', () => {
+  function condition(overrides: Partial<ClusterCondition>): ClusterCondition {
+    return {
+      kind: 'Pod', namespace: 'gpu-operator', name: 'a-pod', uid: 'uid-1', reason: 'Warning',
+      severity: 0, resolved: false, at: '2026-08-15T09:00:00Z', message: 'm', ...overrides,
+    }
+  }
+
+  it('picks the highest-severity unresolved condition', () => {
+    const warn = condition({ uid: 'uid-1', reason: 'Warning', severity: 1 })
+    const error = condition({ uid: 'uid-2', reason: 'FailedScheduling', severity: 2 })
+    expect(activeCondition([warn, error])?.reason).toBe('FailedScheduling')
+    expect(activeCondition([error, warn])?.reason).toBe('FailedScheduling')
+  })
+
+  it('returns undefined once every condition on the row is resolved', () => {
+    const resolved = condition({ severity: 2, resolved: true })
+    expect(activeCondition([resolved])).toBeUndefined()
   })
 })

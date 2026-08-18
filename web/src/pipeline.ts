@@ -38,6 +38,37 @@ export interface ComponentState extends ComponentData {
   generated: boolean
   /** For a generated action, the name of the component step it trails. Undefined for a real component. */
   parent?: string
+  /**
+   * Cluster conditions attributed to this action while it was the active
+   * one, one per distinct (UID, Reason) the observer has reported. This is
+   * NOT the same as "what the row shows" -- see activeCondition -- a row
+   * keeps every condition it has seen so a later resolution or recurrence
+   * on the same (UID, Reason) can update its own slot instead of losing the
+   * others sharing this row.
+   */
+  conditions: ClusterCondition[]
+}
+
+/**
+ * ClusterCondition mirrors Go's bus.ClusterData (internal/bus/cluster.go)
+ * field for field, plus message -- which lives on the wrapping Event, not
+ * ClusterData, but is carried alongside here because a row has nothing else
+ * to render as the human-readable narration.
+ */
+export interface ClusterCondition {
+  kind: string
+  namespace?: string
+  name: string
+  uid: string
+  container?: string
+  reason: string
+  ready?: number
+  desired?: number
+  /** 0 info / 1 warn / 2 error -- bus.Severity's own ordering. */
+  severity: number
+  resolved?: boolean
+  at: string
+  message: string
 }
 
 function isComponentData(data: unknown): data is ComponentData {
@@ -46,6 +77,73 @@ function isComponentData(data: unknown): data is ComponentData {
 
 function isFailureData(data: unknown): data is FailureInfo {
   return typeof data === 'object' && data !== null && 'exitError' in data
+}
+
+function isClusterData(data: unknown): data is Omit<ClusterCondition, 'message'> {
+  return typeof data === 'object' && data !== null && 'uid' in data && 'reason' in data && 'severity' in data && 'at' in data
+}
+
+/** conditionKey identifies one row's condition slot: same UID AND same Reason, matching bus.ClusterData.Supersedes's own identity rule. */
+function conditionKey(c: Pick<ClusterCondition, 'uid' | 'reason'>): string {
+  return `${c.uid}::${c.reason}`
+}
+
+/**
+ * clusterConditionSupersedes mirrors bus.ClusterData.Supersedes
+ * (internal/bus/cluster.go) field for field: same UID AND same Reason (the
+ * caller already guarantees this via conditionKey, but the check is kept
+ * here too so this function matches its Go counterpart's contract on its
+ * own, independent of the caller), then later At wins outright regardless
+ * of Resolved or Severity; those two only break a tie on an identical At.
+ * Kept as its own function rather than inlined into the fold so the
+ * required bite-proof -- drop the UID half of this check -- is a one-line
+ * mutation with an obvious, nameable blast radius.
+ */
+function clusterConditionSupersedes(next: ClusterCondition, prev: ClusterCondition): boolean {
+  if (next.uid !== prev.uid || next.reason !== prev.reason) return false
+  const nextAt = Date.parse(next.at)
+  const prevAt = Date.parse(prev.at)
+  if (nextAt !== prevAt) return nextAt > prevAt
+  if (Boolean(next.resolved) !== Boolean(prev.resolved)) return Boolean(next.resolved)
+  return next.severity > prev.severity
+}
+
+/**
+ * foldClusterEvent attaches a KindCluster event to the row named by
+ * Event.Component -- the attribution stamp internal/observer's publish
+ * stamps from the engine's Attribution snapshot. An event with no Component
+ * (outside Apply, between actions, after a terminal state) is a first-class
+ * outcome, not an error: it is left in conditionsByAction untouched, which
+ * means it never attaches to any row and simply remains in the timeline.
+ */
+function foldClusterEvent(conditionsByAction: Map<string, Map<string, ClusterCondition>>, e: AicrEvent) {
+  if (!e.component || !isClusterData(e.data)) return
+  const cond: ClusterCondition = { ...e.data, message: e.message }
+  const key = conditionKey(cond)
+  let row = conditionsByAction.get(e.component)
+  if (!row) {
+    row = new Map()
+    conditionsByAction.set(e.component, row)
+  }
+  const prev = row.get(key)
+  if (!prev || clusterConditionSupersedes(cond, prev)) row.set(key, cond)
+}
+
+/**
+ * activeCondition picks the one condition a row displays: the
+ * highest-severity member that is not resolved. A resolved (UID, Reason)
+ * keeps its slot in the row's full set -- a later recurrence supersedes it
+ * in place -- it just stops competing to be shown. Returns undefined when
+ * every condition on the row has resolved, which is a full clear: the row
+ * genuinely has nothing outstanding, not "waiting on the next one."
+ */
+export function activeCondition(conditions: ClusterCondition[]): ClusterCondition | undefined {
+  let best: ClusterCondition | undefined
+  for (const c of conditions) {
+    if (c.resolved) continue
+    if (!best || c.severity > best.severity) best = c
+  }
+  return best
 }
 
 /**
@@ -104,9 +202,20 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
   const recipeSet = new Set(recipeComponentNames ?? [])
   const order: string[] = []
   const byName = new Map<string, ComponentState>()
+  // Keyed on Event.Component (the row), then on (UID, Reason) within that
+  // row -- kept apart from byName because a cluster event's Component names
+  // a row that may not have been assigned yet at this point in the replay
+  // (only the FINAL merge below requires the row to exist); accumulating
+  // conditions independently means fold order within this pass never
+  // matters to the result.
+  const conditionsByAction = new Map<string, Map<string, ClusterCondition>>()
   let lastRealComponent: string | undefined
 
   for (const e of relevantTo(events)) {
+    if (e.kind === 'cluster') {
+      foldClusterEvent(conditionsByAction, e)
+      continue
+    }
     if (e.kind !== 'component' || !isComponentData(e.data)) continue
     const data = e.data
     const existing = byName.get(data.name)
@@ -127,6 +236,9 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
       parent: generated ? (existing?.parent ?? lastRealComponent) : undefined,
       startedAt: existing?.startedAt ?? (data.status === 'started' ? e.at : undefined),
       endedAt: data.status === 'installed' || data.status === 'failed' ? e.at : existing?.endedAt,
+      // Overwritten below once every event has been folded; empty here
+      // just keeps this object a valid ComponentState in the meantime.
+      conditions: existing?.conditions ?? [],
     }
 
     if (!existing) order.push(data.name)
@@ -134,7 +246,10 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
     if (!generated) lastRealComponent = data.name
   }
 
-  return order.map(name => byName.get(name)!)
+  return order.map(name => ({
+    ...byName.get(name)!,
+    conditions: [...(conditionsByAction.get(name)?.values() ?? [])],
+  }))
 }
 
 /**
