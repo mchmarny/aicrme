@@ -53,13 +53,40 @@ import (
 // SharedInformerFactory plus the two informers materialized on it, and the
 // stop channel that owns their lifetime independently of the process-wide
 // stopCh the three cluster-scoped informers in observer.go share. Handlers
-// are not registered here -- that is Tasks 5 and 6's job; this type only
-// makes the informers exist and keeps their lifetime correct.
+// are registered on pod and event in startNamespace, using the
+// scopedHandlers this type's owning scopedInformers was constructed with --
+// this type itself only makes the informers exist and keeps their lifetime
+// correct.
 type factoryEntry struct {
 	factory informers.SharedInformerFactory
 	pod     cache.SharedIndexInformer
 	event   cache.SharedIndexInformer
 	stop    chan struct{}
+}
+
+// scopedHandlers holds the ResourceEventHandlerDetailedFuncs each
+// namespace's Pod and Event informers register with, on startNamespace's
+// pod and event informers respectively. Both use
+// ResourceEventHandlerDetailedFuncs -- not the plain
+// ResourceEventHandlerFuncs Observer.register uses for the three
+// cluster-scoped kinds -- because both need AddFunc's isInInitialList
+// parameter to tell an informer's initial-list Add from a later one: Pods
+// (Task 5) so a pod already broken before this process started is not
+// narrated as newly broken, and Events (Task 6) because an Event is created
+// once and never updated, so a Warning that arrives only as an Add would
+// otherwise be silently indistinguishable from initial-list noise.
+//
+// Passed in at construction (newScopedInformers) rather than reached for
+// through a package-level Observer reference: scopedInformers has no
+// reference to the Observer that owns it, and giving it one just to reach
+// two method values would make the dependency run the wrong direction. A
+// zero-value field (every func nil) is registered safely -- each
+// ResourceEventHandlerDetailedFuncs method checks its own func for nil
+// before calling through -- which is what lets event stay unset until Task 6
+// without any change here.
+type scopedHandlers struct {
+	pod   cache.ResourceEventHandlerDetailedFuncs
+	event cache.ResourceEventHandlerDetailedFuncs
 }
 
 // scopedInformers owns the Pod/Event factories for whichever run is
@@ -71,7 +98,8 @@ type factoryEntry struct {
 // calling reconcile directly, from the test's own goroutine, and that access
 // pattern is genuinely concurrent even though production's is not.
 type scopedInformers struct {
-	client kubernetes.Interface
+	client   kubernetes.Interface
+	handlers scopedHandlers
 
 	mu sync.Mutex
 	// runID is the run these entries belong to, or "" when nothing is
@@ -82,8 +110,8 @@ type scopedInformers struct {
 	entries map[string]*factoryEntry
 }
 
-func newScopedInformers(client kubernetes.Interface) *scopedInformers {
-	return &scopedInformers{client: client, entries: make(map[string]*factoryEntry)}
+func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers) *scopedInformers {
+	return &scopedInformers{client: client, handlers: handlers, entries: make(map[string]*factoryEntry)}
 }
 
 // reconcile starts and stops per-namespace factories so the live set matches
@@ -150,6 +178,18 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 	factory := informers.NewSharedInformerFactoryWithOptions(s.client, resyncPeriod, informers.WithNamespace(ns))
 	pod := factory.Core().V1().Pods().Informer()
 	event := factory.Core().V1().Events().Informer()
+
+	// AddEventHandler only registers a listener; it does no network I/O and
+	// cannot block, so it is safe here on reconcile's own goroutine -- the
+	// same posture as the factory.Start/WaitForCacheSync pair below, which
+	// DOES reach the network and is therefore pushed onto its own goroutine
+	// instead.
+	if _, err := pod.AddEventHandler(s.handlers.pod); err != nil {
+		slog.Warn("scoped observer pod handler registration failed", "namespace", ns, "error", err)
+	}
+	if _, err := event.AddEventHandler(s.handlers.event); err != nil {
+		slog.Warn("scoped observer event handler registration failed", "namespace", ns, "error", err)
+	}
 
 	go func() {
 		factory.Start(stop)

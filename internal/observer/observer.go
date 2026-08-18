@@ -105,20 +105,47 @@ type Observer struct {
 	// compared with Quantity.Cmp rather than string equality, since 8,
 	// 8000m and "8" are the same quantity with different serializations.
 	gpuQty map[stateKey]resource.Quantity
+	// pods holds the trouble condition (pods.go's podCondition) currently
+	// attributed to each tracked Pod. Separate from workload because its
+	// value type differs (a Reason/Container pair, not a display string) and
+	// because a healthy pod is never given an entry at all -- see
+	// podCondition's own doc comment.
+	pods map[stateKey]podCondition
 }
 
 // New returns an Observer. A nil client yields a no-op: the console's whole
 // Discover-to-Apply arc works without cluster telemetry, so failing to build
 // a client must degrade rather than prevent startup.
+//
+// o is built as a variable, not returned directly from one struct literal,
+// because scopedHandlers.pod below needs bound method values (o.onPodAdd
+// etc.) that close over o itself -- those can only be taken once o exists as
+// an addressable value. o.pods is initialized before that point, in the same
+// literal as workload/gpuQty, so the handlers never see a nil map once the
+// informers they are registered on start delivering.
 func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observer {
-	return &Observer{
+	o := &Observer{
 		client:   client,
 		bus:      b,
 		scope:    scope,
-		scoped:   newScopedInformers(client),
 		workload: make(map[stateKey]string),
 		gpuQty:   make(map[stateKey]resource.Quantity),
+		pods:     make(map[stateKey]podCondition),
 	}
+	o.scoped = newScopedInformers(client, scopedHandlers{
+		pod: cache.ResourceEventHandlerDetailedFuncs{
+			AddFunc:    o.onPodAdd,
+			UpdateFunc: o.onPodUpdate,
+			DeleteFunc: o.onDelete,
+		},
+		// event is Task 6's: the identical ResourceEventHandlerDetailedFuncs
+		// hook, left at its zero value (every field nil) until then.
+		// AddEventHandler accepts a handler with nil funcs without error --
+		// ResourceEventHandlerDetailedFuncs.OnAdd/OnUpdate/OnDelete each
+		// check for nil before calling through -- so registering it now
+		// costs nothing and needs no follow-up change to scoped.go.
+	})
+	return o
 }
 
 // Start registers handlers and starts the informers. It returns once caches

@@ -159,6 +159,19 @@ func (o *Observer) onDelete(obj any) {
 			Resolved: true,
 		}
 		o.publish("", fmt.Sprintf("%s removed", t.Name), cd)
+	case *corev1.Pod:
+		key := podKey(t)
+		o.mu.Lock()
+		prev, had := o.pods[key]
+		delete(o.pods, key)
+		o.mu.Unlock()
+		if !had {
+			// No tracked trouble -- either the pod was healthy, or this
+			// observer never saw it. Either way there is no condition on any
+			// row to clear.
+			return
+		}
+		o.publish(t.Namespace, podMessage(t, prev, true), podClusterData(t, prev, true))
 	}
 }
 

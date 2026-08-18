@@ -51,7 +51,7 @@ func namespaceSet(ns []string) map[string]struct{} {
 // assertion.
 func TestScopedInformersDoNotStartBeforeAScopeExists(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 
 	s.reconcile(RunScope{})
 
@@ -76,7 +76,7 @@ func TestScopedInformersDoNotStartBeforeAScopeExists(t *testing.T) {
 // actually reaches those two properties.
 func TestScopedInformersStartOncePerNamespace(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 
 	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler", "ai-runtime"))
 
@@ -116,7 +116,7 @@ func TestScopedInformersStartOncePerNamespace(t *testing.T) {
 // so the initial waitFor times out.
 func TestScopedInformersWatchOnlyTheirOwnNamespace(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 
 	s.reconcile(scopeWith("run-1", "gpu-operator"))
 
@@ -137,7 +137,7 @@ func TestScopedInformersWatchOnlyTheirOwnNamespace(t *testing.T) {
 // path production does: a scope whose Terminal has flipped true.
 func TestScopedInformersStopWhenTheRunEnds(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler"))
 	if got := len(s.entries); got != 2 {
 		t.Fatalf("entries before termination = %d, want 2", got)
@@ -164,7 +164,7 @@ func TestScopedInformersStopWhenTheRunEnds(t *testing.T) {
 // deterministically, independent of timing.
 func TestScopedInformersStopClosesTheFactoryStopChannel(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 	s.reconcile(scopeWith("run-1", "gpu-operator"))
 
 	entry, ok := s.entries["gpu-operator"]
@@ -188,7 +188,7 @@ func TestScopedInformersStopClosesTheFactoryStopChannel(t *testing.T) {
 // silently churning every factory underneath.
 func TestScopedInformersAreIdempotent(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 	sc := scopeWith("run-1", "gpu-operator", "kai-scheduler", "ai-runtime")
 
 	s.reconcile(sc)
@@ -247,7 +247,7 @@ func TestScopedInformerStartDoesNotBlock(t *testing.T) {
 		t.Fatalf("kubernetes.NewForConfig() error = %v", err)
 	}
 
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 	done := make(chan struct{})
 	go func() {
 		s.reconcile(scopeWith("run-1", "gpu-operator"))
@@ -265,7 +265,7 @@ func TestScopedInformerStartDoesNotBlock(t *testing.T) {
 // stops the old set and starts the new, never leaving the two mixed.
 func TestScopedInformersSurviveAScopeChange(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 
 	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler"))
 	if got := len(s.entries); got != 2 {
@@ -306,7 +306,7 @@ func TestScopedInformersSurviveAScopeChange(t *testing.T) {
 // restart it.
 func TestScopedInformersRestartAfterRetryReusesTheRunID(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 	b := bus.New(64)
 
 	var scopeMu scopeHolder
@@ -355,7 +355,7 @@ func TestScopedInformersRestartAfterRetryReusesTheRunID(t *testing.T) {
 // so a pass here is only possible if the bus event itself woke run().
 func TestScopedInformersRunReconcilesOnEveryPhaseEvent(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 	b := bus.New(64)
 
 	var scopeMu scopeHolder
@@ -391,7 +391,7 @@ func TestScopedInformersRunReconcilesOnEveryPhaseEvent(t *testing.T) {
 // time -- only the ticker is present to have done it.
 func TestScopedInformersRunTicksAsACorrectnessFloor(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client)
+	s := newScopedInformers(client, scopedHandlers{})
 	b := bus.New(64)
 
 	var scopeMu scopeHolder
