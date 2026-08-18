@@ -168,8 +168,12 @@ describe('Cockpit', () => {
 
   // Teardown happens at EITHER terminal state, not just StateDone -- Failed
   // must carry the same "last observed" discipline, not the live present
-  // tense a mid-run screen would use.
-  it('failed: a still-open condition on the Failed screen is also labeled last observed, not live', () => {
+  // tense a mid-run screen would use. Pre-merge fix wave: "installed" is
+  // wrong here specifically -- the Failed screen's own heading says
+  // "Install failed", and "(last observed while gpu-operator installed)"
+  // sitting on a failed run reads as "it installed successfully", the
+  // opposite claim. "was installing" keeps the same discipline without it.
+  it('failed: a still-open condition on the Failed screen is labeled last observed, past continuous -- never a success claim', () => {
     const events: AicrEvent[] = [
       componentEvent(1, 'gpu-operator', { index: 1, total: 2, status: 'started' }),
       componentEvent(2, 'gpu-operator', { status: 'installed' }),
@@ -187,6 +191,7 @@ describe('Cockpit', () => {
     render(<Cockpit events={events} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
 
     const gpuRow = screen.getByTestId('component-gpu-operator')
-    expect(gpuRow.textContent).toMatch(/last observed while gpu-operator installed\)/i)
+    expect(gpuRow.textContent).toMatch(/last observed while gpu-operator was installing\)/i)
+    expect(gpuRow.textContent).not.toMatch(/gpu-operator installed\)/i)
   })
 })

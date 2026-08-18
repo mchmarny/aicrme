@@ -64,16 +64,34 @@ describe('ComponentConditions', () => {
   // one property a reviewer cannot verify by reading behavior, the same
   // class as the temporal-not-ownership assertion above, so it's pinned as
   // a literal string here too.
-  it('labels a terminal-state condition "last observed", not a live claim', () => {
+  //
+  // Pre-merge fix wave: Done and Failed are asserted SEPARATELY, not as one
+  // "terminal" case, because the wording differs by which one -- see
+  // ComponentConditions.tsx's doc comment on `terminalState`.
+  it('labels a Done-state condition "last observed ... installed" -- a true, completed claim', () => {
     const error = condition({ reason: 'ImagePullBackOff' })
-    render(<ComponentConditions name="gpu-operator" conditions={[error]} terminal />)
+    render(<ComponentConditions name="gpu-operator" conditions={[error]} terminalState="done" />)
     const el = screen.getByTestId('condition-gpu-operator')
     expect(el.textContent).toMatch(/last observed while gpu-operator installed\)/i)
     expect(el.textContent).not.toMatch(/while gpu-operator installs\)/i)
     expect(el.textContent).not.toMatch(/cluster activity/i)
   })
 
-  it('defaults to the live, present-tense caption when terminal is omitted', () => {
+  // "installed" on the Failed screen would read as "it installed
+  // successfully" -- the opposite of what that screen means -- so Failed
+  // gets the past-continuous "was installing" instead of Done's past-simple
+  // "installed". Same "last observed, not current" discipline, no success
+  // claim.
+  it('labels a Failed-state condition "last observed ... was installing" -- no success claim', () => {
+    const error = condition({ reason: 'ImagePullBackOff' })
+    render(<ComponentConditions name="kai-scheduler" conditions={[error]} terminalState="failed" />)
+    const el = screen.getByTestId('condition-kai-scheduler')
+    expect(el.textContent).toMatch(/last observed while kai-scheduler was installing\)/i)
+    expect(el.textContent).not.toMatch(/kai-scheduler installed\)/i)
+    expect(el.textContent).not.toMatch(/cluster activity/i)
+  })
+
+  it('defaults to the live, present-tense caption when terminalState is omitted', () => {
     const error = condition({ reason: 'ImagePullBackOff' })
     render(<ComponentConditions name="gpu-operator" conditions={[error]} />)
     const el = screen.getByTestId('condition-gpu-operator')

@@ -491,9 +491,17 @@ describe('compareAt', () => {
 
   it('a trimmed (short) fraction and a full 9-digit fraction compare correctly by true magnitude, not by string length', () => {
     // 500,000,000ns ("...5Z", trimmed) vs 500,000,001ns
-    // ("...500000001Z", untrimmable) -- the latter is 1ns later. Right-
-    // padding both to 9 digits before comparing is what makes this work;
-    // comparing the raw, unpadded strings ("5" vs "500000001") would not.
+    // ("...500000001Z", untrimmable) -- the latter is 1ns later, and "5" is
+    // a strict PREFIX of "500000001". No padding needed for this to work
+    // (M-2, Task 7 final fix wave -- the previous version of compareAt
+    // right-padded both fractions before comparing, on a claim this test
+    // now disproves rather than merely stops depending on): RFC3339Nano
+    // trims trailing zeros, so "500000001" -- the longer string -- can
+    // never be all zeros past "5"'s length; it is GUARANTEED to carry a
+    // nonzero digit somewhere in there (its own final digit, at minimum),
+    // which is exactly what makes the shorter prefix the smaller value.
+    // JS's native string ordering already ranks a strict prefix as
+    // smaller, so raw comparison gets this right on its own.
     expect(compareAt('2026-08-15T09:01:00.5Z', '2026-08-15T09:01:00.500000001Z')).toBeLessThan(0)
     expect(compareAt('2026-08-15T09:01:00.500000001Z', '2026-08-15T09:01:00.5Z')).toBeGreaterThan(0)
   })

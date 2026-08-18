@@ -13,19 +13,22 @@ const statusClass: Record<ComponentState['status'], string> = {
 }
 
 /**
- * `terminal` defaults to false: Running is the one screen where the run's
- * observer is still watching, so a condition on it is genuinely current.
- * Ruling 38 (Task 7 final fix wave): Failed and Done both pass `terminal` --
- * the observer tears down its informers the instant a run reaches EITHER
- * terminal state, not just StateDone (an earlier version of this component
- * treated Failed as still-live, reasoning that it "can be mid-retry-decision";
- * that reasoning conflated "an operator might click Retry next" with "the
- * observer is still watching", which it is not, in either terminal state,
- * until Retry actually restarts the run and the SPA's own `tracked` clears
- * on "run retrying"). See ComponentConditions's doc comment on `terminal`
- * for what the caption change actually claims.
+ * `terminalState` defaults to undefined: Running is the one screen where
+ * the run's observer is still watching, so a condition on it is genuinely
+ * current. Ruling 38 (Task 7 final fix wave): Failed and Done both pass
+ * their own `run.state` -- the observer tears down its informers the
+ * instant a run reaches EITHER terminal state, not just StateDone (an
+ * earlier version of this component treated Failed as still-live,
+ * reasoning that it "can be mid-retry-decision"; that reasoning conflated
+ * "an operator might click Retry next" with "the observer is still
+ * watching", which it is not, in either terminal state, until Retry
+ * actually restarts the run and the SPA's own `tracked` clears on "run
+ * retrying"). The two terminal states pass DIFFERENT values, not a shared
+ * boolean, because the wording differs -- see ComponentConditions's doc
+ * comment on `terminalState` for why "installed" is a true claim on Done
+ * and a false one on Failed.
  */
-function ComponentRow({ c, terminal = false }: { c: ComponentState; terminal?: boolean }) {
+function ComponentRow({ c, terminalState }: { c: ComponentState; terminalState?: 'done' | 'failed' }) {
   const active = c.status === 'started' || c.status === 'retrying'
   const note = active ? slowStepNote(c.name) : undefined
 
@@ -45,7 +48,7 @@ function ComponentRow({ c, terminal = false }: { c: ComponentState; terminal?: b
         )}
       </div>
       {note && <p className="mt-1 max-w-2xl text-xs text-slate-500">{note}</p>}
-      <ComponentConditions name={c.name} conditions={c.conditions} terminal={terminal} />
+      <ComponentConditions name={c.name} conditions={c.conditions} terminalState={terminalState} />
     </li>
   )
 }
@@ -159,7 +162,7 @@ function Failed({
       {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
-        {components.map(c => <ComponentRow key={c.name} c={c} terminal />)}
+        {components.map(c => <ComponentRow key={c.name} c={c} terminalState="failed" />)}
       </ul>
 
       {failure && (
@@ -197,7 +200,7 @@ function Done({ components, recipeCount }: { components: ComponentState[]; recip
       {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
-        {components.map(c => <ComponentRow key={c.name} c={c} terminal />)}
+        {components.map(c => <ComponentRow key={c.name} c={c} terminalState="done" />)}
       </ul>
     </section>
   )

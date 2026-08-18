@@ -26,28 +26,46 @@ const severityClass: Record<number, string> = {
  * installing. See
  * docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md, Section 1.
  *
- * `terminal` (Ruling 38, Task 7 final fix wave, replacing fix round 2's
- * `tense` prop). Teardown stops the observer's informers the instant a run
- * reaches a terminal state (StateDone or StateFailed) -- deliberately, and
- * that is not being revisited here. The consequence for THIS component:
- * after teardown, nothing can ever publish a resolution for a condition
- * still open at that instant, and `tracked` (pipeline.ts) never expires it
- * either -- by design, since a genuinely broken component is exactly what
- * an operator needs to keep seeing (see deriveComponents's doc comment on
- * `tracked`). So a condition surviving to a terminal screen is not stale
- * information the console failed to update; it is the LAST thing the
- * observer ever saw, permanently, because nothing is watching anymore.
- * "(cluster activity while gpu-operator installs)" on that screen claims a
- * present fact the console has no way to still know. `terminal` swaps the
- * caption to "(last observed while gpu-operator installed)" -- the same
- * copy discipline that governs the temporal-correlation label itself: the
- * console states only what it actually knows, and post-teardown that is
- * "this was true when we stopped watching," not "this is true."
- * Cockpit.tsx passes `terminal` for both Done and Failed (both terminal
- * states that tear down the observer identically); Running leaves it at
- * its default `false`.
+ * `terminalState` (Ruling 38, Task 7 final fix wave; refined again in the
+ * pre-merge fix wave -- see below). Teardown stops the observer's
+ * informers the instant a run reaches a terminal state (StateDone or
+ * StateFailed) -- deliberately, and that is not being revisited here. The
+ * consequence for THIS component: after teardown, nothing can ever publish
+ * a resolution for a condition still open at that instant, and `tracked`
+ * (pipeline.ts) never expires it either -- by design, since a genuinely
+ * broken component is exactly what an operator needs to keep seeing (see
+ * deriveComponents's doc comment on `tracked`). So a condition surviving
+ * to a terminal screen is not stale information the console failed to
+ * update; it is the LAST thing the observer ever saw, permanently, because
+ * nothing is watching anymore. "(cluster activity while gpu-operator
+ * installs)" on that screen claims a present fact the console has no way
+ * to still know -- the same copy discipline that governs the
+ * temporal-correlation label itself: the console states only what it
+ * actually knows, and post-teardown that is "this was true when we
+ * stopped watching," not "this is true."
+ *
+ * `terminalState` is undefined on a still-running screen (the live
+ * caption applies) and is the run's own terminal `state` -- `'done'` or
+ * `'failed'` -- everywhere else, because the WORDING differs by which one:
+ *
+ * - `'done'`: "(last observed while gpu-operator installed)". Past tense,
+ *   and a TRUE claim -- a row rendered on the Done screen genuinely did
+ *   finish installing (the run would not be StateDone otherwise), so
+ *   "installed" states a fact, just one that's no longer being watched.
+ * - `'failed'`: "(last observed while gpu-operator was installing)". Past
+ *   CONTINUOUS, not past simple, and deliberately not "installed": the
+ *   Failed screen's own heading says "Install failed", and "installed"
+ *   sitting on that screen reads as "it installed successfully" -- the
+ *   exact opposite claim -- regardless of whether this particular row's
+ *   own action happened to complete before a later one failed. "was
+ *   installing" keeps the same "last observed, not current" discipline
+ *   without asserting an outcome the row may not have reached.
+ *
+ * Cockpit.tsx passes the run's own `state` for both Done and Failed (both
+ * terminal states that tear down the observer identically); Running
+ * leaves it undefined.
  */
-export function ComponentConditions({ name, conditions, terminal = false }: { name: string; conditions: ClusterCondition[]; terminal?: boolean }) {
+export function ComponentConditions({ name, conditions, terminalState }: { name: string; conditions: ClusterCondition[]; terminalState?: 'done' | 'failed' }) {
   const active = activeCondition(conditions)
   if (!active) return null
 
@@ -60,7 +78,11 @@ export function ComponentConditions({ name, conditions, terminal = false }: { na
   // fix round 1).
   const reasonInMessage = active.message.includes(active.reason)
 
-  const note = terminal ? `last observed while ${name} installed` : `cluster activity while ${name} installs`
+  const note = terminalState === 'done'
+    ? `last observed while ${name} installed`
+    : terminalState === 'failed'
+      ? `last observed while ${name} was installing`
+      : `cluster activity while ${name} installs`
 
   return (
     <p data-testid={`condition-${name}`} className={`mt-1 max-w-2xl text-xs ${severityClass[active.severity] ?? 'text-slate-400'}`}>
