@@ -548,6 +548,101 @@ func TestPodHighestSeverityTroubleWinsAcrossContainers(t *testing.T) {
 	}
 }
 
+// TestPodMultiReasonRecoveryResolvesEveryNarratedReason pins Ruling 20 (Task
+// 5 fix round 3) against the re-review's exact probe: an ORDINARY Apply
+// sequence, not an edge case -- a pod pends on GPU capacity (Unschedulable),
+// then gets scheduled and its image pull stalls (ImagePullBackOff), then
+// fully recovers. Ruling 17 already collapsed the ErrImagePull/
+// ImagePullBackOff ALIAS pair into one Reason, but that left the STRANDING
+// CLASS open: Unschedulable and ImagePullBackOff are genuinely different
+// Reasons, and round 2's single-tracked-value o.pods lost track of
+// Unschedulable the instant ImagePullBackOff overwrote it -- nothing ever
+// resolved it. The review found this strictly worse than the case Ruling 17
+// closed: the stranded Unschedulable entry is Error severity, which
+// OUTRANKS a resolved ImagePullBackOff entry, so a row picking
+// highest-severity-unresolved would show permanent red on a fully healthy
+// pod. A test that only exercises one reason arising and clearing cannot
+// see this -- three rounds of tests didn't -- so this one walks the full
+// three-state sequence and asserts BOTH reasons resolve, not just the last.
+func TestPodMultiReasonRecoveryResolvesEveryNarratedReason(t *testing.T) {
+	o, sub := newTestObserver(t)
+
+	o.onPodUpdate(nil, withUnschedulable(testPod("pod-uid")))
+	arose1 := decodeClusterData(t, sub)
+	if arose1.Reason != reasonUnschedulable || arose1.Resolved {
+		t.Fatalf("setup: Unschedulable arising = %+v, want Reason=%q Resolved=false", arose1, reasonUnschedulable)
+	}
+
+	// Scheduled now: podTrouble no longer reports Unschedulable at all (the
+	// fresh pod object below carries no PodScheduled=False condition), but
+	// its image pull is stuck.
+	o.onPodUpdate(nil, withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff))
+	arose2 := decodeClusterData(t, sub)
+	if arose2.Reason != reasonImagePullBackOff || arose2.Resolved {
+		t.Fatalf("setup: ImagePullBackOff arising = %+v, want Reason=%q Resolved=false", arose2, reasonImagePullBackOff)
+	}
+
+	// Full recovery.
+	o.onPodUpdate(nil, withRunning(testPod("pod-uid"), "app"))
+
+	resolved := map[string]bus.ClusterData{}
+	for range 2 {
+		cd := decodeClusterData(t, sub)
+		resolved[cd.Reason] = cd
+	}
+	assertNoEvent(t, sub) // exactly two resolves, nothing more
+
+	for _, reason := range []string{reasonUnschedulable, reasonImagePullBackOff} {
+		cd, ok := resolved[reason]
+		if !ok {
+			t.Errorf("no resolve event published for %q -- stranded", reason)
+			continue
+		}
+		if !cd.Resolved {
+			t.Errorf("%q Resolved = false, want true", reason)
+		}
+		if cd.UID != "pod-uid" {
+			t.Errorf("%q UID = %q, want %q", reason, cd.UID, "pod-uid")
+		}
+	}
+}
+
+// TestPodMultiReasonDeleteResolvesEveryNarratedReason is
+// TestPodMultiReasonRecoveryResolvesEveryNarratedReason's delete-path
+// sibling -- Ruling 20 explicitly requires the same treatment there,
+// respecting the narrated distinction (Important 3/Minor C) rather than
+// resolving unconditionally the way the recovery path does.
+func TestPodMultiReasonDeleteResolvesEveryNarratedReason(t *testing.T) {
+	o, sub := newTestObserver(t)
+
+	o.onPodUpdate(nil, withUnschedulable(testPod("pod-uid")))
+	decodeClusterData(t, sub) // Unschedulable arises
+
+	scheduled := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
+	o.onPodUpdate(nil, scheduled)
+	decodeClusterData(t, sub) // ImagePullBackOff arises
+
+	o.onDelete(scheduled)
+
+	removed := map[string]bus.ClusterData{}
+	for range 2 {
+		cd := decodeClusterData(t, sub)
+		removed[cd.Reason] = cd
+	}
+	assertNoEvent(t, sub) // exactly two removals, nothing stranded
+
+	for _, reason := range []string{reasonUnschedulable, reasonImagePullBackOff} {
+		cd, ok := removed[reason]
+		if !ok {
+			t.Errorf("delete did not publish a removal for %q -- stranded", reason)
+			continue
+		}
+		if !cd.Resolved {
+			t.Errorf("%q Resolved = false, want true", reason)
+		}
+	}
+}
+
 // TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown pins Important 4
 // (Task 5 fix round 1): one narrated pod, its event fully AWAITED before
 // teardown, so nothing is ever in flight when the sweep runs. That is a real
@@ -579,7 +674,7 @@ func TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown(t *testing.T) {
 
 	o.mu.Lock()
 	after := len(o.pods)
-	stranded := make(map[stateKey]podCondition, len(o.pods))
+	stranded := make(map[stateKey]map[string]podCondition, len(o.pods))
 	for k, v := range o.pods {
 		stranded[k] = v
 	}
@@ -648,7 +743,7 @@ func TestPodTroubleDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
 
 		o.mu.Lock()
 		after := len(o.pods)
-		stranded := make(map[stateKey]podCondition, len(o.pods))
+		stranded := make(map[stateKey]map[string]podCondition, len(o.pods))
 		for k, v := range o.pods {
 			stranded[k] = v
 		}

@@ -162,23 +162,27 @@ func (o *Observer) onDelete(obj any) {
 	case *corev1.Pod:
 		key := podKey(t)
 		o.mu.Lock()
-		prev, had := o.pods[key]
+		set := o.pods[key]
 		delete(o.pods, key)
 		o.mu.Unlock()
-		if !had || !prev.narrated {
-			// No tracked trouble, or the trouble was only ever seeded
-			// silently from an informer's initial list and never actually
-			// narrated (Important 3, Task 5 fix round 1) -- either way there
-			// is no condition on any row a consumer was ever shown, and
-			// publishing a resolution for one would invent a phantom entry
-			// exactly like this comment already warns against for the other
-			// three kinds.
-			return
+		// Ruling 20 (Task 5 fix round 3): resolve EVERY narrated reason in
+		// the pod's set, not just whichever was tracked most recently --
+		// same reasoning as onPodChange's full-recovery sweep (pods.go),
+		// applied to deletion. Filtered by narrated, unlike that sweep
+		// (Important 3, Minor C): a condition only ever seeded silently
+		// from an initial list must not manufacture a phantom event for
+		// something no consumer was ever shown, exactly like this comment
+		// already warns against for the other three kinds. Ranging over a
+		// nil map (no tracked trouble at all) is a safe no-op.
+		for _, cond := range set {
+			if !cond.narrated {
+				continue
+			}
+			// "removed", not "resolved": the pod did not recover, it was
+			// deleted. The three cluster-scoped kinds above say "removed"
+			// for the identical reason.
+			o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), podClusterData(t, cond, true))
 		}
-		// "removed", not "resolved": the pod did not recover, it was
-		// deleted. The three cluster-scoped kinds above say "removed" for
-		// the identical reason.
-		o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), podClusterData(t, prev, true))
 	}
 }
 

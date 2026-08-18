@@ -33,7 +33,13 @@ import (
 // presence in o.scoped.entries -- a real precondition in production (that
 // map is only ever populated by a namespace's own running informer), so a
 // direct handler call here needs the same fact recorded, without paying for
-// a real informer this file's whole point is to avoid.
+// a real informer this file's whole point is to avoid. stop is a real
+// channel, not the zero value (Minor finding, Task 5 fix round 3): a nil
+// channel is fine for every test today (nothing here calls
+// scoped.stop()/reconcile(), the only callers that ever close(e.stop)), but
+// a bare &factoryEntry{} is a panic waiting for whichever future test does
+// -- close(nil channel) panics -- and make(chan struct{}) costs nothing to
+// avoid it now.
 func newTestObserver(t *testing.T) (*Observer, <-chan bus.Event) {
 	t.Helper()
 	b := bus.New(64)
@@ -43,7 +49,7 @@ func newTestObserver(t *testing.T) (*Observer, <-chan bus.Event) {
 	o := New(nil, b, func() RunScope {
 		return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{"gpu-operator": {}}}
 	})
-	o.scoped.entries["gpu-operator"] = &factoryEntry{}
+	o.scoped.entries["gpu-operator"] = &factoryEntry{stop: make(chan struct{})}
 	return o, sub
 }
 

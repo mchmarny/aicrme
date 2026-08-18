@@ -58,16 +58,21 @@ func normalizeReason(raw string) string {
 	return raw
 }
 
-// podCondition is the trouble this observer currently attributes to a Pod.
-// reason is normalized (podTrouble/normalizeReason) and is what
-// ClusterData.Reason carries -- the Supersedes key. detail is the raw
-// kubelet reason (equal to reason except for the ErrImagePull/
-// ImagePullBackOff pair Ruling 17 normalizes), used only in the narration
-// message. The zero value means healthy. No entry is ever stored for a
-// healthy pod (onPodChange and seedPodBaseline both skip it), so a map
-// lookup miss and "recorded healthy" are the same state and never need to
-// be told apart -- unlike gpuQty, which must distinguish "never seen" from
-// "seen at zero".
+// podCondition is ONE narrated trouble Reason this observer currently
+// attributes to a Pod. o.pods holds a SET of these per Pod, keyed by
+// reason (Ruling 20, Task 5 fix round 3) -- a Pod can accumulate more than
+// one over its lifetime (Unschedulable while pending, then ImagePullBackOff
+// once scheduled), and each needs its own resolve when the pod recovers, not
+// just whichever was narrated last. reason is normalized
+// (podTrouble/normalizeReason) and is what ClusterData.Reason carries -- the
+// Supersedes key; it is also, redundantly, the key o.pods[key] stores this
+// value under, kept on the struct so a podCondition pulled out of the map
+// during a resolve sweep is self-describing without threading the key
+// alongside it. detail is the raw kubelet reason (equal to reason except
+// for the ErrImagePull/ImagePullBackOff pair Ruling 17 normalizes), used
+// only in the narration message. No entry, and no SET entry for a given
+// reason, is ever stored for a healthy pod (onPodChange and seedPodBaseline
+// both skip it) -- see podCondition's own doc comment.
 type podCondition struct {
 	reason    string
 	detail    string
@@ -81,7 +86,8 @@ type podCondition struct {
 	// ever shown (Important 3, Task 5 fix round 1).
 	//
 	// onPodChange's OWN recovery path deliberately does NOT consult
-	// narrated (Minor C, Task 5 fix round 2): a pod that was already broken
+	// narrated (Minor C, Task 5 fix round 2, re-verified independently and
+	// upheld in fix round 3's re-review): a pod that was already broken
 	// before this process started, and later genuinely recovers, is telling
 	// this observer something true and useful -- "the thing I never
 	// mentioned is fixed now" -- which TestPodConditionResolves (a
@@ -90,7 +96,10 @@ type podCondition struct {
 	// and reporting "resolved" for a condition no one was ever shown would
 	// be inventing a claim this observer cannot back either way. The two
 	// call sites differ because the underlying claims differ, not by
-	// oversight.
+	// oversight. This asymmetry now applies PER REASON in the set, not just
+	// to a single tracked value: onPodChange's full-recovery sweep resolves
+	// every entry regardless of narrated, onDelete's sweep resolves only the
+	// narrated ones.
 	narrated bool
 }
 
@@ -224,9 +233,9 @@ func podMessage(pod *corev1.Pod, cond podCondition, resolved bool) string {
 // narrating here would report a pod that has sat broken for hours as a fresh
 // transition. A pod with no current trouble is not recorded at all --
 // onPodChange's own rule for what belongs in o.pods -- so this only ever
-// seeds a trouble state a later change can resolve. narrated stays at its
-// zero value (false): see podCondition's own doc comment for why that
-// distinction matters to onDelete.
+// seeds one entry in the pod's set (Ruling 20) that a later change can
+// resolve. narrated stays at its zero value (false): see podCondition's own
+// doc comment for why that distinction matters to onDelete.
 //
 // Gated by o.scoped.withNamespaceLive (Important B, Task 5 fix round 2): an
 // informer's initial list can still be draining when its namespace tears
@@ -242,27 +251,42 @@ func (o *Observer) seedPodBaseline(pod *corev1.Pod) {
 	o.scoped.withNamespaceLive(pod.Namespace, func() {
 		o.mu.Lock()
 		defer o.mu.Unlock()
-		o.pods[podKey(pod)] = podCondition{reason: reason, detail: detail, container: container}
+		key := podKey(pod)
+		if o.pods[key] == nil {
+			o.pods[key] = make(map[string]podCondition)
+		}
+		o.pods[key][reason] = podCondition{reason: reason, detail: detail, container: container}
 	})
 }
 
 // onPodChange computes pod's current trouble state and publishes what
-// changed relative to what was last recorded.
+// changed relative to what was last recorded for THAT SPECIFIC reason, or --
+// on full recovery -- resolves every reason ever narrated for this pod.
 //
-// Ruling 14(b) (Task 5 fix round 1): the PREVIOUS condition is only
-// published resolved when the pod is now FULLY healthy (cur.reason == "").
-// A Reason CHANGE while the pod remains broken -- a different container now
-// being the one in trouble -- is not a resolution: publishing "resolved"
-// for it would be false narration on the operator's timeline, since the pod
-// never stopped being broken. The resolved event, when it does fire,
-// carries the PREVIOUS reason/container -- not whatever podTrouble reports
-// now -- so ClusterData.Supersedes (same UID, same Reason) matches the
-// unresolved row entry it is meant to clear. Ruling 17 (Task 5 fix round 2)
-// normalizes ErrImagePull/ImagePullBackOff into one Reason before this
-// function ever sees it (podTrouble), which is what keeps kubelet's
-// backoff-cycle oscillation between the two from looking like a Reason
-// change at all -- see normalizeReason's doc comment for why that mattered
-// more than 14(b) alone could fix.
+// Ruling 20 (Task 5 fix round 3), replacing Ruling 14(b)'s per-pod single
+// value: o.pods holds a SET of reasons per pod (podCondition's own doc
+// comment), because 14(b)/17 tracking only the CURRENT condition meant a
+// pod that narrated Unschedulable and then ImagePullBackOff -- pends on GPU
+// capacity, gets scheduled, then its image pull stalls; an ORDINARY Apply
+// sequence, not an edge case -- lost track of Unschedulable the instant
+// ImagePullBackOff overwrote the single tracked value. Nothing ever
+// resolved it: the row kept an Error-severity Unschedulable pinned
+// unresolved on a pod that went on to become fully healthy, outranking the
+// resolved ImagePullBackOff entry and showing permanent red. On full
+// recovery (cur.reason == ""), every reason in the pod's set is now
+// resolved and the whole set is dropped -- not just whichever reason was
+// tracked most recently.
+//
+// A single onPodChange call still narrates at most ONE arising reason
+// (podTrouble reports only the current highest-severity condition), added
+// to or updated within the set; reasons already in the set that are not
+// podTrouble's current pick are left untouched until the pod either fully
+// recovers or is deleted -- this observer has no signal telling it a
+// SPECIFIC earlier reason cleared mid-lifecycle, only that the pod overall
+// has or has not. Ruling 17's normalization still matters here: without it,
+// kubelet's ErrImagePull/ImagePullBackOff oscillation would populate the
+// set with what looks like two reasons for one stuck pull, each needing its
+// own arise/resolve pair, exactly the noise Ruling 17 exists to collapse.
 //
 // The map read, compare, and write all happen inside the closure passed to
 // o.scoped.withNamespaceLive (Important B, Task 5 fix round 2), which holds
@@ -276,41 +300,53 @@ func (o *Observer) seedPodBaseline(pod *corev1.Pod) {
 // publish must never run under either lock.
 func (o *Observer) onPodChange(pod *corev1.Pod) {
 	reason, detail, container, ok := podTrouble(pod)
-	var cur podCondition
-	if ok {
-		cur = podCondition{reason: reason, detail: detail, container: container}
-	}
 
 	key := podKey(pod)
-	var prev podCondition
-	var hadPrev, changed bool
+	var toResolve []podCondition // every reason in the set, only populated on full recovery
+	var arose podCondition
+	var arising bool
+
 	o.scoped.withNamespaceLive(pod.Namespace, func() {
 		o.mu.Lock()
 		defer o.mu.Unlock()
-		p, had := o.pods[key]
-		if had && p.reason == cur.reason && p.container == cur.container {
-			return // no change (narrated/detail are bookkeeping, not part of this comparison)
-		}
-		prev, hadPrev, changed = p, had, true
-		if cur.reason == "" {
-			delete(o.pods, key)
-		} else {
-			// About to publish cur as unresolved below -- record it
-			// narrated so a later delete (handlers.go's onDelete) knows
-			// this condition was actually shown, not just seeded silently
-			// from an initial list.
-			o.pods[key] = podCondition{reason: cur.reason, detail: cur.detail, container: cur.container, narrated: true}
-		}
-	})
-	if !changed {
-		return // either nothing changed, or pod.Namespace is no longer live
-	}
+		set := o.pods[key]
 
-	if hadPrev && prev.reason != "" && cur.reason == "" {
-		o.publish(pod.Namespace, podMessage(pod, prev, true), podClusterData(pod, prev, true))
+		if !ok {
+			// Fully healthy: resolve EVERY reason ever narrated for this
+			// pod, not just the current one -- Ruling 20's whole point.
+			// Deliberately does NOT filter on narrated (Minor C): matches
+			// TestPodConditionResolves' pinned behavior for a
+			// seeded-but-never-shown condition that later genuinely clears.
+			for _, cond := range set {
+				toResolve = append(toResolve, cond)
+			}
+			delete(o.pods, key)
+			return
+		}
+
+		existing, had := set[reason]
+		if had && existing.container == container {
+			return // no change for this specific reason
+		}
+
+		if set == nil {
+			set = make(map[string]podCondition)
+			o.pods[key] = set
+		}
+		// About to publish this reason as unresolved below -- record it
+		// narrated so a later delete (handlers.go's onDelete) knows this
+		// specific reason was actually shown, not just seeded silently
+		// from an initial list.
+		arose = podCondition{reason: reason, detail: detail, container: container, narrated: true}
+		set[reason] = arose
+		arising = true
+	})
+
+	for _, cond := range toResolve {
+		o.publish(pod.Namespace, podMessage(pod, cond, true), podClusterData(pod, cond, true))
 	}
-	if cur.reason != "" {
-		o.publish(pod.Namespace, podMessage(pod, cur, false), podClusterData(pod, cur, false))
+	if arising {
+		o.publish(pod.Namespace, podMessage(pod, arose, false), podClusterData(pod, arose, false))
 	}
 }
 

@@ -318,6 +318,22 @@ func (s *scopedInformers) stopAllLocked() {
 // namespace's own handler delivery, so anything slower here would serialize
 // far more than the one write it exists to protect; pods.go's callers keep
 // their o.publish calls outside fn for exactly this reason.
+//
+// Deliberately deferred, not closed: this checks existence in s.entries,
+// not per-entry identity/generation. A namespace ns torn down and then
+// RESTARTED under a brand-new *factoryEntry -- a different run reusing the
+// same namespace name -- would make this return true again for a stale
+// delivery from the OLD, already-torn-down informer's lingering backlog,
+// since existence alone cannot tell "live under a new generation" from
+// "live under the generation this delivery belongs to". Reaching that
+// window needs a notification to survive not just close(stop) not
+// stopping delivery synchronously (the race this function closes) but ALSO
+// two full reconcile cycles -- teardown, then a second namespace's worth of
+// startNamespace work -- typically minutes apart in production (Ruling 9's
+// 2s floor is the FLOOR, not the common case; the fast path is a KindPhase
+// bus event, and consecutive runs are operator-paced). Confirmed real, not
+// yet worth a full generation counter for how rarely it is reachable;
+// revisit if a future consumer needs the stronger guarantee.
 func (s *scopedInformers) withNamespaceLive(ns string, fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

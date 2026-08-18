@@ -105,12 +105,23 @@ type Observer struct {
 	// compared with Quantity.Cmp rather than string equality, since 8,
 	// 8000m and "8" are the same quantity with different serializations.
 	gpuQty map[stateKey]resource.Quantity
-	// pods holds the trouble condition (pods.go's podCondition) currently
-	// attributed to each tracked Pod. Separate from workload because its
-	// value type differs (a Reason/Container pair, not a display string) and
-	// because a healthy pod is never given an entry at all -- see
-	// podCondition's own doc comment.
-	pods map[stateKey]podCondition
+	// pods holds every narrated trouble Reason (pods.go's podCondition) per
+	// tracked Pod, keyed by Reason within each Pod's own entry -- a SET, not
+	// a single value (Ruling 20, Task 5 fix round 3). Ruling 14(b)/17 only
+	// ever remembered the CURRENT single condition, so a Pod that narrated
+	// Unschedulable and then ImagePullBackOff (an ordinary Apply sequence:
+	// pends on capacity, gets scheduled, then its image pull stalls) lost
+	// track of Unschedulable the moment ImagePullBackOff overwrote it --
+	// nothing ever resolved it, stranding an Error-severity condition on a
+	// pod that went on to become fully healthy. onPodChange's full-recovery
+	// path now resolves every entry in a Pod's set, not just the last one;
+	// onDelete does the same, filtered by narrated. Separate from workload
+	// because its value type differs (a set of Reason/Container pairs, not
+	// a display string) and because a healthy pod is never given an entry
+	// at all -- see podCondition's own doc comment. A nil inner map (no
+	// entry for a Pod at all) and an absent key both mean "nothing tracked"
+	// -- callers range over it directly rather than checking for nil first.
+	pods map[stateKey]map[string]podCondition
 }
 
 // New returns an Observer. A nil client yields a no-op: the console's whole
@@ -130,7 +141,7 @@ func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observ
 		scope:    scope,
 		workload: make(map[stateKey]string),
 		gpuQty:   make(map[stateKey]resource.Quantity),
-		pods:     make(map[stateKey]podCondition),
+		pods:     make(map[stateKey]map[string]podCondition),
 	}
 	o.scoped = newScopedInformers(client, scopedHandlers{
 		pod: cache.ResourceEventHandlerDetailedFuncs{
