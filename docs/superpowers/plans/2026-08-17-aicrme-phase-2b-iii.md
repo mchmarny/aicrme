@@ -467,4 +467,15 @@ Key the fold on `Component` alone (dropping the UID check) and confirm the coexi
 
 1. **What does a row show while its action installs but nothing has happened?** Blank is indistinguishable from "no telemetry"; "waiting" is noisy across 14 rows. Best answered against the real install.
 2. **Should pre-existing workloads in a recipe namespace be narrated?** Namespace scoping cannot distinguish "this run installed it" from "it was already there". Suppressing needs an ownership signal this phase defers.
-3. **How aggressive should lazy teardown be?** Stopping informers when a run ends reclaims memory but loses the post-Apply convergence window — the 10-20 minutes `deploy.sh` warns about, which may be the most interesting telemetry the console could show.
+3. ~~How aggressive should lazy teardown be?~~ **Decided 2026-08-17: as aggressive as possible.**
+   Pod and Event informers stop as soon as the run reaches a terminal state — no
+   grace window, no lingering watches. Task 4 implements that directly rather
+   than making it configurable.
+
+   **The cost, stated so nobody rediscovers it as a bug:** the console will not
+   narrate the post-Apply convergence window `deploy.sh` warns about — up to
+   10-20 minutes of node tuning on fresh GPU nodes. A driver DaemonSet that
+   fails to come up *after* the run reports `done` will be invisible to the
+   console. That is a deliberate trade of telemetry for a bounded, simple
+   lifecycle, and it is the right default for a demo console whose runs are
+   watched live. Revisit only with evidence that the missed window matters.
