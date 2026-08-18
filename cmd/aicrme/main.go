@@ -209,14 +209,37 @@ type attributionReader interface {
 // different reads taken microseconds apart across a run transition -- narrow,
 // but avoidable for free by picking the read that is already atomic.
 //
+// nsScope() and eng.Attribution() are themselves two INDEPENDENT lock
+// acquisitions -- nsScope calls Engine.CurrentID, which takes and releases
+// e.mu on its own, before this func separately takes and releases e.mu again
+// via Attribution(). A run transition landing between those two calls would
+// otherwise pair one run's Namespaces with a different run's RunID/Component
+// -- precisely the race RunScope's own doc comment forbids, one layer
+// higher up (observer.go: "reading the run ID and the namespaces separately
+// would let attribution and filtering come from different runs across a
+// race"). The sc.RunID != a.RunID check below is what closes that gap: on
+// disagreement this returns the zero RunScope rather than merging the two
+// reads (Ruling 6). Merging is ruled out because it is the one option
+// guaranteed to produce a WRONG answer -- an event stamped with one run's
+// action but filtered by another run's namespaces. A retry loop is the
+// wrong shape for a per-watch-event path. The zero RunScope costs nothing:
+// unattributed is already a first-class outcome in this design (spec
+// Section 1), and the disagreement window is a single transition instant,
+// not a sustained state.
+//
 // The result is called by the observer exactly once per watch event
 // (observer.Observer.publish), so eng.Attribution() -- itself cheap by
 // construction -- is also called exactly once per event: one call in here,
-// one call by the observer into this func.
+// one call by the observer into this func. The disagreement check compares
+// values already in hand (sc.RunID, a.RunID); it must never justify a third
+// call into eng to "double check".
 func newObserverScopeFn(eng attributionReader, nsScope func() observer.RunScope) func() observer.RunScope {
 	return func() observer.RunScope {
 		sc := nsScope()
 		a := eng.Attribution()
+		if sc.RunID != a.RunID {
+			return observer.RunScope{}
+		}
 		sc.RunID = a.RunID
 		sc.Component = a.ActiveAction
 		sc.Generation = a.Generation
