@@ -39,12 +39,16 @@ export interface ComponentState extends ComponentData {
   /** For a generated action, the name of the component step it trails. Undefined for a real component. */
   parent?: string
   /**
-   * Cluster conditions attributed to this action while it was the active
-   * one, one per distinct (UID, Reason) the observer has reported. This is
-   * NOT the same as "what the row shows" -- see activeCondition -- a row
-   * keeps every condition it has seen so a later resolution or recurrence
-   * on the same (UID, Reason) can update its own slot instead of losing the
-   * others sharing this row.
+   * Cluster conditions currently PLACED on this row, one per distinct (UID,
+   * Reason) the observer has reported. "Placed", not "arose while this
+   * action was active": Component is a moving cursor (see
+   * clusterConditionSupersedes's doc comment / Ruling 27), so a condition's
+   * placement can move to a later row than the one it arose on, or stay put
+   * under a resolution that carried no attribution at all. This is NOT the
+   * same as "what the row shows" -- see activeCondition -- a row keeps
+   * every condition currently placed on it, resolved or not, so a later
+   * resolution or recurrence on the same (UID, Reason) can update its own
+   * slot instead of losing the others sharing this row.
    */
   conditions: ClusterCondition[]
 }
@@ -97,36 +101,88 @@ function conditionKey(c: Pick<ClusterCondition, 'uid' | 'reason'>): string {
  * of Resolved or Severity; those two only break a tie on an identical At.
  * Kept as its own function rather than inlined into the fold so the
  * required bite-proof -- drop the UID half of this check -- is a one-line
- * mutation with an obvious, nameable blast radius.
+ * mutation with an obvious, nameable blast radius. Exported so each branch
+ * (the UID/Reason guard, At-primary ordering, and the Resolved-then-Severity
+ * tie-break) can be pinned directly, without constructing a whole event
+ * sequence to reach it (Important 1, Task 7 fix round 1: an unconditional
+ * `return true` here previously left the suite green, because nothing
+ * exercised anything past the guard).
+ *
+ * At is compared as a plain string, not via Date.parse: Observer.publish
+ * always stamps RFC3339 in UTC (time.Now().UTC()), and for timestamps in
+ * that one fixed format, lexicographic string order IS chronological
+ * order -- including whatever sub-millisecond precision Go's clock
+ * produces, which Date.parse would silently truncate to whole
+ * milliseconds. It also cannot produce NaN the way Date.parse can on a
+ * malformed value: a NaN > NaN comparison is always false, which would
+ * pin a condition on its row forever rather than fail loudly (Minor 1,
+ * Task 7 fix round 1) -- silently invisible is the worse failure mode of
+ * the two.
  */
-function clusterConditionSupersedes(next: ClusterCondition, prev: ClusterCondition): boolean {
+export function clusterConditionSupersedes(next: ClusterCondition, prev: ClusterCondition): boolean {
   if (next.uid !== prev.uid || next.reason !== prev.reason) return false
-  const nextAt = Date.parse(next.at)
-  const prevAt = Date.parse(prev.at)
-  if (nextAt !== prevAt) return nextAt > prevAt
+  if (next.at !== prev.at) return next.at > prev.at
   if (Boolean(next.resolved) !== Boolean(prev.resolved)) return Boolean(next.resolved)
   return next.severity > prev.severity
 }
 
 /**
- * foldClusterEvent attaches a KindCluster event to the row named by
- * Event.Component -- the attribution stamp internal/observer's publish
- * stamps from the engine's Attribution snapshot. An event with no Component
- * (outside Apply, between actions, after a terminal state) is a first-class
- * outcome, not an error: it is left in conditionsByAction untouched, which
- * means it never attaches to any row and simply remains in the timeline.
+ * TrackedCondition is the fold's per-(UID, Reason) unit of truth. `data` is
+ * the current ClusterCondition; `component` is a SEPARATE, independently
+ * updated field saying which row it currently renders under.
+ *
+ * Ruling 27 (Task 7 fix round 1, Critical 1). The previous version nested
+ * the fold under Event.Component first and (UID, Reason) second -- i.e. it
+ * treated Component as part of the condition's IDENTITY. It is not.
+ * internal/engine/attribution.go's ActiveAction is a moving cursor, empty
+ * between actions and outside Apply, so an arising condition and its own
+ * resolution routinely carry DIFFERENT Component values, or the resolution
+ * carries none at all -- that is the direct, unavoidable consequence of the
+ * temporal framing this whole feature is built on (Section 1 of the design
+ * doc), not a bug in the stamping. Nesting under Component first meant a
+ * resolution attributed to a LATER action created a brand-new entry on that
+ * later action's row instead of superseding the original -- the row that
+ * actually displayed the condition never saw the superseding entry and kept
+ * showing it, unresolved, forever. Exactly the failure
+ * internal/bus/cluster.go's own doc comment opens with: "a stale
+ * ImagePullBackOff ends up pinned to a row forever."
+ *
+ * Keeping identity flat on (UID, Reason) and placement as a trailing field
+ * means a resolution ALWAYS finds and updates the one entry that matters,
+ * regardless of which row either event was attributed to, or whether the
+ * resolution was attributed at all.
  */
-function foldClusterEvent(conditionsByAction: Map<string, Map<string, ClusterCondition>>, e: AicrEvent) {
-  if (!e.component || !isClusterData(e.data)) return
+interface TrackedCondition {
+  data: ClusterCondition
+  /**
+   * Row this condition currently renders under. Undefined when the
+   * condition has never been observed with an active action -- it still
+   * exists (so a later resolution or recurrence can supersede it), it just
+   * has nowhere to render, matching "unattributed events do not attach to
+   * any row". Only moves when a SUPERSEDING event itself carries a
+   * Component; an unattributed superseding event (between actions, or
+   * after the run's terminal state clears ActiveAction) still updates
+   * `data` -- that is what lets a between-actions resolution clear a row
+   * the arising condition was attributed to -- but leaves placement where
+   * it last was, rather than un-rendering a condition that has not
+   * actually changed rows.
+   */
+  component?: string
+}
+
+/**
+ * foldClusterEvent updates the flat (UID, Reason) identity map from one
+ * KindCluster event. Every cluster event is folded here, attributed or not
+ * -- see TrackedCondition's doc comment for why an unattributed event must
+ * still be able to supersede an existing entry rather than being dropped.
+ */
+function foldClusterEvent(tracked: Map<string, TrackedCondition>, e: AicrEvent) {
+  if (!isClusterData(e.data)) return
   const cond: ClusterCondition = { ...e.data, message: e.message }
   const key = conditionKey(cond)
-  let row = conditionsByAction.get(e.component)
-  if (!row) {
-    row = new Map()
-    conditionsByAction.set(e.component, row)
-  }
-  const prev = row.get(key)
-  if (!prev || clusterConditionSupersedes(cond, prev)) row.set(key, cond)
+  const prev = tracked.get(key)
+  if (prev && !clusterConditionSupersedes(cond, prev.data)) return
+  tracked.set(key, { data: cond, component: e.component || prev?.component })
 }
 
 /**
@@ -136,12 +192,22 @@ function foldClusterEvent(conditionsByAction: Map<string, Map<string, ClusterCon
  * in place -- it just stops competing to be shown. Returns undefined when
  * every condition on the row has resolved, which is a full clear: the row
  * genuinely has nothing outstanding, not "waiting on the next one."
+ *
+ * On an exact severity tie, the later At wins (Minor 4, Task 7 fix round
+ * 1). `conditions`' array order reflects Map insertion order -- i.e. when a
+ * (UID, Reason) FIRST arose, not its most recent update, since
+ * clusterConditionSupersedes updates a slot in place without moving it --
+ * so picking the first same-severity match would silently prefer whichever
+ * condition happened to arrive first and never budge again. The contract
+ * does not state a tie-break; "most recent" is the more defensible default
+ * of the two, and matches the At-primary rule Supersedes itself uses one
+ * level up.
  */
 export function activeCondition(conditions: ClusterCondition[]): ClusterCondition | undefined {
   let best: ClusterCondition | undefined
   for (const c of conditions) {
     if (c.resolved) continue
-    if (!best || c.severity > best.severity) best = c
+    if (!best || c.severity > best.severity || (c.severity === best.severity && c.at > best.at)) best = c
   }
   return best
 }
@@ -164,6 +230,22 @@ function relevantTo(events: AicrEvent[]): AicrEvent[] {
   const runId = currentRunIdOf(events)
   return runId ? events.filter(e => e.runId === runId) : events
 }
+
+/**
+ * RUN_RETRYING_MESSAGE is the exact KindPhase Message engine.Retry publishes
+ * (internal/engine/engine.go's Retry: `bus.Event{RunID: runID, Kind:
+ * bus.KindPhase, Message: "run retrying"}`) at the instant it starts
+ * re-executing a failed run. Ruling 28 (Task 7 fix round 1, Important 2):
+ * Retry reuses the SAME RunID -- attribution.go's own doc comment says so
+ * explicitly -- so relevantTo's RunID filter cannot tell attempt 1 from
+ * attempt 2, and a condition observed during the failed attempt would
+ * otherwise ride into the retried one forever, describing a pod the retry
+ * may have already replaced. This message is the signal that actually marks
+ * a new attempt starting; clearing tracked conditions here, not on a RunID
+ * change that never happens, uses the real boundary instead of a proxy for
+ * one that doesn't exist on this path.
+ */
+const RUN_RETRYING_MESSAGE = 'run retrying'
 
 /**
  * deriveComponents replays the current run's KindComponent events into one
@@ -202,18 +284,22 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
   const recipeSet = new Set(recipeComponentNames ?? [])
   const order: string[] = []
   const byName = new Map<string, ComponentState>()
-  // Keyed on Event.Component (the row), then on (UID, Reason) within that
-  // row -- kept apart from byName because a cluster event's Component names
-  // a row that may not have been assigned yet at this point in the replay
-  // (only the FINAL merge below requires the row to exist); accumulating
-  // conditions independently means fold order within this pass never
-  // matters to the result.
-  const conditionsByAction = new Map<string, Map<string, ClusterCondition>>()
+  // Flat on (UID, Reason) -- see TrackedCondition's doc comment (Ruling 27)
+  // for why Component must NOT be part of this map's key. Kept apart from
+  // byName because a cluster event's placement can name a row that hasn't
+  // been assigned yet at this point in the replay (only the FINAL merge
+  // below requires the row to exist); accumulating independently means fold
+  // order within this pass never matters to the result.
+  const tracked = new Map<string, TrackedCondition>()
   let lastRealComponent: string | undefined
 
   for (const e of relevantTo(events)) {
+    if (e.kind === 'phase' && e.message === RUN_RETRYING_MESSAGE) {
+      tracked.clear()
+      continue
+    }
     if (e.kind === 'cluster') {
-      foldClusterEvent(conditionsByAction, e)
+      foldClusterEvent(tracked, e)
       continue
     }
     if (e.kind !== 'component' || !isComponentData(e.data)) continue
@@ -236,9 +322,14 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
       parent: generated ? (existing?.parent ?? lastRealComponent) : undefined,
       startedAt: existing?.startedAt ?? (data.status === 'started' ? e.at : undefined),
       endedAt: data.status === 'installed' || data.status === 'failed' ? e.at : existing?.endedAt,
-      // Overwritten below once every event has been folded; empty here
-      // just keeps this object a valid ComponentState in the meantime.
-      conditions: existing?.conditions ?? [],
+      // `tracked` is the single source of truth for conditions -- it's
+      // computed once, below, after every event in the run has been folded,
+      // because a condition's placement can still move on a LATER event
+      // than this one (Ruling 27). Carrying `existing`'s conditions forward
+      // here would just be a second copy that the final map immediately
+      // discards; an empty placeholder makes that discarding obvious rather
+      // than implying this value ever gets read.
+      conditions: [],
     }
 
     if (!existing) order.push(data.name)
@@ -248,7 +339,7 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
 
   return order.map(name => ({
     ...byName.get(name)!,
-    conditions: [...(conditionsByAction.get(name)?.values() ?? [])],
+    conditions: [...tracked.values()].filter(t => t.component === name).map(t => t.data),
   }))
 }
 

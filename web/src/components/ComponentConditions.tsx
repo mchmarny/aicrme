@@ -11,24 +11,39 @@ const severityClass: Record<number, string> = {
  * activeCondition's pick, or nothing once every condition on the row has
  * resolved.
  *
- * The trailing note is deliberately "while installing", not "caused by" or
- * "owned by": attribution here is a TEMPORAL correlation, not a claim of
+ * The trailing note names `name`, the row's own action, and reads
+ * "while `<name>` installs" -- not "while installing" (Minor 2, Task 7 fix
+ * round 1): the spec's own phrasing (design doc line 69, "cluster activity
+ * while `<action>` installs") names the subject, and without it the
+ * participle dangles onto the nearest noun in the line, which is the
+ * resource, not the action. Still deliberately NOT "caused by" or "owned
+ * by": attribution here is a TEMPORAL correlation, not a claim of
  * ownership. deploy.sh explicitly warns that cluster convergence continues
- * asynchronously after `--wait` returns (deploy.sh.tmpl:488-492) -- Nodewright
- * alone can run 10-20 minutes past the script exiting -- so the console has
- * no basis to say this action's workloads produced the condition, only that
- * the observer saw it while this action was the one installing. See
+ * asynchronously after `--wait` returns (deploy.sh.tmpl:488-492) --
+ * Nodewright alone can run 10-20 minutes past the script exiting -- so the
+ * console has no basis to say this action's workloads produced the
+ * condition, only that the observer saw it while this action was the one
+ * installing. See
  * docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md, Section 1.
  */
 export function ComponentConditions({ name, conditions }: { name: string; conditions: ClusterCondition[] }) {
   const active = activeCondition(conditions)
   if (!active) return null
 
+  // internal/observer/pods.go's podMessage and events.go's
+  // eventMessage/eventResolutionMessage already embed the raw reason text in
+  // the message itself (e.g. "gpu-operator/pod: ImagePullBackOff"); handlers.go's
+  // Deployment/DaemonSet rollout messages ("3/8 ready") do not. Showing the
+  // reason label only when the message doesn't already say it avoids printing
+  // it twice for the former without losing it for the latter (Minor 3, Task 7
+  // fix round 1).
+  const reasonInMessage = active.message.includes(active.reason)
+
   return (
     <p data-testid={`condition-${name}`} className={`mt-1 max-w-2xl text-xs ${severityClass[active.severity] ?? 'text-slate-400'}`}>
-      <span className="font-mono">{active.reason}</span>
-      {active.message && <span className="ml-1 text-slate-500">{active.message}</span>}
-      <span className="ml-1 text-slate-600">(cluster activity while installing)</span>
+      {!reasonInMessage && <span className="font-mono">{active.reason}</span>}
+      {active.message && <span className={`text-slate-500 ${reasonInMessage ? '' : 'ml-1'}`}>{active.message}</span>}
+      <span className="ml-1 text-slate-600">(cluster activity while {name} installs)</span>
     </p>
   )
 }

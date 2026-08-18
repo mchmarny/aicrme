@@ -90,7 +90,7 @@ describe('Cockpit', () => {
 
     const gpuRow = screen.getByTestId('component-gpu-operator')
     expect(gpuRow.textContent).toMatch(/ImagePullBackOff/)
-    expect(gpuRow.textContent).toMatch(/while installing/i)
+    expect(gpuRow.textContent).toMatch(/while gpu-operator installs/i)
     expect(screen.getByTestId('component-cert-manager').textContent).not.toMatch(/ImagePullBackOff/)
   })
 

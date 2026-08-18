@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { activeCondition, deriveComponents, deriveFailure, deploymentActionsTotal, type ClusterCondition } from './pipeline'
+import { activeCondition, clusterConditionSupersedes, deriveComponents, deriveFailure, deploymentActionsTotal, type ClusterCondition } from './pipeline'
 import type { AicrEvent } from './useEvents'
 import applyRun from './fixtures/apply-run.json'
 
@@ -257,6 +257,146 @@ describe('deriveComponents cluster conditions', () => {
     expect(activeCondition(afterRecurrence.conditions)?.uid).toBe(podA)
     expect(activeCondition(afterRecurrence.conditions)?.resolved).toBeFalsy()
   })
+
+  // Ruling 27 (Task 7 fix round 1, Critical 1). Every fixture above holds
+  // `component` constant for its whole sequence -- exactly the blind spot
+  // the review named. Event.Component is a moving cursor
+  // (internal/engine/attribution.go's ActiveAction, empty between actions
+  // and outside Apply), so an arising condition and its own resolution
+  // routinely carry DIFFERENT Component values. This is that sequence.
+  it('a resolution attributed to a LATER action still clears the row that showed the arising condition', () => {
+    const timeline: AicrEvent[] = [
+      ...headers, // cert-manager x2, gpu-operator started
+      clusterEvent(4, 'gpu-operator', { uid: 'uid-1', reason: 'ImagePullBackOff', severity: 2, at: '2026-08-15T09:01:00Z' }, 'pod stuck'),
+      { id: 5, runId: 'run1', at: '2026-08-15T09:02:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'gpu-operator installed', data: { name: 'gpu-operator', status: 'installed' } },
+      { id: 6, runId: 'run1', at: '2026-08-15T09:02:01Z', kind: 'component', level: 'info', phase: 'apply', component: 'kai-scheduler', message: 'installing kai-scheduler', data: { name: 'kai-scheduler', index: 3, total: 3, status: 'started' } },
+      // The observer happened to see the resolution while kai-scheduler,
+      // not gpu-operator, was the active action -- the whole condition is
+      // the same (uid, reason) that arose on gpu-operator's watch.
+      clusterEvent(7, 'kai-scheduler', { uid: 'uid-1', reason: 'ImagePullBackOff', severity: 2, resolved: true, at: '2026-08-15T09:03:00Z' }, 'pod recovered'),
+    ]
+
+    const rows = deriveComponents(timeline, undefined)
+    const gpuOperator = rows.find(c => c.name === 'gpu-operator')!
+    const kaiScheduler = rows.find(c => c.name === 'kai-scheduler')!
+
+    // The row that showed it unresolved must not keep showing it: the
+    // resolution superseded the SAME (uid, reason) entry regardless of
+    // which row it landed on.
+    expect(activeCondition(gpuOperator.conditions)).toBeUndefined()
+    // The entry now lives wherever it was last observed -- present, but
+    // resolved conditions never render (activeCondition skips them), so
+    // kai-scheduler's row shows nothing either.
+    expect(kaiScheduler.conditions).toHaveLength(1)
+    expect(activeCondition(kaiScheduler.conditions)).toBeUndefined()
+  })
+
+  it('a resolution published with NO attribution at all still clears the row that showed the arising condition', () => {
+    const timeline: AicrEvent[] = [
+      ...headers,
+      clusterEvent(4, 'gpu-operator', { uid: 'uid-2', reason: 'CrashLoopBackOff', severity: 2, at: '2026-08-15T09:01:00Z' }, 'pod crashlooping'),
+      { id: 5, runId: 'run1', at: '2026-08-15T09:02:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'gpu-operator installed', data: { name: 'gpu-operator', status: 'installed' } },
+      // No Component: ActiveAction is empty between actions
+      // (attribution.go's clearActiveAction) or after the run's terminal
+      // state. The resolution must not be dropped just because there is
+      // nowhere new to place it -- it still supersedes wherever the
+      // condition already lives.
+      clusterEvent(6, undefined, { uid: 'uid-2', reason: 'CrashLoopBackOff', severity: 2, resolved: true, at: '2026-08-15T09:03:00Z' }, 'pod recovered'),
+    ]
+
+    const rows = deriveComponents(timeline, undefined)
+    const gpuOperator = rows.find(c => c.name === 'gpu-operator')!
+    expect(gpuOperator.conditions).toHaveLength(1)
+    expect(activeCondition(gpuOperator.conditions)).toBeUndefined()
+  })
+
+  // Ruling 28 (Task 7 fix round 1, Important 2). engine.Retry reuses the
+  // SAME RunID, so relevantTo's RunID filter cannot separate attempt 1 from
+  // the retried attempt 2 -- a condition from the failed attempt would
+  // otherwise describe a pod the retry may have already replaced, forever.
+  it('clears tracked conditions on "run retrying", so a failed attempt does not leak into the retry', () => {
+    const timeline: AicrEvent[] = [
+      { id: 1, runId: 'run1', at: '2026-08-15T09:00:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'installing gpu-operator', data: { name: 'gpu-operator', index: 1, total: 1, status: 'started' } },
+      clusterEvent(2, 'gpu-operator', { uid: 'uid-old-pod', reason: 'CrashLoopBackOff', severity: 2, at: '2026-08-15T09:00:30Z' }, 'attempt 1 pod crashlooping'),
+      { id: 3, runId: 'run1', at: '2026-08-15T09:01:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'gpu-operator failed', data: { name: 'gpu-operator', status: 'failed', attempt: 1, maxAttempts: 2 } },
+      // engine.go's Retry: bus.Event{RunID: runID, Kind: bus.KindPhase, Message: "run retrying"} -- same RunID.
+      { id: 4, runId: 'run1', at: '2026-08-15T09:01:30Z', kind: 'phase', level: 'info', message: 'run retrying' },
+      { id: 5, runId: 'run1', at: '2026-08-15T09:01:31Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'installing gpu-operator', data: { name: 'gpu-operator', index: 1, total: 1, status: 'started' } },
+    ]
+
+    const rows = deriveComponents(timeline, undefined)
+    const gpuOperator = rows.find(c => c.name === 'gpu-operator')!
+    expect(gpuOperator.conditions).toHaveLength(0)
+  })
+})
+
+describe('clusterConditionSupersedes', () => {
+  function cond(overrides: Partial<ClusterCondition>): ClusterCondition {
+    return {
+      kind: 'Pod', namespace: 'gpu-operator', name: 'a-pod', uid: 'uid-1', reason: 'ImagePullBackOff',
+      severity: 1, resolved: false, at: '2026-08-15T09:00:00Z', message: 'm', ...overrides,
+    }
+  }
+
+  // Important 1 (Task 7 fix round 1): an unconditional `return true` after
+  // the UID/Reason guard left the suite fully green, because nothing below
+  // that guard had a falsifier. Each test here pins exactly one branch.
+
+  it('never supersedes across a different UID or a different Reason, however much later or more severe', () => {
+    const prev = cond({ uid: 'uid-1', reason: 'ImagePullBackOff', at: '2026-08-15T09:00:00Z' })
+    expect(clusterConditionSupersedes(cond({ uid: 'uid-2', reason: 'ImagePullBackOff', severity: 2, resolved: true, at: '2026-08-15T09:05:00Z' }), prev)).toBe(false)
+    expect(clusterConditionSupersedes(cond({ uid: 'uid-1', reason: 'CrashLoopBackOff', severity: 2, resolved: true, at: '2026-08-15T09:05:00Z' }), prev)).toBe(false)
+  })
+
+  it('At is primary: a later event supersedes even with lower severity and unresolved', () => {
+    const prev = cond({ severity: 2, resolved: true, at: '2026-08-15T09:00:00Z' })
+    const next = cond({ severity: 0, resolved: false, at: '2026-08-15T09:01:00Z' })
+    expect(clusterConditionSupersedes(next, prev)).toBe(true)
+  })
+
+  it('an earlier event never supersedes, even if resolved and higher severity', () => {
+    const prev = cond({ severity: 0, resolved: false, at: '2026-08-15T09:01:00Z' })
+    const stale = cond({ severity: 2, resolved: true, at: '2026-08-15T09:00:00Z' })
+    expect(clusterConditionSupersedes(stale, prev)).toBe(false)
+  })
+
+  it('a same-At tie breaks on Resolved first, whatever Severity says', () => {
+    const at = '2026-08-15T09:00:00Z'
+    const unresolvedHighSeverity = cond({ severity: 2, resolved: false, at })
+    const resolvedLowSeverity = cond({ severity: 0, resolved: true, at })
+    expect(clusterConditionSupersedes(resolvedLowSeverity, unresolvedHighSeverity)).toBe(true)
+    expect(clusterConditionSupersedes(unresolvedHighSeverity, resolvedLowSeverity)).toBe(false)
+  })
+
+  it('a same-At, same-Resolved tie breaks on Severity', () => {
+    const at = '2026-08-15T09:00:00Z'
+    const low = cond({ severity: 0, resolved: false, at })
+    const high = cond({ severity: 2, resolved: false, at })
+    expect(clusterConditionSupersedes(high, low)).toBe(true)
+    expect(clusterConditionSupersedes(low, high)).toBe(false)
+  })
+
+  // Minor 1 (Task 7 fix round 1): Date.parse truncates Go's nanosecond At to
+  // milliseconds, so two events inside the same millisecond read as a tie
+  // in TS while Go orders them strictly -- and a malformed At produced NaN,
+  // which is never greater than anything, pinning the entry permanently.
+  // String comparison (RFC3339, always UTC on this wire) fixes both.
+
+  it('orders by At down to sub-millisecond precision, which Date.parse would truncate away', () => {
+    const prev = cond({ ready: 3, at: '2026-08-15T09:00:00.000000001Z' })
+    const next = cond({ ready: 4, at: '2026-08-15T09:00:00.000000900Z' })
+    expect(clusterConditionSupersedes(next, prev)).toBe(true)
+    expect(clusterConditionSupersedes(prev, next)).toBe(false)
+  })
+
+  it('a malformed At produces a determinate order rather than pinning the entry forever (no NaN comparison)', () => {
+    const malformed = cond({ at: 'not-a-real-timestamp' })
+    const wellFormed = cond({ at: '2026-08-15T09:00:00Z' })
+    // Date.parse(malformed) is NaN, and NaN > x and x > NaN are BOTH false
+    // -- neither direction could ever supersede the other, pinning whichever
+    // arrived first. Exactly one direction must hold here.
+    expect(clusterConditionSupersedes(wellFormed, malformed)).not.toBe(clusterConditionSupersedes(malformed, wellFormed))
+  })
 })
 
 describe('activeCondition', () => {
@@ -277,5 +417,16 @@ describe('activeCondition', () => {
   it('returns undefined once every condition on the row is resolved', () => {
     const resolved = condition({ severity: 2, resolved: true })
     expect(activeCondition([resolved])).toBeUndefined()
+  })
+
+  // Minor 4 (Task 7 fix round 1): array order reflects Map insertion order
+  // -- when a (UID, Reason) FIRST arose, not its most recent update -- so a
+  // naive "first same-severity match wins" would pin the earliest-seen
+  // condition forever, however stale, over one that just recurred.
+  it('on an exact severity tie, prefers the later At, not the first-seen entry', () => {
+    const older = condition({ uid: 'uid-old', reason: 'CrashLoopBackOff', severity: 2, at: '2026-08-15T09:01:00Z' })
+    const newer = condition({ uid: 'uid-new', reason: 'ImagePullBackOff', severity: 2, at: '2026-08-15T09:09:00Z' })
+    expect(activeCondition([older, newer])?.uid).toBe('uid-new')
+    expect(activeCondition([newer, older])?.uid).toBe('uid-new')
   })
 })
