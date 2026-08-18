@@ -51,27 +51,61 @@ func TestSupersedesPrefersNewerAtEqualSeverity(t *testing.T) {
 	}
 }
 
-// Breaks if the Resolved check is removed, or inverted (see the Step 6
-// bite-proof), or reordered after the severity/At checks. resolved here
-// deliberately has BOTH a lower severity AND an earlier At than unresolved,
-// so any of those other fields deciding the outcome first would also flip
-// this test -- it is not enough for the Resolved branch to merely exist, it
-// has to run first and win.
+// Rewritten under Task 5 fix round 1 (Rulings 14/15): the old contract --
+// "a resolved condition always supersedes, whatever the severity or At" --
+// let a stale resolution permanently mask a live recurrence (see
+// TestUnresolvedRecurrenceSupersedesTheOlderResolution, the sibling this
+// ruling requires). Resolved is no longer an unconditional trump card; it
+// only breaks a tie between two events sharing the exact same At. This test
+// pins that narrower, corrected role: resolved and unresolved published at
+// the identical instant (the shape two publish() calls made back to back in
+// the same handler invocation, before this fix's (b) half, could produce)
+// still favor the resolved one, because a false "still broken" is the safer
+// wrong answer of the two at a genuine tie.
 func TestResolvedConditionSupersedesUnresolved(t *testing.T) {
+	at := time.Unix(200, 0)
 	unresolved := bus.ClusterData{
 		UID: "ds-uid", Reason: "ImagePullBackOff",
-		Severity: bus.SeverityError, At: time.Unix(200, 0),
+		Severity: bus.SeverityError, At: at,
 	}
 	resolved := bus.ClusterData{
 		UID: "ds-uid", Reason: "ImagePullBackOff",
-		Severity: bus.SeverityInfo, Resolved: true, At: time.Unix(100, 0),
+		Severity: bus.SeverityInfo, Resolved: true, At: at,
 	}
 
 	if !resolved.Supersedes(unresolved) {
-		t.Errorf("resolved.Supersedes(unresolved) = false, want true (lower severity and earlier At must not matter)")
+		t.Errorf("resolved.Supersedes(unresolved) = false, want true at equal At (lower severity must not matter)")
 	}
 	if unresolved.Supersedes(resolved) {
-		t.Errorf("unresolved.Supersedes(resolved) = true, want false")
+		t.Errorf("unresolved.Supersedes(resolved) = true, want false at equal At")
+	}
+}
+
+// TestUnresolvedRecurrenceSupersedesTheOlderResolution is Ruling 15's
+// required sibling, pinning the property the rewrite above exists to fix: a
+// condition that genuinely resolved and then genuinely recurs -- say
+// CrashLoopBackOff, then Running, then CrashLoopBackOff again -- must re-arm
+// the row. Under the old "resolved always wins, whatever the severity"
+// rule this failed outright: the review that forced this rewrite
+// demonstrated `again.Supersedes(resolved) == false`, meaning the row's
+// entry stayed marked Resolved: true while the pod was actively
+// crash-looping a second time. Now At decides it: the recurrence's later
+// timestamp is what makes it win, regardless of Resolved or Severity.
+func TestUnresolvedRecurrenceSupersedesTheOlderResolution(t *testing.T) {
+	resolved := bus.ClusterData{
+		UID: "ds-uid", Reason: "CrashLoopBackOff",
+		Severity: bus.SeverityInfo, Resolved: true, At: time.Unix(100, 0),
+	}
+	recurred := bus.ClusterData{
+		UID: "ds-uid", Reason: "CrashLoopBackOff",
+		Severity: bus.SeverityError, Resolved: false, At: time.Unix(200, 0),
+	}
+
+	if !recurred.Supersedes(resolved) {
+		t.Errorf("recurred.Supersedes(resolved) = false, want true: a later recurrence must re-arm the row")
+	}
+	if resolved.Supersedes(recurred) {
+		t.Errorf("resolved.Supersedes(recurred) = true, want false: an older resolution must never mask a live recurrence")
 	}
 }
 

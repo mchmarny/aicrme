@@ -3,6 +3,7 @@ package observer
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +28,7 @@ const podTestNamespace = "gpu-operator"
 // 2s floor for no reason. Start (the cluster-wide DaemonSet/Deployment/Node
 // factory) is never called: no Pod test needs it, and the whole point of
 // scoped.go's lazy lifecycle is that Pods/Events do not ride that factory.
-func newScopedPodTestObserver(t *testing.T, client *fake.Clientset) <-chan bus.Event {
+func newScopedPodTestObserver(t *testing.T, client *fake.Clientset) (*Observer, <-chan bus.Event) {
 	t.Helper()
 	b := bus.New(64)
 	sub, unsub := b.Subscribe(0)
@@ -45,29 +46,36 @@ func newScopedPodTestObserver(t *testing.T, client *fake.Clientset) <-chan bus.E
 	}
 	waitFor(t, entry.pod.HasSynced)
 
-	return sub
+	return o, sub
 }
 
-// waitForEvent blocks for up to within for the next published event, failing
-// the test on timeout instead of checking immediately: unlike
+// podEventWait bounds how long these tests wait for a real informer to
+// deliver an event it is expected to. Every waitForEvent/waitForClusterData
+// call site in this file wants the same bound, so it is a constant rather
+// than a threaded-through parameter (an unused degree of freedom golangci-
+// lint's unparam correctly flags when nothing varies it).
+const podEventWait = 2 * time.Second
+
+// waitForEvent blocks for up to podEventWait for the next published event,
+// failing the test on timeout instead of checking immediately: unlike
 // handlers_internal_test.go's decodeClusterData (which calls handlers
 // directly, so bus.Publish has already run by the time the call returns),
 // these tests drive a real informer whose delivery is asynchronous relative
 // to the fake clientset call that triggered it.
-func waitForEvent(t *testing.T, sub <-chan bus.Event, within time.Duration) bus.Event {
+func waitForEvent(t *testing.T, sub <-chan bus.Event) bus.Event {
 	t.Helper()
 	select {
 	case e := <-sub:
 		return e
-	case <-time.After(within):
+	case <-time.After(podEventWait):
 		t.Fatal("no event published within deadline")
 		return bus.Event{}
 	}
 }
 
-func waitForClusterData(t *testing.T, sub <-chan bus.Event, within time.Duration) bus.ClusterData {
+func waitForClusterData(t *testing.T, sub <-chan bus.Event) bus.ClusterData {
 	t.Helper()
-	e := waitForEvent(t, sub, within)
+	e := waitForEvent(t, sub)
 	var cd bus.ClusterData
 	if err := json.Unmarshal(e.Data, &cd); err != nil {
 		t.Fatalf("Unmarshal(ClusterData) error = %v, raw = %s", err, e.Data)
@@ -174,14 +182,14 @@ func TestPodNarratesImagePullBackOff(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			client := fake.NewSimpleClientset()
-			sub := newScopedPodTestObserver(t, client)
+			_, sub := newScopedPodTestObserver(t, client)
 
 			pod := tc.mutate(testPod("pod-uid"))
 			if _, err := client.CoreV1().Pods(podTestNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 				t.Fatalf("Create() error = %v", err)
 			}
 
-			cd := waitForClusterData(t, sub, 2*time.Second)
+			cd := waitForClusterData(t, sub)
 			if cd.Kind != kindPod {
 				t.Errorf("Kind = %q, want %q", cd.Kind, kindPod)
 			}
@@ -212,7 +220,7 @@ func TestPodNarratesImagePullBackOff(t *testing.T) {
 func TestPodDoesNotNarrateHealthyTransitions(t *testing.T) {
 	initial := testPod("pod-uid")
 	client := fake.NewSimpleClientset(initial)
-	sub := newScopedPodTestObserver(t, client)
+	_, sub := newScopedPodTestObserver(t, client)
 
 	running := withRunning(testPod("pod-uid"), "app")
 	if _, err := client.CoreV1().Pods(podTestNamespace).Update(context.Background(), running, metav1.UpdateOptions{}); err != nil {
@@ -232,14 +240,14 @@ func TestPodDoesNotNarrateHealthyTransitions(t *testing.T) {
 func TestPodConditionResolves(t *testing.T) {
 	broken := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
 	client := fake.NewSimpleClientset(broken)
-	sub := newScopedPodTestObserver(t, client)
+	_, sub := newScopedPodTestObserver(t, client)
 
 	healthy := withRunning(testPod("pod-uid"), "app")
 	if _, err := client.CoreV1().Pods(podTestNamespace).Update(context.Background(), healthy, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 
-	cd := waitForClusterData(t, sub, 2*time.Second)
+	cd := waitForClusterData(t, sub)
 	if cd.Reason != reasonImagePullBackOff {
 		t.Errorf("Reason = %q, want %q (the reason it resolved FROM)", cd.Reason, reasonImagePullBackOff)
 	}
@@ -258,7 +266,7 @@ func TestPodConditionResolves(t *testing.T) {
 func TestPodInitialListDoesNotNarrate(t *testing.T) {
 	broken := withContainerWaiting(testPod("pod-uid"), "app", reasonCrashLoopBackOff)
 	client := fake.NewSimpleClientset(broken)
-	sub := newScopedPodTestObserver(t, client)
+	_, sub := newScopedPodTestObserver(t, client)
 
 	if events := collectPodEvents(sub, time.Second); len(events) != 0 {
 		t.Fatalf("published %d events for the initial list, want 0: %+v", len(events), events)
@@ -272,14 +280,14 @@ func TestPodInitialListDoesNotNarrate(t *testing.T) {
 // Reason/Severity are what the row displays and ranks by.
 func TestPodEmitsTypedClusterData(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	sub := newScopedPodTestObserver(t, client)
+	_, sub := newScopedPodTestObserver(t, client)
 
 	pod := withContainerWaiting(testPod("pod-typed-uid"), "trainer", reasonImagePullBackOff)
 	if _, err := client.CoreV1().Pods(podTestNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	cd := waitForClusterData(t, sub, 2*time.Second)
+	cd := waitForClusterData(t, sub)
 	if cd.Kind != kindPod {
 		t.Errorf("Kind = %q, want %q", cd.Kind, kindPod)
 	}
@@ -300,13 +308,70 @@ func TestPodEmitsTypedClusterData(t *testing.T) {
 // TestPodDeleteClearsTrackedTrouble is Ruling 5's binding requirement for the
 // kind this task introduces: a pod that goes away while its trouble
 // condition is still unresolved must not leave that condition pinned to its
-// row forever. Seeded via onPodAdd's initial-list path directly -- the only
-// way this observer ever records a Pod's trouble -- rather than through a
-// full informer, matching handlers_internal_test.go's own rationale for
-// testing onDelete's effect by direct call: nothing observable over the bus
-// distinguishes a working delete-clearing path from a stub one except the
-// publish itself.
+// row forever.
+//
+// Rewritten under Ruling 15 (Task 5 fix round 1): the original version
+// seeded via onPodAdd's INITIAL-LIST path (isInInitialList=true), which
+// never narrates -- so it was actually pinning a defect (Important 3): a
+// delete manufacturing a "resolved" event for a condition no consumer was
+// ever shown. This version seeds via a LATER Add (isInInitialList=false),
+// which does narrate, so the condition being cleared here is one the
+// operator's timeline genuinely reported as arising.
+// TestPodDeleteOfASeededButNeverNarratedTroublePublishesNothing is the
+// required sibling pinning the corrected initial-list case.
 func TestPodDeleteClearsTrackedTrouble(t *testing.T) {
+	o, sub := newTestObserver(t)
+	pod := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
+
+	o.onPodAdd(pod, false) // a later Add: this DOES narrate
+	select {
+	case e := <-sub:
+		if e.Message == "" {
+			t.Fatal("onPodAdd(isInInitialList=false) published an empty message; test setup failure")
+		}
+	default:
+		t.Fatal("onPodAdd(isInInitialList=false) did not narrate; test setup failure")
+	}
+
+	o.onDelete(pod)
+
+	select {
+	case e := <-sub:
+		if !strings.Contains(e.Message, "removed") {
+			t.Errorf("Message = %q, want it to say removed -- the pod was deleted, it did not recover", e.Message)
+		}
+		if strings.Contains(e.Message, "resolved") {
+			t.Errorf("Message = %q, must not say resolved for a deleted pod", e.Message)
+		}
+		var cd bus.ClusterData
+		if err := json.Unmarshal(e.Data, &cd); err != nil {
+			t.Fatalf("Unmarshal(ClusterData) error = %v, raw = %s", err, e.Data)
+		}
+		if cd.UID != "pod-uid" {
+			t.Errorf("UID = %q, want %q", cd.UID, "pod-uid")
+		}
+		if cd.Reason != reasonImagePullBackOff {
+			t.Errorf("Reason = %q, want %q", cd.Reason, reasonImagePullBackOff)
+		}
+		if cd.Container != "app" {
+			t.Errorf("Container = %q, want %q", cd.Container, "app")
+		}
+		if !cd.Resolved {
+			t.Error("Resolved = false, want true: pod deletion must clear the row")
+		}
+	default:
+		t.Fatal("no event published for deleting a narrated trouble")
+	}
+}
+
+// TestPodDeleteOfASeededButNeverNarratedTroublePublishesNothing is Ruling
+// 15's required sibling: a pod already broken in an informer's initial list
+// is seeded silently (onPodAdd's isInInitialList=true path -- see
+// TestPodInitialListDoesNotNarrate), and its deletion must not manufacture a
+// "removed" event for a condition no consumer was ever shown (Important 3,
+// Task 5 fix round 1; podCondition.narrated is what makes onDelete able to
+// tell the two cases apart).
+func TestPodDeleteOfASeededButNeverNarratedTroublePublishesNothing(t *testing.T) {
 	o, sub := newTestObserver(t)
 	pod := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
 
@@ -315,19 +380,7 @@ func TestPodDeleteClearsTrackedTrouble(t *testing.T) {
 
 	o.onDelete(pod)
 
-	cd := decodeClusterData(t, sub)
-	if cd.UID != "pod-uid" {
-		t.Errorf("UID = %q, want %q", cd.UID, "pod-uid")
-	}
-	if cd.Reason != reasonImagePullBackOff {
-		t.Errorf("Reason = %q, want %q", cd.Reason, reasonImagePullBackOff)
-	}
-	if cd.Container != "app" {
-		t.Errorf("Container = %q, want %q", cd.Container, "app")
-	}
-	if !cd.Resolved {
-		t.Error("Resolved = false, want true: pod deletion must clear the row")
-	}
+	assertNoEvent(t, sub)
 }
 
 // TestPodDeleteOfAHealthyPodPublishesNothing matches
@@ -343,4 +396,119 @@ func TestPodDeleteOfAHealthyPodPublishesNothing(t *testing.T) {
 	o.onDelete(pod)
 
 	assertNoEvent(t, sub)
+}
+
+// TestPodReasonChangeWhileStillBrokenDoesNotPublishAFalseResolve pins
+// Ruling 14(b) (Task 5 fix round 1) against the exact scenario the review
+// demonstrated: kubelet alternates ErrImagePull and ImagePullBackOff every
+// backoff cycle on one continuously-stuck pull. The review's probe showed 7
+// bus events for 4 such cycles, 3 of them a false "resolved" for a pod that
+// never recovered. This test drives the identical 4-cycle oscillation and
+// asserts on the payload of every event published: exactly one per Reason
+// change (never a "resolved" then a re-arrival for the same transition), and
+// Resolved is never true while the pod never stops being broken.
+func TestPodReasonChangeWhileStillBrokenDoesNotPublishAFalseResolve(t *testing.T) {
+	o, sub := newTestObserver(t)
+	pod := testPod("pod-uid")
+
+	reasons := []string{reasonErrImagePull, reasonImagePullBackOff, reasonErrImagePull, reasonImagePullBackOff}
+	for _, r := range reasons {
+		o.onPodUpdate(nil, withContainerWaiting(pod, "app", r))
+	}
+
+	got := make([]bus.ClusterData, 0, len(reasons))
+	for i := range reasons {
+		select {
+		case e := <-sub:
+			var cd bus.ClusterData
+			if err := json.Unmarshal(e.Data, &cd); err != nil {
+				t.Fatalf("Unmarshal(ClusterData) error = %v, raw = %s", err, e.Data)
+			}
+			got = append(got, cd)
+		default:
+			t.Fatalf("only %d of %d expected transitions were narrated", i, len(reasons))
+		}
+	}
+	assertNoEvent(t, sub) // exactly one event per transition -- no extra resolves
+
+	for i, cd := range got {
+		if cd.Resolved {
+			t.Errorf("event %d (Reason=%q) published Resolved=true while the pod was still broken -- false narration", i, cd.Reason)
+		}
+		if cd.Reason != reasons[i] {
+			t.Errorf("event %d Reason = %q, want %q", i, cd.Reason, reasons[i])
+		}
+		if cd.Container != "app" {
+			t.Errorf("event %d Container = %q, want %q", i, cd.Container, "app")
+		}
+	}
+}
+
+// TestPodHighestSeverityTroubleWinsAcrossContainers pins the Minor finding
+// (Task 5 fix round 1): podTrouble must not report whichever container's
+// waiting reason happens to sort first in ContainerStatuses. "puller" (Warn,
+// ImagePullBackOff) is placed before "worker" (Error, CrashLoopBackOff) in
+// the slice specifically so a first-in-slice implementation would report
+// the wrong one -- the review's probe showed exactly that (0 further events
+// for the CrashLoopBackOff container, ever).
+func TestPodHighestSeverityTroubleWinsAcrossContainers(t *testing.T) {
+	o, sub := newTestObserver(t)
+	pod := testPod("pod-uid")
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: "puller", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonImagePullBackOff}}},
+		{Name: "worker", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}}},
+	}
+
+	o.onPodUpdate(nil, pod)
+
+	cd := decodeClusterData(t, sub)
+	if cd.Reason != reasonCrashLoopBackOff {
+		t.Errorf("Reason = %q, want %q: the higher-severity condition must not be hidden by container order", cd.Reason, reasonCrashLoopBackOff)
+	}
+	if cd.Container != "worker" {
+		t.Errorf("Container = %q, want %q", cd.Container, "worker")
+	}
+	if cd.Severity != bus.SeverityError {
+		t.Errorf("Severity = %v, want %v", cd.Severity, bus.SeverityError)
+	}
+}
+
+// TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown pins Important 4
+// (Task 5 fix round 1). The review demonstrated, end to end through a real
+// informer, that o.pods stranded an entry across teardown + pod deletion +
+// a new run: Task 4's teardown is immediate on RunScope.Terminal, so a pod
+// deleted after that point is never delivered to onDelete, and nothing else
+// cleared the entry. scopedInformers.onNamespaceStop (wired to
+// Observer.clearNamespacePods in New) now runs on every teardown, which this
+// drives directly via o.scoped.reconcile rather than through run()'s
+// bus/ticker machinery -- same rationale as newScopedPodTestObserver.
+func TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	o, sub := newScopedPodTestObserver(t, client)
+
+	pod := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
+	if _, err := client.CoreV1().Pods(podTestNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	waitForClusterData(t, sub) // wait for the trouble to be narrated and recorded
+
+	o.mu.Lock()
+	before := len(o.pods)
+	o.mu.Unlock()
+	if before != 1 {
+		t.Fatalf("o.pods before teardown = %d entries, want 1; test setup failure", before)
+	}
+
+	o.scoped.reconcile(terminalScope(podTestNamespace))
+
+	o.mu.Lock()
+	after := len(o.pods)
+	stranded := make(map[stateKey]podCondition, len(o.pods))
+	for k, v := range o.pods {
+		stranded[k] = v
+	}
+	o.mu.Unlock()
+	if after != 0 {
+		t.Errorf("o.pods after the namespace's informer tore down = %d entries, want 0 -- stranded: %+v", after, stranded)
+	}
 }

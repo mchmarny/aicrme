@@ -165,13 +165,20 @@ func (o *Observer) onDelete(obj any) {
 		prev, had := o.pods[key]
 		delete(o.pods, key)
 		o.mu.Unlock()
-		if !had {
-			// No tracked trouble -- either the pod was healthy, or this
-			// observer never saw it. Either way there is no condition on any
-			// row to clear.
+		if !had || !prev.narrated {
+			// No tracked trouble, or the trouble was only ever seeded
+			// silently from an informer's initial list and never actually
+			// narrated (Important 3, Task 5 fix round 1) -- either way there
+			// is no condition on any row a consumer was ever shown, and
+			// publishing a resolution for one would invent a phantom entry
+			// exactly like this comment already warns against for the other
+			// three kinds.
 			return
 		}
-		o.publish(t.Namespace, podMessage(t, prev, true), podClusterData(t, prev, true))
+		// "removed", not "resolved": the pod did not recover, it was
+		// deleted. The three cluster-scoped kinds above say "removed" for
+		// the identical reason.
+		o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), podClusterData(t, prev, true))
 	}
 }
 

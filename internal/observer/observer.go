@@ -144,8 +144,33 @@ func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observ
 		// ResourceEventHandlerDetailedFuncs.OnAdd/OnUpdate/OnDelete each
 		// check for nil before calling through -- so registering it now
 		// costs nothing and needs no follow-up change to scoped.go.
-	})
+	}, o.clearNamespacePods)
 	return o
+}
+
+// clearNamespacePods drops every tracked Pod trouble condition in ns. Wired
+// as scopedInformers' onNamespaceStop callback, invoked whenever ns's
+// factories are torn down -- run termination, a scope change that drops ns,
+// or process shutdown (Important 4, Task 5 fix round 1). Without this,
+// o.pods entries for a torn-down namespace are stranded permanently: Task
+// 4's teardown is immediate on RunScope.Terminal, so a pod deleted after
+// that point is never delivered to onDelete, and nothing else would ever
+// evict the entry.
+//
+// Deliberately does not publish anything: tearing down does not mean the
+// pods it was watching are fixed, removed, or in any particular state --
+// this process simply stopped being able to say anything more about them.
+// Publishing a resolution here would be inventing a claim this observer
+// cannot back, the same failure mode Ruling 14/Important 3 just fixed
+// elsewhere in this file.
+func (o *Observer) clearNamespacePods(ns string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for key := range o.pods {
+		if key.namespace == ns {
+			delete(o.pods, key)
+		}
+	}
 }
 
 // Start registers handlers and starts the informers. It returns once caches

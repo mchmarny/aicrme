@@ -49,19 +49,32 @@ import (
 // terminal, and a dropped bus event costs one missed wakeup, not permanent
 // divergence -- see run's doc comment for what bounds that cost.
 
-// factoryEntry is one namespace's Pod/Event watch: its own
-// SharedInformerFactory plus the two informers materialized on it, and the
-// stop channel that owns their lifetime independently of the process-wide
-// stopCh the three cluster-scoped informers in observer.go share. Handlers
-// are registered on pod and event in startNamespace, using the
-// scopedHandlers this type's owning scopedInformers was constructed with --
-// this type itself only makes the informers exist and keeps their lifetime
-// correct.
+// factoryEntry is one namespace's Pod/Event watch: TWO SharedInformerFactory
+// instances (not one) plus the informer materialized on each, and the stop
+// channel that owns their lifetime independently of the process-wide stopCh
+// the three cluster-scoped informers in observer.go share. Handlers are
+// registered on pod and event in startNamespace, using the scopedHandlers
+// this type's owning scopedInformers was constructed with -- this type
+// itself only makes the informers exist and keeps their lifetime correct.
+//
+// Two factories, not one, is Important 2's fix (Task 5 fix round 1): a
+// SharedInformerFactory's WithTweakListOptions applies to every informer
+// built from it -- ONE factory-level field
+// (client-go@v0.36.3/informers/factory.go:62,91,398 --
+// `core.New(f, f.namespace, f.tweakListOptions)`), not a per-informer
+// setting. Task 6 needs `FieldSelector: "type=Warning"` on the Event
+// ListWatch only; `type` is not a supported Pod field selector, so sharing
+// one factory between the two would make the Event tweak apply to the Pod
+// ListWatch too and the API server would reject it -- this namespace's Pod
+// informer, this task's entire deliverable, would never sync. Splitting the
+// factory now means Task 6 carries its tweak on its own factory without
+// reopening this file a second time.
 type factoryEntry struct {
-	factory informers.SharedInformerFactory
-	pod     cache.SharedIndexInformer
-	event   cache.SharedIndexInformer
-	stop    chan struct{}
+	podFactory   informers.SharedInformerFactory
+	eventFactory informers.SharedInformerFactory
+	pod          cache.SharedIndexInformer
+	event        cache.SharedIndexInformer
+	stop         chan struct{}
 }
 
 // scopedHandlers holds the ResourceEventHandlerDetailedFuncs each
@@ -100,6 +113,19 @@ type scopedHandlers struct {
 type scopedInformers struct {
 	client   kubernetes.Interface
 	handlers scopedHandlers
+	// onNamespaceStop, if non-nil, is called with a namespace's name every
+	// time that namespace's factories are torn down -- both when its run
+	// ends/changes (stopAllLocked) and when it individually drops out of a
+	// continuing run's scope (reconcile's per-namespace removal loop).
+	// Important 4 (Task 5 fix round 1): Task 4's teardown is immediate on
+	// RunScope.Terminal, so a pod deleted after that point is never
+	// delivered to onDelete, and nothing else would clear the namespace-
+	// scoped state Task 5/6's handlers accumulate (Observer.pods here).
+	// scopedInformers has no reference to the Observer that owns that
+	// state -- same reasoning as scopedHandlers' own doc comment for why
+	// this is a callback passed in at construction, not a field reached for
+	// the other way.
+	onNamespaceStop func(ns string)
 
 	mu sync.Mutex
 	// runID is the run these entries belong to, or "" when nothing is
@@ -110,8 +136,13 @@ type scopedInformers struct {
 	entries map[string]*factoryEntry
 }
 
-func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers) *scopedInformers {
-	return &scopedInformers{client: client, handlers: handlers, entries: make(map[string]*factoryEntry)}
+func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers, onNamespaceStop func(ns string)) *scopedInformers {
+	return &scopedInformers{
+		client:          client,
+		handlers:        handlers,
+		onNamespaceStop: onNamespaceStop,
+		entries:         make(map[string]*factoryEntry),
+	}
 }
 
 // reconcile starts and stops per-namespace factories so the live set matches
@@ -154,8 +185,7 @@ func (s *scopedInformers) reconcile(sc RunScope) {
 
 	for ns, e := range s.entries {
 		if _, ok := sc.Namespaces[ns]; !ok {
-			close(e.stop)
-			delete(s.entries, ns)
+			s.stopNamespaceLocked(ns, e)
 		}
 	}
 	for ns := range sc.Namespaces {
@@ -173,16 +203,34 @@ func (s *scopedInformers) reconcile(sc RunScope) {
 // must hold s.mu; the goroutine launched here touches only the factory and
 // stop values it closes over, never s itself, so it needs no lock of its
 // own.
+//
+// AddEventHandler errors below are logged, not returned, unlike
+// Observer.register's identical call (observer.go) -- a deliberate
+// divergence, not an oversight (Minor finding, Task 5 fix round 1).
+// register's caller is Start, which itself returns an error to main, so
+// propagating fits naturally. reconcile -- startNamespace's only caller --
+// runs off run()'s own goroutine with no caller waiting on a return value
+// (RunScope-driven and level-triggered; see reconcile's own doc comment for
+// why it never blocks), so there is no plumbing-compatible path to surface
+// an error meaningfully without restructuring reconcile's fire-and-forget
+// shape Task 4 established. AddEventHandler only errors when the informer
+// has already stopped, which cannot happen here (stop is fresh, closed by
+// nothing yet) -- unreachable in practice, logged defensively in case that
+// invariant ever stops holding.
 func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 	stop := make(chan struct{})
-	factory := informers.NewSharedInformerFactoryWithOptions(s.client, resyncPeriod, informers.WithNamespace(ns))
-	pod := factory.Core().V1().Pods().Informer()
-	event := factory.Core().V1().Events().Informer()
+	// Two factories, not one -- see factoryEntry's doc comment (Important 2,
+	// Task 5 fix round 1) for why sharing one between Pod and Event would
+	// make Task 6's Event-only field selector apply to the Pod ListWatch too.
+	podFactory := informers.NewSharedInformerFactoryWithOptions(s.client, resyncPeriod, informers.WithNamespace(ns))
+	eventFactory := informers.NewSharedInformerFactoryWithOptions(s.client, resyncPeriod, informers.WithNamespace(ns))
+	pod := podFactory.Core().V1().Pods().Informer()
+	event := eventFactory.Core().V1().Events().Informer()
 
 	// AddEventHandler only registers a listener; it does no network I/O and
 	// cannot block, so it is safe here on reconcile's own goroutine -- the
-	// same posture as the factory.Start/WaitForCacheSync pair below, which
-	// DOES reach the network and is therefore pushed onto its own goroutine
+	// same posture as the factory.Start/WaitForCacheSync pairs below, which
+	// DO reach the network and are therefore pushed onto their own goroutine
 	// instead.
 	if _, err := pod.AddEventHandler(s.handlers.pod); err != nil {
 		slog.Warn("scoped observer pod handler registration failed", "namespace", ns, "error", err)
@@ -192,15 +240,36 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 	}
 
 	go func() {
-		factory.Start(stop)
-		for typ, ok := range factory.WaitForCacheSync(stop) {
+		podFactory.Start(stop)
+		eventFactory.Start(stop)
+		for typ, ok := range podFactory.WaitForCacheSync(stop) {
+			if !ok {
+				slog.Warn("scoped observer cache did not sync", "namespace", ns, "type", typ.String())
+			}
+		}
+		for typ, ok := range eventFactory.WaitForCacheSync(stop) {
 			if !ok {
 				slog.Warn("scoped observer cache did not sync", "namespace", ns, "type", typ.String())
 			}
 		}
 	}()
 
-	return &factoryEntry{factory: factory, pod: pod, event: event, stop: stop}
+	return &factoryEntry{podFactory: podFactory, eventFactory: eventFactory, pod: pod, event: event, stop: stop}
+}
+
+// stopNamespaceLocked closes ns's factories, evicts its entry, and -- if the
+// caller supplied one -- notifies onNamespaceStop so namespace-scoped state
+// Task 5/6's handlers accumulate outside this package (Observer.pods) can be
+// cleared in step with the informer that used to feed it (Important 4, Task
+// 5 fix round 1). Callers must hold s.mu; onNamespaceStop runs synchronously
+// on this call's goroutine, same posture as everything else reconcile does
+// under lock -- it is expected to be cheap in-memory bookkeeping, not I/O.
+func (s *scopedInformers) stopNamespaceLocked(ns string, e *factoryEntry) {
+	close(e.stop)
+	delete(s.entries, ns)
+	if s.onNamespaceStop != nil {
+		s.onNamespaceStop(ns)
+	}
 }
 
 // stopAllLocked closes and releases every tracked namespace's factory.
@@ -208,8 +277,7 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 // s.runID afterward -- this only empties s.entries.
 func (s *scopedInformers) stopAllLocked() {
 	for ns, e := range s.entries {
-		close(e.stop)
-		delete(s.entries, ns)
+		s.stopNamespaceLocked(ns, e)
 	}
 }
 

@@ -31,9 +31,16 @@ type ClusterData struct {
 	Ready     int32    `json:"ready,omitempty"`
 	Desired   int32    `json:"desired,omitempty"`
 	Severity  Severity `json:"severity"`
-	// Resolved marks a condition clearing rather than arising. A resolved
-	// condition always supersedes the unresolved one it clears, whatever the
-	// severity -- otherwise a row keeps showing a failure that has gone away.
+	// Resolved marks a condition clearing rather than arising. It does NOT
+	// unconditionally outrank an unresolved condition on the same (UID,
+	// Reason) -- Supersedes orders by At first, so a later recurrence can
+	// re-arm a row that an earlier resolution would otherwise mask forever.
+	// That used to be the rule ("a resolved condition always supersedes,
+	// whatever the severity"), and it was wrong in the more dangerous
+	// direction: stale-green (a resolved entry hiding a live failure) is
+	// worse than stale-red (an unresolved entry lingering a beat too long).
+	// Resolved now only breaks a tie between two events sharing the exact
+	// same At.
 	Resolved bool      `json:"resolved,omitempty"`
 	At       time.Time `json:"at"`
 }
@@ -46,15 +53,27 @@ type ClusterData struct {
 // compares across Reasons; two different Reasons on the same resource (say
 // RolloutProgress and ImagePullBackOff) are two distinct conditions that
 // coexist, not two versions of one condition racing to replace each other.
+//
+// Ordering is by At first: whichever event happened later wins, full stop,
+// regardless of Resolved or Severity. Resolved and Severity only decide a
+// tie between two events sharing the identical At (a publisher, like
+// Observer.publish, that stamps At itself will rarely if ever produce one).
+// This is deliberately NOT "a resolution always wins" -- that rule stopped a
+// stale failure from pinning a row, but its unexamined inverse was that a
+// genuine RECURRENCE (an unresolved condition arriving after an earlier
+// resolution on the same UID+Reason -- CrashLoopBackOff, then Running, then
+// CrashLoopBackOff again) could never re-arm the row either. At-ordering
+// fixes both directions with one rule: whatever happened most recently is
+// what the row shows.
 func (d ClusterData) Supersedes(prev ClusterData) bool {
 	if d.UID != prev.UID || d.Reason != prev.Reason {
 		return false
 	}
+	if !d.At.Equal(prev.At) {
+		return d.At.After(prev.At)
+	}
 	if d.Resolved != prev.Resolved {
 		return d.Resolved
 	}
-	if d.Severity != prev.Severity {
-		return d.Severity > prev.Severity
-	}
-	return d.At.After(prev.At)
+	return d.Severity > prev.Severity
 }

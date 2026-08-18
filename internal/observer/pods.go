@@ -42,6 +42,15 @@ const (
 type podCondition struct {
 	reason    string
 	container string
+	// narrated is true once this observer has actually published cond as
+	// unresolved. seedPodBaseline (an informer's initial-list Add) never
+	// sets it -- a snapshot of pre-existing state is not a transition this
+	// observer ever told anyone about. onPodChange always sets it when it
+	// publishes cur. onDelete (handlers.go) checks it before publishing a
+	// resolution: a condition only ever seeded silently must not manufacture
+	// a "resolved"/"removed" event for something no consumer was ever shown
+	// (Important 3, Task 5 fix round 1).
+	narrated bool
 }
 
 // podReasonSeverity ranks CrashLoopBackOff and an unschedulable pod as more
@@ -66,49 +75,66 @@ func podKey(p *corev1.Pod) stateKey {
 }
 
 // podTrouble reports the single condition this observer narrates for pod, if
-// any. Precedence, in order: PodScheduled=False/Unschedulable first (no
-// container has even started, so nothing else can be more relevant), then
-// the first init or regular container carrying a tracked waiting reason.
-// Init containers are checked before regular ones because an init
-// container's failure blocks every regular container behind it -- it is the
-// more relevant of the two to report.
+// any. PodScheduled=False/Unschedulable wins outright (no container has even
+// started, so nothing else can be more relevant). Otherwise it scans every
+// init and regular container's waiting reason and reports the
+// HIGHEST-SEVERITY one found, not the first in slice order: a pod with one
+// container ImagePullBackOff (Warn) and another CrashLoopBackOff (Error)
+// must not have the Error hidden behind whichever container happened to
+// list first (Minor finding, Task 5 fix round 1 -- probed and confirmed:
+// first-in-slice order left the CrashLoopBackOff completely unnarrated).
+// Ties (equal severity) keep whichever was found first, which incidentally
+// still favors an init container's trouble over a regular one's when both
+// carry the same severity, since init containers are scanned first.
 //
-// A Pod can, in principle, have more than one container in trouble at once
-// (say two sidecars both ImagePullBackOff on different images). This
-// observer tracks and reports at most one condition per Pod, matching the
-// granularity every other handler in this package uses (one summary per
+// A Pod can, in principle, have more than one container in trouble at once.
+// This observer tracks and reports at most one condition per Pod, matching
+// the granularity every other handler in this package uses (one summary per
 // DaemonSet/Deployment/Node, not one per container) -- a judgment call, not
 // a constraint from the type system: ClusterData already carries a Container
-// field capable of a finer key. In practice this rarely costs real signal:
-// distinct waiting reasons on the same pod almost always arise sequentially
-// (a container must reach Running, clearing this observer's tracked
-// condition, before it can later crash-loop), not simultaneously.
+// field capable of a finer key. Selecting by severity, rather than position,
+// is what keeps that simplification from silently costing the worse of two
+// simultaneous conditions.
 func podTrouble(pod *corev1.Pod) (reason, container string, ok bool) {
 	for _, c := range pod.Status.Conditions {
 		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == reasonUnschedulable {
 			return reasonUnschedulable, "", true
 		}
 	}
-	if r, c, ok := firstWaitingTrouble(pod.Status.InitContainerStatuses); ok {
-		return r, c, true
+
+	var bestReason, bestContainer string
+	bestSeverity := bus.Severity(-1) // below SeverityInfo (0): any real match replaces it
+	consider := func(statuses []corev1.ContainerStatus) {
+		for _, cs := range statuses {
+			r, ok := waitingTroubleReason(cs)
+			if !ok {
+				continue
+			}
+			if sev := podReasonSeverity(r); sev > bestSeverity {
+				bestSeverity = sev
+				bestReason = r
+				bestContainer = cs.Name
+			}
+		}
 	}
-	if r, c, ok := firstWaitingTrouble(pod.Status.ContainerStatuses); ok {
-		return r, c, true
+	consider(pod.Status.InitContainerStatuses)
+	consider(pod.Status.ContainerStatuses)
+	if bestReason == "" {
+		return "", "", false
 	}
-	return "", "", false
+	return bestReason, bestContainer, true
 }
 
-func firstWaitingTrouble(statuses []corev1.ContainerStatus) (reason, container string, ok bool) {
-	for _, cs := range statuses {
-		if cs.State.Waiting == nil {
-			continue
-		}
-		switch cs.State.Waiting.Reason {
-		case reasonImagePullBackOff, reasonErrImagePull, reasonCrashLoopBackOff:
-			return cs.State.Waiting.Reason, cs.Name, true
-		}
+func waitingTroubleReason(cs corev1.ContainerStatus) (string, bool) {
+	if cs.State.Waiting == nil {
+		return "", false
 	}
-	return "", "", false
+	switch cs.State.Waiting.Reason {
+	case reasonImagePullBackOff, reasonErrImagePull, reasonCrashLoopBackOff:
+		return cs.State.Waiting.Reason, true
+	default:
+		return "", false
+	}
 }
 
 // podClusterData builds the typed payload for cond, which is either pod's
@@ -145,7 +171,9 @@ func podMessage(pod *corev1.Pod, cond podCondition, resolved bool) string {
 // narrating here would report a pod that has sat broken for hours as a fresh
 // transition. A pod with no current trouble is not recorded at all --
 // onPodChange's own rule for what belongs in o.pods -- so this only ever
-// seeds a trouble state a later change can resolve.
+// seeds a trouble state a later change can resolve. narrated stays at its
+// zero value (false): see podCondition's own doc comment for why that
+// distinction matters to onDelete.
 func (o *Observer) seedPodBaseline(pod *corev1.Pod) {
 	reason, container, ok := podTrouble(pod)
 	if !ok {
@@ -157,16 +185,18 @@ func (o *Observer) seedPodBaseline(pod *corev1.Pod) {
 }
 
 // onPodChange computes pod's current trouble state and publishes what
-// changed relative to what was last recorded. Up to two events can result
-// from one change: if the PREVIOUS trouble is no longer current, it is
-// published resolved first, tagged with ITS OWN reason/container -- not
-// whatever podTrouble reports now -- so ClusterData.Supersedes (same UID,
-// same Reason) matches the unresolved row entry it is meant to clear. Then,
-// if a trouble is current now, it is published unresolved. Publishing
-// resolve-then-arrive in that order, rather than collapsing straight from
-// one trouble reason to another, keeps every ClusterData event this observer
-// emits self-consistent: a consumer never has to infer that an unresolved
-// event silently superseded a different, never-resolved Reason.
+// changed relative to what was last recorded.
+//
+// Ruling 14(b) (Task 5 fix round 1): the PREVIOUS condition is only
+// published resolved when the pod is now FULLY healthy (cur.reason == "").
+// A Reason CHANGE while the pod remains broken -- kubelet oscillating
+// ErrImagePull and ImagePullBackOff every backoff cycle on one stuck pull,
+// or a different container now being the one in trouble -- is not a
+// resolution: publishing "resolved" for it would be false narration on the
+// operator's timeline, since the pod never stopped being broken. The
+// resolved event, when it does fire, carries the PREVIOUS reason/container
+// -- not whatever podTrouble reports now -- so ClusterData.Supersedes (same
+// UID, same Reason) matches the unresolved row entry it is meant to clear.
 func (o *Observer) onPodChange(pod *corev1.Pod) {
 	reason, container, ok := podTrouble(pod)
 	var cur podCondition
@@ -177,18 +207,21 @@ func (o *Observer) onPodChange(pod *corev1.Pod) {
 	key := podKey(pod)
 	o.mu.Lock()
 	prev, had := o.pods[key]
-	if had && prev == cur {
+	if had && prev.reason == cur.reason && prev.container == cur.container {
 		o.mu.Unlock()
-		return
+		return // no change (narrated is bookkeeping, not part of this comparison)
 	}
-	if cur == (podCondition{}) {
+	if cur.reason == "" {
 		delete(o.pods, key)
 	} else {
-		o.pods[key] = cur
+		// About to publish cur as unresolved below -- record it narrated so
+		// a later delete (handlers.go's onDelete) knows this condition was
+		// actually shown, not just seeded silently from an initial list.
+		o.pods[key] = podCondition{reason: cur.reason, container: cur.container, narrated: true}
 	}
 	o.mu.Unlock()
 
-	if had && prev.reason != "" {
+	if had && prev.reason != "" && cur.reason == "" {
 		o.publish(pod.Namespace, podMessage(pod, prev, true), podClusterData(pod, prev, true))
 	}
 	if cur.reason != "" {

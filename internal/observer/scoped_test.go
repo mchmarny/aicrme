@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -51,7 +52,7 @@ func namespaceSet(ns []string) map[string]struct{} {
 // assertion.
 func TestScopedInformersDoNotStartBeforeAScopeExists(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 
 	s.reconcile(RunScope{})
 
@@ -67,7 +68,12 @@ func TestScopedInformersDoNotStartBeforeAScopeExists(t *testing.T) {
 // against the pinned client-go directly: informers.WithNamespace takes
 // exactly one namespace (informers/factory.go:99, "factory.namespace =
 // namespace" -- a single field, not a set), so a three-namespace recipe
-// scope must yield three distinct factories, not one namespace-filtered one.
+// scope must yield three distinct factories PER KIND, not one
+// namespace-filtered one. Pod and Event each get their own factory
+// (Important 2, Task 5 fix round 1): a shared factory's
+// WithTweakListOptions applies to every informer built from it, so Task 6's
+// Event-only field selector would otherwise also hit the Pod ListWatch --
+// see factoryEntry's doc comment (scoped.go).
 //
 // This only reaches map bookkeeping and non-nil handles, both of which stay
 // true for factories that were never started or that watch the whole
@@ -76,7 +82,7 @@ func TestScopedInformersDoNotStartBeforeAScopeExists(t *testing.T) {
 // actually reaches those two properties.
 func TestScopedInformersStartOncePerNamespace(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 
 	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler", "ai-runtime"))
 
@@ -84,10 +90,15 @@ func TestScopedInformersStartOncePerNamespace(t *testing.T) {
 		t.Fatalf("entries = %d, want 3 (one per namespace)", got)
 	}
 	seen := make(map[string]bool, 3)
-	factories := make(map[interface{}]bool, 3)
+	podFactories := make(map[interface{}]bool, 3)
+	eventFactories := make(map[interface{}]bool, 3)
 	for ns, e := range s.entries {
 		seen[ns] = true
-		factories[e.factory] = true
+		podFactories[e.podFactory] = true
+		eventFactories[e.eventFactory] = true
+		if e.podFactory == e.eventFactory {
+			t.Errorf("namespace %q: Pod and Event share one factory -- Task 6's tweak would leak onto the Pod ListWatch", ns)
+		}
 		if e.pod == nil || e.event == nil {
 			t.Errorf("namespace %q: pod/event informer not materialized", ns)
 		}
@@ -97,8 +108,11 @@ func TestScopedInformersStartOncePerNamespace(t *testing.T) {
 			t.Errorf("namespace %q has no factory entry", ns)
 		}
 	}
-	if len(factories) != 3 {
-		t.Fatalf("distinct factories = %d, want 3 (one factory per namespace, never shared)", len(factories))
+	if len(podFactories) != 3 {
+		t.Fatalf("distinct Pod factories = %d, want 3 (one per namespace, never shared)", len(podFactories))
+	}
+	if len(eventFactories) != 3 {
+		t.Fatalf("distinct Event factories = %d, want 3 (one per namespace, never shared)", len(eventFactories))
 	}
 }
 
@@ -116,7 +130,7 @@ func TestScopedInformersStartOncePerNamespace(t *testing.T) {
 // so the initial waitFor times out.
 func TestScopedInformersWatchOnlyTheirOwnNamespace(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 
 	s.reconcile(scopeWith("run-1", "gpu-operator"))
 
@@ -137,7 +151,7 @@ func TestScopedInformersWatchOnlyTheirOwnNamespace(t *testing.T) {
 // path production does: a scope whose Terminal has flipped true.
 func TestScopedInformersStopWhenTheRunEnds(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler"))
 	if got := len(s.entries); got != 2 {
 		t.Fatalf("entries before termination = %d, want 2", got)
@@ -164,7 +178,7 @@ func TestScopedInformersStopWhenTheRunEnds(t *testing.T) {
 // deterministically, independent of timing.
 func TestScopedInformersStopClosesTheFactoryStopChannel(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 	s.reconcile(scopeWith("run-1", "gpu-operator"))
 
 	entry, ok := s.entries["gpu-operator"]
@@ -181,6 +195,50 @@ func TestScopedInformersStopClosesTheFactoryStopChannel(t *testing.T) {
 	}
 }
 
+// TestScopedInformersNotifyOnNamespaceStopOnFullTeardown is Important 4
+// (Task 5 fix round 1): a run's terminal transition must notify
+// onNamespaceStop for every namespace it tears down, not just close the
+// factory and drop the map entry -- that notification is what lets
+// Observer.clearNamespacePods (observer.go) evict namespace-scoped state
+// (o.pods) in step with the informer that used to feed it, instead of
+// stranding it (the review's demonstrated defect).
+func TestScopedInformersNotifyOnNamespaceStopOnFullTeardown(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var stopped []string
+	s := newScopedInformers(client, scopedHandlers{}, func(ns string) {
+		stopped = append(stopped, ns)
+	})
+	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler"))
+
+	s.reconcile(terminalScope("gpu-operator", "kai-scheduler"))
+
+	sort.Strings(stopped)
+	if got := stopped; len(got) != 2 || got[0] != "gpu-operator" || got[1] != "kai-scheduler" {
+		t.Errorf("onNamespaceStop notified for %v, want both gpu-operator and kai-scheduler exactly once each", got)
+	}
+}
+
+// TestScopedInformersNotifyOnNamespaceStopWhenScopeShrinks is
+// TestScopedInformersNotifyOnNamespaceStopOnFullTeardown's counterpart for
+// the OTHER teardown path: a continuing run whose namespace set shrinks
+// (reconcile's per-namespace removal loop, not stopAllLocked). Both paths
+// must notify -- a fix that only wired the callback into stopAllLocked would
+// leave this path silently stranding state exactly as before.
+func TestScopedInformersNotifyOnNamespaceStopWhenScopeShrinks(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var stopped []string
+	s := newScopedInformers(client, scopedHandlers{}, func(ns string) {
+		stopped = append(stopped, ns)
+	})
+	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler"))
+
+	s.reconcile(scopeWith("run-1", "gpu-operator")) // kai-scheduler drops out of scope, run continues
+
+	if got := stopped; len(got) != 1 || got[0] != "kai-scheduler" {
+		t.Errorf("onNamespaceStop notified for %v, want exactly [kai-scheduler]", got)
+	}
+}
+
 // TestScopedInformersAreIdempotent is the property named in the brief: a
 // repeated scope must not double-start. Comparing factory pointers, not just
 // the count, is what actually proves it -- a naive reconcile that tore down
@@ -188,7 +246,7 @@ func TestScopedInformersStopClosesTheFactoryStopChannel(t *testing.T) {
 // silently churning every factory underneath.
 func TestScopedInformersAreIdempotent(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 	sc := scopeWith("run-1", "gpu-operator", "kai-scheduler", "ai-runtime")
 
 	s.reconcile(sc)
@@ -247,7 +305,7 @@ func TestScopedInformerStartDoesNotBlock(t *testing.T) {
 		t.Fatalf("kubernetes.NewForConfig() error = %v", err)
 	}
 
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 	done := make(chan struct{})
 	go func() {
 		s.reconcile(scopeWith("run-1", "gpu-operator"))
@@ -265,7 +323,7 @@ func TestScopedInformerStartDoesNotBlock(t *testing.T) {
 // stops the old set and starts the new, never leaving the two mixed.
 func TestScopedInformersSurviveAScopeChange(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 
 	s.reconcile(scopeWith("run-1", "gpu-operator", "kai-scheduler"))
 	if got := len(s.entries); got != 2 {
@@ -306,7 +364,7 @@ func TestScopedInformersSurviveAScopeChange(t *testing.T) {
 // restart it.
 func TestScopedInformersRestartAfterRetryReusesTheRunID(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 	b := bus.New(64)
 
 	var scopeMu scopeHolder
@@ -355,7 +413,7 @@ func TestScopedInformersRestartAfterRetryReusesTheRunID(t *testing.T) {
 // so a pass here is only possible if the bus event itself woke run().
 func TestScopedInformersRunReconcilesOnEveryPhaseEvent(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 	b := bus.New(64)
 
 	var scopeMu scopeHolder
@@ -391,7 +449,7 @@ func TestScopedInformersRunReconcilesOnEveryPhaseEvent(t *testing.T) {
 // time -- only the ticker is present to have done it.
 func TestScopedInformersRunTicksAsACorrectnessFloor(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	s := newScopedInformers(client, scopedHandlers{})
+	s := newScopedInformers(client, scopedHandlers{}, nil)
 	b := bus.New(64)
 
 	var scopeMu scopeHolder
