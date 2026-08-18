@@ -134,28 +134,51 @@ type scopedInformers struct {
 	// runID is the run these entries belong to, or "" when nothing is
 	// scoped. Compared only to decide whether an incoming scope names a
 	// DIFFERENT run (tear down and restart fresh) -- termination itself is
-	// decided by sc.Terminal, never by anything stored here.
+	// decided by sc.Terminal, never by anything stored here. Reset to "" on
+	// every terminal transition (Ruling 8's contract, pinned by
+	// TestScopedInformersStopWhenTheRunEnds) -- which is exactly why
+	// everTornDownRunID below cannot reuse this field for Ruling 37's
+	// purpose: by the time the NEXT reconcile call arrives, runID has
+	// already forgotten which run it was.
 	runID   string
 	entries map[string]*factoryEntry
-	// everTornDown records every namespace this PROCESS has torn down at
-	// least once (Ruling 32, Task 6 fix round 3) -- the signal
-	// onPodAdd/onEventAdd need to tell a console's first-ever sighting of a
-	// namespace (an informer's initial list is a snapshot that predates this
-	// process -- suppress, TestPodInitialListDoesNotNarrate's case) from a
-	// RESUMPTION after this SAME process already discarded whatever it knew
-	// about that namespace (clearNamespacePods/clearNamespaceEvents, wired
-	// as onNamespaceStop below) -- narrate instead, because the prior
-	// narration is genuinely gone on both sides, not because anything is
-	// newly happening. engine.Retry (internal/engine/engine.go) reusing the
-	// SAME RunID is the motivating case, but a brand-new run reusing a
-	// namespace name qualifies identically: either way this process already
-	// told the operator "I no longer know anything about this namespace",
-	// so a still-broken resource in it deserves to be re-told, not silently
-	// re-swallowed. Set in stopNamespaceLocked; read via isRestart. Never
-	// cleared -- "has this process ever discarded state for ns" only grows
-	// more true over the process's lifetime, never reverts, so a namespace
-	// that qualifies once qualifies for the rest of the process's life.
+	// everTornDown records every namespace THE CURRENT RUN (see
+	// everTornDownRunID) has torn down at least once (Ruling 32, Task 6 fix
+	// round 3) -- the signal onPodAdd/onEventAdd need to tell a namespace's
+	// first-ever sighting under the current run (an informer's initial list
+	// is a snapshot that predates it -- suppress,
+	// TestPodInitialListDoesNotNarrate's case) from a RESUMPTION after this
+	// SAME run already discarded whatever it knew about that namespace
+	// (clearNamespacePods/clearNamespaceEvents, wired as onNamespaceStop
+	// below) -- narrate instead, because the prior narration is genuinely
+	// gone on both sides, not because anything is newly happening.
+	//
+	// Ruling 37 (Task 6 fix round 4, replacing part of Ruling 32): scoped to
+	// engine.Retry's RunID, not to the process. Ruling 32 originally kept
+	// this for the process's whole life ("a brand-new run reusing a
+	// namespace name qualifies identically") -- the whole-branch review
+	// (finding I2) demonstrated that reasoning does not survive Kubernetes'
+	// own 1h Event TTL: a Warning from run 1, still present when run 2
+	// starts because it has not yet TTL-expired, has NO resolution path for
+	// run 2 (the pod it was about is gone, so neither Ruling 23's edge nor
+	// Ruling 26's pull can ever retract it) -- run 2 re-narrates run 1's
+	// leftover onto its own rows, permanently. reconcile clears this map
+	// (see everTornDownRunID) exactly when it detects the incoming scope
+	// names a genuinely DIFFERENT run, which preserves Ruling 32's
+	// motivating Retry case (the SAME RunID after a failure) exactly while
+	// dropping the cross-run carry-over.
 	everTornDown map[string]bool
+	// everTornDownRunID is the RunID everTornDown's current contents belong
+	// to. reconcile compares an incoming sc.RunID against THIS, not against
+	// runID: runID is blank during the entire gap between a run reaching
+	// Terminal and whatever reconcile call comes next (including a Retry's
+	// own restart), so comparing against it cannot tell "the next
+	// non-terminal call names the SAME run" (Retry -- keep everTornDown)
+	// from "a DIFFERENT run" (clear it) -- both would look like a change
+	// from blank. everTornDownRunID is never reset to "" for that reason;
+	// it only ever moves to whatever RunID reconcile most recently started
+	// tracking a live scope for, surviving the Terminal gap runID does not.
+	everTornDownRunID string
 }
 
 func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers, onNamespaceStop func(ns string)) *scopedInformers {
@@ -191,6 +214,17 @@ func newScopedInformers(client kubernetes.Interface, handlers scopedHandlers, on
 // sc.Terminal is re-read on every call, never cached: see the package doc
 // comment above for why that -- not a remembered fact about a run ID -- is
 // what makes a retried run (same ID, Terminal now false) resume watching.
+//
+// Ruling 37 (Task 6 fix round 4): also clears everTornDown, but ONLY when
+// sc.RunID differs from everTornDownRunID -- the run whose teardown history
+// that map currently reflects -- which is deliberately NOT the same
+// condition as the s.runID check three lines below. runID is already ""
+// here on every call that follows a terminal transition (this function's
+// own first branch just reset it, on THIS call or an earlier one), so
+// comparing sc.RunID against runID cannot tell a Retry (same RunID resuming
+// after Terminal) from a genuinely new run (different RunID) -- both look
+// like "runID changed from blank". everTornDownRunID survives that gap
+// (see its own doc comment) specifically so this comparison can.
 func (s *scopedInformers) reconcile(sc RunScope) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -199,6 +233,11 @@ func (s *scopedInformers) reconcile(sc RunScope) {
 		s.stopAllLocked()
 		s.runID = ""
 		return
+	}
+
+	if sc.RunID != s.everTornDownRunID {
+		s.everTornDown = make(map[string]bool)
+		s.everTornDownRunID = sc.RunID
 	}
 
 	if s.runID != sc.RunID {

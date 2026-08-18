@@ -394,6 +394,87 @@ func TestEventStillPresentAcrossRetryIsReNarrated(t *testing.T) {
 	}
 }
 
+// TestEventLeftoverDoesNotSurviveANewRun is Ruling 37 (Task 6 fix round 4,
+// whole-branch review finding I2): everTornDown must be scoped to the RunID
+// it was earned under, not carried for the process's whole life the way
+// Ruling 32 originally specified. Ruling 32's own comment claimed "a
+// brand-new run reusing a namespace name qualifies identically" to a
+// Retry -- the review demonstrated that is false once Kubernetes' 1h Event
+// TTL is in play: a Warning from run 1, still present (not yet TTL-expired)
+// when run 2 starts, has NO resolution path for run 2 -- the pod it was
+// about is gone, so neither Ruling 23's edge nor Ruling 26's pull can ever
+// retract it -- so re-narrating it onto run 2's rows strands a phantom
+// condition there permanently.
+//
+// Distinguishes a Retry from a genuinely new run in the SAME sequence,
+// rather than each in isolation, so the fix for one cannot regress the
+// other: TestEventStillPresentAcrossRetryIsReNarrated already pins the
+// Retry case alone (and stays green, unmodified, after this fix); this
+// walks both back to back.
+//  1. run-1's first-ever sighting of the namespace: a stale Warning
+//     predates it -- seeded silently.
+//  2. run-1 fails: teardown.
+//  3. Retry: the SAME RunID "run-1" -- the stale Warning (still unchanged
+//     in the fake clientset) IS re-narrated. Ruling 32's motivating case,
+//     re-confirmed here as the control this test's real point needs.
+//  4. run-1's retry also ends: teardown again.
+//  5. A genuinely NEW run: a DIFFERENT RunID "run-2", same namespace. The
+//     SAME Event object is still exactly what it was -- nothing in this
+//     scenario ever deleted or updated it. It must stay silent: seeded
+//     again (o.events still tracks it, for a future teardown/retry of
+//     run-2 itself to discover), but never published.
+func TestEventLeftoverDoesNotSurviveANewRun(t *testing.T) {
+	ev := testEvent("pod-uid", "worker-1.a", corev1.EventTypeWarning)
+	client := fake.NewSimpleClientset(ev)
+	o, sub := newScopedEventTestObserver(t, client)
+
+	// 1. First-ever start: silent.
+	if events := collectPodEvents(sub); len(events) != 0 {
+		t.Fatalf("published %d events on the first-ever start, want 0 (silent seed): %+v", len(events), events)
+	}
+
+	// 2. run-1 fails.
+	o.scoped.reconcile(terminalScope(podTestNamespace))
+
+	// 3. Retry: SAME RunID -- re-narrates (Ruling 32's case, the control).
+	o.scoped.reconcile(scopeWith("run-1", podTestNamespace))
+	entry, ok := o.scoped.entries[podTestNamespace]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after retry reconcile", podTestNamespace)
+	}
+	waitFor(t, entry.event.HasSynced)
+
+	retried := waitForClusterData(t, sub)
+	if retried.Reason != reasonFailedScheduling || retried.Resolved {
+		t.Fatalf("setup: retry re-arising = %+v, want Reason=%q Resolved=false", retried, reasonFailedScheduling)
+	}
+
+	// 4. The retry also ends.
+	o.scoped.reconcile(terminalScope(podTestNamespace))
+
+	// 5. A genuinely NEW run, same namespace, DIFFERENT RunID.
+	o.scoped.reconcile(scopeWith("run-2", podTestNamespace))
+	entry, ok = o.scoped.entries[podTestNamespace]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after new-run reconcile", podTestNamespace)
+	}
+	waitFor(t, entry.event.HasSynced)
+
+	if events := collectPodEvents(sub); len(events) != 0 {
+		t.Fatalf("published %d events for run-2's first sighting of a run-1 leftover, want 0 -- run-1's Warning leaked onto run-2's rows: %+v", len(events), events)
+	}
+
+	// Seeded, not narrated: proves isRestart correctly reported false for
+	// run-2 (routing through seedEventBaseline), not that the informer
+	// simply never delivered anything.
+	o.mu.Lock()
+	remaining := len(o.events)
+	o.mu.Unlock()
+	if remaining != 1 {
+		t.Errorf("o.events after run-2's silent reseed = %d entries, want 1 (seeded silently, not narrated)", remaining)
+	}
+}
+
 // TestEventFieldSelectorAppliesOnlyToTheEventFactory verifies Step 2's
 // server-side filter (informers.WithTweakListOptions setting
 // FieldSelector: "type=Warning") reaches the Event factory's List/Watch

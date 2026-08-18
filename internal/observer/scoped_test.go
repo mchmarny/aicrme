@@ -1,6 +1,7 @@
 package observer
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
@@ -567,5 +570,142 @@ func waitFor(t *testing.T, cond func() bool) {
 		case <-deadline:
 			t.Fatal("condition not met within 2s")
 		}
+	}
+}
+
+// TestObserverDiscriminatesBetweenNamespacesOnPartialTeardown is I1
+// (Task 6 fix round 4, whole-branch review): the observer's namespace
+// dimension had NO Observer-level coverage at more than one namespace --
+// every RunScope.Namespaces fixture in pods_test.go/events_test.go/
+// handlers_internal_test.go has exactly one entry, and scoped_test.go's own
+// two-namespace tests (scopeWith("run-1","gpu-operator","kai-scheduler"))
+// construct newScopedInformers directly with an empty scopedHandlers{} and
+// a nil onNamespaceStop -- they exercise factory lifecycle only, never
+// o.pods/o.events/withNamespaceLive's actual discriminating behavior. With
+// one namespace, s.entries[ns] (the correct check) and len(s.entries) > 0
+// (a namespace-blind mutation of it) are the SAME predicate, and
+// clearNamespacePods/clearNamespaceEvents deleting unconditionally vs.
+// filtering on ns are indistinguishable when there is only ever one key to
+// delete either way -- which is exactly why three mutations of that shape
+// survived all 79 existing observer tests (see this file's own three
+// bite-proofs in the fix-round report).
+//
+// Uses a REAL Observer (New, not newScopedInformers directly) with two live
+// namespaces, each carrying its own narrated Pod condition AND Event
+// condition, so this single test reaches all three mutation sites:
+//  1. Tears down JUST namespace A via reconcile's per-namespace removal
+//     loop (a continuing run's scope shrinking -- not a full terminal
+//     teardown, so B staying live is the point) and asserts A's o.pods/
+//     o.events entries are gone while B's survive untouched (kills M12 --
+//     clearNamespacePods ignoring ns -- and M13, clearNamespaceEvents's
+//     identical shape).
+//  2. Asserts withNamespaceLive refuses a write for torn-down A even
+//     though B is still live (len(s.entries) > 0 is true purely because of
+//     B) -- and that it still ADMITS a write for B, so the test cannot pass
+//     by a mutation that simply refuses everything (kills M14).
+func TestObserverDiscriminatesBetweenNamespacesOnPartialTeardown(t *testing.T) {
+	const nsA = "gpu-operator"
+	const nsB = "kai-scheduler"
+
+	client := fake.NewSimpleClientset()
+	b := bus.New(64)
+	o := New(client, b, func() RunScope {
+		return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{nsA: {}, nsB: {}}}
+	})
+	sub, unsub := b.Subscribe(0)
+	t.Cleanup(unsub)
+
+	o.scoped.reconcile(scopeWith("run-1", nsA, nsB))
+	t.Cleanup(o.scoped.stop)
+
+	entryA, ok := o.scoped.entries[nsA]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after reconcile", nsA)
+	}
+	entryB, ok := o.scoped.entries[nsB]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after reconcile", nsB)
+	}
+	waitFor(t, entryA.pod.HasSynced)
+	waitFor(t, entryB.pod.HasSynced)
+	waitFor(t, entryA.event.HasSynced)
+	waitFor(t, entryB.event.HasSynced)
+
+	podA := withContainerWaiting(testPod("pod-uid-a"), "app", reasonImagePullBackOff)
+	podB := withContainerWaiting(testPod("pod-uid-b"), "app", reasonImagePullBackOff)
+	podB.Namespace = nsB
+
+	if _, err := client.CoreV1().Pods(nsA).Create(context.Background(), podA, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create() pod A error = %v", err)
+	}
+	waitForClusterData(t, sub) // A's pod narration
+
+	if _, err := client.CoreV1().Pods(nsB).Create(context.Background(), podB, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create() pod B error = %v", err)
+	}
+	waitForClusterData(t, sub) // B's pod narration
+
+	evA := testEvent("evt-uid-a", "worker-1.a", corev1.EventTypeWarning)
+	evB := testEvent("evt-uid-b", "worker-1.b", corev1.EventTypeWarning)
+	evB.Namespace = nsB
+	evB.InvolvedObject.Namespace = nsB
+
+	if _, err := client.CoreV1().Events(nsA).Create(context.Background(), evA, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create() event A error = %v", err)
+	}
+	waitForClusterData(t, sub) // A's event narration
+
+	if _, err := client.CoreV1().Events(nsB).Create(context.Background(), evB, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create() event B error = %v", err)
+	}
+	waitForClusterData(t, sub) // B's event narration
+
+	o.mu.Lock()
+	podsBefore, eventsBefore := len(o.pods), len(o.events)
+	o.mu.Unlock()
+	if podsBefore != 2 || eventsBefore != 2 {
+		t.Fatalf("setup: o.pods = %d, o.events = %d, want 2 and 2", podsBefore, eventsBefore)
+	}
+
+	// Tear down JUST namespace A -- reconcile's per-namespace removal loop
+	// (a continuing run's scope shrinking), not stopAllLocked -- while B
+	// stays live in the SAME scopedInformers instance.
+	o.scoped.reconcile(scopeWith("run-1", nsB))
+
+	o.mu.Lock()
+	_, aPodTracked := o.pods[podKey(podA)]
+	_, bPodTracked := o.pods[podKey(podB)]
+	_, aEventTracked := o.events[eventInvolvedKey(evA)]
+	_, bEventTracked := o.events[eventInvolvedKey(evB)]
+	o.mu.Unlock()
+
+	if aPodTracked {
+		t.Error("namespace A's Pod condition survived its own teardown -- clearNamespacePods ignored ns (M12)")
+	}
+	if !bPodTracked {
+		t.Error("namespace B's Pod condition was wiped by namespace A's teardown -- clearNamespacePods ignored ns (M12)")
+	}
+	if aEventTracked {
+		t.Error("namespace A's Event condition survived its own teardown -- clearNamespaceEvents ignored ns (M13)")
+	}
+	if !bEventTracked {
+		t.Error("namespace B's Event condition was wiped by namespace A's teardown -- clearNamespaceEvents ignored ns (M13)")
+	}
+
+	// withNamespaceLive discrimination (M14): a write for the torn-down
+	// namespace A must be refused even though B is STILL live --
+	// len(s.entries) > 0 is true purely because of B.
+	var wroteA bool
+	o.scoped.withNamespaceLive(nsA, func() { wroteA = true })
+	if wroteA {
+		t.Error("withNamespaceLive admitted a write for a torn-down namespace because an unrelated namespace is still live (M14)")
+	}
+
+	// And B's own liveness must still work -- proves this isn't "always
+	// refuse", which would pass the assertion above for the wrong reason.
+	var wroteB bool
+	o.scoped.withNamespaceLive(nsB, func() { wroteB = true })
+	if !wroteB {
+		t.Error("withNamespaceLive refused a write for the still-live namespace B -- setup/regression failure")
 	}
 }

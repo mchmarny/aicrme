@@ -137,7 +137,16 @@ func eventMessage(ev *corev1.Event) string {
 func eventClusterData(ev *corev1.Event) bus.ClusterData {
 	io := ev.InvolvedObject
 	return bus.ClusterData{
-		Kind:      io.Kind,
+		Kind: io.Kind,
+		// Namespace: io.Namespace (InvolvedObject's), not ev.Namespace (the
+		// Event API object's own) -- the resource this payload describes is
+		// InvolvedObject, and for a cluster-scoped one (a Node) io.Namespace
+		// is correctly "" even though the Event object itself lives in a
+		// real namespace. resolveEventsLocked's resolution payload builds
+		// Namespace from a DIFFERENT source (key.namespace, i.e.
+		// ev.Namespace) for its own reason (M-4, Phase 2b-iii whole-branch
+		// review) -- see that function's own comment; the two agree for
+		// every case either is ever actually reached with today.
 		Namespace: io.Namespace,
 		Name:      io.Name,
 		UID:       string(io.UID),
@@ -417,7 +426,22 @@ func (o *Observer) resolveEventsLocked(key stateKey, narratedOnly bool) []bus.Cl
 			continue
 		}
 		out = append(out, bus.ClusterData{
-			Kind:      key.kind,
+			Kind: key.kind,
+			// Namespace: key.namespace, not io.InvolvedObject.Namespace the
+			// way eventClusterData's own arising payload builds it (M-4,
+			// Phase 2b-iii whole-branch review) -- key.namespace is
+			// eventInvolvedKey's field, which M1 (Task 6) deliberately keys
+			// off ev.Namespace (the Event API object's own namespace), not
+			// io.Namespace, so the sweep and the write gate agree (M1's own
+			// doc comment). The two sources AGREE for every key this
+			// function is ever actually called with today: both call sites
+			// pass podKey(pod), and for a namespaced Pod ev.Namespace ==
+			// io.Namespace always. They would diverge only if this were
+			// ever called with a cluster-scoped resource's key (io.Namespace
+			// == "" but ev.Namespace is a real namespace, M1's whole
+			// point) -- unreachable today because onEventChange's own
+			// key.kind != kindPod guard (Ruling 26) means only Pod keys
+			// ever reach here.
 			Namespace: key.namespace,
 			Name:      key.name,
 			UID:       string(key.uid),

@@ -390,6 +390,72 @@ func TestPodStillBrokenAcrossRetryIsReNarrated(t *testing.T) {
 	}
 }
 
+// TestPodLeftoverDoesNotSurviveANewRun is the Pod-side symmetry check for
+// Ruling 37 (Task 6 fix round 4, whole-branch review finding I2 --
+// demonstrated on the Event side, where Kubernetes' 1h Event TTL makes a
+// cross-run leftover concretely reachable). isRestart/everTornDown are one
+// shared mechanism behind both onPodAdd and onEventAdd
+// (scopedInformers.everTornDown, scoped.go); this confirms the fix -- clear
+// everTornDown when the RunID genuinely changes, keep it for a same-RunID
+// Retry -- holds for the Pod path too, not just the Event path the review
+// happened to probe.
+//
+// Walks the identical five-step sequence
+// TestEventLeftoverDoesNotSurviveANewRun does: first-ever start (silent) ->
+// run-1 fails -> Retry, same RunID (re-narrates -- the control) -> retry
+// also fails -> a genuinely new run, different RunID, same namespace, same
+// still-broken pod object (silent -- not carried over).
+func TestPodLeftoverDoesNotSurviveANewRun(t *testing.T) {
+	pod := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
+	client := fake.NewSimpleClientset(pod)
+	o, sub := newScopedPodTestObserver(t, client)
+
+	// 1. First-ever start: silent.
+	if events := collectPodEvents(sub); len(events) != 0 {
+		t.Fatalf("published %d events on the first-ever start, want 0 (silent seed): %+v", len(events), events)
+	}
+
+	// 2. run-1 fails.
+	o.scoped.reconcile(terminalScope(podTestNamespace))
+
+	// 3. Retry: SAME RunID -- re-narrates (Ruling 32's case, the control).
+	o.scoped.reconcile(scopeWith("run-1", podTestNamespace))
+	entry, ok := o.scoped.entries[podTestNamespace]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after retry reconcile", podTestNamespace)
+	}
+	waitFor(t, entry.pod.HasSynced)
+
+	retried := waitForClusterData(t, sub)
+	if retried.Reason != reasonImagePullBackOff || retried.Resolved {
+		t.Fatalf("setup: retry re-arising = %+v, want Reason=%q Resolved=false", retried, reasonImagePullBackOff)
+	}
+
+	// 4. The retry also ends.
+	o.scoped.reconcile(terminalScope(podTestNamespace))
+
+	// 5. A genuinely NEW run, same namespace, DIFFERENT RunID. The pod
+	// object is unchanged -- still ImagePullBackOff.
+	o.scoped.reconcile(scopeWith("run-2", podTestNamespace))
+	entry, ok = o.scoped.entries[podTestNamespace]
+	if !ok {
+		t.Fatalf("no scoped entry for namespace %q after new-run reconcile", podTestNamespace)
+	}
+	waitFor(t, entry.pod.HasSynced)
+
+	if events := collectPodEvents(sub); len(events) != 0 {
+		t.Fatalf("published %d events for run-2's first sighting of a run-1 leftover, want 0 -- run-1's pod trouble leaked onto run-2's rows: %+v", len(events), events)
+	}
+
+	// Seeded, not narrated.
+	o.mu.Lock()
+	remaining := len(o.pods)
+	o.mu.Unlock()
+	if remaining != 1 {
+		t.Errorf("o.pods after run-2's silent reseed = %d entries, want 1 (seeded silently, not narrated)", remaining)
+	}
+}
+
 // TestPodEmitsTypedClusterData pins that every field the cockpit needs to
 // render and correlate a Pod row is populated from the live object, not left
 // at a zero value: Kind identifies the resource type, UID is what

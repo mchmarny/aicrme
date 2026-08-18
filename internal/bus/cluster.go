@@ -13,10 +13,18 @@ const (
 	SeverityError
 )
 
-// ClusterData is the typed payload of a KindCluster event. It exists instead
-// of a formatted message string because the cockpit needs to compare and
-// supersede conditions per row, and parsing prose to do that is how a stale
-// ImagePullBackOff ends up pinned to a row forever.
+// ClusterData is the typed payload internal/observer's handlers attach to a
+// KindCluster event's Data field. It exists instead of a formatted message
+// string because the cockpit needs to compare and supersede conditions per
+// row, and parsing prose to do that is how a stale ImagePullBackOff ends up
+// pinned to a row forever.
+//
+// Not every KindCluster event carries one (M-3, Phase 2b-iii whole-branch
+// review): internal/steps/discover.go publishes KindCluster for each
+// capability-gap finding with no Data at all, since there is no
+// resource/UID to identify a condition against before a run has started.
+// See KindCluster's own doc comment (event.go) for the discriminator the
+// SPA actually uses.
 //
 // Kind/Namespace/Name/UID identify the resource. UID is the identity that
 // matters: a Deployment deleted and recreated under the same name is a
@@ -45,6 +53,19 @@ type ClusterData struct {
 	At       time.Time `json:"at"`
 }
 
+// Supersedes has zero production callers today (M-1, Phase 2b-iii
+// whole-branch review: `grep -rn '\.Supersedes(' --include=*.go .` returns
+// only cluster_test.go). The rule that actually ships is
+// web/src/pipeline.ts's clusterConditionSupersedes, a second implementation
+// of the identical precedence rule in TypeScript, pinned by its own tests,
+// with nothing in the code connecting the two. This is deliberate, not an
+// oversight: the server aggregates and narrates but does not itself decide
+// what a row shows -- that decision is the SPA's, over the full event
+// history it holds. Treat this method, and the reasoning in its doc comment
+// below, as the REFERENCE definition of the precedence rule -- worth
+// reading before changing either implementation -- not as the one Go
+// actually enforces at runtime.
+//
 // Supersedes reports whether d is a newer version of prev's own condition --
 // same resource (UID), same Reason -- and should replace it. This is NOT the
 // same question as what a row displays: a row holds one ClusterData per
