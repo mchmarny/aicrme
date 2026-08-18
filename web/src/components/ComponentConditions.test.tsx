@@ -57,6 +57,21 @@ describe('ComponentConditions', () => {
     expect(el.textContent).toContain('3/8 ready')
   })
 
+  it('renders past tense when tense="past" (Minor 2, fix round 2 -- the Done screen)', () => {
+    const error = condition({ reason: 'ImagePullBackOff' })
+    render(<ComponentConditions name="gpu-operator" conditions={[error]} tense="past" />)
+    const el = screen.getByTestId('condition-gpu-operator')
+    expect(el.textContent).toMatch(/while gpu-operator installed\)/i)
+    expect(el.textContent).not.toMatch(/while gpu-operator installs/i)
+  })
+
+  it('defaults to present tense when tense is omitted', () => {
+    const error = condition({ reason: 'ImagePullBackOff' })
+    render(<ComponentConditions name="gpu-operator" conditions={[error]} />)
+    const el = screen.getByTestId('condition-gpu-operator')
+    expect(el.textContent).toMatch(/while gpu-operator installs\)/i)
+  })
+
   it('renders nothing once every condition on the row has resolved', () => {
     const resolved = condition({ resolved: true })
     render(<ComponentConditions name="gpu-operator" conditions={[resolved]} />)

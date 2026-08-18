@@ -12,7 +12,17 @@ const statusClass: Record<ComponentState['status'], string> = {
   failed: 'text-red-400',
 }
 
-function ComponentRow({ c }: { c: ComponentState }) {
+/**
+ * tense defaults to 'present': Running and Failed show a condition on a row
+ * whose action may still be installing (Failed can be mid-retry-decision),
+ * so "while X installs" is still accurate. Done is the one screen where the
+ * run is definitively over -- Minor 2, Task 7 fix round 2: the caption
+ * previously stayed present tense there too, reading "(cluster activity
+ * while gpu-operator installs)" directly beside "installed successfully",
+ * which a still-open condition CAN reach (Ruling 27's stated intent is that
+ * it survives to Done, not that it gets rephrased away).
+ */
+function ComponentRow({ c, tense = 'present' }: { c: ComponentState; tense?: 'present' | 'past' }) {
   const active = c.status === 'started' || c.status === 'retrying'
   const note = active ? slowStepNote(c.name) : undefined
 
@@ -32,7 +42,7 @@ function ComponentRow({ c }: { c: ComponentState }) {
         )}
       </div>
       {note && <p className="mt-1 max-w-2xl text-xs text-slate-500">{note}</p>}
-      <ComponentConditions name={c.name} conditions={c.conditions} />
+      <ComponentConditions name={c.name} conditions={c.conditions} tense={tense} />
     </li>
   )
 }
@@ -184,7 +194,7 @@ function Done({ components, recipeCount }: { components: ComponentState[]; recip
       {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
-        {components.map(c => <ComponentRow key={c.name} c={c} />)}
+        {components.map(c => <ComponentRow key={c.name} c={c} tense="past" />)}
       </ul>
     </section>
   )

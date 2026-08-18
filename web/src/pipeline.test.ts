@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { activeCondition, clusterConditionSupersedes, deriveComponents, deriveFailure, deploymentActionsTotal, type ClusterCondition } from './pipeline'
+import { activeCondition, clusterConditionSupersedes, compareAt, deriveComponents, deriveFailure, deploymentActionsTotal, type ClusterCondition } from './pipeline'
 import type { AicrEvent } from './useEvents'
 import applyRun from './fixtures/apply-run.json'
 
@@ -258,13 +258,16 @@ describe('deriveComponents cluster conditions', () => {
     expect(activeCondition(afterRecurrence.conditions)?.resolved).toBeFalsy()
   })
 
-  // Ruling 27 (Task 7 fix round 1, Critical 1). Every fixture above holds
-  // `component` constant for its whole sequence -- exactly the blind spot
-  // the review named. Event.Component is a moving cursor
-  // (internal/engine/attribution.go's ActiveAction, empty between actions
-  // and outside Apply), so an arising condition and its own resolution
-  // routinely carry DIFFERENT Component values. This is that sequence.
-  it('a resolution attributed to a LATER action still clears the row that showed the arising condition', () => {
+  // Ruling 27 (Task 7 fix round 1, Critical 1) / Ruling 30 (Task 7 fix round
+  // 2, Important 1(new)). Every fixture above holds `component` constant
+  // for its whole sequence -- the blind spot the fix round 1 review named.
+  // The four tests below vary `component` (same row / a later row / no
+  // attribution) and `resolved` (true / false) INDEPENDENTLY across a
+  // cross-component sequence -- the exact combination the fix round 2
+  // review found still constant (every prior cross-component fixture set
+  // `resolved: true`, so an unresolved re-observation crossing rows was
+  // never exercised).
+  it('a resolution attributed to a LATER action still clears the row that showed the arising condition, without moving there (Ruling 30: placement is sticky)', () => {
     const timeline: AicrEvent[] = [
       ...headers, // cert-manager x2, gpu-operator started
       clusterEvent(4, 'gpu-operator', { uid: 'uid-1', reason: 'ImagePullBackOff', severity: 2, at: '2026-08-15T09:01:00Z' }, 'pod stuck'),
@@ -281,14 +284,42 @@ describe('deriveComponents cluster conditions', () => {
     const kaiScheduler = rows.find(c => c.name === 'kai-scheduler')!
 
     // The row that showed it unresolved must not keep showing it: the
-    // resolution superseded the SAME (uid, reason) entry regardless of
-    // which row it landed on.
+    // resolution superseded the SAME (uid, reason) entry.
     expect(activeCondition(gpuOperator.conditions)).toBeUndefined()
-    // The entry now lives wherever it was last observed -- present, but
-    // resolved conditions never render (activeCondition skips them), so
-    // kai-scheduler's row shows nothing either.
-    expect(kaiScheduler.conditions).toHaveLength(1)
-    expect(activeCondition(kaiScheduler.conditions)).toBeUndefined()
+    // Ruling 30, replacing the fix round 1 assertion this same test made
+    // (Ruling 31 authorizes the rewrite: that assertion pinned "placement
+    // moves to the resolving event's row" as a requirement nobody had
+    // actually ruled on). The entry stays on the row it was FIRST
+    // attributed to -- gpu-operator, still resolved, so it doesn't render
+    // there either -- and never visits kai-scheduler's row at all.
+    expect(gpuOperator.conditions).toHaveLength(1)
+    expect(kaiScheduler.conditions).toHaveLength(0)
+  })
+
+  it('an UNRESOLVED re-observation under a LATER action does not move the row -- the visible red line stays where it was first seen (Ruling 30)', () => {
+    const timeline: AicrEvent[] = [
+      ...headers,
+      clusterEvent(4, 'gpu-operator', { uid: 'uid-3', reason: 'ImagePullBackOff', severity: 2, at: '2026-08-15T09:01:00Z' }, 'still stuck'),
+      { id: 5, runId: 'run1', at: '2026-08-15T09:02:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'gpu-operator installed', data: { name: 'gpu-operator', status: 'installed' } },
+      { id: 6, runId: 'run1', at: '2026-08-15T09:02:01Z', kind: 'component', level: 'info', phase: 'apply', component: 'kai-scheduler', message: 'installing kai-scheduler', data: { name: 'kai-scheduler', index: 3, total: 3, status: 'started' } },
+      // The SAME pod, SAME reason, STILL unresolved -- onDaemonSet/
+      // onPodChange republish on every change, not just on recovery, so
+      // this re-observation under kai-scheduler is the normal path for
+      // trouble that outlives its own action's install window.
+      clusterEvent(7, 'kai-scheduler', { uid: 'uid-3', reason: 'ImagePullBackOff', severity: 2, resolved: false, at: '2026-08-15T09:03:00Z' }, 'still stuck, seen again'),
+    ]
+
+    const rows = deriveComponents(timeline, undefined)
+    const gpuOperator = rows.find(c => c.name === 'gpu-operator')!
+    const kaiScheduler = rows.find(c => c.name === 'kai-scheduler')!
+
+    // gpu-operator keeps showing the (still current, still unresolved)
+    // condition it first surfaced -- installed does not mean quiet.
+    expect(activeCondition(gpuOperator.conditions)?.uid).toBe('uid-3')
+    expect(activeCondition(gpuOperator.conditions)?.resolved).toBeFalsy()
+    // kai-scheduler never installed this pod and must not render a false
+    // red line for it -- the bug this Ruling closes.
+    expect(kaiScheduler.conditions).toHaveLength(0)
   })
 
   it('a resolution published with NO attribution at all still clears the row that showed the arising condition', () => {
@@ -310,6 +341,23 @@ describe('deriveComponents cluster conditions', () => {
     expect(activeCondition(gpuOperator.conditions)).toBeUndefined()
   })
 
+  it('an UNRESOLVED re-observation with NO attribution at all does not un-place the condition either (Ruling 30)', () => {
+    const timeline: AicrEvent[] = [
+      ...headers,
+      clusterEvent(4, 'gpu-operator', { uid: 'uid-4', reason: 'CrashLoopBackOff', severity: 2, at: '2026-08-15T09:01:00Z' }, 'pod crashlooping'),
+      { id: 5, runId: 'run1', at: '2026-08-15T09:02:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'gpu-operator installed', data: { name: 'gpu-operator', status: 'installed' } },
+      // Still broken, still no active action, so still no Component --
+      // placement must stay exactly where the first attributed sighting
+      // put it, not fall back to "nowhere" just because this later event
+      // has nothing to offer.
+      clusterEvent(6, undefined, { uid: 'uid-4', reason: 'CrashLoopBackOff', severity: 2, resolved: false, at: '2026-08-15T09:03:00Z' }, 'pod still crashlooping'),
+    ]
+
+    const rows = deriveComponents(timeline, undefined)
+    const gpuOperator = rows.find(c => c.name === 'gpu-operator')!
+    expect(activeCondition(gpuOperator.conditions)?.uid).toBe('uid-4')
+  })
+
   // Ruling 28 (Task 7 fix round 1, Important 2). engine.Retry reuses the
   // SAME RunID, so relevantTo's RunID filter cannot separate attempt 1 from
   // the retried attempt 2 -- a condition from the failed attempt would
@@ -327,6 +375,26 @@ describe('deriveComponents cluster conditions', () => {
     const rows = deriveComponents(timeline, undefined)
     const gpuOperator = rows.find(c => c.name === 'gpu-operator')!
     expect(gpuOperator.conditions).toHaveLength(0)
+  })
+
+  // Minor 1 (Task 7 fix round 2, new): the retry-clear guard checks BOTH
+  // Kind and Message. engine.go's runStep publishes a KindPhase event on
+  // every step -- "phase started" (engine.go:591) and "phase complete"
+  // (engine.go:701) -- so a guard checking `e.kind === 'phase'` alone would
+  // silently wipe every row's conditions at every ordinary phase
+  // transition, not just on retry.
+  it('an ordinary phase event ("phase complete") does NOT clear tracked conditions -- only "run retrying" does', () => {
+    const timeline: AicrEvent[] = [
+      { id: 1, runId: 'run1', at: '2026-08-15T09:00:00Z', kind: 'component', level: 'info', phase: 'apply', component: 'gpu-operator', message: 'installing gpu-operator', data: { name: 'gpu-operator', index: 1, total: 1, status: 'started' } },
+      clusterEvent(2, 'gpu-operator', { uid: 'uid-still-broken', reason: 'ImagePullBackOff', severity: 2, at: '2026-08-15T09:00:30Z' }, 'pod stuck'),
+      // A real, unrelated KindPhase event -- same shape as engine.go's
+      // "phase complete" publish, just not the retry one.
+      { id: 3, runId: 'run1', at: '2026-08-15T09:01:00Z', kind: 'phase', level: 'info', phase: 'apply', message: 'phase complete' },
+    ]
+
+    const rows = deriveComponents(timeline, undefined)
+    const gpuOperator = rows.find(c => c.name === 'gpu-operator')!
+    expect(activeCondition(gpuOperator.conditions)?.uid).toBe('uid-still-broken')
   })
 })
 
@@ -377,25 +445,71 @@ describe('clusterConditionSupersedes', () => {
   })
 
   // Minor 1 (Task 7 fix round 1): Date.parse truncates Go's nanosecond At to
-  // milliseconds, so two events inside the same millisecond read as a tie
-  // in TS while Go orders them strictly -- and a malformed At produced NaN,
-  // which is never greater than anything, pinning the entry permanently.
-  // String comparison (RFC3339, always UTC on this wire) fixes both.
+  // milliseconds -- and a malformed At produced NaN, which is never greater
+  // than anything, pinning the entry permanently.
 
-  it('orders by At down to sub-millisecond precision, which Date.parse would truncate away', () => {
+  it('orders by At down to full nanosecond precision, which Date.parse would truncate away', () => {
     const prev = cond({ ready: 3, at: '2026-08-15T09:00:00.000000001Z' })
     const next = cond({ ready: 4, at: '2026-08-15T09:00:00.000000900Z' })
     expect(clusterConditionSupersedes(next, prev)).toBe(true)
     expect(clusterConditionSupersedes(prev, next)).toBe(false)
   })
 
-  it('a malformed At produces a determinate order rather than pinning the entry forever (no NaN comparison)', () => {
-    const malformed = cond({ at: 'not-a-real-timestamp' })
-    const wellFormed = cond({ at: '2026-08-15T09:00:00Z' })
-    // Date.parse(malformed) is NaN, and NaN > x and x > NaN are BOTH false
-    // -- neither direction could ever supersede the other, pinning whichever
-    // arrived first. Exactly one direction must hold here.
-    expect(clusterConditionSupersedes(wellFormed, malformed)).not.toBe(clusterConditionSupersedes(malformed, wellFormed))
+  it('a malformed At falls through to the Resolved/Severity tie-break instead of blocking supersession outright (Minor 1, fix round 1 -- no NaN comparison)', () => {
+    const malformed = cond({ at: 'not-a-real-timestamp', severity: 0, resolved: false })
+    const alsoMalformed = cond({ at: 'also-not-a-real-timestamp', severity: 0, resolved: true })
+    // Date.parse(malformed) was NaN, and `NaN !== x` is true while
+    // `NaN > x` is false -- so the OLD code took the At branch and
+    // returned false in BOTH directions, regardless of Resolved or
+    // Severity, permanently blocking supersession. compareAt returns 0 for
+    // an unparseable value instead, which falls through to the tie-break
+    // below it -- so Resolved can still decide the outcome.
+    expect(clusterConditionSupersedes(alsoMalformed, malformed)).toBe(true)
+    expect(clusterConditionSupersedes(malformed, alsoMalformed)).toBe(false)
+  })
+})
+
+describe('compareAt', () => {
+  // Ruling 33 (Task 7 fix round 2, Important 3(new)). Go's time.Time
+  // marshals as RFC3339Nano -- VARIABLE width: trailing zero fraction
+  // digits are trimmed, and a whole second drops the fraction entirely.
+  // Plain string comparison (the fix round 1 shape) gets this wrong
+  // because 'Z' (0x5A) sorts above '.' (0x2E): a whole second ("...:00Z")
+  // reads as LATER than any fraction within that same second
+  // ("...:00.5Z"), which is backwards. These three tests are the three
+  // widths Go's marshaler actually produces -- no fraction, a trimmed
+  // fraction, and full nanosecond precision -- compared pairwise so the
+  // property holds in general, not just within one width.
+
+  it('a whole second (no fraction) is EARLIER than any fraction within that same second, not later', () => {
+    // The exact end-to-end symptom: an ImagePullBackOff arising at
+    // 09:01:00Z and resolving at 09:01:00.5Z left the row stuck forever,
+    // because plain string comparison ranked "...:00Z" above "...:00.5Z".
+    expect(compareAt('2026-08-15T09:01:00Z', '2026-08-15T09:01:00.5Z')).toBeLessThan(0)
+    expect(compareAt('2026-08-15T09:01:00.5Z', '2026-08-15T09:01:00Z')).toBeGreaterThan(0)
+  })
+
+  it('a trimmed (short) fraction and a full 9-digit fraction compare correctly by true magnitude, not by string length', () => {
+    // 500,000,000ns ("...5Z", trimmed) vs 500,000,001ns
+    // ("...500000001Z", untrimmable) -- the latter is 1ns later. Right-
+    // padding both to 9 digits before comparing is what makes this work;
+    // comparing the raw, unpadded strings ("5" vs "500000001") would not.
+    expect(compareAt('2026-08-15T09:01:00.5Z', '2026-08-15T09:01:00.500000001Z')).toBeLessThan(0)
+    expect(compareAt('2026-08-15T09:01:00.500000001Z', '2026-08-15T09:01:00.5Z')).toBeGreaterThan(0)
+  })
+
+  it('two full nanosecond-precision fractions order correctly down to the last digit', () => {
+    expect(compareAt('2026-08-15T09:00:00.000000001Z', '2026-08-15T09:00:00.000000900Z')).toBeLessThan(0)
+    expect(compareAt('2026-08-15T09:00:00.000000900Z', '2026-08-15T09:00:00.000000001Z')).toBeGreaterThan(0)
+  })
+
+  it('a differing whole-second prefix decides the order before any fraction is considered', () => {
+    expect(compareAt('2026-08-15T09:00:00.999999999Z', '2026-08-15T09:00:01Z')).toBeLessThan(0)
+  })
+
+  it('returns 0 (not NaN, not a throw) for a value that does not match RFC3339 UTC', () => {
+    expect(compareAt('not-a-real-timestamp', '2026-08-15T09:00:00Z')).toBe(0)
+    expect(compareAt('2026-08-15T09:00:00Z', 'not-a-real-timestamp')).toBe(0)
   })
 })
 

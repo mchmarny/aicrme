@@ -39,16 +39,17 @@ export interface ComponentState extends ComponentData {
   /** For a generated action, the name of the component step it trails. Undefined for a real component. */
   parent?: string
   /**
-   * Cluster conditions currently PLACED on this row, one per distinct (UID,
-   * Reason) the observer has reported. "Placed", not "arose while this
-   * action was active": Component is a moving cursor (see
-   * clusterConditionSupersedes's doc comment / Ruling 27), so a condition's
-   * placement can move to a later row than the one it arose on, or stay put
-   * under a resolution that carried no attribution at all. This is NOT the
-   * same as "what the row shows" -- see activeCondition -- a row keeps
-   * every condition currently placed on it, resolved or not, so a later
-   * resolution or recurrence on the same (UID, Reason) can update its own
-   * slot instead of losing the others sharing this row.
+   * Cluster conditions placed on this row, one per distinct (UID, Reason)
+   * the observer has reported. "Placed", not "currently active on": a
+   * condition's placement is set once, at its first attributed observation,
+   * and never moves after that (see TrackedCondition's doc comment /
+   * Ruling 30) -- a later resolution or an unresolved re-observation under
+   * a different action updates the condition's data in place but stays on
+   * the row it first arose on. This is NOT the same as "what the row
+   * shows" -- see activeCondition -- a row keeps every condition ever
+   * placed on it, resolved or not, so a later resolution or recurrence on
+   * the same (UID, Reason) can update its own slot instead of losing the
+   * others sharing this row.
    */
   conditions: ClusterCondition[]
 }
@@ -93,6 +94,60 @@ function conditionKey(c: Pick<ClusterCondition, 'uid' | 'reason'>): string {
 }
 
 /**
+ * AT_PATTERN splits an RFC3339 UTC timestamp into its whole-second prefix
+ * (group 1, fixed width) and its fractional digits (group 2, present only
+ * when Go's marshaling didn't trim them all away). Anchored to `Z` because
+ * Observer.publish always stamps `time.Now().UTC()` -- this is not a
+ * general RFC3339-with-offset parser, and doesn't need to be.
+ */
+const AT_PATTERN = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z$/
+
+/**
+ * compareAt orders two RFC3339 UTC timestamps chronologically: negative if
+ * `a` is earlier, positive if later, 0 if equal or unparseable.
+ *
+ * NOT a plain string comparison (Ruling 33, Task 7 fix round 2, closing an
+ * Important the previous round's fix introduced). Go's `time.Time`
+ * marshals as RFC3339**Nano**, which is variable width: trailing zero
+ * fraction digits are trimmed, and a whole second drops the fraction
+ * entirely -- `time.Date(..., 0)` marshals to `"...:00Z"`,
+ * `time.Date(..., 500_000_000)` to `"...:00.5Z"`. Since `'Z'` (0x5A) sorts
+ * above `'.'` (0x2E) and both sort above digits, the two strings first
+ * differ right after the seconds field, where `'Z'` (no fraction) beats
+ * `'.'` (has one) -- so plain string comparison ranks a WHOLE second above
+ * any fractional moment within that same second, even though any positive
+ * fraction is strictly later. Demonstrated end to end: an `ImagePullBackOff`
+ * arising at `09:01:00Z` and resolving at `09:01:00.5Z` left the row stuck
+ * forever, because the resolution's `next.at > prev.at` read false under
+ * plain string comparison.
+ *
+ * Fixed by comparing the two parts separately: the whole-second prefix
+ * first (fixed width, safe to compare as a string), then the fractional
+ * digits, both sides right-padded with `'0'` to the same width before
+ * comparing -- padding is what makes Go's trimming safe to compare at all:
+ * `"5"` (500,000,000ns) padded to `"500000000"` correctly outranks
+ * `"050000000"` (50,000,000ns), where comparing the raw, unpadded strings
+ * `"5"` vs `"05"` would not.
+ *
+ * A value that doesn't match RFC3339 UTC returns 0 rather than NaN: this
+ * path is unreachable on the observer's live output (`ClusterData.At` is
+ * always `time.Now().UTC()`), so it exists only so a malformed value falls
+ * through to clusterConditionSupersedes's Resolved/Severity tie-break
+ * instead of blocking supersession outright the way `Date.parse`'s `NaN`
+ * did (Minor 1, Task 7 fix round 1).
+ */
+export function compareAt(a: string, b: string): number {
+  const ma = AT_PATTERN.exec(a)
+  const mb = AT_PATTERN.exec(b)
+  if (!ma || !mb) return 0
+  if (ma[1] !== mb[1]) return ma[1] < mb[1] ? -1 : 1
+  const fa = (ma[2] ?? '').padEnd(9, '0')
+  const fb = (mb[2] ?? '').padEnd(9, '0')
+  if (fa === fb) return 0
+  return fa < fb ? -1 : 1
+}
+
+/**
  * clusterConditionSupersedes mirrors bus.ClusterData.Supersedes
  * (internal/bus/cluster.go) field for field: same UID AND same Reason (the
  * caller already guarantees this via conditionKey, but the check is kept
@@ -108,20 +163,14 @@ function conditionKey(c: Pick<ClusterCondition, 'uid' | 'reason'>): string {
  * `return true` here previously left the suite green, because nothing
  * exercised anything past the guard).
  *
- * At is compared as a plain string, not via Date.parse: Observer.publish
- * always stamps RFC3339 in UTC (time.Now().UTC()), and for timestamps in
- * that one fixed format, lexicographic string order IS chronological
- * order -- including whatever sub-millisecond precision Go's clock
- * produces, which Date.parse would silently truncate to whole
- * milliseconds. It also cannot produce NaN the way Date.parse can on a
- * malformed value: a NaN > NaN comparison is always false, which would
- * pin a condition on its row forever rather than fail loudly (Minor 1,
- * Task 7 fix round 1) -- silently invisible is the worse failure mode of
- * the two.
+ * At ordering is delegated to compareAt -- see its doc comment for why
+ * plain string comparison (this function's Task 7 fix round 1 shape) is
+ * wrong.
  */
 export function clusterConditionSupersedes(next: ClusterCondition, prev: ClusterCondition): boolean {
   if (next.uid !== prev.uid || next.reason !== prev.reason) return false
-  if (next.at !== prev.at) return next.at > prev.at
+  const atCmp = compareAt(next.at, prev.at)
+  if (atCmp !== 0) return atCmp > 0
   if (Boolean(next.resolved) !== Boolean(prev.resolved)) return Boolean(next.resolved)
   return next.severity > prev.severity
 }
@@ -155,17 +204,31 @@ export function clusterConditionSupersedes(next: ClusterCondition, prev: Cluster
 interface TrackedCondition {
   data: ClusterCondition
   /**
-   * Row this condition currently renders under. Undefined when the
-   * condition has never been observed with an active action -- it still
-   * exists (so a later resolution or recurrence can supersede it), it just
-   * has nowhere to render, matching "unattributed events do not attach to
-   * any row". Only moves when a SUPERSEDING event itself carries a
-   * Component; an unattributed superseding event (between actions, or
-   * after the run's terminal state clears ActiveAction) still updates
-   * `data` -- that is what lets a between-actions resolution clear a row
-   * the arising condition was attributed to -- but leaves placement where
-   * it last was, rather than un-rendering a condition that has not
-   * actually changed rows.
+   * Row this condition renders under. Undefined when the condition has
+   * never been observed with an active action -- it still exists (so a
+   * later resolution or recurrence can supersede it), it just has nowhere
+   * to render, matching "unattributed events do not attach to any row".
+   *
+   * Ruling 30 (Task 7 fix round 2, Important 1(new)): STICKY at first
+   * attribution, not "moves to whichever superseding event carries a
+   * Component" (that was the fix round 1 shape). `onDaemonSet`
+   * (internal/observer/handlers.go) republishes the same (UID,
+   * "RolloutProgress") on every ready-count change, and `onPodChange`
+   * republishes on every change to a pod's narrated detail -- so
+   * re-observation, not just resolution, is the normal path for a
+   * condition that outlives its own action's install window (the
+   * 10-20-minute Nodewright convergence this whole feature exists to
+   * narrate). Under "moves", a still-BROKEN, still-UNRESOLVED condition
+   * re-observed under the next action's Component would visibly hop off
+   * the row an operator has been watching red and onto a row that never
+   * installed it, rendering that row a false clean green. A condition is a
+   * temporal correlation -- "first observed while X was installing" --
+   * and re-observation under a later action means the trouble PERSISTED,
+   * not that it migrated: anchoring on first attribution is what makes
+   * that reading literally true. Resolution is unaffected either way,
+   * since a resolved entry never renders anywhere (activeCondition skips
+   * it) -- so this only changes behavior for the case that matters, an
+   * unresolved condition still needing to be seen.
    */
   component?: string
 }
@@ -175,6 +238,12 @@ interface TrackedCondition {
  * KindCluster event. Every cluster event is folded here, attributed or not
  * -- see TrackedCondition's doc comment for why an unattributed event must
  * still be able to supersede an existing entry rather than being dropped.
+ *
+ * `prev?.component ?? e.component`, not `e.component || prev?.component`:
+ * once a placement exists it never changes (Ruling 30) -- an already-placed
+ * entry keeps `prev.component` regardless of what `e.component` says, and
+ * only a key with NO prior placement adopts `e.component` (which may itself
+ * be undefined, i.e. still unattributed).
  */
 function foldClusterEvent(tracked: Map<string, TrackedCondition>, e: AicrEvent) {
   if (!isClusterData(e.data)) return
@@ -182,7 +251,7 @@ function foldClusterEvent(tracked: Map<string, TrackedCondition>, e: AicrEvent) 
   const key = conditionKey(cond)
   const prev = tracked.get(key)
   if (prev && !clusterConditionSupersedes(cond, prev.data)) return
-  tracked.set(key, { data: cond, component: e.component || prev?.component })
+  tracked.set(key, { data: cond, component: prev?.component ?? e.component })
 }
 
 /**
@@ -194,8 +263,10 @@ function foldClusterEvent(tracked: Map<string, TrackedCondition>, e: AicrEvent) 
  * genuinely has nothing outstanding, not "waiting on the next one."
  *
  * On an exact severity tie, the later At wins (Minor 4, Task 7 fix round
- * 1). `conditions`' array order reflects Map insertion order -- i.e. when a
- * (UID, Reason) FIRST arose, not its most recent update, since
+ * 1), ordered via compareAt -- not `c.at > best.at`, for the same reason
+ * clusterConditionSupersedes doesn't use plain string comparison either
+ * (Ruling 33). `conditions`' array order reflects Map insertion order --
+ * i.e. when a (UID, Reason) FIRST arose, not its most recent update, since
  * clusterConditionSupersedes updates a slot in place without moving it --
  * so picking the first same-severity match would silently prefer whichever
  * condition happened to arrive first and never budge again. The contract
@@ -207,7 +278,7 @@ export function activeCondition(conditions: ClusterCondition[]): ClusterConditio
   let best: ClusterCondition | undefined
   for (const c of conditions) {
     if (c.resolved) continue
-    if (!best || c.severity > best.severity || (c.severity === best.severity && c.at > best.at)) best = c
+    if (!best || c.severity > best.severity || (c.severity === best.severity && compareAt(c.at, best.at) > 0)) best = c
   }
   return best
 }

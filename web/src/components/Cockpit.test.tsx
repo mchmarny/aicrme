@@ -136,4 +136,31 @@ describe('Cockpit', () => {
     expect(screen.getByTestId('cockpit-success')).toBeDefined()
     expect(screen.queryByRole('button', { name: /retry/i })).toBeNull()
   })
+
+  // Minor 2 (Task 7 fix round 2, new): Ruling 27's stated intent is that a
+  // still-open condition survives to the Done screen -- an operator seeing
+  // "installed successfully" needs to still see the one row that isn't
+  // actually clean. The caption's tense must match: the run is over, so
+  // "installed", not "installs".
+  it('done: a still-open condition survives to the Done screen in past tense', () => {
+    const events: AicrEvent[] = [
+      componentEvent(1, 'gpu-operator', { index: 1, total: 1, status: 'started' }),
+      componentEvent(2, 'gpu-operator', { status: 'installed' }),
+      {
+        id: 3, runId: 'run1', at: '2026-08-15T09:03:00Z', kind: 'cluster', level: 'info', phase: 'apply',
+        component: 'gpu-operator', message: 'gpu-operator/nvidia-driver-daemonset-abc ImagePullBackOff',
+        data: {
+          kind: 'Pod', namespace: 'gpu-operator', name: 'nvidia-driver-daemonset-abc', uid: 'uid-1',
+          reason: 'ImagePullBackOff', severity: 2, resolved: false, at: '2026-08-15T09:03:00Z',
+        },
+      },
+    ]
+    const run = baseRun({ state: 'done' })
+    render(<Cockpit events={events} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    const gpuRow = screen.getByTestId('component-gpu-operator')
+    expect(gpuRow.textContent).toMatch(/ImagePullBackOff/)
+    expect(gpuRow.textContent).toMatch(/while gpu-operator installed\)/i)
+    expect(gpuRow.textContent).not.toMatch(/while gpu-operator installs/i)
+  })
 })

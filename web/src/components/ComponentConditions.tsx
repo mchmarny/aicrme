@@ -25,8 +25,16 @@ const severityClass: Record<number, string> = {
  * condition, only that the observer saw it while this action was the one
  * installing. See
  * docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md, Section 1.
+ *
+ * `tense` (Minor 2, Task 7 fix round 2): "installs" is present tense,
+ * correct while the run is still going -- but Ruling 27 means a condition
+ * can survive to the Done screen (a still-open pod condition beside "every
+ * component installed successfully" is the exact case this feature exists
+ * to surface, not to hide). Cockpit.tsx's Done passes `tense="past"` so the
+ * caption reads "installed" there instead of describing a run that is
+ * already over as still in progress.
  */
-export function ComponentConditions({ name, conditions }: { name: string; conditions: ClusterCondition[] }) {
+export function ComponentConditions({ name, conditions, tense = 'present' }: { name: string; conditions: ClusterCondition[]; tense?: 'present' | 'past' }) {
   const active = activeCondition(conditions)
   if (!active) return null
 
@@ -43,7 +51,7 @@ export function ComponentConditions({ name, conditions }: { name: string; condit
     <p data-testid={`condition-${name}`} className={`mt-1 max-w-2xl text-xs ${severityClass[active.severity] ?? 'text-slate-400'}`}>
       {!reasonInMessage && <span className="font-mono">{active.reason}</span>}
       {active.message && <span className={`text-slate-500 ${reasonInMessage ? '' : 'ml-1'}`}>{active.message}</span>}
-      <span className="ml-1 text-slate-600">(cluster activity while {name} installs)</span>
+      <span className="ml-1 text-slate-600">(cluster activity while {name} {tense === 'past' ? 'installed' : 'installs'})</span>
     </p>
   )
 }
