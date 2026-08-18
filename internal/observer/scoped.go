@@ -23,8 +23,10 @@ import (
 // informers.WithNamespace takes exactly one namespace (verified against the
 // pinned client-go v0.36.3, informers/factory.go:99 -- "factory.namespace =
 // namespace" is a single field, last write wins, not a set), so following a
-// multi-namespace recipe means one SharedInformerFactory per namespace,
-// roughly ten for the current recipe, not one namespace-filtered factory.
+// multi-namespace recipe means one SharedInformerFactory per namespace PER
+// KIND -- two per namespace (Important 2, Task 5 fix round 1: Pod and Event
+// cannot share one factory, see factoryEntry's doc comment), roughly twenty
+// for the current ten-namespace recipe, not one namespace-filtered factory.
 //
 // reconcile is driven purely by RunScope.Terminal (Ruling 8), re-derived by
 // main from engine.Attribution() on every call
@@ -196,13 +198,14 @@ func (s *scopedInformers) reconcile(sc RunScope) {
 	}
 }
 
-// startNamespace builds one namespace's factory and materializes its Pod and
-// Event informers, then starts them on their own goroutine so a wedged API
-// server's initial List cannot stall reconcile's caller -- the bite-proof
-// this file exists to satisfy (TestScopedInformerStartDoesNotBlock). Callers
-// must hold s.mu; the goroutine launched here touches only the factory and
-// stop values it closes over, never s itself, so it needs no lock of its
-// own.
+// startNamespace builds one namespace's two factories (Important 2, Task 5
+// fix round 1 -- Pod and Event each get their own) and materializes the Pod
+// and Event informer on each, then starts them on their own goroutine so a
+// wedged API server's initial List cannot stall reconcile's caller -- the
+// bite-proof this file exists to satisfy (TestScopedInformerStartDoesNotBlock).
+// Callers must hold s.mu; the goroutine launched here touches only the
+// factory and stop values it closes over, never s itself, so it needs no
+// lock of its own.
 //
 // AddEventHandler errors below are logged, not returned, unlike
 // Observer.register's identical call (observer.go) -- a deliberate
@@ -264,6 +267,19 @@ func (s *scopedInformers) startNamespace(ns string) *factoryEntry {
 // 5 fix round 1). Callers must hold s.mu; onNamespaceStop runs synchronously
 // on this call's goroutine, same posture as everything else reconcile does
 // under lock -- it is expected to be cheap in-memory bookkeeping, not I/O.
+//
+// This sweep alone is NOT sufficient to prevent Observer.pods from
+// re-accumulating stale entries after teardown (Important B, Task 5 fix
+// round 2): close(e.stop) does not stop the informer's sharedProcessor
+// synchronously, so a Pod notification already queued for delivery keeps
+// arriving at onPodAdd/onPodUpdate after this function returns, and a write
+// from one of those would land after this sweep already ran -- a sweep
+// cannot win a race against deliveries already in flight, however it is
+// ordered or however many times it runs. withNamespaceLive is the other
+// half: every write those handlers make is gated on ns still being in
+// s.entries, checked under the SAME s.mu this function also uses, so a
+// stale delivery declines to write instead of racing the sweep that
+// already happened.
 func (s *scopedInformers) stopNamespaceLocked(ns string, e *factoryEntry) {
 	close(e.stop)
 	delete(s.entries, ns)
@@ -278,6 +294,35 @@ func (s *scopedInformers) stopNamespaceLocked(ns string, e *factoryEntry) {
 func (s *scopedInformers) stopAllLocked() {
 	for ns, e := range s.entries {
 		s.stopNamespaceLocked(ns, e)
+	}
+}
+
+// withNamespaceLive runs fn only if ns is still tracked as live (present in
+// s.entries), holding s.mu for the CHECK and for fn's ENTIRE execution --
+// not just the check -- so a teardown, which also needs s.mu (via
+// stopNamespaceLocked), cannot interleave between "ns is live" and whatever
+// fn does about it (Important B, Task 5 fix round 2).
+//
+// Mirrors internal/engine's epoch/aliveLocked(epoch) idiom: a check made and
+// then acted on after releasing the lock, or under a different one, is not
+// a guard -- it is exactly as racy as no check at all, just less obviously
+// so. See stopNamespaceLocked's doc comment for the specific race this
+// closes: close(stop) does not stop an informer's sharedProcessor
+// synchronously, so a notification already queued keeps being delivered to
+// Pod/Event handlers after teardown returns, and those handlers must
+// decline to write once torn down rather than race the sweep that already
+// ran.
+//
+// fn is expected to be fast, in-memory work -- a single map read/write --
+// never I/O or a bus publish. s.mu also gates reconcile() and every other
+// namespace's own handler delivery, so anything slower here would serialize
+// far more than the one write it exists to protect; pods.go's callers keep
+// their o.publish calls outside fn for exactly this reason.
+func (s *scopedInformers) withNamespaceLive(ns string, fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.entries[ns]; ok {
+		fn()
 	}
 }
 

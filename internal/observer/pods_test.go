@@ -3,6 +3,7 @@ package observer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -75,12 +76,23 @@ func waitForEvent(t *testing.T, sub <-chan bus.Event) bus.Event {
 
 func waitForClusterData(t *testing.T, sub <-chan bus.Event) bus.ClusterData {
 	t.Helper()
+	_, cd := waitForEventAndClusterData(t, sub)
+	return cd
+}
+
+// waitForEventAndClusterData is waitForClusterData's counterpart when a test
+// also needs the raw Event.Message -- Ruling 17 (Task 5 fix round 2) keeps
+// the raw kubelet reason in the narration message even though
+// ClusterData.Reason is normalized, and TestPodNarratesImagePullBackOff's
+// ErrImagePull case needs to check both.
+func waitForEventAndClusterData(t *testing.T, sub <-chan bus.Event) (bus.Event, bus.ClusterData) {
+	t.Helper()
 	e := waitForEvent(t, sub)
 	var cd bus.ClusterData
 	if err := json.Unmarshal(e.Data, &cd); err != nil {
 		t.Fatalf("Unmarshal(ClusterData) error = %v, raw = %s", err, e.Data)
 	}
-	return cd
+	return e, cd
 }
 
 // collectPodEvents drains sub for the full duration, so a "nothing published"
@@ -144,39 +156,49 @@ func withUnschedulable(pod *corev1.Pod) *corev1.Pod {
 // signal, not just "no Adds ever narrate".
 func TestPodNarratesImagePullBackOff(t *testing.T) {
 	tests := []struct {
-		name     string
-		mutate   func(*corev1.Pod) *corev1.Pod
-		reason   string
-		wantSev  bus.Severity
-		wantCont string
+		name       string
+		mutate     func(*corev1.Pod) *corev1.Pod
+		wantReason string // normalized -- the ClusterData.Reason / Supersedes key (Ruling 17)
+		wantDetail string // raw kubelet reason, expected inside the narration message
+		wantSev    bus.Severity
+		wantCont   string
 	}{
 		{
-			name:     "ImagePullBackOff",
-			mutate:   func(p *corev1.Pod) *corev1.Pod { return withContainerWaiting(p, "app", reasonImagePullBackOff) },
-			reason:   reasonImagePullBackOff,
-			wantSev:  bus.SeverityWarn,
-			wantCont: "app",
+			name:       "ImagePullBackOff",
+			mutate:     func(p *corev1.Pod) *corev1.Pod { return withContainerWaiting(p, "app", reasonImagePullBackOff) },
+			wantReason: reasonImagePullBackOff,
+			wantDetail: reasonImagePullBackOff,
+			wantSev:    bus.SeverityWarn,
+			wantCont:   "app",
 		},
 		{
-			name:     "ErrImagePull",
-			mutate:   func(p *corev1.Pod) *corev1.Pod { return withContainerWaiting(p, "app", reasonErrImagePull) },
-			reason:   reasonErrImagePull,
-			wantSev:  bus.SeverityWarn,
-			wantCont: "app",
+			// Ruling 17 (Task 5 fix round 2): ErrImagePull normalizes to the
+			// SAME Reason as ImagePullBackOff -- kubelet's two names for one
+			// stuck pull -- so this case's wantReason is deliberately
+			// reasonImagePullBackOff, not reasonErrImagePull. The raw
+			// "ErrImagePull" detail must still reach the narration message.
+			name:       "ErrImagePull",
+			mutate:     func(p *corev1.Pod) *corev1.Pod { return withContainerWaiting(p, "app", reasonErrImagePull) },
+			wantReason: reasonImagePullBackOff,
+			wantDetail: reasonErrImagePull,
+			wantSev:    bus.SeverityWarn,
+			wantCont:   "app",
 		},
 		{
-			name:     "CrashLoopBackOff",
-			mutate:   func(p *corev1.Pod) *corev1.Pod { return withContainerWaiting(p, "app", reasonCrashLoopBackOff) },
-			reason:   reasonCrashLoopBackOff,
-			wantSev:  bus.SeverityError,
-			wantCont: "app",
+			name:       "CrashLoopBackOff",
+			mutate:     func(p *corev1.Pod) *corev1.Pod { return withContainerWaiting(p, "app", reasonCrashLoopBackOff) },
+			wantReason: reasonCrashLoopBackOff,
+			wantDetail: reasonCrashLoopBackOff,
+			wantSev:    bus.SeverityError,
+			wantCont:   "app",
 		},
 		{
-			name:     "unschedulable",
-			mutate:   withUnschedulable,
-			reason:   reasonUnschedulable,
-			wantSev:  bus.SeverityError,
-			wantCont: "",
+			name:       "unschedulable",
+			mutate:     withUnschedulable,
+			wantReason: reasonUnschedulable,
+			wantDetail: reasonUnschedulable,
+			wantSev:    bus.SeverityError,
+			wantCont:   "",
 		},
 	}
 	for _, tc := range tests {
@@ -189,15 +211,18 @@ func TestPodNarratesImagePullBackOff(t *testing.T) {
 				t.Fatalf("Create() error = %v", err)
 			}
 
-			cd := waitForClusterData(t, sub)
+			e, cd := waitForEventAndClusterData(t, sub)
 			if cd.Kind != kindPod {
 				t.Errorf("Kind = %q, want %q", cd.Kind, kindPod)
 			}
 			if cd.UID != "pod-uid" {
 				t.Errorf("UID = %q, want %q", cd.UID, "pod-uid")
 			}
-			if cd.Reason != tc.reason {
-				t.Errorf("Reason = %q, want %q", cd.Reason, tc.reason)
+			if cd.Reason != tc.wantReason {
+				t.Errorf("Reason = %q, want %q", cd.Reason, tc.wantReason)
+			}
+			if !strings.Contains(e.Message, tc.wantDetail) {
+				t.Errorf("Message = %q, want it to contain the raw reason %q", e.Message, tc.wantDetail)
 			}
 			if cd.Container != tc.wantCont {
 				t.Errorf("Container = %q, want %q", cd.Container, tc.wantCont)
@@ -398,16 +423,25 @@ func TestPodDeleteOfAHealthyPodPublishesNothing(t *testing.T) {
 	assertNoEvent(t, sub)
 }
 
-// TestPodReasonChangeWhileStillBrokenDoesNotPublishAFalseResolve pins
-// Ruling 14(b) (Task 5 fix round 1) against the exact scenario the review
+// TestPodImagePullOscillationNarratesOnceAndNeverFalselyResolves pins Ruling
+// 17 (Task 5 fix round 2) against the exact scenario the original review
 // demonstrated: kubelet alternates ErrImagePull and ImagePullBackOff every
-// backoff cycle on one continuously-stuck pull. The review's probe showed 7
-// bus events for 4 such cycles, 3 of them a false "resolved" for a pod that
-// never recovered. This test drives the identical 4-cycle oscillation and
-// asserts on the payload of every event published: exactly one per Reason
-// change (never a "resolved" then a re-arrival for the same transition), and
-// Resolved is never true while the pod never stops being broken.
-func TestPodReasonChangeWhileStillBrokenDoesNotPublishAFalseResolve(t *testing.T) {
+// backoff cycle on one continuously-stuck pull.
+//
+// Round 1's fix (Ruling 14(b): only resolve on full recovery) stopped the
+// false "resolved" events, but the FOLLOW-UP review (Important A) found the
+// mirror defect: keyed per RAW reason, a genuine recovery resolved only
+// whichever raw reason kubelet happened to be using LAST, leaving the other
+// permanently unresolved on the row. Ruling 17 fixes this at the source by
+// normalizing both raw reasons into ONE Reason (normalizeReason) before
+// podTrouble ever returns -- so this 4-cycle oscillation is not four
+// transitions at all, just one arising event followed by three no-op
+// updates against the SAME normalized condition. That is the property this
+// test now pins: EXACTLY ONE event total, never a false resolve, and the
+// raw detail from the FIRST cycle survives in the message (podMessage uses
+// podCondition.detail, captured once and not live-updated by later
+// wobbles -- see onPodChange's no-change guard).
+func TestPodImagePullOscillationNarratesOnceAndNeverFalselyResolves(t *testing.T) {
 	o, sub := newTestObserver(t)
 	pod := testPod("pod-uid")
 
@@ -416,32 +450,73 @@ func TestPodReasonChangeWhileStillBrokenDoesNotPublishAFalseResolve(t *testing.T
 		o.onPodUpdate(nil, withContainerWaiting(pod, "app", r))
 	}
 
-	got := make([]bus.ClusterData, 0, len(reasons))
-	for i := range reasons {
-		select {
-		case e := <-sub:
-			var cd bus.ClusterData
-			if err := json.Unmarshal(e.Data, &cd); err != nil {
-				t.Fatalf("Unmarshal(ClusterData) error = %v, raw = %s", err, e.Data)
-			}
-			got = append(got, cd)
-		default:
-			t.Fatalf("only %d of %d expected transitions were narrated", i, len(reasons))
-		}
+	e, cd := waitForEventAndClusterData(t, sub)
+	if cd.Reason != reasonImagePullBackOff {
+		t.Errorf("Reason = %q, want the normalized %q", cd.Reason, reasonImagePullBackOff)
 	}
-	assertNoEvent(t, sub) // exactly one event per transition -- no extra resolves
+	if !strings.Contains(e.Message, reasonErrImagePull) {
+		t.Errorf("Message = %q, want it to carry the raw detail from the first cycle (%q)", e.Message, reasonErrImagePull)
+	}
+	if cd.Resolved {
+		t.Error("Resolved = true, want false: the pod never stopped being broken")
+	}
+	if cd.Container != "app" {
+		t.Errorf("Container = %q, want %q", cd.Container, "app")
+	}
+	assertNoEvent(t, sub) // every later wobble is the SAME normalized condition -- nothing more to publish
+}
 
-	for i, cd := range got {
-		if cd.Resolved {
-			t.Errorf("event %d (Reason=%q) published Resolved=true while the pod was still broken -- false narration", i, cd.Reason)
-		}
-		if cd.Reason != reasons[i] {
-			t.Errorf("event %d Reason = %q, want %q", i, cd.Reason, reasons[i])
-		}
-		if cd.Container != "app" {
-			t.Errorf("event %d Container = %q, want %q", i, cd.Container, "app")
-		}
+// TestPodImagePullOscillationThenDeleteLeavesNothingStranded is Important
+// A's delete-path sibling (Task 5 fix round 2). Before Ruling 17, deleting a
+// pod after it had oscillated between ErrImagePull and ImagePullBackOff
+// cleared only the last raw reason kubelet had used, stranding the other
+// permanently unresolved (the review's PROBE1c). With both normalized to
+// one Reason, there is only ever one row entry for a stuck pull to strand --
+// deleting the pod clears that one entry, full stop.
+func TestPodImagePullOscillationThenDeleteLeavesNothingStranded(t *testing.T) {
+	o, sub := newTestObserver(t)
+	pod := testPod("pod-uid")
+
+	for _, r := range []string{reasonErrImagePull, reasonImagePullBackOff, reasonErrImagePull} {
+		o.onPodUpdate(nil, withContainerWaiting(pod, "app", r))
 	}
+	decodeClusterData(t, sub) // the single arising event; later wobbles publish nothing (see the sibling above)
+
+	o.onDelete(pod)
+
+	cd := decodeClusterData(t, sub)
+	if cd.Reason != reasonImagePullBackOff {
+		t.Errorf("Reason = %q, want %q", cd.Reason, reasonImagePullBackOff)
+	}
+	if !cd.Resolved {
+		t.Error("Resolved = false, want true: delete must clear the row")
+	}
+	assertNoEvent(t, sub) // nothing stranded -- there was only ever one row entry to clear
+}
+
+// TestPodUnchangedTroubleEmitsExactlyOnce pins Minor D (Task 5 fix round 2):
+// this package's own headline constraint, "it aggregates, it never relays"
+// (observer.go), applied to Pods. An informer's UpdateFunc fires on any
+// field change -- managedFields, resourceVersion, annotations -- not just
+// the ones this observer tracks. Ten repeated, IDENTICAL updates for one
+// still-broken pod must produce exactly one event, not one per delivery:
+// reverting onPodChange's dedupe guard from the explicit
+// "p.reason == cur.reason && p.container == cur.container" back to a bare
+// struct comparison (`prev == cur`) leaves every OTHER Pod test green,
+// because podCondition.narrated (added for Important 3) makes a
+// freshly-recorded entry compare unequal to its own stored value forever --
+// nothing before this test asserted on REPEATED identical updates
+// specifically.
+func TestPodUnchangedTroubleEmitsExactlyOnce(t *testing.T) {
+	o, sub := newTestObserver(t)
+	pod := withContainerWaiting(testPod("pod-uid"), "app", reasonImagePullBackOff)
+
+	for i := 0; i < 10; i++ {
+		o.onPodUpdate(nil, pod)
+	}
+
+	decodeClusterData(t, sub) // the one genuine transition
+	assertNoEvent(t, sub)     // the other 9 identical updates must not re-publish
 }
 
 // TestPodHighestSeverityTroubleWinsAcrossContainers pins the Minor finding
@@ -474,14 +549,15 @@ func TestPodHighestSeverityTroubleWinsAcrossContainers(t *testing.T) {
 }
 
 // TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown pins Important 4
-// (Task 5 fix round 1). The review demonstrated, end to end through a real
-// informer, that o.pods stranded an entry across teardown + pod deletion +
-// a new run: Task 4's teardown is immediate on RunScope.Terminal, so a pod
-// deleted after that point is never delivered to onDelete, and nothing else
-// cleared the entry. scopedInformers.onNamespaceStop (wired to
-// Observer.clearNamespacePods in New) now runs on every teardown, which this
-// drives directly via o.scoped.reconcile rather than through run()'s
-// bus/ticker machinery -- same rationale as newScopedPodTestObserver.
+// (Task 5 fix round 1): one narrated pod, its event fully AWAITED before
+// teardown, so nothing is ever in flight when the sweep runs. That is a real
+// property (o.pods does get cleared here) but not the one that bites in
+// practice -- see TestPodTroubleDoesNotStrandUnderConcurrentTeardown for the
+// load shape (many pods, no synchronization point before an immediate
+// terminal reconcile) that the round-2 re-review found still stranded
+// entries on 23 of 25 attempts (Important B). Both tests are kept: this one
+// pins the simple case cheaply, the other pins the case that actually
+// mattered.
 func TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	o, sub := newScopedPodTestObserver(t, client)
@@ -510,5 +586,75 @@ func TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown(t *testing.T) {
 	o.mu.Unlock()
 	if after != 0 {
 		t.Errorf("o.pods after the namespace's informer tore down = %d entries, want 0 -- stranded: %+v", after, stranded)
+	}
+	// Minor G (Task 5 fix round 2): clearNamespacePods deliberately publishes
+	// nothing -- a torn-down informer means this process can no longer speak
+	// about those pods, not that anything resolved or was removed. Assert it,
+	// not just the doc comment's word for it.
+	assertNoEvent(t, sub)
+}
+
+// TestPodTroubleDoesNotStrandUnderConcurrentTeardown is Important B (Task 5
+// fix round 2). Round 1's sweep (clearNamespacePods, called once from
+// stopNamespaceLocked) raced the informer's own in-flight deliveries:
+// close(stop) does not stop a SharedIndexInformer's sharedProcessor
+// synchronously, so a notification already queued kept being delivered to
+// onPodAdd/onPodUpdate after the sweep had already run, writing straight
+// back into o.pods. The re-review's own probe -- driven through a real
+// informer, 40 broken pods created with NO synchronization point before an
+// immediate terminal reconcile, repeated 25 times -- stranded entries on 23
+// of 25 attempts.
+// TestPodTroubleIsClearedWhenTheNamespaceInformerTearsDown cannot see this:
+// it awaits its one event before tearing down, so nothing is ever actually
+// in flight. This test reproduces the load shape that bites: many pods
+// created back to back, then an immediate reconcile into Terminal, repeated
+// enough times that a racy fix would show stranding with overwhelming
+// probability. The fix (scopedInformers.withNamespaceLive, scoped.go) gates
+// every Pod handler write on the namespace still being tracked, checked
+// under the same lock the sweep itself uses -- mirroring
+// internal/engine's epoch/aliveLocked(epoch) idiom -- so this passes
+// regardless of how the race resolves, not because of the timing this test
+// happens to exercise.
+func TestPodTroubleDoesNotStrandUnderConcurrentTeardown(t *testing.T) {
+	const podCount = 40
+	const attempts = 25
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		client := fake.NewSimpleClientset()
+		o, _ := newScopedPodTestObserver(t, client)
+
+		for i := 0; i < podCount; i++ {
+			pod := withContainerWaiting(
+				testPod(types.UID(fmt.Sprintf("pod-uid-%d-%d", attempt, i))),
+				"app", reasonImagePullBackOff)
+			pod.Name = fmt.Sprintf("worker-%d", i)
+			if _, err := client.CoreV1().Pods(podTestNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("attempt %d: Create() error = %v", attempt, err)
+			}
+		}
+
+		// No synchronization point here -- this IS the shape that bites: an
+		// immediate terminal reconcile with pod creation still (possibly) in
+		// flight through the informer, matching a real Apply reaching
+		// Terminal with dozens of pods mid-pull.
+		o.scoped.reconcile(terminalScope(podTestNamespace))
+
+		// Give any straggling delivery every opportunity to land before
+		// checking -- a flaky pass here would UNDERSTATE the race, never
+		// overstate it: we are trying to prove nothing lands, not that
+		// everything lands quickly, and nothing in this test re-sweeps
+		// afterward to paper over a late arrival.
+		time.Sleep(20 * time.Millisecond)
+
+		o.mu.Lock()
+		after := len(o.pods)
+		stranded := make(map[stateKey]podCondition, len(o.pods))
+		for k, v := range o.pods {
+			stranded[k] = v
+		}
+		o.mu.Unlock()
+		if after != 0 {
+			t.Fatalf("attempt %d: o.pods after concurrent teardown = %d entries, want 0 -- stranded: %+v", attempt, after, stranded)
+		}
 	}
 }

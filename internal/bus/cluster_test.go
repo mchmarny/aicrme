@@ -57,11 +57,15 @@ func TestSupersedesPrefersNewerAtEqualSeverity(t *testing.T) {
 // TestUnresolvedRecurrenceSupersedesTheOlderResolution, the sibling this
 // ruling requires). Resolved is no longer an unconditional trump card; it
 // only breaks a tie between two events sharing the exact same At. This test
-// pins that narrower, corrected role: resolved and unresolved published at
-// the identical instant (the shape two publish() calls made back to back in
-// the same handler invocation, before this fix's (b) half, could produce)
-// still favor the resolved one, because a false "still broken" is the safer
-// wrong answer of the two at a genuine tie.
+// pins that narrower, corrected role directly: two events at the identical
+// instant still favor the resolved one, because a false "still broken" is
+// the safer wrong answer of the two at a genuine tie. (An equal-At tie is
+// not a shape Observer's own live path can currently produce -- see
+// ClusterData.Supersedes' own doc comment, corrected in fix round 2 after
+// an earlier version of this comment described a "two publish() calls back
+// to back" scenario that, post Ruling 14(b), no single handler invocation
+// can actually trigger. The tie-break is still correct to have; it is just
+// exercised by fixture here, not by anything shipping today.)
 func TestResolvedConditionSupersedesUnresolved(t *testing.T) {
 	at := time.Unix(200, 0)
 	unresolved := bus.ClusterData{
@@ -129,13 +133,17 @@ func TestSupersedesIsNotTransitiveAcrossResources(t *testing.T) {
 
 // Breaks if the Reason equality check is dropped from Supersedes' guard.
 // Same resource, two distinct conditions (RolloutProgress and
-// ImagePullBackOff): failure has both a later At and, being unresolved
-// against rollout's resolved state, the Resolved-mismatch branch's
-// tie-break in its favor too, so without the Reason check the fall-through
-// comparisons alone would make failure supersede rollout -- collapsing two
-// conditions a row must hold side by side into one. See ClusterData.Supersedes'
-// doc comment: this is the boundary between "newer version of the same
-// condition" and "a different condition entirely".
+// ImagePullBackOff): failure has a strictly later At than rollout, so
+// without the Reason check, At-ordering alone (the first fall-through
+// comparison -- see ClusterData.Supersedes' own doc comment; corrected in
+// Task 5 fix round 2, an earlier version of this comment described the OLD
+// Resolved-first rule's tie-break as working "in failure's favor", which
+// was backwards even under that rule: failure.Resolved is false against
+// rollout's true, so that branch would have returned false, not favored
+// failure) would make failure supersede rollout -- collapsing two
+// conditions a row must hold side by side into one. This is the boundary
+// between "newer version of the same condition" and "a different condition
+// entirely".
 func TestSupersedesRequiresMatchingReason(t *testing.T) {
 	rollout := bus.ClusterData{
 		UID: "ds-uid", Reason: "RolloutProgress",

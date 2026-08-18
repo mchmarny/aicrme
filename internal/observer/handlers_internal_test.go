@@ -26,6 +26,14 @@ import (
 // plus a subscriber holding everything it publishes. bus.Publish fans out
 // synchronously under its own lock, so by the time a handler returns any
 // event it produced is already queued -- no test here needs to wait.
+//
+// o.scoped.entries["gpu-operator"] is pre-seeded with a bare *factoryEntry
+// (Important B, Task 5 fix round 2): onPodChange/seedPodBaseline now gate
+// every write on o.scoped.withNamespaceLive, which checks namespace
+// presence in o.scoped.entries -- a real precondition in production (that
+// map is only ever populated by a namespace's own running informer), so a
+// direct handler call here needs the same fact recorded, without paying for
+// a real informer this file's whole point is to avoid.
 func newTestObserver(t *testing.T) (*Observer, <-chan bus.Event) {
 	t.Helper()
 	b := bus.New(64)
@@ -35,6 +43,7 @@ func newTestObserver(t *testing.T) (*Observer, <-chan bus.Event) {
 	o := New(nil, b, func() RunScope {
 		return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{"gpu-operator": {}}}
 	})
+	o.scoped.entries["gpu-operator"] = &factoryEntry{}
 	return o, sub
 }
 

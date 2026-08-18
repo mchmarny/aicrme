@@ -56,15 +56,27 @@ type ClusterData struct {
 //
 // Ordering is by At first: whichever event happened later wins, full stop,
 // regardless of Resolved or Severity. Resolved and Severity only decide a
-// tie between two events sharing the identical At (a publisher, like
-// Observer.publish, that stamps At itself will rarely if ever produce one).
-// This is deliberately NOT "a resolution always wins" -- that rule stopped a
-// stale failure from pinning a row, but its unexamined inverse was that a
-// genuine RECURRENCE (an unresolved condition arriving after an earlier
-// resolution on the same UID+Reason -- CrashLoopBackOff, then Running, then
-// CrashLoopBackOff again) could never re-arm the row either. At-ordering
-// fixes both directions with one rule: whatever happened most recently is
-// what the row shows.
+// tie between two events sharing the identical At -- unreachable on
+// Observer's own live path today (Observer.publish calls this at most once
+// per handler invocation, so no single caller can produce two events at
+// once), reachable only via a coarser clock or two independently-stamped
+// sources; the tie-break exists for that case, not for anything currently
+// shipping. This is deliberately NOT "a resolution always wins" -- that
+// rule stopped a stale failure from pinning a row, but its unexamined
+// inverse was that a genuine RECURRENCE (an unresolved condition arriving
+// after an earlier resolution on the same UID+Reason -- CrashLoopBackOff,
+// then Running, then CrashLoopBackOff again) could never re-arm the row
+// either. At-ordering fixes both directions with one rule: whatever
+// happened most recently is what the row shows.
+//
+// Promoting At from tiebreak to primary key does make Supersedes sensitive
+// to wall-clock non-monotonicity: Observer.publish stamps time.Now().UTC(),
+// which strips the monotonic reading, so a backwards clock step between two
+// publishes could make a genuinely later event fail to supersede an earlier
+// one -- the same live-failure-masked-by-stale-state risk this ordering
+// exists to close, reached through the clock instead of the rule. Bounded
+// and unlikely (an NTP step mid-process, not routine drift); worth knowing,
+// not worth a monotonic-source rewrite for this console's scale.
 func (d ClusterData) Supersedes(prev ClusterData) bool {
 	if d.UID != prev.UID || d.Reason != prev.Reason {
 		return false
