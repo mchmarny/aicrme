@@ -239,9 +239,10 @@ func isLive(s State) bool {
 	return s == StateRunning || s == StateAwaitingDecision
 }
 
-// isTerminal reports whether s is a state finish() actually reaches. Only
-// two call sites ever call finish today (:495 StateDone, :545 and :636
-// StateFailed), so this matches finish's real coverage exactly.
+// isTerminal reports whether s is a state finish() actually reaches. finish
+// is called from exactly three sites today (:511 StateDone, :561 and :652
+// StateFailed) -- two distinct states -- so this matches finish's real
+// coverage exactly.
 //
 // Deliberately not "!isLive(s)": that would also be true for StateIdle
 // (never observed on e.current after Start, which always sets StateRunning)

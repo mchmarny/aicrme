@@ -63,9 +63,13 @@ type factoryEntry struct {
 }
 
 // scopedInformers owns the Pod/Event factories for whichever run is
-// currently in scope. mu guards every field below it: reconcile can run
-// concurrently with itself in production, since run() calls it from both the
-// bus subscription and the ticker with nothing else serializing the two.
+// currently in scope. mu guards every field below it. In production,
+// reconcile has exactly one caller, run, and run's own select over its bus
+// and ticker arms (below) strictly serializes the two -- reconcile never
+// actually runs concurrently with itself there. The lock exists for tests:
+// several drive run on its own goroutine while polling entryCount, or
+// calling reconcile directly, from the test's own goroutine, and that access
+// pattern is genuinely concurrent even though production's is not.
 type scopedInformers struct {
 	client kubernetes.Interface
 
@@ -90,10 +94,12 @@ func newScopedInformers(client kubernetes.Interface) *scopedInformers {
 // rather than once at process start, so no caller can be trusted to
 // remember to wrap it in a goroutine itself.
 //
-// Idempotent and safe to call from multiple goroutines (run below does, from
-// both the bus fast path and the ticker floor) or with an unchanged sc:
-// namespaces already present are left alone, so a repeated identical scope
-// never restarts a factory that is already watching.
+// Idempotent, including under concurrent calls from separate goroutines
+// (which only tests make -- run's own bus and ticker arms are two cases of
+// one select and never call this concurrently with themselves, see
+// scopedInformers' doc comment): namespaces already present are left alone,
+// so a repeated identical scope never restarts a factory that is already
+// watching.
 //
 // Tears down every existing factory when sc says there is nothing (or
 // nothing further) to watch -- sc.RunID == "" (no run, or the two composed

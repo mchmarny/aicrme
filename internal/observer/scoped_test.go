@@ -3,6 +3,8 @@ package observer
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -300,7 +302,7 @@ func TestScopedInformersSurviveAScopeChange(t *testing.T) {
 // every reconcile (Ruling 8) instead of remembered here, a retried run's
 // very next scope() read -- Terminal back to false for the identical RunID,
 // exactly what Engine.Attribution reports once Retry flips e.current.State
-// to StateRunning (internal/engine/engine.go:769) -- is enough on its own to
+// to StateRunning (internal/engine/engine.go:785) -- is enough on its own to
 // restart it.
 func TestScopedInformersRestartAfterRetryReusesTheRunID(t *testing.T) {
 	client := fake.NewSimpleClientset()
@@ -335,7 +337,7 @@ func TestScopedInformersRestartAfterRetryReusesTheRunID(t *testing.T) {
 
 	// engine.Retry reuses the SAME run ID and flips State back to
 	// StateRunning, under e.mu, before publishing "run retrying"
-	// (engine.go:769, 810) -- Attribution() recomputes Terminal live off
+	// (engine.go:785, 826) -- Attribution() recomputes Terminal live off
 	// e.current.State on every call, so scope() reports Terminal: false
 	// again for the identical RunID with no memory of the earlier read.
 	scopeMu.set(scopeWith("run-1", "gpu-operator"))
@@ -412,6 +414,55 @@ func TestScopedInformersRunTicksAsACorrectnessFloor(t *testing.T) {
 	scopeMu.set(terminalScope("gpu-operator"))
 
 	waitFor(t, func() bool { return s.entryCount() == 0 })
+}
+
+// reconcileIntervalLeakBound is TestReconcileIntervalStaysWithinTheLeakBound's
+// ceiling on the constant that actually ships. Every other run()-test above
+// injects its own interval specifically to run fast and to isolate one wake
+// source from the other, which is the right call for those tests but leaves
+// the value Observer.Start actually passes (reconcileInterval) never
+// exercised by anything: every test in this file would stay green even if
+// reconcileInterval itself silently grew to, say, 24h, quietly removing
+// Ruling 9's correctness floor from production. This bound is deliberately
+// generous relative to the constant's own 2s (an order of magnitude, not a
+// tight tolerance) -- the property worth pinning is "this cannot regress to
+// effectively unbounded", not "this must stay exactly 2s".
+const reconcileIntervalLeakBound = 30 * time.Second
+
+// TestReconcileIntervalStaysWithinTheLeakBound pins the production constant
+// itself, not the mechanism every other test in this file exercises through
+// its own injected interval. reconcileInterval IS the answer to "how long can
+// ~10 namespaces' Pod/Event watches survive a dropped terminal KindPhase
+// event" (see reconcileInterval's own doc comment) -- it is Ruling 9's
+// correctness floor, not an incidental tuning knob, so a value outside a sane
+// bound is not a performance regression, it is that floor quietly disappearing
+// with every other test in the package still green.
+func TestReconcileIntervalStaysWithinTheLeakBound(t *testing.T) {
+	if reconcileInterval <= 0 || reconcileInterval > reconcileIntervalLeakBound {
+		t.Fatalf("reconcileInterval = %v, want a positive value at or under %v -- this constant IS the bound on how long a dropped terminal event can leave scoped informers running, not just a tuning knob",
+			reconcileInterval, reconcileIntervalLeakBound)
+	}
+}
+
+// TestObserverStartPassesTheProductionReconcileInterval closes the gap the
+// bound above does not: that reconcileInterval is a sane value proves
+// nothing about whether Observer.Start's o.scoped.run(...) call actually
+// passes IT, rather than a hardcoded literal or a second constant that
+// quietly drifts from it. Reading observer.go's own source for the call
+// site is the same technique internal/bus/kinds_web_test.go already uses to
+// pin a cross-file contract without running anything -- cheaper than a
+// wall-clock test that waits out Observer.Start's real timer, which is not
+// worth the seconds it would cost for a fact a source read proves directly.
+func TestObserverStartPassesTheProductionReconcileInterval(t *testing.T) {
+	const observerSource = "observer.go"
+	raw, err := os.ReadFile(observerSource)
+	if err != nil {
+		t.Fatalf("reading %s: %v", observerSource, err)
+	}
+	re := regexp.MustCompile(`o\.scoped\.run\([^)]*\breconcileInterval\b[^)]*\)`)
+	if !re.Match(raw) {
+		t.Fatalf("%s's o.scoped.run(...) call does not reference reconcileInterval by name -- production wiring may have drifted to a hardcoded or different interval, decoupled from TestReconcileIntervalStaysWithinTheLeakBound's guarantee", observerSource)
+	}
 }
 
 // scopeHolder lets the tests above swap the RunScope run() reads without a
