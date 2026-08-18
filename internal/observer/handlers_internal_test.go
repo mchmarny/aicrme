@@ -335,3 +335,157 @@ func TestOnNodeClusterDataFromTheObject(t *testing.T) {
 		})
 	}
 }
+
+// TestOnDeleteClearsTheConditionForTrackedResources is spec Section 4's "or
+// is deleted" half of clearing: a resource deleted while its condition is
+// still unresolved (an operator killing a stuck DaemonSet mid-rollout) must
+// still clear the row, not leave the last unresolved condition pinned
+// forever. Each case seeds the observer via onAdd, exactly as an informer's
+// initial list or a prior Add would, then deletes it and checks the
+// published ClusterData carries the object's own UID (not a zero value) and
+// Reason, so a row can find the right (UID, Reason) entry to clear via
+// Supersedes.
+func TestOnDeleteClearsTheConditionForTrackedResources(t *testing.T) {
+	t.Run("DaemonSet", func(t *testing.T) {
+		o, sub := newTestObserver(t)
+		ds := testDaemonSet("ds-real-uid", 3, 8)
+		o.onAdd(ds)
+
+		o.onDelete(ds)
+
+		cd := decodeClusterData(t, sub)
+		if cd.UID != "ds-real-uid" {
+			t.Errorf("UID = %q, want %q", cd.UID, "ds-real-uid")
+		}
+		if cd.Reason != reasonRollout {
+			t.Errorf("Reason = %q, want %q", cd.Reason, reasonRollout)
+		}
+		if !cd.Resolved {
+			t.Error("Resolved = false, want true: deletion must clear the row")
+		}
+	})
+	t.Run("Deployment", func(t *testing.T) {
+		o, sub := newTestObserver(t)
+		d := testDeployment("deploy-real-uid")
+		o.onAdd(d)
+
+		o.onDelete(d)
+
+		cd := decodeClusterData(t, sub)
+		if cd.UID != "deploy-real-uid" {
+			t.Errorf("UID = %q, want %q", cd.UID, "deploy-real-uid")
+		}
+		if cd.Reason != reasonRollout {
+			t.Errorf("Reason = %q, want %q", cd.Reason, reasonRollout)
+		}
+		if !cd.Resolved {
+			t.Error("Resolved = false, want true: deletion must clear the row")
+		}
+	})
+	t.Run("Node", func(t *testing.T) {
+		o, sub := newTestObserver(t)
+		n := testNode("gpu-node-real", "node-real-uid", "8")
+		o.onAdd(n)
+
+		o.onDelete(n)
+
+		cd := decodeClusterData(t, sub)
+		if cd.UID != "node-real-uid" {
+			t.Errorf("UID = %q, want %q", cd.UID, "node-real-uid")
+		}
+		if cd.Reason != reasonGPUAllocatable {
+			t.Errorf("Reason = %q, want %q", cd.Reason, reasonGPUAllocatable)
+		}
+		if !cd.Resolved {
+			t.Error("Resolved = false, want true: deletion must clear the row")
+		}
+	})
+}
+
+// TestOnDeleteTombstoneMatchesDirectDelete pins that DeletedFinalStateUnknown
+// is unwrapped before ClusterData is built, not just before the cache
+// lookup. A tombstone is exactly the case where the cache would otherwise be
+// the only record of what existed, so the published UID must come from the
+// wrapped object, not be left zero.
+func TestOnDeleteTombstoneMatchesDirectDelete(t *testing.T) {
+	o, sub := newTestObserver(t)
+	ds := testDaemonSet("ds-real-uid", 3, 8)
+	o.onAdd(ds)
+
+	o.onDelete(cache.DeletedFinalStateUnknown{
+		Key: "gpu-operator/nvidia-driver-daemonset",
+		Obj: ds,
+	})
+
+	cd := decodeClusterData(t, sub)
+	if cd.UID != "ds-real-uid" {
+		t.Errorf("UID = %q, want %q", cd.UID, "ds-real-uid")
+	}
+	if !cd.Resolved {
+		t.Error("Resolved = false, want true")
+	}
+}
+
+// TestOnDeleteOfAnUntrackedResourcePublishesNothing: no cache entry means no
+// condition to clear. Publishing anyway would put a phantom entry on a row
+// that never showed a condition in the first place -- ds here is never
+// passed to onAdd or onDaemonSet, so the observer has no record of it.
+func TestOnDeleteOfAnUntrackedResourcePublishesNothing(t *testing.T) {
+	o, sub := newTestObserver(t)
+	ds := testDaemonSet("ds-real-uid", 3, 8)
+
+	o.onDelete(ds)
+
+	assertNoEvent(t, sub)
+}
+
+// TestOnDeletePublishesWithoutHoldingTheLock is the ordering bite-proof: a
+// publish from onDelete must happen after o.mu is released, matching the
+// shape onDaemonSet/onDeployment/onNode already use, because
+// o.bus.Publish takes bus's own lock and calling it while holding o.mu would
+// nest the two locks in the one order 2b-i was deliberate about avoiding.
+//
+// bus.Bus.Publish never blocks on a slow subscriber (its fan-out send is
+// select-with-default in bus.go), so there is no way to build a "blocking
+// bus" in this package to observe the ordering that way, and Observer.bus is
+// a concrete *bus.Bus field, not an interface, so it cannot be swapped for a
+// fake. No existing test in this package has this shape either. Instead this
+// asserts the ordering directly through the one hook publish() calls first:
+// the RunScope provider func. That func calls o.mu.TryLock() on itself --
+// TryLock is non-blocking and reports false if the mutex is already held by
+// anyone, including the calling goroutine (sync.Mutex tracks lock state, not
+// ownership), so it directly answers "is o.mu held right now" at the exact
+// moment publish runs, without needing a second goroutine or a timeout to
+// detect a hang.
+func TestOnDeletePublishesWithoutHoldingTheLock(t *testing.T) {
+	b := bus.New(64)
+	sub, unsub := b.Subscribe(0)
+	t.Cleanup(unsub)
+
+	var scopeRan, lockWasFree bool
+	var o *Observer
+	o = New(nil, b, func() RunScope {
+		scopeRan = true
+		if lockWasFree = o.mu.TryLock(); lockWasFree {
+			o.mu.Unlock()
+		}
+		return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{"gpu-operator": {}}}
+	})
+
+	ds := testDaemonSet("ds-real-uid", 3, 8)
+	o.onAdd(ds)
+
+	o.onDelete(ds)
+
+	if !scopeRan {
+		t.Fatal("scope callback never ran -- onDelete did not publish at all")
+	}
+	if !lockWasFree {
+		t.Error("o.mu.TryLock() failed from inside publish's scope callback: o.mu was still held when publish ran")
+	}
+
+	cd := decodeClusterData(t, sub)
+	if !cd.Resolved {
+		t.Error("Resolved = false, want true")
+	}
+}

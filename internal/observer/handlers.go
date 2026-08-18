@@ -20,6 +20,16 @@ const (
 	reasonGPUAllocatable = "GPUAllocatable"
 )
 
+// kindDaemonSet, kindDeployment and kindNode are ClusterData.Kind values.
+// Each handler's live-update path and onDelete's clearing path both set
+// Kind for the same resource type, so these are shared rather than
+// re-literaled.
+const (
+	kindDaemonSet  = "DaemonSet"
+	kindDeployment = "Deployment"
+	kindNode       = "Node"
+)
+
 // rolloutSeverityInfo is RolloutProgress's Severity, always: Supersedes only
 // orders conditions sharing a Reason, and RolloutProgress at Warn would rank
 // equal to an unrelated Reason -- say ImagePullBackOff -- also at Warn, so a
@@ -60,31 +70,100 @@ func (o *Observer) onAdd(obj any) {
 	}
 }
 
-// onDelete releases the cache entry. This is memory hygiene, not
-// correctness: stateKey carries the object's UID, so a recreate already gets
-// a fresh key and cannot inherit the deleted object's state either way.
-// Without it, o.workload and o.gpuQty retain one permanently unreachable
-// entry per deleted object for the life of the process.
+// onDelete releases the cache entry and, if the observer had a tracked
+// condition for the resource, publishes it Resolved: true so the row it was
+// pinned to clears. stateKey carries the object's UID, so a recreate already
+// gets a fresh key and cannot inherit the deleted object's state either way
+// -- eviction here is memory hygiene, not what makes that safe. Publishing
+// is what spec Section 4's "or is deleted" half of clearing needs: the
+// healthy-state half is covered by onDaemonSet/onDeployment/onNode's own
+// Resolved computation, but a resource deleted while still unresolved (an
+// operator killing a stuck DaemonSet) never reaches that path any other way.
+//
+// A resource this observer never tracked (no cache entry) publishes nothing
+// -- there is no condition to clear, and inventing one would put a phantom
+// entry on a row that never showed anything.
+//
 // DeletedFinalStateUnknown is the tombstone client-go delivers when a watch
-// gap meant the final object was missed.
+// gap meant the final object was missed; it is unwrapped first because the
+// cache is the only record of what existed once that happens.
+//
+// Each case locks, reads and evicts, then UNLOCKS before publish -- same
+// shape onDaemonSet/onDeployment/onNode already use, and required here for
+// the same reason: o.bus.Publish takes bus's own lock, and calling it while
+// holding o.mu would nest the two locks in the one order 2b-i was deliberate
+// about avoiding.
 func (o *Observer) onDelete(obj any) {
 	if tomb, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tomb.Obj
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
+
 	switch t := obj.(type) {
 	case *appsv1.DaemonSet:
-		delete(o.workload, dsKey(t))
+		key := dsKey(t)
+		o.mu.Lock()
+		_, had := o.workload[key]
+		delete(o.workload, key)
+		o.mu.Unlock()
+		if !had {
+			return
+		}
+		cd := bus.ClusterData{
+			Kind:      kindDaemonSet,
+			Namespace: t.Namespace,
+			Name:      t.Name,
+			UID:       string(t.UID),
+			Reason:    reasonRollout,
+			Ready:     t.Status.NumberReady,
+			Desired:   t.Status.DesiredNumberScheduled,
+			Severity:  rolloutSeverityInfo,
+			Resolved:  true,
+		}
+		o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), cd)
 	case *appsv1.Deployment:
-		delete(o.workload, deployKey(t))
+		key := deployKey(t)
+		o.mu.Lock()
+		_, had := o.workload[key]
+		delete(o.workload, key)
+		o.mu.Unlock()
+		if !had {
+			return
+		}
+		cd := bus.ClusterData{
+			Kind:      kindDeployment,
+			Namespace: t.Namespace,
+			Name:      t.Name,
+			UID:       string(t.UID),
+			Reason:    reasonRollout,
+			Ready:     t.Status.ReadyReplicas,
+			Desired:   deployDesired(t),
+			Severity:  rolloutSeverityInfo,
+			Resolved:  true,
+		}
+		o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), cd)
 	case *corev1.Node:
-		delete(o.gpuQty, nodeKey(t))
+		key := nodeKey(t)
+		o.mu.Lock()
+		_, had := o.gpuQty[key]
+		delete(o.gpuQty, key)
+		o.mu.Unlock()
+		if !had {
+			return
+		}
+		cd := bus.ClusterData{
+			Kind:     kindNode,
+			Name:     t.Name,
+			UID:      string(t.UID),
+			Reason:   reasonGPUAllocatable,
+			Severity: bus.SeverityInfo,
+			Resolved: true,
+		}
+		o.publish("", fmt.Sprintf("%s removed", t.Name), cd)
 	}
 }
 
 func dsKey(ds *appsv1.DaemonSet) stateKey {
-	return stateKey{kind: "DaemonSet", namespace: ds.Namespace, name: ds.Name, uid: ds.UID}
+	return stateKey{kind: kindDaemonSet, namespace: ds.Namespace, name: ds.Name, uid: ds.UID}
 }
 
 func dsSummary(ds *appsv1.DaemonSet) string {
@@ -109,7 +188,7 @@ func (o *Observer) onDaemonSet(obj any) {
 	o.mu.Unlock()
 
 	cd := bus.ClusterData{
-		Kind:      "DaemonSet",
+		Kind:      kindDaemonSet,
 		Namespace: ds.Namespace,
 		Name:      ds.Name,
 		UID:       string(ds.UID),
@@ -126,7 +205,7 @@ func (o *Observer) onDaemonSet(obj any) {
 }
 
 func deployKey(d *appsv1.Deployment) stateKey {
-	return stateKey{kind: "Deployment", namespace: d.Namespace, name: d.Name, uid: d.UID}
+	return stateKey{kind: kindDeployment, namespace: d.Namespace, name: d.Name, uid: d.UID}
 }
 
 // deployDesired defaults to 1, matching the API server's default for an
@@ -170,7 +249,7 @@ func (o *Observer) onDeployment(obj any) {
 
 	desired := deployDesired(d)
 	cd := bus.ClusterData{
-		Kind:      "Deployment",
+		Kind:      kindDeployment,
 		Namespace: d.Namespace,
 		Name:      d.Name,
 		UID:       string(d.UID),
@@ -189,7 +268,7 @@ func (o *Observer) onDeployment(obj any) {
 const gpuResource = "nvidia.com/gpu"
 
 func nodeKey(n *corev1.Node) stateKey {
-	return stateKey{kind: "Node", name: n.Name, uid: n.UID}
+	return stateKey{kind: kindNode, name: n.Name, uid: n.UID}
 }
 
 func nodeGPUs(n *corev1.Node) resource.Quantity {
@@ -226,7 +305,7 @@ func (o *Observer) onNode(obj any) {
 		return
 	}
 	cd := bus.ClusterData{
-		Kind:     "Node",
+		Kind:     kindNode,
 		Name:     n.Name,
 		UID:      string(n.UID),
 		Reason:   reasonGPUAllocatable,
