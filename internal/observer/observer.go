@@ -10,6 +10,7 @@
 package observer
 
 import (
+	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
@@ -125,18 +126,26 @@ func (o *Observer) register(inf cache.SharedIndexInformer, onUpdate func(any)) e
 	return err
 }
 
-func (o *Observer) publish(ns, msg string) {
+// publish attaches cd to the event as its typed Data payload, stamping both
+// Event.At and ClusterData.At from the same now() call so the two never
+// disagree about when the transition happened.
+func (o *Observer) publish(ns, msg string, cd bus.ClusterData) {
 	sc := o.scope()
 	if ns != "" {
 		if _, ok := sc.Namespaces[ns]; !ok {
 			return
 		}
 	}
+	cd.At = time.Now().UTC()
+	// ClusterData holds only strings, ints, bools and a time.Time, so Marshal
+	// cannot fail.
+	data, _ := json.Marshal(cd)
 	o.bus.Publish(bus.Event{
 		RunID:   sc.RunID,
 		Kind:    bus.KindCluster,
 		Level:   bus.LevelInfo,
-		At:      time.Now().UTC(),
+		At:      cd.At,
 		Message: msg,
+		Data:    data,
 	})
 }

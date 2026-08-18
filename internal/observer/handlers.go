@@ -7,7 +7,36 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/mchmarny/aicrme/internal/bus"
 )
+
+// reasonRollout and reasonGPUAllocatable name the condition a ClusterData
+// event reports. They stay constant across a resource's transitions
+// (0/8 ready -> 8/8 ready is still "RolloutProgress") so ClusterData.Supersedes
+// can compare successive events on the same (UID, Reason) pair.
+const (
+	reasonRollout        = "RolloutProgress"
+	reasonGPUAllocatable = "GPUAllocatable"
+)
+
+// rolloutSeverity flags a readiness shortfall as the state worth watching; a
+// workload at or above its desired count is informational.
+func rolloutSeverity(ready, desired int32) bus.Severity {
+	if ready < desired {
+		return bus.SeverityWarn
+	}
+	return bus.SeverityInfo
+}
+
+// allocatableSeverity flags a GPU capacity drop as the state worth watching;
+// a rise back to or above the prior value is the condition clearing.
+func allocatableSeverity(prev, cur resource.Quantity) bus.Severity {
+	if cur.Cmp(prev) < 0 {
+		return bus.SeverityWarn
+	}
+	return bus.SeverityInfo
+}
 
 // onAdd records state without emitting. An informer's initial list delivers
 // every existing object as an Add, so emitting here would narrate the
@@ -79,13 +108,34 @@ func (o *Observer) onDaemonSet(obj any) {
 	o.workload[key] = summary
 	o.mu.Unlock()
 
+	cd := bus.ClusterData{
+		Kind:      "DaemonSet",
+		Namespace: ds.Namespace,
+		Name:      ds.Name,
+		UID:       string(ds.UID),
+		Reason:    reasonRollout,
+		Ready:     ds.Status.NumberReady,
+		Desired:   ds.Status.DesiredNumberScheduled,
+		Severity:  rolloutSeverity(ds.Status.NumberReady, ds.Status.DesiredNumberScheduled),
+		Resolved:  ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled,
+	}
+
 	// Namespace-qualified: two DaemonSets in different namespaces can share
 	// a name, and an unqualified message would be ambiguous.
-	o.publish(ds.Namespace, fmt.Sprintf("%s/%s %s", ds.Namespace, ds.Name, summary))
+	o.publish(ds.Namespace, fmt.Sprintf("%s/%s %s", ds.Namespace, ds.Name, summary), cd)
 }
 
 func deployKey(d *appsv1.Deployment) stateKey {
 	return stateKey{kind: "Deployment", namespace: d.Namespace, name: d.Name, uid: d.UID}
+}
+
+// deployDesired defaults to 1, matching the API server's default for an
+// unset Spec.Replicas.
+func deployDesired(d *appsv1.Deployment) int32 {
+	if d.Spec.Replicas != nil {
+		return *d.Spec.Replicas
+	}
+	return 1
 }
 
 // deploySummary reports readiness against spec.replicas, not status.replicas.
@@ -93,11 +143,7 @@ func deployKey(d *appsv1.Deployment) stateKey {
 // in progress would read "1/1 ready" while eight are desired -- a "finished"
 // message during precisely the stall this observer exists to narrate.
 func deploySummary(d *appsv1.Deployment) string {
-	desired := int32(1)
-	if d.Spec.Replicas != nil {
-		desired = *d.Spec.Replicas
-	}
-	return fmt.Sprintf("%d/%d ready", d.Status.ReadyReplicas, desired)
+	return fmt.Sprintf("%d/%d ready", d.Status.ReadyReplicas, deployDesired(d))
 }
 
 func (o *Observer) onDeployment(obj any) {
@@ -122,7 +168,20 @@ func (o *Observer) onDeployment(obj any) {
 	o.workload[key] = summary
 	o.mu.Unlock()
 
-	o.publish(d.Namespace, fmt.Sprintf("%s/%s %s", d.Namespace, d.Name, summary))
+	desired := deployDesired(d)
+	cd := bus.ClusterData{
+		Kind:      "Deployment",
+		Namespace: d.Namespace,
+		Name:      d.Name,
+		UID:       string(d.UID),
+		Reason:    reasonRollout,
+		Ready:     d.Status.ReadyReplicas,
+		Desired:   desired,
+		Severity:  rolloutSeverity(d.Status.ReadyReplicas, desired),
+		Resolved:  d.Status.ReadyReplicas >= desired,
+	}
+
+	o.publish(d.Namespace, fmt.Sprintf("%s/%s %s", d.Namespace, d.Name, summary), cd)
 }
 
 // gpuResource is the allocatable resource this product cares about. A bare
@@ -166,10 +225,19 @@ func (o *Observer) onNode(obj any) {
 		// had capacity when the console started.
 		return
 	}
+	cd := bus.ClusterData{
+		Kind:     "Node",
+		Name:     n.Name,
+		UID:      string(n.UID),
+		Reason:   reasonGPUAllocatable,
+		Severity: allocatableSeverity(prev, cur),
+		Resolved: cur.Cmp(prev) >= 0,
+	}
+
 	// The message is a TRANSITION, formatted here from the cached previous
 	// value -- it is deliberately not what gets cached, because a repeated
 	// identical update would then compute "8 -> 8", compare unequal to
 	// "0 -> 8", and emit again.
 	o.publish("", fmt.Sprintf("%s: %s allocatable %s → %s",
-		n.Name, gpuResource, prev.String(), cur.String()))
+		n.Name, gpuResource, prev.String(), cur.String()), cd)
 }
