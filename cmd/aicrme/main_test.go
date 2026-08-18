@@ -10,12 +10,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/observer"
 	"github.com/mchmarny/aicrme/internal/steps"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -424,6 +426,111 @@ func TestNewRunScopeFnNoCurrentRunReturnsZeroValueWithoutCloning(t *testing.T) {
 	}
 	if fake.artifactCalls != 0 {
 		t.Errorf("Artifact() called %d times, want 0 -- CurrentID() alone should short-circuit", fake.artifactCalls)
+	}
+}
+
+// fakeAttributionReader is an attributionReader test double, letting the
+// composition test drive engine.Attribution() independently of
+// fakeRunReader's namespace-cache behavior -- the two are separate
+// interfaces precisely because they are separate sources (Ruling 2).
+type fakeAttributionReader struct {
+	a     engine.Attribution
+	calls int
+}
+
+func (f *fakeAttributionReader) Attribution() engine.Attribution {
+	f.calls++
+	return f.a
+}
+
+// TestNewObserverScopeFnComposesNamespacesAndAttribution pins the
+// composition this task exists to build: Namespaces come from the cached
+// recipe parsing (nsScope, i.e. newRunScopeFn), RunID/Component/Generation/
+// Terminal come from the engine's attribution snapshot -- and both land in
+// the one RunScope the observer actually reads, despite coming from two
+// separate accessors that cannot be merged on the engine side (Ruling 2:
+// Namespaces would require internal/engine to import internal/steps, which
+// already imports internal/engine).
+//
+// This also doubles as the "matching RunIDs compose normally" case for
+// Ruling 6's disagreement check (nsFake.id and attrFake.a.RunID are both
+// "run-1" here): the check below must not reject the ordinary case where
+// both sources already describe the same run. See
+// TestNewObserverScopeFnRunIDDisagreementYieldsTheZeroScope for the
+// mismatched case.
+func TestNewObserverScopeFnComposesNamespacesAndAttribution(t *testing.T) {
+	nsFake := &fakeRunReader{
+		id: "run-1", ok: true,
+		run: &engine.Run{ID: "run-1", Artifacts: map[string][]byte{
+			"recipe.json": recipeFixture(t, steps.ComponentSummary{Name: "a", Namespace: "gpu-operator"}),
+		}},
+	}
+	attrFake := &fakeAttributionReader{a: engine.Attribution{
+		RunID:        "run-1",
+		ActiveAction: "gpu-operator",
+		Generation:   7,
+		Terminal:     true,
+	}}
+
+	scope := newObserverScopeFn(attrFake, newRunScopeFn(nsFake))
+	sc := scope()
+
+	if sc.RunID != "run-1" {
+		t.Errorf("RunID = %q, want run-1", sc.RunID)
+	}
+	if _, ok := sc.Namespaces["gpu-operator"]; !ok {
+		t.Errorf("Namespaces = %v, want gpu-operator from the cached recipe parsing", sc.Namespaces)
+	}
+	if sc.Component != "gpu-operator" {
+		t.Errorf("Component = %q, want gpu-operator from Attribution().ActiveAction", sc.Component)
+	}
+	if sc.Generation != 7 {
+		t.Errorf("Generation = %d, want 7 from Attribution().Generation", sc.Generation)
+	}
+	if !sc.Terminal {
+		t.Error("Terminal = false, want true from Attribution().Terminal (Ruling 8)")
+	}
+	if attrFake.calls != 1 {
+		t.Errorf("Attribution() called %d times by one scope() call, want exactly 1", attrFake.calls)
+	}
+}
+
+// TestNewObserverScopeFnRunIDDisagreementYieldsTheZeroScope pins Ruling 6.
+// nsScope (Engine.CurrentID, under its own lock inside newRunScopeFn) and
+// eng.Attribution() (a second, independent lock acquisition) can observe two
+// different runs across a transition landing between the two calls -- here
+// manufactured directly, rather than raced, by simply giving the two fakes
+// disagreeing RunIDs. Merging the two reads anyway would pair one run's
+// Namespaces with a different run's RunID/Component -- a wrong answer, and
+// exactly the race RunScope's own doc comment forbids one layer down
+// (internal/observer/observer.go). The fix returns the zero RunScope
+// instead: this asserts on the WHOLE value via reflect.DeepEqual, not just
+// RunID, so a partial merge (e.g. zeroing RunID but leaving Namespaces or
+// Component from one of the two disagreeing sources) still fails.
+func TestNewObserverScopeFnRunIDDisagreementYieldsTheZeroScope(t *testing.T) {
+	nsFake := &fakeRunReader{
+		id: "run-1", ok: true,
+		run: &engine.Run{ID: "run-1", Artifacts: map[string][]byte{
+			"recipe.json": recipeFixture(t, steps.ComponentSummary{Name: "a", Namespace: "gpu-operator"}),
+		}},
+	}
+	attrFake := &fakeAttributionReader{a: engine.Attribution{
+		RunID:        "run-2",
+		ActiveAction: "kai-scheduler",
+		Generation:   9,
+	}}
+
+	scope := newObserverScopeFn(attrFake, newRunScopeFn(nsFake))
+	sc := scope()
+
+	if !reflect.DeepEqual(sc, observer.RunScope{}) {
+		t.Errorf("scope() = %+v, want the zero RunScope on RunID disagreement (nsScope=run-1, Attribution=run-2)", sc)
+	}
+	// The disagreement check compares values already read, not a
+	// double-check call into eng -- a third read is exactly what the
+	// coordinator's review flagged as the wrong shape to guard against here.
+	if attrFake.calls != 1 {
+		t.Errorf("Attribution() called %d times by one scope() call, want exactly 1", attrFake.calls)
 	}
 }
 

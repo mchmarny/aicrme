@@ -17,7 +17,17 @@ const (
 	KindLog Kind = "log"
 	// KindComponent is per-component install progress.
 	KindComponent Kind = "component"
-	// KindCluster is observer-sourced cluster telemetry.
+	// KindCluster is cluster-condition telemetry -- not exclusively
+	// observer-sourced, and not every KindCluster event carries a
+	// ClusterData Data payload (M-3, Phase 2b-iii whole-branch review):
+	// internal/observer's handlers (internal/observer/*.go) always attach
+	// one, but internal/steps/discover.go's capability-gap findings publish
+	// KindCluster with Level/Message only, Data left unset, for each gap
+	// AICR reports before any run -- there is no resource/UID to identify a
+	// condition against yet. web/src/pipeline.ts's isClusterData is the
+	// SPA's own discriminator (checks Data has uid/reason/severity/at, not
+	// the Kind alone) precisely because of this; see ClusterData's own doc
+	// comment for the Go side.
 	KindCluster Kind = "cluster"
 	// KindDecision signals the run is parked awaiting user input.
 	KindDecision Kind = "decision"
