@@ -78,6 +78,17 @@ type Engine struct {
 	resume  chan struct{}
 	newID   func() string
 
+	// attribution is the small, cheap snapshot Engine.Attribution() serves --
+	// see attribution.go. It holds only ActiveAction/ActiveIndex/ActiveTotal/
+	// Generation; RunID and Phase are composed from e.current at read time
+	// instead of mirrored here, because e.current.ID never changes after
+	// Start and e.current.Phase is set eagerly at the top of runStep --
+	// unlike e.current.Components, which is exactly why this snapshot exists
+	// at all. Keeping RunID/Phase out of this field means there is nothing
+	// about them to keep in sync across Start/Retry/finish; only
+	// ActiveAction's own transitions need a mutator.
+	attribution Attribution
+
 	// epoch increments on every Start and Retry. Each execute goroutine
 	// captures the value current when it launched and re-checks it before
 	// every state write. Start's isLive check alone cannot cover this:
@@ -226,6 +237,22 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 
 func isLive(s State) bool {
 	return s == StateRunning || s == StateAwaitingDecision
+}
+
+// isTerminal reports whether s is a state finish() actually reaches. finish
+// is called from exactly three sites today (:511 StateDone, :561 and :652
+// StateFailed) -- two distinct states -- so this matches finish's real
+// coverage exactly.
+//
+// Deliberately not "!isLive(s)": that would also be true for StateIdle
+// (never observed on e.current after Start, which always sets StateRunning)
+// and StateActive (run.go's own comment reserves it for the Prove workload;
+// no path sets it today). A consumer keyed off "not live" instead of
+// "actually terminal" -- internal/observer's scoped informer teardown is
+// exactly this shape -- would tear down the day StateActive is wired up,
+// mid-Prove, which is the opposite of what that state exists to mean.
+func isTerminal(s State) bool {
+	return s == StateDone || s == StateFailed
 }
 
 // aliveLocked reports whether the goroutine holding this epoch is still the
@@ -571,6 +598,17 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 			ev.Phase = string(step.Phase())
 		}
 		e.bus.Publish(ev)
+		// Attribution updates AFTER the marker reaches the bus, never
+		// before: that ordering is the contract (design doc §2, "Marker
+		// ordering is part of the contract"), not an incidental consequence
+		// of statement order. Update it any earlier and a concurrent reader
+		// of Attribution() (the observer, on its own goroutine) could label
+		// a cluster event with an action whose header this line has not yet
+		// handed to the bus -- the SPA would then receive an event citing a
+		// row it has never heard of.
+		if ev.Kind == bus.KindComponent {
+			applyComponentMarker(e, epoch, ev.Data)
+		}
 	}
 
 	if err := step.Run(ctx, scratch, emit); err != nil {
@@ -603,6 +641,13 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 			e.current.Components = scratch.Components
 		}
 		e.mu.Unlock()
+
+		// The run is leaving Apply on a failure -- clear the cursor so a
+		// retry (or the terminal state finish is about to record) does not
+		// keep pointing at an action that stopped installing.
+		if step.Phase() == PhaseApply {
+			e.clearActiveAction(epoch)
+		}
 
 		e.finish(ctx, epoch, StateFailed, msg)
 		return err
@@ -641,6 +686,13 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	merged := e.current.Clone()
 	e.mu.Unlock()
 
+	// The run is leaving Apply on success -- the action cursor is meaningless
+	// once nothing in this step is installing, and the next step (if any)
+	// will set its own Phase before any new marker can arrive.
+	if step.Phase() == PhaseApply {
+		e.clearActiveAction(epoch)
+	}
+
 	if err := e.store.Save(ctx, merged); err != nil {
 		slog.Warn("run checkpoint failed", "run", runID, "error", err)
 	}
@@ -663,6 +715,16 @@ func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg s
 	e.current.UpdatedAt = time.Now().UTC()
 	snapshot := e.current.Clone()
 	e.mu.Unlock()
+
+	// Defensive backstop: runStep's success and failure branches already
+	// clear the active action on every path that leaves Apply, but a
+	// terminal state is where that guarantee must hold regardless of how it
+	// was reached -- nothing this run does from here on should ever again be
+	// read as "an action is installing". epoch-guarded like the two runStep
+	// call sites, which also closes the window between the e.mu.Unlock()
+	// above and this call, where a new Start could in principle have already
+	// landed.
+	e.clearActiveAction(epoch)
 
 	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), terminalSaveTimeout)
 	defer saveCancel()

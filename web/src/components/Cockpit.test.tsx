@@ -72,6 +72,28 @@ describe('Cockpit', () => {
     expect(screen.getByTestId('component-cert-manager').textContent).not.toMatch(/driver DaemonSet compiles/)
   })
 
+  it('renders an attributed cluster condition inside its own row and nowhere else', () => {
+    const events: AicrEvent[] = [
+      componentEvent(1, 'cert-manager', { index: 1, total: 4, status: 'started' }),
+      componentEvent(2, 'gpu-operator', { index: 2, total: 4, status: 'started' }),
+      {
+        id: 3, runId: 'run1', at: '2026-08-15T09:03:00Z', kind: 'cluster', level: 'info', phase: 'apply',
+        component: 'gpu-operator', message: 'gpu-operator/nvidia-driver-daemonset-abc ImagePullBackOff',
+        data: {
+          kind: 'Pod', namespace: 'gpu-operator', name: 'nvidia-driver-daemonset-abc', uid: 'uid-1',
+          reason: 'ImagePullBackOff', severity: 2, resolved: false, at: '2026-08-15T09:03:00Z',
+        },
+      },
+    ]
+    const run = baseRun({ state: 'running' })
+    render(<Cockpit events={events} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    const gpuRow = screen.getByTestId('component-gpu-operator')
+    expect(gpuRow.textContent).toMatch(/ImagePullBackOff/)
+    expect(gpuRow.textContent).toMatch(/while gpu-operator installs/i)
+    expect(screen.getByTestId('component-cert-manager').textContent).not.toMatch(/ImagePullBackOff/)
+  })
+
   it('failed: renders the failing component, exit error, and tail, and Retry calls onRetry', () => {
     const events: AicrEvent[] = [
       componentEvent(1, 'cert-manager', { index: 1, total: 4, status: 'started' }),
@@ -113,5 +135,63 @@ describe('Cockpit', () => {
 
     expect(screen.getByTestId('cockpit-success')).toBeDefined()
     expect(screen.queryByRole('button', { name: /retry/i })).toBeNull()
+  })
+
+  // Ruling 38 (Task 7 final fix wave, replacing fix round 2's tense-only
+  // fix). Ruling 27's stated intent is that a still-open condition survives
+  // to the Done screen -- an operator seeing "installed successfully" needs
+  // to still see the one row that isn't actually clean. But teardown means
+  // the console can no longer claim this is CURRENT, only that it was the
+  // last thing observed -- so the caption must say "last observed", not
+  // just switch to past tense.
+  it('done: a still-open condition survives to the Done screen, labeled as last observed rather than current', () => {
+    const events: AicrEvent[] = [
+      componentEvent(1, 'gpu-operator', { index: 1, total: 1, status: 'started' }),
+      componentEvent(2, 'gpu-operator', { status: 'installed' }),
+      {
+        id: 3, runId: 'run1', at: '2026-08-15T09:03:00Z', kind: 'cluster', level: 'info', phase: 'apply',
+        component: 'gpu-operator', message: 'gpu-operator/nvidia-driver-daemonset-abc ImagePullBackOff',
+        data: {
+          kind: 'Pod', namespace: 'gpu-operator', name: 'nvidia-driver-daemonset-abc', uid: 'uid-1',
+          reason: 'ImagePullBackOff', severity: 2, resolved: false, at: '2026-08-15T09:03:00Z',
+        },
+      },
+    ]
+    const run = baseRun({ state: 'done' })
+    render(<Cockpit events={events} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    const gpuRow = screen.getByTestId('component-gpu-operator')
+    expect(gpuRow.textContent).toMatch(/ImagePullBackOff/)
+    expect(gpuRow.textContent).toMatch(/last observed while gpu-operator installed\)/i)
+    expect(gpuRow.textContent).not.toMatch(/while gpu-operator installs\)/i)
+  })
+
+  // Teardown happens at EITHER terminal state, not just StateDone -- Failed
+  // must carry the same "last observed" discipline, not the live present
+  // tense a mid-run screen would use. Pre-merge fix wave: "installed" is
+  // wrong here specifically -- the Failed screen's own heading says
+  // "Install failed", and "(last observed while gpu-operator installed)"
+  // sitting on a failed run reads as "it installed successfully", the
+  // opposite claim. "was installing" keeps the same discipline without it.
+  it('failed: a still-open condition on the Failed screen is labeled last observed, past continuous -- never a success claim', () => {
+    const events: AicrEvent[] = [
+      componentEvent(1, 'gpu-operator', { index: 1, total: 2, status: 'started' }),
+      componentEvent(2, 'gpu-operator', { status: 'installed' }),
+      {
+        id: 3, runId: 'run1', at: '2026-08-15T09:03:00Z', kind: 'cluster', level: 'info', phase: 'apply',
+        component: 'gpu-operator', message: 'gpu-operator/nvidia-driver-daemonset-abc ImagePullBackOff',
+        data: {
+          kind: 'Pod', namespace: 'gpu-operator', name: 'nvidia-driver-daemonset-abc', uid: 'uid-1',
+          reason: 'ImagePullBackOff', severity: 2, resolved: false, at: '2026-08-15T09:03:00Z',
+        },
+      },
+      componentEvent(4, 'kai-scheduler', { index: 2, total: 2, status: 'failed', attempt: 1 }),
+    ]
+    const run = baseRun({ state: 'failed', error: 'bundle apply failed: exit status 1' })
+    render(<Cockpit events={events} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    const gpuRow = screen.getByTestId('component-gpu-operator')
+    expect(gpuRow.textContent).toMatch(/last observed while gpu-operator was installing\)/i)
+    expect(gpuRow.textContent).not.toMatch(/gpu-operator installed\)/i)
   })
 })
