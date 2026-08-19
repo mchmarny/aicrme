@@ -39,3 +39,4 @@ internal/web/dist/*
 
 # Compiled binaries
 bin/
+.e2e-diag/

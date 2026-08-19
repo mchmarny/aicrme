@@ -118,3 +118,18 @@ jobs:
         with:
           install_only: true
       - run: test/e2e/apply-real.sh
+      # Kept deliberately, with apply-real.sh's instrumentation. `if: always()`
+      # is the entire point: the 2026-08-19 11:23 failure killed the script in a
+      # way that skipped its EXIT trap, so everything it had captured was dumped
+      # nowhere and lost with the runner. A collector that runs regardless is
+      # the only one that survives the script dying badly -- and apply-real
+      # still fails intermittently for a reason nobody has captured yet
+      # (docs/phase-2b-iii-regression.md).
+      - name: collect e2e diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-real-diag
+          path: .e2e-diag/
+          if-no-files-found: warn
+          retention-days: 7
