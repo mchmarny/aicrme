@@ -508,7 +508,15 @@ func (e *Engine) execute(ctx context.Context, epoch uint64) {
 			return
 		}
 	}
-	e.finish(ctx, epoch, StateDone, "")
+	// The final step decides the terminal state. StateActive means something
+	// this run created is still running in the cluster and only an operator
+	// action ends it -- see Stop. A failure earlier in the loop returns
+	// before reaching here, so a failed run can never land Active.
+	terminal := StateDone
+	if len(e.steps) > 0 && isActive(e.steps[len(e.steps)-1]) {
+		terminal = StateActive
+	}
+	e.finish(ctx, epoch, terminal, "")
 }
 
 // awaitDecisions parks the run until every key in step.Requires() is present.
