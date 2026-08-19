@@ -123,3 +123,17 @@ jobs:
         with:
           install_only: true
       - run: test/e2e/apply-real.sh
+      # TEMPORARY, paired with apply-real.sh's instrumentation -- remove both
+      # together before 2b-iii re-merges. `if: always()` is the entire point:
+      # the 2026-08-19 11:23 failure killed the script in a way that skipped its
+      # EXIT trap, so everything it had captured was dumped nowhere and lost
+      # with the runner. A collector that runs regardless is the only one that
+      # survives the script dying badly.
+      - name: collect e2e diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-real-diag
+          path: .e2e-diag/
+          if-no-files-found: warn
+          retention-days: 7

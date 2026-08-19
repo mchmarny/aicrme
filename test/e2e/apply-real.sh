@@ -76,7 +76,14 @@ ec=0
 # So the captures below deliberately overlap at three levels -- host kernel,
 # container, and in-cluster process -- because each is blind to a failure the
 # others can see.
-DIAG_DIR="$(mktemp -d -t aicrme-diag.XXXXXX)"
+# Deliberately NOT mktemp: this must land somewhere a workflow artifact step
+# can still reach after the script is gone. The 2026-08-19 11:23 run proved why
+# -- the shell was killed in a way that skipped its EXIT trap entirely (no
+# output, no cleanup, exit 1 after 7m32s of silence), so every capture that only
+# surfaced via cleanup died with it. Dumping at the end is not durable; writing
+# where something else can collect it is.
+DIAG_DIR="${DIAG_DIR:-${SCRIPT_DIR}/../../.e2e-diag}"
+mkdir -p "${DIAG_DIR}"
 DOCKER_EVENTS_PID=""
 SAMPLER_PID=""
 CONSOLE_LOG_PID=""
@@ -260,7 +267,7 @@ cleanup() {
     kill "${PF_PID}" 2>/dev/null || true
   fi
   rm -f "${JAR}" "${EVENTS_FILE}"
-  rm -rf "${DIAG_DIR}"
+  # DIAG_DIR is deliberately left in place for the workflow's artifact upload.
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
 trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
@@ -365,6 +372,7 @@ curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
 echo "--- poll until done or failed (Apply)"
 STATE=""
 CURL_FAILS=0
+POLLS=0
 for _ in $(seq 1 240); do
   # Deliberately NOT `curl -fsS ...` bare: under `set -e` a single failed poll
   # aborted the script instantly, and every diagnostic then ran from the EXIT
@@ -385,6 +393,20 @@ for _ in $(seq 1 240); do
   CURL_FAILS=0
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
+  POLLS=$((POLLS + 1))
+  # A heartbeat straight to stdout every ~60s. Everything else this script
+  # captures is written to disk and surfaced later, which is worthless when the
+  # shell is SIGKILLed -- the 11:23 run died with 7m32s of silence and took its
+  # whole capture set with it. A line already flushed into the CI log cannot be
+  # killed with the process, so this is the one signal guaranteed to survive.
+  if [[ $((POLLS % 6)) -eq 0 ]]; then
+    HB_MEM="$(free -m 2>/dev/null | sed -n '2p' | awk '{print "avail="$7"MiB"}')"
+    HB_CP="$(docker stats --no-stream --format '{{.Name}}={{.MemUsage}}' 2>/dev/null \
+      | grep control-plane | head -1)"
+    HB_RS="$(kubectl -n kube-system get pods -l tier=control-plane \
+      -o jsonpath='{range .items[*]}{.metadata.name}:{.status.containerStatuses[0].restartCount} {end}' 2>/dev/null)"
+    echo "[hb $(date -u +%H:%M:%S)] runner ${HB_MEM:-?} | ${HB_CP:-cp=?} | restarts: ${HB_RS:-?}"
+  fi
   sleep 10
 done
 
