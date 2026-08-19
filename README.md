@@ -41,6 +41,15 @@ constant-time password comparison, rate-limited login, and an 8-hour session. Th
 no multi-user support, and no scoped RBAC — by design, and only defensible under the framing
 above.
 
+## Demo
+
+To run the whole arc locally in a browser — Kind + simulated GPU nodes, a real install of every
+component, live cockpit telemetry — see **[DEMO.md](DEMO.md)**:
+
+```sh
+make demo
+```
+
 ## Development
 
 ```sh
