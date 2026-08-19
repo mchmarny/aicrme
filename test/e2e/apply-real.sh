@@ -57,38 +57,89 @@ ec=0
 # runs fires from the EXIT trap -- by which time the cluster is already gone.
 #
 # So this samples continuously during the run and writes to the runner's disk,
-# which survives the cluster dying. The three captures answer three different
-# questions and none substitutes for another: docker events says whether a
-# container was OOM-killed and which one; the sampler says how memory was
-# trending before that; and the at-the-moment cluster probe in the Apply poll
-# loop below says whether the console or the whole API server went first.
+# which survives the cluster dying. Each capture answers a question no other one
+# can: docker events says whether a CONTAINER was OOM-killed and which; the
+# sampler says how memory and apiserver load were trending before that; the
+# streamed console log says what this console itself was doing; and the
+# at-the-moment probe in the Apply poll loop says whether the console or the
+# API server underneath it went first.
+#
+# THE GAP THE SECOND ROUND CLOSED: kube-apiserver and etcd run as STATIC PODS INSIDE
+# the Kind control-plane container. If one of those processes is OOM-killed the
+# container survives, so `docker events oom` never fires -- and reading that
+# silence as "no OOM happened" would be a false negative from a capture that
+# structurally could not see it. An in-container process death also matches the
+# observed symptom better than a container death does: `connection reset by
+# peer` then `EOF` is what a client sees when the API server process dies and
+# restarts underneath it, not when its container disappears.
+#
+# So the captures below deliberately overlap at three levels -- host kernel,
+# container, and in-cluster process -- because each is blind to a failure the
+# others can see.
 DIAG_DIR="$(mktemp -d -t aicrme-diag.XXXXXX)"
 DOCKER_EVENTS_PID=""
 SAMPLER_PID=""
+CONSOLE_LOG_PID=""
+SAMPLE_SECONDS="${SAMPLE_SECONDS:-5}"
 
 start_instrumentation() {
-  # Container-level truth. An OOM kill of the kind control-plane container is
-  # the single hypothesis this whole exercise exists to confirm or kill, and it
-  # shows up here and nowhere else in this script.
   docker events \
     --filter 'event=oom' --filter 'event=die' --filter 'event=kill' \
     --format '{{.Time}} {{.Action}} {{.Actor.Attributes.name}}' \
     >"${DIAG_DIR}/docker-events.log" 2>&1 &
   DOCKER_EVENTS_PID=$!
 
+  # The console's own account of what it did. Streamed continuously because the
+  # failure takes the cluster with it -- `kubectl logs` after the fact returns
+  # nothing, which is why the two failing runs on main have no console output at
+  # all. The loop re-attaches across restarts and grabs --previous, so an
+  # OOMKilled console leaves its dying words rather than a gap.
+  (
+    while :; do
+      kubectl -n "${NS}" logs -l app.kubernetes.io/name=aicrme \
+        --tail=-1 --timestamps --follow >>"${DIAG_DIR}/console.log" 2>&1 || true
+      echo "=== console log stream ended $(date -u +%H:%M:%S); previous container: ===" \
+        >>"${DIAG_DIR}/console.log" 2>&1
+      kubectl -n "${NS}" logs -l app.kubernetes.io/name=aicrme \
+        --tail=200 --timestamps --previous >>"${DIAG_DIR}/console.log" 2>&1 || true
+      sleep 2
+    done
+  ) &
+  CONSOLE_LOG_PID=$!
+
   # Every command here is failure-tolerant on purpose: this subshell must never
   # be able to fail the run it is observing.
   (
+    i=0
     while :; do
+      i=$((i + 1))
       {
         echo "=== $(date -u +%H:%M:%S) ==="
-        free -m 2>/dev/null | sed -n '1,2p'
+        # Runner headroom. Without this a container memory number has nothing to
+        # mean anything against.
+        free -m 2>/dev/null | sed -n '2p' | awk '{print "runner mem total="$2" used="$3" avail="$7}'
         docker stats --no-stream \
           --format '{{.Name}} mem={{.MemUsage}} ({{.MemPerc}}) cpu={{.CPUPerc}}' 2>/dev/null
+        # The static pods. restartCount rising here IS the smoking gun for an
+        # in-container OOM that docker events cannot see.
+        kubectl -n kube-system get pods \
+          -l tier=control-plane \
+          -o jsonpath='{range .items[*]}{.metadata.name} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}{end}' 2>/dev/null
         kubectl -n "${NS}" get pod -l app.kubernetes.io/name=aicrme \
-          -o jsonpath='console restarts={.items[0].status.containerStatuses[0].restartCount} lastTerminated={.items[0].status.containerStatuses[0].lastState.terminated.reason}{"\n"}' 2>/dev/null
+          -o jsonpath='console restarts={.items[0].status.containerStatuses[0].restartCount} last={.items[0].status.containerStatuses[0].lastState.terminated.reason}{"\n"}' 2>/dev/null
+        # Host-kernel OOM verdicts, sampled rather than only dumped at the end:
+        # names the process the kernel actually killed, which is the one fact
+        # that separates "apiserver died" from "our console died".
+        sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -3
+        # Every other sample only: one extra API request, and it directly tests
+        # whether ~20 new watches loaded the apiserver.
+        if [[ $((i % 2)) -eq 0 ]]; then
+          kubectl get --raw /metrics 2>/dev/null \
+            | grep -E '^apiserver_current_inflight_requests|^apiserver_longrunning_requests\{.*watch' \
+            | head -6
+        fi
       } >>"${DIAG_DIR}/samples.log" 2>&1
-      sleep 10
+      sleep "${SAMPLE_SECONDS}"
     done
   ) &
   SAMPLER_PID=$!
@@ -97,6 +148,7 @@ start_instrumentation() {
 stop_instrumentation() {
   [[ -n "${SAMPLER_PID}" ]] && kill "${SAMPLER_PID}" 2>/dev/null || true
   [[ -n "${DOCKER_EVENTS_PID}" ]] && kill "${DOCKER_EVENTS_PID}" 2>/dev/null || true
+  [[ -n "${CONSOLE_LOG_PID}" ]] && kill "${CONSOLE_LOG_PID}" 2>/dev/null || true
 }
 
 # Fires the moment a poll fails, while the cluster may still be answering.
@@ -115,6 +167,17 @@ probe_at_failure() {
       -o jsonpath='restarts={.items[0].status.containerStatuses[0].restartCount} lastTerminated={.items[0].status.containerStatuses[0].lastState.terminated.reason} exit={.items[0].status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}' 2>&1
     echo "-- kind containers --"
     docker ps -a --filter "name=${CLUSTER}" --format '{{.Names}} {{.Status}}' 2>&1
+    # The static pods, asked from inside the control-plane container via crictl
+    # rather than through kubectl: if the API server is the thing that died,
+    # kubectl cannot answer questions about it, and this path still can.
+    echo "-- static pods via crictl (survives a dead apiserver) --"
+    docker exec "${CLUSTER}-control-plane" crictl ps -a \
+      --name 'kube-apiserver|etcd' -o table 2>&1 | head -10
+    echo "-- apiserver container log tail (in-container) --"
+    docker exec "${CLUSTER}-control-plane" sh -c \
+      'crictl logs --tail 25 $(crictl ps -a --name kube-apiserver -q | head -1) 2>&1' 2>&1 | tail -25
+    echo "-- kernel OOM verdicts right now --"
+    sudo dmesg 2>&1 | grep -iE 'killed process|out of memory' | tail -5
   } >>"${DIAG_DIR}/at-failure.log" 2>&1
   echo "console unreachable (${n}) -- probe captured" >&2
 }
@@ -127,18 +190,41 @@ dump_instrumentation() {
   echo "--- instrumentation: kernel OOM ---" >&2
   sudo dmesg 2>/dev/null | grep -iE 'out of memory|killed process' | tail -20 >&2 \
     || echo "(no kernel OOM lines, or dmesg unavailable)" >&2
-  echo "--- instrumentation: last 30 resource samples ---" >&2
-  tail -n 210 "${DIAG_DIR}/samples.log" >&2 2>/dev/null || echo "(none captured)" >&2
+  # The WHOLE sample series, not a tail. The failures happen minutes in, and the
+  # trend leading up to one is the evidence -- a truncated window would show the
+  # aftermath and hide the ramp.
+  echo "--- instrumentation: full resource sample series ---" >&2
+  cat "${DIAG_DIR}/samples.log" >&2 2>/dev/null || echo "(none captured)" >&2
+  echo "--- instrumentation: console log (streamed, survives cluster loss) ---" >&2
+  tail -n 400 "${DIAG_DIR}/console.log" >&2 2>/dev/null || echo "(none captured)" >&2
 }
 
-# Printed on SUCCESS too. A passing run's peak is the baseline the failing runs
-# have to be compared against -- without it, a memory number from a failure is
-# a number with nothing to mean anything against.
-dump_peak_memory() {
-  echo "--- instrumentation: peak container memory this run ---"
-  grep -o '[a-z0-9-]*control-plane mem=[0-9.]*MiB\|[a-z0-9-]*worker[0-9]* mem=[0-9.]*MiB' \
+# Printed on SUCCESS. A passing run is the baseline a failing run's numbers have
+# to mean something against -- without it, "control-plane at 1004MiB" is a number
+# with nothing to compare to. Each line below is the counterpart of a signal the
+# failure path dumps in full.
+dump_run_baseline() {
+  echo "--- instrumentation: baseline for this passing run ---"
+  echo "peak container memory:"
+  grep -o '[a-z0-9-]*\(control-plane\|worker[0-9]*\) mem=[0-9.]*MiB' \
     "${DIAG_DIR}/samples.log" 2>/dev/null | sort -u -t= -k2 -rn | head -5 \
-    || echo "(no samples)"
+    || echo "  (no samples)"
+  echo "runner memory low-water mark (lowest available seen):"
+  grep -o 'runner mem total=[0-9]* used=[0-9]* avail=[0-9]*' \
+    "${DIAG_DIR}/samples.log" 2>/dev/null | sort -t= -k4 -n | head -1 \
+    || echo "  (not captured)"
+  # If these are non-zero on a PASSING run, the static pods are already
+  # restarting under load and the failures are the same thing, further along.
+  echo "control-plane static pod restarts (final):"
+  kubectl -n kube-system get pods -l tier=control-plane \
+    -o jsonpath='{range .items[*]}  {.metadata.name} restarts={.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null \
+    || echo "  (unavailable)"
+  echo "peak apiserver inflight requests:"
+  grep -h '^apiserver_current_inflight_requests' "${DIAG_DIR}/samples.log" 2>/dev/null \
+    | sort -k2 -rn | head -2 || echo "  (not captured)"
+  echo "kernel OOM verdicts this run:"
+  sudo dmesg 2>/dev/null | grep -icE 'killed process' | sed 's/^/  count=/' \
+    || echo "  (dmesg unavailable)"
 }
 
 dump_recent_events() {
@@ -543,6 +629,6 @@ SYNTH_CONTIGUOUS="$(jq -n '[1,2,4] as $a | (($a | max) - ($a | min) + 1) == ($a 
   exit 1
 }
 
-dump_peak_memory
+dump_run_baseline
 
 echo "PASS: apply-real e2e green (run ${RUN_ID}; ${TOTAL} components installed for real, state=done, every workload at desired replicas, ${CLUSTER_TOTAL} cluster events attributed and contiguous)"
