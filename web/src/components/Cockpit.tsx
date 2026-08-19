@@ -2,7 +2,6 @@ import { bundleUrl } from '../api'
 import { deriveComponents, deriveFailure, deploymentActionsTotal, type ComponentState } from '../pipeline'
 import { slowStepNote } from '../slowSteps'
 import type { AicrEvent } from '../useEvents'
-import { ComponentConditions } from './ComponentConditions'
 import type { RunState } from './Wizard'
 
 const statusClass: Record<ComponentState['status'], string> = {
@@ -12,23 +11,7 @@ const statusClass: Record<ComponentState['status'], string> = {
   failed: 'text-red-400',
 }
 
-/**
- * `terminalState` defaults to undefined: Running is the one screen where
- * the run's observer is still watching, so a condition on it is genuinely
- * current. Ruling 38 (Task 7 final fix wave): Failed and Done both pass
- * their own `run.state` -- the observer tears down its informers the
- * instant a run reaches EITHER terminal state, not just StateDone (an
- * earlier version of this component treated Failed as still-live,
- * reasoning that it "can be mid-retry-decision"; that reasoning conflated
- * "an operator might click Retry next" with "the observer is still
- * watching", which it is not, in either terminal state, until Retry
- * actually restarts the run and the SPA's own `tracked` clears on "run
- * retrying"). The two terminal states pass DIFFERENT values, not a shared
- * boolean, because the wording differs -- see ComponentConditions's doc
- * comment on `terminalState` for why "installed" is a true claim on Done
- * and a false one on Failed.
- */
-function ComponentRow({ c, terminalState }: { c: ComponentState; terminalState?: 'done' | 'failed' }) {
+function ComponentRow({ c }: { c: ComponentState }) {
   const active = c.status === 'started' || c.status === 'retrying'
   const note = active ? slowStepNote(c.name) : undefined
 
@@ -48,7 +31,6 @@ function ComponentRow({ c, terminalState }: { c: ComponentState; terminalState?:
         )}
       </div>
       {note && <p className="mt-1 max-w-2xl text-xs text-slate-500">{note}</p>}
-      <ComponentConditions name={c.name} conditions={c.conditions} terminalState={terminalState} />
     </li>
   )
 }
@@ -162,7 +144,7 @@ function Failed({
       {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
-        {components.map(c => <ComponentRow key={c.name} c={c} terminalState="failed" />)}
+        {components.map(c => <ComponentRow key={c.name} c={c} />)}
       </ul>
 
       {failure && (
@@ -200,7 +182,7 @@ function Done({ components, recipeCount }: { components: ComponentState[]; recip
       {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
-        {components.map(c => <ComponentRow key={c.name} c={c} terminalState="done" />)}
+        {components.map(c => <ComponentRow key={c.name} c={c} />)}
       </ul>
     </section>
   )

@@ -267,13 +267,6 @@ components underneath it.
 
 ### Reset
 
-**Reset is never automatic.** It is always initiated by the operator and always passes an
-explicit confirmation before anything is uninstalled — the same shape as Apply's confirm gate,
-which the console cannot pass without a recorded decision, and Reset is strictly more
-destructive than Apply. Nothing in the product may trigger it on the operator's behalf: not a
-failed run, not a restart, not a timeout, not a recovered run being discarded. A run that ends
-badly leaves the cluster exactly as it is and says so.
-
 Teardown button that first stops any running Prove workload, then runs `helm uninstall` in
 reverse order plus namespace cleanup, so the demo is repeatable on the same cluster without
 rebuilding it. Tearing down components while a GPU workload still holds devices is the obvious

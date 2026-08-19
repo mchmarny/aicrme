@@ -7,46 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/tools/cache"
-
-	"github.com/mchmarny/aicrme/internal/bus"
 )
-
-// reasonRollout and reasonGPUAllocatable name the condition a ClusterData
-// event reports. They stay constant across a resource's transitions
-// (0/8 ready -> 8/8 ready is still "RolloutProgress") so ClusterData.Supersedes
-// can compare successive events on the same (UID, Reason) pair.
-const (
-	reasonRollout        = "RolloutProgress"
-	reasonGPUAllocatable = "GPUAllocatable"
-)
-
-// kindDaemonSet, kindDeployment and kindNode are ClusterData.Kind values.
-// Each handler's live-update path and onDelete's clearing path both set
-// Kind for the same resource type, so these are shared rather than
-// re-literaled.
-const (
-	kindDaemonSet  = "DaemonSet"
-	kindDeployment = "Deployment"
-	kindNode       = "Node"
-)
-
-// rolloutSeverityInfo is RolloutProgress's Severity, always: Supersedes only
-// orders conditions sharing a Reason, and RolloutProgress at Warn would rank
-// equal to an unrelated Reason -- say ImagePullBackOff -- also at Warn, so a
-// row picking the worse of the conditions it holds could no longer tell
-// "still installing" from "actually stuck". Warn/Error are reserved for
-// Reasons that describe a fault requiring operator action; a readiness
-// shortfall mid-rollout is expected, not that.
-const rolloutSeverityInfo = bus.SeverityInfo
-
-// allocatableSeverity flags a GPU capacity drop as the state worth watching;
-// a rise back to or above the prior value is the condition clearing.
-func allocatableSeverity(prev, cur resource.Quantity) bus.Severity {
-	if cur.Cmp(prev) < 0 {
-		return bus.SeverityWarn
-	}
-	return bus.SeverityInfo
-}
 
 // onAdd records state without emitting. An informer's initial list delivers
 // every existing object as an Add, so emitting here would narrate the
@@ -70,187 +31,31 @@ func (o *Observer) onAdd(obj any) {
 	}
 }
 
-// onDelete releases the cache entry and, if the observer had a tracked
-// condition for the resource, publishes it Resolved: true so the row it was
-// pinned to clears. stateKey carries the object's UID, so a recreate already
-// gets a fresh key and cannot inherit the deleted object's state either way
-// -- eviction here is memory hygiene, not what makes that safe. Publishing
-// is what spec Section 4's "or is deleted" half of clearing needs: the
-// healthy-state half is covered by onDaemonSet/onDeployment/onNode's own
-// Resolved computation, but a resource deleted while still unresolved (an
-// operator killing a stuck DaemonSet) never reaches that path any other way.
-//
-// A resource this observer never tracked (no cache entry) publishes nothing
-// -- there is no condition to clear, and inventing one would put a phantom
-// entry on a row that never showed anything.
-//
+// onDelete releases the cache entry. This is memory hygiene, not
+// correctness: stateKey carries the object's UID, so a recreate already gets
+// a fresh key and cannot inherit the deleted object's state either way.
+// Without it, o.workload and o.gpuQty retain one permanently unreachable
+// entry per deleted object for the life of the process.
 // DeletedFinalStateUnknown is the tombstone client-go delivers when a watch
-// gap meant the final object was missed; it is unwrapped first because the
-// cache is the only record of what existed once that happens.
-//
-// Each case locks, reads and evicts, then UNLOCKS before publish -- same
-// shape onDaemonSet/onDeployment/onNode already use, and required here for
-// the same reason: o.bus.Publish takes bus's own lock, and calling it while
-// holding o.mu would nest the two locks in the one order 2b-i was deliberate
-// about avoiding.
+// gap meant the final object was missed.
 func (o *Observer) onDelete(obj any) {
 	if tomb, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tomb.Obj
 	}
-
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	switch t := obj.(type) {
 	case *appsv1.DaemonSet:
-		key := dsKey(t)
-		o.mu.Lock()
-		_, had := o.workload[key]
-		delete(o.workload, key)
-		o.mu.Unlock()
-		if !had {
-			return
-		}
-		cd := bus.ClusterData{
-			Kind:      kindDaemonSet,
-			Namespace: t.Namespace,
-			Name:      t.Name,
-			UID:       string(t.UID),
-			Reason:    reasonRollout,
-			Ready:     t.Status.NumberReady,
-			Desired:   t.Status.DesiredNumberScheduled,
-			Severity:  rolloutSeverityInfo,
-			Resolved:  true,
-		}
-		o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), cd)
+		delete(o.workload, dsKey(t))
 	case *appsv1.Deployment:
-		key := deployKey(t)
-		o.mu.Lock()
-		_, had := o.workload[key]
-		delete(o.workload, key)
-		o.mu.Unlock()
-		if !had {
-			return
-		}
-		cd := bus.ClusterData{
-			Kind:      kindDeployment,
-			Namespace: t.Namespace,
-			Name:      t.Name,
-			UID:       string(t.UID),
-			Reason:    reasonRollout,
-			Ready:     t.Status.ReadyReplicas,
-			Desired:   deployDesired(t),
-			Severity:  rolloutSeverityInfo,
-			Resolved:  true,
-		}
-		o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), cd)
+		delete(o.workload, deployKey(t))
 	case *corev1.Node:
-		key := nodeKey(t)
-		o.mu.Lock()
-		_, had := o.gpuQty[key]
-		delete(o.gpuQty, key)
-		o.mu.Unlock()
-		if !had {
-			return
-		}
-		cd := bus.ClusterData{
-			Kind:     kindNode,
-			Name:     t.Name,
-			UID:      string(t.UID),
-			Reason:   reasonGPUAllocatable,
-			Severity: bus.SeverityInfo,
-			Resolved: true,
-		}
-		o.publish("", fmt.Sprintf("%s removed", t.Name), cd)
-	case *corev1.Pod:
-		key := podKey(t)
-		o.mu.Lock()
-		set := o.pods[key]
-		delete(o.pods, key)
-		// M2 (Task 6 fix round 1): a deleted Pod is also the ONLY genuine
-		// "this resource is gone" signal any Event-sourced Warning about it
-		// will ever get -- eventInvolvedKey(ev) is byte-identical to
-		// podKey(pod) (events.go), and spec Section 3 says the dedupe map is
-		// "cleaned on resource deletion", which the Event-object-TTL path
-		// (the *corev1.Event case just below) cannot speak to for the
-		// INVOLVED resource, only for the Event record itself. Falls out of
-		// Ruling 23's resolveEventsLocked (added for Important 1/onPodChange)
-		// rather than needing its own logic -- same key, same helper, same
-		// already-held o.mu. narratedOnly: true (Task 6 fix round 2,
-		// Important 1(new)) -- matches the SAME filter the Pod loop below
-		// already applies to o.pods' own set: a delete cannot claim a
-		// seeded-only Warning "resolved/removed" any more than it can for a
-		// seeded-only podCondition. Passing false here (as onPodChange's
-		// recovery branch correctly does) is exactly the phantom-resolution
-		// defect the re-review found: a pre-existing Warning re-seeded on
-		// every process start or Retry would publish "removed" for a
-		// condition no consumer was ever shown.
-		resolvedEvents := o.resolveEventsLocked(key, true)
-		o.mu.Unlock()
-		// Ruling 20 (Task 5 fix round 3): resolve EVERY narrated reason in
-		// the pod's set, not just whichever was tracked most recently --
-		// same reasoning as onPodChange's full-recovery sweep (pods.go),
-		// applied to deletion. Filtered by narrated, unlike that sweep
-		// (Important 3, Minor C): a condition only ever seeded silently
-		// from an initial list must not manufacture a phantom event for
-		// something no consumer was ever shown, exactly like this comment
-		// already warns against for the other three kinds. Ranging over a
-		// nil map (no tracked trouble at all) is a safe no-op.
-		for _, cond := range set {
-			if !cond.narrated {
-				continue
-			}
-			// "removed", not "resolved": the pod did not recover, it was
-			// deleted. The three cluster-scoped kinds above say "removed"
-			// for the identical reason.
-			o.publish(t.Namespace, fmt.Sprintf("%s/%s removed", t.Namespace, t.Name), podClusterData(t, cond, true))
-		}
-		for _, cd := range resolvedEvents {
-			// "removed", matching the Pod loop just above: the pod did not
-			// recover, it (and whatever it was reporting) is gone.
-			o.publish(t.Namespace, eventResolutionMessage(cd, "removed"), cd)
-		}
-	case *corev1.Event:
-		// Not gated by withNamespaceLive, matching the Pod case just above:
-		// a delete only ever REMOVES an o.events entry, never writes a new
-		// one, so a stray delivery racing a torn-down namespace's teardown
-		// sweep costs at most a redundant delete(map, key) against an
-		// already-absent key -- harmless, unlike onEventChange/
-		// seedEventBaseline's writes, which withNamespaceLive genuinely
-		// must gate (events.go).
-		//
-		// This is the Event API object itself aging out of Kubernetes'
-		// TTL-based garbage collection (--event-ttl, 1h by default), not the
-		// resource t.InvolvedObject describes being deleted -- Events carry
-		// no owner reference back to that resource, so this is the only
-		// deletion signal THIS INFORMER, watching only Events, ever receives
-		// for it. (M2, Task 6 fix round 1: that used to overstate the
-		// OBSERVER's position, not just this informer's -- the Pod case
-		// three cases above delivers the involved-resource-deleted signal
-		// under an identical key, via resolveEventsLocked, for the common
-		// case where InvolvedObject is a Pod.) Deliberately publishes
-		// nothing here: unlike a DaemonSet/Deployment/Node/Pod going away, an
-		// old Event record aging out of etcd says nothing about whether
-		// t.Reason is still happening -- inventing a "resolved" here would be
-		// exactly the claim Important 3/clearNamespacePods' own comment
-		// already warns against manufacturing elsewhere in this file. This is
-		// what bounds o.events across the process lifetime
-		// (TestEventDedupeIsClearedOnResourceDeletion): without it, a
-		// resource that keeps generating the SAME reason indefinitely, with
-		// each occurrence's Event object eventually TTL-evicted and
-		// replaced by a fresh one, would leave the ORIGINAL dedupe entry
-		// pinned forever under a key nothing ever revisits.
-		key := eventInvolvedKey(t)
-		o.mu.Lock()
-		if set := o.events[key]; set != nil {
-			delete(set, t.Reason)
-			if len(set) == 0 {
-				delete(o.events, key)
-			}
-		}
-		o.mu.Unlock()
+		delete(o.gpuQty, nodeKey(t))
 	}
 }
 
 func dsKey(ds *appsv1.DaemonSet) stateKey {
-	return stateKey{kind: kindDaemonSet, namespace: ds.Namespace, name: ds.Name, uid: ds.UID}
+	return stateKey{kind: "DaemonSet", namespace: ds.Namespace, name: ds.Name, uid: ds.UID}
 }
 
 func dsSummary(ds *appsv1.DaemonSet) string {
@@ -274,34 +79,13 @@ func (o *Observer) onDaemonSet(obj any) {
 	o.workload[key] = summary
 	o.mu.Unlock()
 
-	cd := bus.ClusterData{
-		Kind:      kindDaemonSet,
-		Namespace: ds.Namespace,
-		Name:      ds.Name,
-		UID:       string(ds.UID),
-		Reason:    reasonRollout,
-		Ready:     ds.Status.NumberReady,
-		Desired:   ds.Status.DesiredNumberScheduled,
-		Severity:  rolloutSeverityInfo,
-		Resolved:  ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled,
-	}
-
 	// Namespace-qualified: two DaemonSets in different namespaces can share
 	// a name, and an unqualified message would be ambiguous.
-	o.publish(ds.Namespace, fmt.Sprintf("%s/%s %s", ds.Namespace, ds.Name, summary), cd)
+	o.publish(ds.Namespace, fmt.Sprintf("%s/%s %s", ds.Namespace, ds.Name, summary))
 }
 
 func deployKey(d *appsv1.Deployment) stateKey {
-	return stateKey{kind: kindDeployment, namespace: d.Namespace, name: d.Name, uid: d.UID}
-}
-
-// deployDesired defaults to 1, matching the API server's default for an
-// unset Spec.Replicas.
-func deployDesired(d *appsv1.Deployment) int32 {
-	if d.Spec.Replicas != nil {
-		return *d.Spec.Replicas
-	}
-	return 1
+	return stateKey{kind: "Deployment", namespace: d.Namespace, name: d.Name, uid: d.UID}
 }
 
 // deploySummary reports readiness against spec.replicas, not status.replicas.
@@ -309,7 +93,11 @@ func deployDesired(d *appsv1.Deployment) int32 {
 // in progress would read "1/1 ready" while eight are desired -- a "finished"
 // message during precisely the stall this observer exists to narrate.
 func deploySummary(d *appsv1.Deployment) string {
-	return fmt.Sprintf("%d/%d ready", d.Status.ReadyReplicas, deployDesired(d))
+	desired := int32(1)
+	if d.Spec.Replicas != nil {
+		desired = *d.Spec.Replicas
+	}
+	return fmt.Sprintf("%d/%d ready", d.Status.ReadyReplicas, desired)
 }
 
 func (o *Observer) onDeployment(obj any) {
@@ -334,20 +122,7 @@ func (o *Observer) onDeployment(obj any) {
 	o.workload[key] = summary
 	o.mu.Unlock()
 
-	desired := deployDesired(d)
-	cd := bus.ClusterData{
-		Kind:      kindDeployment,
-		Namespace: d.Namespace,
-		Name:      d.Name,
-		UID:       string(d.UID),
-		Reason:    reasonRollout,
-		Ready:     d.Status.ReadyReplicas,
-		Desired:   desired,
-		Severity:  rolloutSeverityInfo,
-		Resolved:  d.Status.ReadyReplicas >= desired,
-	}
-
-	o.publish(d.Namespace, fmt.Sprintf("%s/%s %s", d.Namespace, d.Name, summary), cd)
+	o.publish(d.Namespace, fmt.Sprintf("%s/%s %s", d.Namespace, d.Name, summary))
 }
 
 // gpuResource is the allocatable resource this product cares about. A bare
@@ -355,7 +130,7 @@ func (o *Observer) onDeployment(obj any) {
 const gpuResource = "nvidia.com/gpu"
 
 func nodeKey(n *corev1.Node) stateKey {
-	return stateKey{kind: kindNode, name: n.Name, uid: n.UID}
+	return stateKey{kind: "Node", name: n.Name, uid: n.UID}
 }
 
 func nodeGPUs(n *corev1.Node) resource.Quantity {
@@ -391,19 +166,10 @@ func (o *Observer) onNode(obj any) {
 		// had capacity when the console started.
 		return
 	}
-	cd := bus.ClusterData{
-		Kind:     kindNode,
-		Name:     n.Name,
-		UID:      string(n.UID),
-		Reason:   reasonGPUAllocatable,
-		Severity: allocatableSeverity(prev, cur),
-		Resolved: cur.Cmp(prev) >= 0,
-	}
-
 	// The message is a TRANSITION, formatted here from the cached previous
 	// value -- it is deliberately not what gets cached, because a repeated
 	// identical update would then compute "8 -> 8", compare unequal to
 	// "0 -> 8", and emit again.
 	o.publish("", fmt.Sprintf("%s: %s allocatable %s → %s",
-		n.Name, gpuResource, prev.String(), cur.String()), cd)
+		n.Name, gpuResource, prev.String(), cur.String()))
 }
