@@ -76,8 +76,32 @@ check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.
 		echo "check-aicr-pin: OK — snapshot agent image $$image matches pin"; \
 	fi
 
+.PHONY: check-tools
+check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml pin
+	@# Warns, never fails: tooling here is Homebrew-managed and upgrades on its
+	@# own schedule, so drift is normal and blocking on it would just be noise.
+	@# What is NOT acceptable is finding out from a red CI run on an unchanged
+	@# file, which is what happened on 2026-08-19 when an unpinned shellcheck
+	@# flagged SC2015 in CI and not locally.
+	@#
+	@# Deliberately covers lint tools only. helm and kubectl are pinned in the
+	@# Dockerfile because they ship INSIDE the console image and deploy.sh runs
+	@# against them -- those pins are the product's contract, and matching them
+	@# to a developer's machine is the mistake that produced the dry-run ceiling
+	@# confusion (docs/phase-2-handoff.md).
+	@want=$$(sed -n 's/^  shellcheck: *.\(v[0-9.]*\).*/\1/p' .settings.yaml); \
+	have=v$$(shellcheck --version 2>/dev/null | awk '/^version:/{print $$2}'); \
+	if [ -n "$$have" ] && [ "$$want" != "$$have" ]; then \
+		echo "WARNING: shellcheck local $$have != pinned $$want (CI uses $$want)"; \
+	fi
+	@want=$$(sed -n "s/^  golangci_lint: *.\(v[0-9.]*\).*/\1/p" .settings.yaml); \
+	have=v$$(golangci-lint --version 2>/dev/null | awk '{print $$4}'); \
+	if [ -n "$$have" ] && [ "$$want" != "$$have" ]; then \
+		echo "WARNING: golangci-lint local $$have != pinned $$want (CI uses $$want)"; \
+	fi
+
 .PHONY: lint-shell
-lint-shell: ## Lints shell scripts with shellcheck
+lint-shell: check-tools ## Lints shell scripts with shellcheck
 	shellcheck -x -P test/e2e -P test/chart test/e2e/*.sh test/chart/*.sh
 
 .PHONY: test-chart

@@ -4,6 +4,11 @@ quality:
 
 linting:
   golangci_lint: 'v2.12.2'
+  # Pinned 2026-08-19 after an unpinned shellcheck cost a red main: CI installed
+  # it from apt while a developer had a newer build, so `make lint-shell` passed
+  # locally and failed in CI on the same file. Every other tool here is pinned
+  # for exactly this reason; this one had simply never drifted before.
+  shellcheck: 'v0.11.0'
 
 build_tools:
   ko: 'v0.19.1'

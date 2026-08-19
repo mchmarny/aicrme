@@ -22,7 +22,21 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: sudo apt-get update && sudo apt-get install -y bc shellcheck
+      - run: sudo apt-get update && sudo apt-get install -y bc
+      # shellcheck comes from its own release, NOT apt: apt's version floats
+      # with the runner image, and a floating linter means `make lint-shell` can
+      # pass locally and fail here on an unchanged file -- which is exactly what
+      # it did on 2026-08-19. Version is owned by .settings.yaml (linting.shellcheck).
+      - name: install pinned shellcheck
+        run: |
+          set -euo pipefail
+          # sed, not yq: yq is installed by a later step, and a linter pin that
+          # depends on install order is a trap for whoever reorders this file.
+          want="$(sed -n 's/^  shellcheck: *.\(v[0-9.]*\).*/\1/p' .settings.yaml)"
+          [ -n "${want}" ] || { echo "no shellcheck pin in .settings.yaml"; exit 1; }
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${want}/shellcheck-${want}.linux.x86_64.tar.xz" \
+            | tar -xJ --strip-components=1 -C /usr/local/bin "shellcheck-${want}/shellcheck"
+          shellcheck --version | grep -E '^version:'
       - uses: mikefarah/yq@v4.53.3
       - uses: azure/setup-helm@v4
         with:
