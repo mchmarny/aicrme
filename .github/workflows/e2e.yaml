@@ -6,12 +6,7 @@ name: e2e
 # (every real run to date has been a developer's arm64 Mac).
 on:
   push:
-    # phase-2b-iii-investigate is TEMPORARY and exists only on that branch:
-    # apply-real fails there and nowhere else, and this repo merges phases
-    # without pull requests, so a push trigger is the only way to run these
-    # jobs against the failing code. REMOVE THIS ENTRY before 2b-iii re-merges
-    # -- see docs/phase-2b-iii-regression.md.
-    branches: [main, phase-2b-iii-investigate]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -123,12 +118,13 @@ jobs:
         with:
           install_only: true
       - run: test/e2e/apply-real.sh
-      # TEMPORARY, paired with apply-real.sh's instrumentation -- remove both
-      # together before 2b-iii re-merges. `if: always()` is the entire point:
-      # the 2026-08-19 11:23 failure killed the script in a way that skipped its
-      # EXIT trap, so everything it had captured was dumped nowhere and lost
-      # with the runner. A collector that runs regardless is the only one that
-      # survives the script dying badly.
+      # Kept deliberately, with apply-real.sh's instrumentation. `if: always()`
+      # is the entire point: the 2026-08-19 11:23 failure killed the script in a
+      # way that skipped its EXIT trap, so everything it had captured was dumped
+      # nowhere and lost with the runner. A collector that runs regardless is
+      # the only one that survives the script dying badly -- and apply-real
+      # still fails intermittently for a reason nobody has captured yet
+      # (docs/phase-2b-iii-regression.md).
       - name: collect e2e diagnostics
         if: always()
         uses: actions/upload-artifact@v4
