@@ -242,6 +242,21 @@ what to capture.
 Runs the per-component chainsaw checks from `recipes/checks/` in-process via `pkg/chainsaw`,
 plus the final recipe validation. Green checks land next to their components in the pipeline.
 
+**Deferred as of 2026-08-18 — both halves of that description turned out to be unbuildable
+today, and the finding is measured rather than argued.** `ValidateState`'s orchestrator Job Pod
+tolerates every taint, so on any cluster carrying KWOK's simulated GPU nodes it lands on one,
+KWOK fakes `ExitCode:0` without starting the container, and every check reports `passed` —
+including for components that are not installed. Those simulated nodes are a *prerequisite* of
+the demo path, not an accident of it: without GPU nodes there is no derivable accelerator and
+recipe resolution fails, so every cluster this console can demo on triggers it. Separately,
+"next to their components" has no data to stand on: `ctrf.Builder` hardcodes each result's
+`Suite` to the phase name, so nothing in the output identifies a component.
+
+Full evidence, the reliable non-execution signal, and the reasons this is not the dry-run
+ceiling repeating are in `docs/phase-2-handoff.md` under "Constraints Phase 3 inherits".
+Revisit when AICR's orchestrator scheduling changes — not before, and do not route around it
+in this console.
+
 ### 6. Prove
 
 | Path | Close |
@@ -403,7 +418,7 @@ Each phase is independently demoable.
 | 0 | Skeleton: repo, CI, chart, auth, SSE bus, embedded SPA shell. Installs on Kind and does nothing. |
 | 1 | Discover and Recommend against Kind/KWOK. Both wizard screens real. |
 | 2 | Applier, cockpit, observer. The bulk of the work. |
-| 3 | Validate and Prove, simulated on Kind. Full arc end to end with no hardware. |
+| 3 | Prove, simulated on Kind. Full arc end to end with no hardware. **Validate was scoped out on 2026-08-18** — measured, not assumed; see the Validate section below. |
 | 4 | Real hardware: EKS, then GKE. Real finale, real timings, slow-step map calibrated. |
 | 5 | AKS, reset, export to GitOps, verification screen polish. |
 
