@@ -16,10 +16,23 @@
 #
 # So: dryrun is the fast grammar/drift check, real is the full-chain gate.
 #
-# WHY THE CLUSTER HAS WORKERS, WHICH apply-dryrun.sh's DOES NOT
+# WHY THE CLUSTER HAS A WORKER, WHICH apply-dryrun.sh's DOES NOT
 # A real install actually creates every component's workloads, and they need
 # somewhere to run. The KWOK nodes carry kwok.x-k8s.io/node=fake:NoSchedule,
 # so everything that does not tolerate that taint lands on real nodes.
+#
+# WHY EXACTLY ONE WORKER, NOT THREE (measured 2026-08-19)
+# This job runs on a 2-core/7.75GiB runner, and every Kind node keeps its OWN
+# copy of every image it pulls, so worker count multiplies the largest cost in
+# the job. Instrumented A/B runs showed runner memory draining 400-700MiB/min
+# throughout Apply and never plateauing: a fast run finished with headroom, a
+# slow one exhausted the runner and the API server died with it. That is the
+# whole intermittent-failure story, and it reproduced on main and on
+# phase-2b-iii equally -- it was never about either branch's code.
+#
+# One worker, not zero: kind leaves a SINGLE-node cluster's control-plane
+# untainted and taints it the moment any worker exists, so dropping to zero
+# would silently invert the scheduling rules this script depends on below.
 #
 # The non-obvious consequence: kind leaves a SINGLE-node cluster's
 # control-plane untainted (otherwise nothing could schedule), but taints it as
@@ -279,8 +292,6 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
-  - role: worker
-  - role: worker
   - role: worker
 EOF
 kind create cluster --name "${CLUSTER}" --config "${KIND_CFG}" --wait 180s
