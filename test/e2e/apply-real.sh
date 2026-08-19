@@ -153,9 +153,18 @@ start_instrumentation() {
 }
 
 stop_instrumentation() {
-  [[ -n "${SAMPLER_PID}" ]] && kill "${SAMPLER_PID}" 2>/dev/null || true
-  [[ -n "${DOCKER_EVENTS_PID}" ]] && kill "${DOCKER_EVENTS_PID}" 2>/dev/null || true
-  [[ -n "${CONSOLE_LOG_PID}" ]] && kill "${CONSOLE_LOG_PID}" 2>/dev/null || true
+  # if-then rather than `[[ ... ]] && kill ... || true`: in that form the `|| true`
+  # also fires when the test itself is false, which reads as an else-branch and
+  # is not one (SC2015).
+  if [[ -n "${SAMPLER_PID}" ]]; then
+    kill "${SAMPLER_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${DOCKER_EVENTS_PID}" ]]; then
+    kill "${DOCKER_EVENTS_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${CONSOLE_LOG_PID}" ]]; then
+    kill "${CONSOLE_LOG_PID}" 2>/dev/null || true
+  fi
 }
 
 # Fires the moment a poll fails, while the cluster may still be answering.
