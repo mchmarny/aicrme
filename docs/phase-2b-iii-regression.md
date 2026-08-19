@@ -1,11 +1,59 @@
-# Phase 2b-iii regression — open, unresolved
+# Phase 2b-iii regression — 2b-iii exonerated; apply-real still fails intermittently
 
-**Status as of 2026-08-18 evening:** the 2b-iii merge is **reverted on `main`**. The work is
-intact on `phase-2b-iii-investigate` (and the original `phase-2b-iii`), both at merge commit
-`79c4f95`. `main` is back to the last commit that passed e2e, plus docs.
+**RESOLVED 2026-08-19: the hypothesis this document was built around is WRONG, and 2b-iii is
+not the cause.** 2b-iii is re-merged. The rest of this file is kept because the measurements
+are reusable and because the reasoning error is worth not repeating.
 
-This file exists because the finding is not in any commit message and the SDD ledger is
-git-ignored scratch. Read it before touching the observer again.
+## What the measurement showed
+
+An instrumented A/B — identical scripts, differing only in whether the observer's
+namespace-scoped Pod and Event informers exist — put **`main` worse than `phase-2b-iii` on
+every sample**, on a 2-core/7.75GiB runner:
+
+| elapsed into Apply | `main` avail / control-plane | `2b-iii` avail / control-plane |
+|---|---|---|
+| ~0:53 | 5436MiB / **1.085GiB** | 5444MiB / 0.913GiB |
+| ~1:57 | 4893MiB / **1.526GiB** | 4913MiB / 1.283GiB |
+| ~3:00 | 4170MiB / **1.686GiB** | 4578MiB / 1.438GiB |
+| ~4:03 | 3760MiB / **1.731GiB** | 4003MiB / 1.520GiB |
+
+Runner memory drains 400-700MiB/min through Apply and never plateaus while components keep
+installing. A run that finishes Apply quickly survives with headroom; a slow one keeps
+draining. Two slow runs failed, faster ones passed — **on both branches**.
+
+## The reasoning error, stated plainly
+
+The failures started after the 2b-iii merge, so 2b-iii was assumed to be the cause, and three
+rounds of instrumentation were built to prove *how* it caused them. Nobody measured whether
+`main` did the same thing until the fourth run. The correlation was real; the causation was
+invented. **One baseline run dissolved it, and it was the run that should have come first.**
+
+Two further guesses inside that same investigation were also wrong, and both were caught only
+by measuring:
+- *"A container OOM will show in `docker events`."* `kube-apiserver` and `etcd` are static pods
+  **inside** the control-plane container; an in-container process OOM leaves the container
+  alive and the events log silent. The first instrument was structurally blind to the most
+  likely mechanism.
+- *"One worker is enough, the workloads are small."* Kind reports each node's allocatable CPU
+  as the **host's** core count, so worker count is the scheduling budget, not just memory.
+  Cutting 3 workers to 1 took Apply from ~5 minutes to over 40 without completing.
+
+## What is still open
+
+**Why `apply-real` fails intermittently is still unknown.** The memory drain is real and
+measured; the link from that drain to the failures is *inferred and unproven*. No OOM has ever
+been captured at failure time — the one run that died hard lost its capture, and the run with
+durable capture passed.
+
+Outcomes do differ by branch (`main` 2/2 pass, 2b-iii 1/3) but the measured mechanism does not
+support a 2b-iii cause and the samples are far too small to separate from chance.
+
+The instrumentation is retained on `main` for exactly this reason: the next failure on either
+branch will now be captured with durable artifacts rather than vanishing with the runner.
+
+---
+
+## Original record (kept — the symptom description is still accurate)
 
 ---
 
@@ -44,7 +92,7 @@ Both failures were **still installing** past the point where the pre-merge run h
 finished. Apply is not merely being interrupted — it is running slower or wedging, and the
 cluster dies after that.
 
-## Leading hypothesis — suspected, NOT established
+## Leading hypothesis — REFUTED 2026-08-19 (kept to show what was tested)
 
 2b-iii added roughly ten namespace-scoped informer factories, each with a Pod **and** an Event
 informer, all live during a 14-release install that generates events heavily.
@@ -81,7 +129,7 @@ beyond CI — demo clusters are routinely small, and a console that dies during 
 worst possible moment for it. That possibility is the reason the merge was reverted rather than
 left red while investigating.
 
-## Next step (agreed 2026-08-18)
+## Next step as it stood on 2026-08-18 (superseded — the A/B above replaced it)
 
 **Instrument before changing code.** Add capture to `apply-real.sh` on the investigation branch
 so the next failure records, during Apply rather than after the cluster is gone:
