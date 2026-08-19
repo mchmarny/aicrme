@@ -372,6 +372,28 @@ By Task 2 of 2b-iii, the running count of "a test existed, exercised real code, 
 
 ---
 
+## Test gaps are recorded, not blocking (standing rule, stated 2026-08-19)
+
+**If something cannot be fully verified on KWOK, capture it as a named test gap and keep
+going.** Do not stall a feature, and do not contort the design to make a simulated cluster
+able to prove something it structurally cannot. Every release gets exercised on a real
+cluster before it ships, so a recorded gap is a thing verified later — not a thing shipped
+unverified.
+
+What this rule requires in exchange: the gap must be **written down where the next person
+will find it** — in this document and next to the code — naming what is unverified and what
+would verify it. An unrecorded gap is the thing this rule is not licensing.
+
+**One distinction it does not erase.** A test gap is *"we do not know."* A false pass is
+*"we are told something untrue."* The second is worse and is not covered by this rule — which
+is why Validate stays deferred above rather than shipped with a gap note: `ValidateState`
+does not fail to verify on KWOK, it reports `passed` for components that are not installed.
+Shipping that would put a green check next to a lie. If a future change makes those results
+merely *unavailable* on simulated clusters rather than *wrong*, this rule applies and Validate
+should ship with a recorded gap.
+
+---
+
 ## Explicit non-goals — do not "fix" these
 
 Air-gapped operation, private registries, and registry mirroring are spec non-goals; direct internet access to ghcr.io, nvcr.io, and the upstream Helm repos is an assumed precondition. `AICRME_SNAPSHOT_IMAGE` is deliberately not exposed in `values.yaml` for this reason. Day-2 operations, multi-user auth/OIDC/scoped RBAC, multi-cluster, and in-UI editing of component sets or versions are all out of scope. The `cluster-admin` grant is deliberate and disclosed; do not attempt to narrow it.
