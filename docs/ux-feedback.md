@@ -35,6 +35,57 @@ follow a live run.
 
 ---
 
+## 2. A stale, already-converged warning sits on a healthy row on the success screen
+
+**Observed:** 2026-08-19, Mark, first local `make demo` run, on the "Bundle installed" screen.
+
+**This is a correctness bug, not a preference.** It is the deferred 2b-iii finding, sighted in
+a real run within minutes of a human first using the product.
+
+The Done screen reads "Every component in the bundle installed successfully", every row says
+INSTALLED — and the `kubeflow-trainer` row carries:
+
+```
+kai-scheduler/kai-scheduler-default-b5c69699f: FailedCreate -- Error creating: pods ...
+is forbidden: error looking up service account kai-scheduler/scheduler:
+serviceaccount "scheduler" not found (last observed while kubeflow-trainer installed)
+```
+
+Two separate things are happening, and only one of them is intended:
+
+**Intended:** the condition appears on `kubeflow-trainer`'s row although it concerns
+`kai-scheduler`, because attribution is *temporal* — that action was installing when the
+condition was observed. The copy says so and claims nothing more. Working as designed.
+
+**Not intended:** the condition is **stale**. `test/e2e/apply-real.sh`'s own header documents
+this exact warning as transient and self-converging ("kai-scheduler's ReplicaSet transiently
+reports FailedCreate ... and converges shortly after" — it is why `SETTLE_SECONDS` exists). It
+resolved, and the row never cleared, because **resolution is keyed to Pod recovery and this is
+a ReplicaSet-involved warning**.
+
+That is exactly the open item recorded in `docs/phase-2-handoff.md` — *"resolution covers
+Pod-involved Warnings only; a DaemonSet `FailedCreate` survives the DaemonSet's own deletion"* —
+deferred during 2b-iii as narrower than the Pod path. It is not narrower in practice: it is the
+first thing a human saw.
+
+**Net effect:** a success screen that shows a red failure for a problem that fixed itself. This
+is the "amber row on a green run" outcome the Pod path was explicitly changed to prevent
+(Ruling 23), still open for non-Pod involved objects.
+
+**Where:** `internal/observer/events.go` — `resolveEventsLocked` and its call sites are keyed on
+`podKey`. A ReplicaSet/DaemonSet-involved Event has no recovery signal.
+
+**Worth thinking about before changing it:**
+- The obvious fix — resolve a workload-involved warning when that workload reaches its desired
+  replica count — means the Event handler needs a second recovery source alongside the Pod
+  cache. 2b-iii already added one such cross-informer read and it was judged sound, so there is
+  a precedent to follow rather than invent.
+- The cheaper alternative is to expire conditions at terminal state, which was **explicitly
+  rejected** in 2b-iii: it hides real conditions to paper over unresolved ones, and at Done a
+  genuinely broken component is what an operator most needs to see. Do not reach for it.
+
+---
+
 ## Observed in the same screenshot, not raised as feedback
 
 Recorded only so they are not re-discovered as surprises. Neither is a request.

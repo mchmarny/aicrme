@@ -37,7 +37,8 @@ PF_FILE="${TMPDIR:-/tmp}/aicrme-demo-portforward.pid"
 
 usage() {
   cat <<EOF
-usage: $(basename "$0") [up|down|status]
+usage: ./scripts/demo.sh [up|down|status]
+       (or: make demo | make demo-down | make demo-status)
 
   up      create the cluster, install the console, print the URL and password
   down    delete the cluster and stop the port-forward
@@ -61,7 +62,7 @@ stop_port_forward() {
 demo_up() {
   if kind get clusters 2>/dev/null | grep -qx "${CLUSTER}"; then
     echo "cluster '${CLUSTER}' already exists -- reusing it."
-    echo "run '$(basename "$0") down' first for a clean start."
+    echo "run 'make demo-down' first for a clean start."
   else
     echo "==> creating cluster '${CLUSTER}' (control-plane + 3 workers)"
     # Three workers, matching test/e2e/apply-real.sh. Worker count is the
@@ -131,7 +132,7 @@ EOF
   Validate and Prove are not built yet (Phase 3), so the arc ends
   at a completed Apply.
 
-  stop it:  $(basename "$0") down
+  stop it:  make demo-down
 ================================================================
 EOF
 }
@@ -157,7 +158,7 @@ demo_status() {
     echo "console:  http://localhost:${PORT} (port-forward running)"
     echo "password: $(e2e_admin_password "${NS}" 2>/dev/null || echo '(unavailable)')"
   else
-    echo "port-forward is not running; re-run '$(basename "$0") up'"
+    echo "port-forward is not running; re-run 'make demo'"
   fi
 }
 
