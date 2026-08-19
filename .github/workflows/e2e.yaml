@@ -6,7 +6,12 @@ name: e2e
 # (every real run to date has been a developer's arm64 Mac).
 on:
   push:
-    branches: [main]
+    # phase-2b-iii-investigate is TEMPORARY and exists only on that branch:
+    # apply-real fails there and nowhere else, and this repo merges phases
+    # without pull requests, so a push trigger is the only way to run these
+    # jobs against the failing code. REMOVE THIS ENTRY before 2b-iii re-merges
+    # -- see docs/phase-2b-iii-regression.md.
+    branches: [main, phase-2b-iii-investigate]
   pull_request:
 
 permissions:
