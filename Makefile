@@ -76,6 +76,18 @@ check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.
 		echo "check-aicr-pin: OK — snapshot agent image $$image matches pin"; \
 	fi
 
+.PHONY: demo
+demo: ## Stands up a local browser-usable demo cluster and leaves it running
+	./scripts/demo.sh up
+
+.PHONY: demo-down
+demo-down: ## Deletes the local demo cluster
+	./scripts/demo.sh down
+
+.PHONY: demo-status
+demo-status: ## Shows whether the local demo is running, and its URL and password
+	./scripts/demo.sh status
+
 .PHONY: check-tools
 check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml pin
 	@# Warns, never fails: tooling here is Homebrew-managed and upgrades on its
@@ -102,7 +114,7 @@ check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml
 
 .PHONY: lint-shell
 lint-shell: check-tools ## Lints shell scripts with shellcheck
-	shellcheck -x -P test/e2e -P test/chart test/e2e/*.sh test/chart/*.sh
+	shellcheck -x -P test/e2e -P test/chart -P scripts test/e2e/*.sh test/chart/*.sh scripts/*.sh
 
 .PHONY: test-chart
 test-chart: ## Runs helm lint plus the chart contract assertions (offline, no cluster)
