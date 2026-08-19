@@ -4,9 +4,7 @@ metadata:
   name: PLACEHOLDER_NAME
   namespace: PLACEHOLDER_NAMESPACE
   labels:
-    app.kubernetes.io/managed-by: aicrme
-    aicrme.dev/run-id: PLACEHOLDER_RUN_ID
-    aicrme.dev/component: prove-workload
+PLACEHOLDER_LABELS
 spec:
   completions: 2
   parallelism: 2
@@ -15,9 +13,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/managed-by: aicrme
-        aicrme.dev/run-id: PLACEHOLDER_RUN_ID
-        aicrme.dev/component: prove-workload
+PLACEHOLDER_POD_LABELS
       annotations:
         # kai-scheduler gangs on this. Two pods, all-or-nothing: the demo's
         # claim is that the cluster can place a multi-node GPU job, and a job

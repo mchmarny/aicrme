@@ -11,6 +11,7 @@ package prove
 import (
 	_ "embed"
 	"fmt"
+	"sort"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -44,25 +45,65 @@ func OwnedKinds() []schema.GroupVersionResource {
 	}
 }
 
-func Render(runID, namespace string) ([]byte, error) {
+// labelBlock renders labels as YAML mapping lines at indent, sorted so
+// output is deterministic.
+func labelBlock(labels map[string]string, indent string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	lines := make([]string, len(keys))
+	for i, k := range keys {
+		lines[i] = indent + k + ": " + labels[k]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderText is Render's implementation, taking the template as an argument
+// so tests can exercise the unreplaced-placeholder guard against a
+// deliberately incomplete template without touching the embedded
+// workload.yaml.
+func renderText(tmpl string, labels map[string]string, name, namespace string) (string, error) {
 	// PLACEHOLDER_NAMESPACE must precede PLACEHOLDER_NAME: PLACEHOLDER_NAME
 	// is a prefix of PLACEHOLDER_NAMESPACE, and strings.Replacer resolves an
 	// overlap by argument order, not by length. Listed the other way round,
 	// every namespace substitution loses its "SPACE" suffix to the shorter,
-	// earlier-listed pattern.
+	// earlier-listed pattern. PLACEHOLDER_LABELS and PLACEHOLDER_POD_LABELS
+	// share no prefix relationship with these or with each other, so their
+	// position in this list does not matter.
 	r := strings.NewReplacer(
 		"PLACEHOLDER_NAMESPACE", namespace,
-		"PLACEHOLDER_NAME", WorkloadName(runID),
-		"PLACEHOLDER_RUN_ID", runID,
+		"PLACEHOLDER_NAME", name,
+		"PLACEHOLDER_LABELS", labelBlock(labels, "    "),
+		"PLACEHOLDER_POD_LABELS", labelBlock(labels, "        "),
 	)
-	out := r.Replace(workloadYAML)
+	out := r.Replace(tmpl)
 
 	// A future edit to workload.yaml that adds a placeholder this replacer
 	// does not know about must fail loudly here, not ship a manifest with a
 	// literal PLACEHOLDER_ token baked into the field kai-scheduler or the
-	// applier reads next.
+	// applier reads next. This does NOT catch every possible substitution
+	// defect -- an overlapping, partially-consumed token (the bug the
+	// PLACEHOLDER_NAMESPACE/PLACEHOLDER_NAME ordering above fixed) leaves no
+	// PLACEHOLDER_ substring behind at all, so this guard is narrower than it
+	// looks: it only catches a wholly unregistered placeholder, not a
+	// mis-ordered one.
 	if strings.Contains(out, "PLACEHOLDER_") {
-		return nil, fmt.Errorf("prove: workload.yaml has an unreplaced placeholder after rendering")
+		return "", fmt.Errorf("prove: template has an unreplaced placeholder after rendering")
+	}
+	return out, nil
+}
+
+// Render builds the manifest from a single source of truth for identity:
+// Labels(runID) supplies every label on both the Job and its pod template,
+// so a selector built from Labels elsewhere (Task 4/8's ownership list) can
+// never diverge from what actually landed on the objects it is meant to
+// find.
+func Render(runID, namespace string) ([]byte, error) {
+	out, err := renderText(workloadYAML, Labels(runID), WorkloadName(runID), namespace)
+	if err != nil {
+		return nil, err
 	}
 	return []byte(out), nil
 }
