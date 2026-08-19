@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER_NAME
+  namespace: PLACEHOLDER_NAMESPACE
+  labels:
+    app.kubernetes.io/managed-by: aicrme
+    aicrme.dev/run-id: PLACEHOLDER_RUN_ID
+    aicrme.dev/component: prove-workload
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: aicrme
+        aicrme.dev/run-id: PLACEHOLDER_RUN_ID
+        aicrme.dev/component: prove-workload
+      annotations:
+        # kai-scheduler gangs on this. Two pods, all-or-nothing: the demo's
+        # claim is that the cluster can place a multi-node GPU job, and a job
+        # that limps along one pod at a time would not show that.
+        kai.scheduler/queue: default
+    spec:
+      schedulerName: kai-scheduler
+      restartPolicy: Never
+      containers:
+        - name: allreduce
+          image: busybox:1.36
+          command: ["sh", "-c", "echo placement proven; sleep infinity"]
+          resources:
+            limits:
+              nvidia.com/gpu: 8
