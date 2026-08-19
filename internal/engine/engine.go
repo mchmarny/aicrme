@@ -170,6 +170,15 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "a run is already in progress")
 	}
+	// StateActive is not isLive -- it has no execute goroutine -- but it does
+	// hold a workload in the cluster, and starting over it would abandon that
+	// workload with nothing tracking it. Teardown is never a side effect of
+	// starting something (approach.md, Reset).
+	if e.current != nil && e.current.State == StateActive {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"a workload from the previous run is still running; stop it before starting a new run")
+	}
 	previous := e.current
 	now := time.Now().UTC()
 	r := &Run{
@@ -870,6 +879,15 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 	if isLive(e.current.State) {
 		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run is live; retry, wait for it to finish, or cancel before discarding")
+	}
+	// Not folded into isLive: isLive means "a goroutine owns this run", which
+	// StateActive does not. This is a different claim -- "the cluster holds
+	// something this run created" -- and discarding would delete the record
+	// that is the only pointer to it.
+	if e.current.State == StateActive {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"run holds a running workload; stop the workload before discarding")
 	}
 	previous := e.current
 	previousRecoveredPending := e.recoveredPending

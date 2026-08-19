@@ -892,12 +892,33 @@ func TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState(t *testing.T) {
 					}
 				}
 
-				// Discard is the affordance that must exist for EVERY state,
-				// including the terminal ones Retry refuses outright. This is
-				// Scenario B: a completed run's record survives, the next
-				// helm upgrade recovers it, and Retry answers "run is not in
-				// a failed state" -- so if Discard did not work here the
-				// console would be bricked by an ordinary upgrade.
+				// Discard is the affordance that must exist for every state
+				// Retry refuses outright -- Scenario B: a completed run's
+				// record survives, the next helm upgrade recovers it, Retry
+				// answers "run is not in a failed state", and without Discard
+				// the console would be bricked by an ordinary upgrade.
+				//
+				// StateActive is the one exception, and a restart does not
+				// remove it: a recovered StateActive record names a workload
+				// that may still be running in the cluster exactly as it
+				// would for a live process's own StateActive run, so
+				// Discard's job here is to refuse and name the same remedy --
+				// see TestDiscardRejectsActiveRun, which pins the identical
+				// invariant for the live-process case this loop cannot reach.
+				if state == engine.StateActive {
+					err := e.Discard(context.Background(), testRunID)
+					if err == nil {
+						t.Fatal("Discard() succeeded on a recovered active run -- it would orphan the workload")
+					}
+					var se *aicrerrors.StructuredError
+					if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+						t.Errorf("Discard() error = %v, want ErrCodeConflict", err)
+					}
+					if !strings.Contains(err.Error(), "stop") {
+						t.Errorf("Discard() error = %q, want it to name stopping the workload", err)
+					}
+					return
+				}
 				if err := e.Discard(context.Background(), testRunID); err != nil {
 					t.Fatalf("Discard() error = %v, want a recovered run discardable in every state", err)
 				}
