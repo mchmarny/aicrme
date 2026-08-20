@@ -58,12 +58,27 @@ const stopWaitAbsentTimeout = 3 * time.Minute
 // Deliberately checked at runStep's failure branch, on the actual error
 // value a Step returned, and recorded on Run.CleanupUnconfirmed there --
 // not re-derived later from Run.Err. Err is human-readable text that Retry
-// legitimately overwrites on every attempt (fix round 1's C2: a retry
-// failing for an unrelated, cleanly-cleaned-up reason must not still read
-// as an unconfirmed orphan), so the determination has to be made once, from
-// the real error, at the one moment it is still a typed value instead of a
-// string.
+// legitimately overwrites on every attempt, so the determination has to be
+// made once, from the real error, at the one moment it is still a typed
+// value instead of a string.
 var ErrUnconfirmedCleanup = errors.New("cleanup could not be confirmed")
+
+// ErrCleanupConfirmed is the sentinel a Step should wrap into an otherwise
+// ordinary failure's error when ITS OWN cleanup call ran and positively
+// confirmed the workload absent -- steps/prove.go's cleanup helper wraps it
+// around cause on the success path. Fix round 2's N2: runStep's failure
+// branch used to CLEAR Run.CleanupUnconfirmed on any failure that did not
+// wrap ErrUnconfirmedCleanup, which conflated two very different cases --
+// "this attempt's cleanup ran and confirmed the workload gone" (safe to
+// clear) and "this attempt never got far enough to attempt cleanup at all"
+// (client.Ready() false, an EnsureNamespace error -- NOT safe to clear,
+// since a PRIOR attempt's orphan may still be exactly as unconfirmed as it
+// was). Demonstrated live: a retry failing at EnsureNamespace cleared the
+// guard over an orphan Job the first attempt's Delete never removed, and
+// Start then succeeded over it with nothing logged. Only ErrUnconfirmedCleanup
+// and ErrCleanupConfirmed move the flag now; every other failure leaves it
+// exactly as it was -- "only cleared by evidence the orphan is gone."
+var ErrCleanupConfirmed = errors.New("cleanup confirmed the workload absent")
 
 // hasUnconfirmedCleanup reports whether r is a failed run whose own cleanup
 // attempt could not be confirmed -- see Run.CleanupUnconfirmed and
@@ -740,15 +755,37 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		// here, before msg above threw away everything but its text) --
 		// see ErrUnconfirmedCleanup's doc comment for why Ruling 12's guard
 		// has to be decided at exactly this point rather than re-derived
-		// later from Run.Err. Unconditional assignment, not "set true on
-		// match": a retry of the SAME run that fails for an unrelated,
-		// cleanly-cleaned-up reason must overwrite a stale true with false,
-		// or fix round 1's C2 (Retry clearing Err while this stayed true)
-		// simply moves to a different field.
+		// later from Run.Err.
+		//
+		// Fix round 2's N2: NOT an unconditional overwrite. Only
+		// ErrUnconfirmedCleanup (sets true) and ErrCleanupConfirmed (clears
+		// to false) move the flag; every other failure -- including one
+		// whose own cleanup logic was never reached at all -- leaves
+		// whatever was there STICKY. An unconditional "false unless
+		// ErrUnconfirmedCleanup" (fix round 1's shape) cleared the guard on
+		// a retry that failed at, say, EnsureNamespace: that attempt never
+		// got far enough to look at the workload a PRIOR attempt's Delete
+		// never removed, so it is not evidence of anything, and treating it
+		// as confirmation let Start proceed over a still-live orphan with
+		// nothing logged. slog calls make both real transitions visible --
+		// a silent flip on a safety guard is how that stayed invisible.
 		e.mu.Lock()
 		if e.aliveLocked(epoch) {
 			e.current.Components = scratch.Components
-			e.current.CleanupUnconfirmed = errors.Is(err, ErrUnconfirmedCleanup)
+			switch {
+			case errors.Is(err, ErrUnconfirmedCleanup):
+				if !e.current.CleanupUnconfirmed {
+					slog.Warn("run's cleanup could not be confirmed; the cluster may still be holding the workload",
+						"run", runID, "phase", step.Phase())
+				}
+				e.current.CleanupUnconfirmed = true
+			case errors.Is(err, ErrCleanupConfirmed):
+				if e.current.CleanupUnconfirmed {
+					slog.Info("run's previously unconfirmed cleanup is now confirmed -- the workload is absent",
+						"run", runID, "phase", step.Phase())
+				}
+				e.current.CleanupUnconfirmed = false
+			}
 		}
 		e.mu.Unlock()
 
@@ -916,21 +953,22 @@ func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 	}
 	prevErr := e.current.Err
 	prevRecoveredPending := e.recoveredPending
-	prevCleanupUnconfirmed := e.current.CleanupUnconfirmed
 	// Retry is the intended resume path for a recovered run: accepting it
 	// here is the operator action that clears the bootstrap gate in Start.
 	e.recoveredPending = false
 	e.current.State = StateRunning
 	e.current.Err = ""
-	// Reset alongside Err, not left to runStep's next failure to overwrite:
-	// a retry that PARKS at a decision gate or is canceled by shutdown
-	// never reaches runStep's failure branch at all, and without this reset
-	// a stale true from the run's PREVIOUS failed attempt would wrongly
-	// paint that unrelated outcome as an unconfirmed orphan too. runStep's
-	// failure branch still recomputes this fresh on every actual step
-	// failure (see its own comment); this reset only covers the paths that
-	// bypass runStep's failure branch entirely.
-	e.current.CleanupUnconfirmed = false
+	// CleanupUnconfirmed is deliberately NOT reset here, unlike Err --
+	// fix round 2's N2. This field is sticky by design (see runStep's own
+	// comment): only ErrUnconfirmedCleanup and ErrCleanupConfirmed move it,
+	// and neither is reachable on a retry that parks at a decision gate or
+	// is canceled by shutdown before runStep's failure branch ever runs.
+	// Resetting it here regardless (fix round 1's shape) would clear Ruling
+	// 12's guard on exactly the paths that produced no new evidence either
+	// way -- the same defect class N2 fixed at runStep, reopened one call
+	// site over. If the run resumes normally, runStep's own failure branch
+	// still recomputes the field fresh from whatever THIS attempt's actual
+	// error says, on every real step failure.
 	e.current.UpdatedAt = time.Now().UTC()
 	e.resume = make(chan struct{}, 1)
 	e.epoch++
@@ -963,10 +1001,9 @@ func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 			// the rest of the block so this cannot stomp a run that has since
 			// legitimately superseded this one.
 			e.recoveredPending = prevRecoveredPending
-			// Same reasoning again: this rollback restores the run to
-			// exactly the StateFailed record it was before this call, and
-			// Ruling 12's guard is part of that record.
-			e.current.CleanupUnconfirmed = prevCleanupUnconfirmed
+			// CleanupUnconfirmed needs no restoration here: this call never
+			// touched it (see the reset above's own comment), so it is
+			// already exactly what it was before Retry was called.
 		}
 		e.mu.Unlock()
 		// See Start's identical rationale: no goroutine will ever run for
@@ -1173,6 +1210,23 @@ func (e *Engine) Stop(ctx context.Context, runID string) error {
 	if err := client.WaitAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
 	}
+
+	// Recorded so a SECOND Stop call also recognizes the resulting
+	// StateDone run via stoppable's arm 2 -- fix round 2's N4. Without
+	// this, a run resolved via arm 3 (StateFailed with unconfirmed
+	// cleanup) reaches StateDone with Workload still at its zero value --
+	// Prove's own success-path write (steps/prove.go) is never reached on
+	// a failure -- so a repeat, idempotent Stop click (spec §7) would be
+	// rejected with "run has no active workload to stop" instead of
+	// succeeding. WorkloadName is deterministic from runID alone, so this
+	// is accurate regardless of which arm resolved it: it names the exact
+	// object Delete/WaitAbsent above just addressed. A harmless no-op for
+	// arm 1 (Prove's own write already set the same value).
+	e.mu.Lock()
+	if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) {
+		e.current.Workload = Workload{Namespace: prove.Namespace, Kind: "Job", Name: prove.WorkloadName(runID)}
+	}
+	e.mu.Unlock()
 
 	// finish is what actually persists StateDone and publishes the terminal
 	// bus event -- the same call every other terminal transition in this

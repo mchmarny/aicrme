@@ -548,6 +548,41 @@ func TestStopRejectsNonActiveRun(t *testing.T) {
 	}
 }
 
+// TestStopRejectsFailedRunWithoutUnconfirmedCleanup is fix round 2's N3:
+// the negative control for stoppable's third arm. Broadening that arm to
+// r.State == StateFailed alone (dropping the CleanupUnconfirmed check)
+// leaves every existing internal/engine test green -- every other
+// StateFailed fixture in this file either never held a workload
+// (TestStopRejectsNonActiveRun, StateDone) or genuinely has
+// CleanupUnconfirmed set, so nothing here previously pinned that an
+// ORDINARY StateFailed run (one that failed for a reason unrelated to
+// cleanup) must still be rejected.
+func TestStopRejectsFailedRunWithoutUnconfirmedCleanup(t *testing.T) {
+	e := newTestEngine(t, &fakeStep{phase: PhaseProve, err: errors.New("boom -- an ordinary failure")})
+	// Wired deliberately, even though a correctly-guarded Stop never
+	// reaches it: without a client, a broadened guard would still be
+	// caught, but only via ErrCodeUnavailable from the client-readiness
+	// check below stoppable -- a confounded catch that says nothing about
+	// stoppable itself. With a client wired, Delete/WaitAbsent against an
+	// absent object trivially succeed (prove.Client.Delete's own contract),
+	// so a broadened guard is caught cleanly: Stop() returns nil instead of
+	// the conflict this test wants.
+	e.SetProveClient(prove.NewClient(fake.NewSimpleClientset()))
+	run := startAndWait(t, e)
+	if run.State != StateFailed || run.CleanupUnconfirmed {
+		t.Fatalf("fixture run = %+v, want StateFailed with CleanupUnconfirmed = false", run)
+	}
+
+	err := e.Stop(context.Background(), run.ID)
+	if err == nil {
+		t.Fatal("Stop() succeeded on an ordinary StateFailed run with no unconfirmed cleanup, want conflict")
+	}
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+		t.Errorf("Stop() error = %v, want ErrCodeConflict", err)
+	}
+}
+
 // TestStopFailsGracefullyWithoutLiveCluster is fix round 1's I3: the
 // nil/unready-client guard in Stop had no test, and deleting it entirely
 // left both internal/engine and internal/api green (the reviewer's own
@@ -665,6 +700,38 @@ func TestStopResolvesUnconfirmedCleanupAndUnblocksStart(t *testing.T) {
 	}
 }
 
+// TestStopIsIdempotentAfterResolvingUnconfirmedCleanup is fix round 2's N4:
+// spec §7's idempotency clause ("stopping an already-stopped workload
+// succeeds") must hold for a run stoppable's THIRD arm resolved too, not
+// just the ordinary Active-then-Done path TestStopIsIdempotent already
+// covers. Before this fix, a run resolved via arm 3 reached StateDone with
+// Workload still at its zero value -- Prove's own success-path write is
+// never reached on a failure -- so stoppable's second arm rejected a
+// repeat, idempotent Stop click with "run has no active workload to stop",
+// contradicting spec §7.
+func TestStopIsIdempotentAfterResolvingUnconfirmedCleanup(t *testing.T) {
+	const runID = "run-cleanup-resolved-idempotent"
+	e := newTestEngine(t, &fakeStep{phase: PhaseProve, err: unconfirmedCleanupErr(runID)})
+	e.newID = func() string { return runID }
+	e.SetProveClient(prove.NewClient(fake.NewSimpleClientset()))
+	run := startAndWait(t, e)
+
+	if err := e.Stop(context.Background(), run.ID); err != nil {
+		t.Fatalf("first Stop() error = %v, want nil", err)
+	}
+	if err := e.Stop(context.Background(), run.ID); err != nil {
+		t.Errorf("second Stop() error = %v, want nil -- spec §7 idempotency must hold for arm 3 too", err)
+	}
+
+	resolved, err := e.Get(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if resolved.State != StateDone {
+		t.Errorf("State after two Stop calls = %q, want %q", resolved.State, StateDone)
+	}
+}
+
 // TestOrdinaryFailureDoesNotBlockStart is the discriminating half of Ruling
 // 12: a run that failed for a reason unrelated to cleanup must not trip the
 // new guard, or every ordinary failure would silently become an orphan
@@ -709,30 +776,38 @@ func (s *twoAttemptStep) Run(_ context.Context, _ *Run, _ Emit) error {
 	return s.laterErr
 }
 
-// TestRetryClearsRuling12GuardOnUnrelatedFailure is fix round 1's C2
-// regression. Retry clears Run.Err on every attempt (Retry's own doc
-// comment: "Retry re-executes... "), so a guard keyed off Err's TEXT would
-// clear the moment a retry failed for ANY reason at all -- including one
-// whose own cleanup succeeded cleanly -- freeing Start over a workload the
-// FIRST cleanup never confirmed it removed. Run.CleanupUnconfirmed is
-// recomputed fresh by runStep on every failure of the SAME run instead (see
-// its own comment in engine.go), so this pins the actual fix: a retry that
-// fails for an unrelated, cleanly-cleaned-up reason correctly UNBLOCKS
-// Start, rather than leaving a stale block or -- the bug this pins -- a
-// stale absence of one.
-func TestRetryClearsRuling12GuardOnUnrelatedFailure(t *testing.T) {
+// confirmedCleanupErr wraps engine.ErrCleanupConfirmed, the same sentinel
+// steps/prove.go's cleanup helper wraps around cause on ITS success path --
+// a failure whose own cleanup logic ran and positively confirmed the
+// workload absent, distinct from an ordinary failure that says nothing
+// about cleanup at all (which twoAttemptStep's plain errors.New fixtures
+// below represent).
+func confirmedCleanupErr() error {
+	return fmt.Errorf("ordinary failure whose own cleanup confirmed the workload absent: %w", ErrCleanupConfirmed)
+}
+
+// TestRetryWithUnrelatedFailureDoesNotClearGuard is fix round 2's N2
+// regression. Fix round 1's implementation (this same test, under the name
+// TestRetryClearsRuling12GuardOnUnrelatedFailure) unconditionally cleared
+// Run.CleanupUnconfirmed on any retry failure that did not itself wrap
+// ErrUnconfirmedCleanup -- which reads "this attempt's cleanup ran and
+// confirmed the workload gone" and "this attempt never got far enough to
+// even ATTEMPT cleanup" as the same signal. They are not: a retry whose
+// failure carries no cleanup information at all must leave a prior
+// unconfirmed-cleanup determination exactly as it was (sticky), because
+// nothing about this attempt is evidence the original orphan is gone.
+// TestRetryWithConfirmedCleanupClearsGuard below is the correct clearing
+// case this one is deliberately NOT.
+func TestRetryWithUnrelatedFailureDoesNotClearGuard(t *testing.T) {
 	step := &twoAttemptStep{
 		phase:    PhaseProve,
-		firstErr: unconfirmedCleanupErr("run-c2"),
-		laterErr: errors.New("boom, unrelated to any cleanup"),
+		firstErr: unconfirmedCleanupErr("run-n2"),
+		laterErr: errors.New("boom -- says nothing about cleanup either way"),
 	}
 	e := newTestEngine(t, step)
 	run := startAndWait(t, e)
 	if run.State != StateFailed || !run.CleanupUnconfirmed {
 		t.Fatalf("fixture run = %+v, want StateFailed with CleanupUnconfirmed = true", run)
-	}
-	if _, err := e.Start(context.Background()); err == nil {
-		t.Fatal("Start() succeeded before Retry, want the unconfirmed-cleanup guard still blocking")
 	}
 
 	retriedRun, err := e.Retry(context.Background(), run.ID)
@@ -743,12 +818,41 @@ func TestRetryClearsRuling12GuardOnUnrelatedFailure(t *testing.T) {
 		t.Errorf("Retry() returned run ID = %q, want %q", retriedRun.ID, run.ID)
 	}
 	retried := waitForRunState(t, e, run.ID, StateFailed)
+	if !retried.CleanupUnconfirmed {
+		t.Errorf("CleanupUnconfirmed = false after a retry whose failure said nothing about cleanup, want true (sticky)")
+	}
+
+	if _, err := e.Start(context.Background()); err == nil {
+		t.Fatal("Start() succeeded after a retry that never confirmed the orphan is gone, want conflict")
+	}
+}
+
+// TestRetryWithConfirmedCleanupClearsGuard is the other, correct half of
+// N2: when a retry's OWN cleanup logic runs and positively confirms the
+// workload absent (wraps engine.ErrCleanupConfirmed), the guard DOES clear
+// -- this attempt actually looked, and found nothing there.
+func TestRetryWithConfirmedCleanupClearsGuard(t *testing.T) {
+	step := &twoAttemptStep{
+		phase:    PhaseProve,
+		firstErr: unconfirmedCleanupErr("run-n2-confirmed"),
+		laterErr: confirmedCleanupErr(),
+	}
+	e := newTestEngine(t, step)
+	run := startAndWait(t, e)
+	if run.State != StateFailed || !run.CleanupUnconfirmed {
+		t.Fatalf("fixture run = %+v, want StateFailed with CleanupUnconfirmed = true", run)
+	}
+
+	if _, err := e.Retry(context.Background(), run.ID); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	retried := waitForRunState(t, e, run.ID, StateFailed)
 	if retried.CleanupUnconfirmed {
-		t.Errorf("CleanupUnconfirmed = true after a retry that failed for an unrelated reason, want false")
+		t.Errorf("CleanupUnconfirmed = true after a retry whose own cleanup confirmed the workload absent, want false")
 	}
 
 	if _, err := e.Start(context.Background()); err != nil {
-		t.Errorf("Start() error = %v after an unrelated retry failure, want nil -- Ruling 12's guard must not still be blocking a resolved run", err)
+		t.Errorf("Start() error = %v after a confirmed-clean retry, want nil", err)
 	}
 }
 

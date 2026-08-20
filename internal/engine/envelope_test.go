@@ -361,3 +361,70 @@ func TestTruncatedIsCarriedForwardOnRewrite(t *testing.T) {
 		t.Errorf("Run.Truncated after a rewrite = %v, want [snapshot.yaml] still named", out.Truncated)
 	}
 }
+
+// TestCleanupUnconfirmedSurvivesTheRoundTrip is fix round 2's N1 unit-level
+// pin, alongside the fuller Recover-based
+// TestUnconfirmedCleanupSurvivesRestart in recover_test.go: envelope.go is a
+// hand-maintained projection, and this field went a full fix round without a
+// producer here, silently dropping Ruling 12's guard across a restart.
+func TestCleanupUnconfirmedSurvivesTheRoundTrip(t *testing.T) {
+	in := testRun()
+	in.State = StateFailed
+	in.CleanupUnconfirmed = true
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if !out.CleanupUnconfirmed {
+		t.Error("CleanupUnconfirmed = false after the round trip, want true")
+	}
+}
+
+// A run that never had an unconfirmed cleanup must decode as false, not pick
+// up junk from an unset field.
+func TestCleanupUnconfirmedFalseOnAnOrdinaryRecord(t *testing.T) {
+	blob, err := encodeRun(testRun())
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if out.CleanupUnconfirmed {
+		t.Error("CleanupUnconfirmed = true for a record that never set it, want false")
+	}
+}
+
+// TestDecodeRunAcceptsARecordWithoutCleanupUnconfirmed is the backward-
+// compatibility check workload_test.go's TestDecodeRunAcceptsARecordWithoutWorkload
+// already establishes the pattern for: a ConfigMap written by a build before
+// this field existed has no "cleanupUnconfirmed" key at all, and a rollout
+// that adds the field must not turn that record unreadable -- it must decode
+// as false, the only value a pre-Ruling-12 record could ever have meant.
+func TestDecodeRunAcceptsARecordWithoutCleanupUnconfirmed(t *testing.T) {
+	old := envelopeBeforeWorkload{
+		Version:   envelopeVersion,
+		ID:        "run-old",
+		State:     StateFailed,
+		Phase:     PhaseApply,
+		StartedAt: time.Now().UTC().Truncate(time.Second),
+		UpdatedAt: time.Now().UTC().Truncate(time.Second),
+	}
+	blob, err := gzipJSON(old)
+	if err != nil {
+		t.Fatalf("gzipJSON() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v, want a pre-CleanupUnconfirmed record to still decode", err)
+	}
+	if out.CleanupUnconfirmed {
+		t.Errorf("CleanupUnconfirmed = true for a record with no cleanupUnconfirmed field, want false")
+	}
+}

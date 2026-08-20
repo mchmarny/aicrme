@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/kubernetes/fake"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
@@ -627,6 +630,66 @@ func TestRecoverInstallsARunPersistedBeforeAnyStepRan(t *testing.T) {
 	}
 	if got.StepIndex != 0 {
 		t.Errorf("StepIndex = %d, want 0 -- no step had completed", got.StepIndex)
+	}
+}
+
+// TestUnconfirmedCleanupSurvivesRestart is fix round 2's N1 regression:
+// envelope.go is a hand-maintained projection -- its own doc comment says
+// it deliberately does not reuse Run's json tags -- and Run.CleanupUnconfirmed
+// went a full fix round without a producer there, so a pod restart silently
+// dropped Ruling 12's guard while the OLD Run.Err text it replaced would
+// have survived just fine. This is why NewMemoryStore cannot be used here:
+// its Save/Load clone the Run struct directly in-process and never touch
+// encodeRun/decodeRun at all, so it would report this field surviving
+// correctly whether or not envelope.go actually carries it. The real
+// ConfigMap-backed store, and a genuinely SECOND *engine.Engine instance
+// over the same persisted record, is what simulates the pod restart spec
+// §9's own recovered-StateActive flow describes.
+func TestUnconfirmedCleanupSurvivesRestart(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	store := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+
+	proveStep := newFakeStep(engine.PhaseProve)
+	proveStep.err = fmt.Errorf("run failed: %w", engine.ErrUnconfirmedCleanup)
+	before := engine.New(bus.New(64), store, newFakeStep(engine.PhaseBundle), proveStep)
+
+	run, err := before.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	failed := waitState(t, before, run.ID, engine.StateFailed)
+	if !failed.CleanupUnconfirmed {
+		t.Fatalf("fixture run.CleanupUnconfirmed = false before restart, want true")
+	}
+	if discardErr := before.Discard(context.Background(), run.ID); discardErr == nil {
+		t.Fatal("fixture check: Discard() succeeded before restart, want the unconfirmed-cleanup guard blocking")
+	}
+
+	// A genuinely second engine instance over the same underlying
+	// ConfigMap, not a second call on `before` -- the shape an actual pod
+	// restart produces.
+	after := engine.New(bus.New(64), store, newFakeStep(engine.PhaseBundle), newFakeStep(engine.PhaseProve))
+	if recoverErr := after.Recover(context.Background()); recoverErr != nil {
+		t.Fatalf("Recover() error = %v", recoverErr)
+	}
+	recovered, err := after.Get(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if recovered.State != engine.StateFailed || !recovered.CleanupUnconfirmed {
+		t.Fatalf("recovered run = %+v, want StateFailed with CleanupUnconfirmed = true", recovered)
+	}
+
+	// Discard is not gated by recoveredPending (Retry and Discard are the
+	// only two things that clear it), so this specifically exercises
+	// Ruling 12's guard surviving the restart, not a different gate.
+	if discardErr := after.Discard(context.Background(), run.ID); discardErr == nil {
+		t.Error("Discard() succeeded on the recovered run -- Ruling 12's guard did not survive the restart")
+	}
+	// End to end: whatever the exact gate, the operator must still not be
+	// able to start a new run over the unresolved orphan post-restart.
+	if _, startErr := after.Start(context.Background()); startErr == nil {
+		t.Error("Start() succeeded on the recovered run -- a new run started over an unconfirmed orphan after a restart")
 	}
 }
 

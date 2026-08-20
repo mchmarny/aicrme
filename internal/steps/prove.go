@@ -171,9 +171,22 @@ func (p *proveStep) awaitGang(ctx context.Context, runID string, emit engine.Emi
 // Cause reassignment: aicrerrors.Wrap already uses its cause argument for
 // the operator-facing chain (Unwrap), and the sentinel has to be reachable
 // from the SAME chain without displacing it -- Join's multi-error Unwrap
-// satisfies errors.Is against either. cause itself is returned unchanged,
-// carrying no sentinel, once cleanup succeeds: a confirmed-clean cleanup is
-// exactly the case Ruling 12 must NOT block on.
+// satisfies errors.Is against either.
+//
+// On success, cause is wrapped with engine.ErrCleanupConfirmed instead of
+// returned bare -- fix round 2's N2. runStep's guard is sticky (only
+// ErrUnconfirmedCleanup and ErrCleanupConfirmed move it; anything else
+// leaves a prior determination untouched), so a cleanup that genuinely ran
+// and confirmed the workload absent has to say so positively, or a run
+// whose cleanup was never reached at all (client.Ready() false, an
+// EnsureNamespace error, above) would be indistinguishable from one that
+// just cleanly confirmed absence -- which is exactly the ambiguity that let
+// a retry silently clear Ruling 12's guard over a still-live orphan.
+// confirmedCleanupError, not errors.Join: Ruling 13 requires this path's
+// Error() text to read identically to an ordinary failure (an operator, or
+// a future console alert, must not see "cleanup" mentioned over a cleanup
+// that succeeded), and errors.Join would prepend ErrCleanupConfirmed's own
+// message ahead of cause's.
 func (p *proveStep) cleanup(ctx context.Context, runID string, cause error) error {
 	if err := p.client.Delete(ctx, runID); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable,
@@ -185,5 +198,21 @@ func (p *proveStep) cleanup(ctx context.Context, runID string, cause error) erro
 			fmt.Sprintf("run %s failed (%v); cleanup failed waiting for the workload to be gone", runID, cause),
 			errors.Join(engine.ErrUnconfirmedCleanup, err))
 	}
-	return cause
+	return &confirmedCleanupError{cause: cause}
+}
+
+// confirmedCleanupError wraps cause so errors.Is can detect a confirmed-
+// clean cleanup (engine.ErrCleanupConfirmed) without changing the
+// operator-facing text at all. Error() delegates entirely to cause; Is
+// recognizes only engine.ErrCleanupConfirmed itself, and Unwrap exposes
+// cause so errors.Is/As chains through it exactly as if this wrapper were
+// not there for any other target.
+type confirmedCleanupError struct {
+	cause error
+}
+
+func (e *confirmedCleanupError) Error() string { return e.cause.Error() }
+func (e *confirmedCleanupError) Unwrap() error { return e.cause }
+func (e *confirmedCleanupError) Is(target error) bool {
+	return target == engine.ErrCleanupConfirmed
 }
