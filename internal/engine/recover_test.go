@@ -633,6 +633,35 @@ func TestRecoverInstallsARunPersistedBeforeAnyStepRan(t *testing.T) {
 	}
 }
 
+// waitForPersistedState polls store directly -- not the engine's in-memory
+// Get -- until id's STORED record reports want or 2 seconds pass. Fix round
+// 3's NEW-2: finish sets Run.State under e.mu but Saves the checkpoint only
+// AFTER releasing it (engine.go), so a caller that treats an in-memory Get
+// reflecting the terminal state as proof the CHECKPOINT is written races
+// that Save. Confirmed non-hypothetical: this exact race made
+// TestUnconfirmedCleanupSurvivesRestart fail once under `-race ./...`
+// (recovering Err "interrupted by a console restart", StepIndex 0,
+// CleanupUnconfirmed false -- the PRIOR, pre-failure checkpoint), and
+// widening the window by 50ms made it fail every time. A restart test's
+// whole point is what a SECOND process reading the STORE would see, so it
+// must wait on the store, not on the first process's own memory.
+func waitForPersistedState(t *testing.T, store engine.Store, id string, want engine.State) *engine.Run {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var r *engine.Run
+	var err error
+	for {
+		r, err = store.Load(context.Background(), id)
+		if err == nil && r.State == want {
+			return r
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("persisted record never reached state %q, last err=%v run=%+v", want, err, r)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestUnconfirmedCleanupSurvivesRestart is fix round 2's N1 regression:
 // envelope.go is a hand-maintained projection -- its own doc comment says
 // it deliberately does not reuse Run's json tags -- and Run.CleanupUnconfirmed
@@ -657,7 +686,11 @@ func TestUnconfirmedCleanupSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	failed := waitState(t, before, run.ID, engine.StateFailed)
+	// waitForPersistedState, not waitState -- see its own doc comment
+	// (fix round 3's NEW-2). before.Discard below reads e.current directly
+	// (not the store), so it is unaffected by this race either way, but the
+	// Recover() call after it is exactly the read this race can corrupt.
+	failed := waitForPersistedState(t, store, run.ID, engine.StateFailed)
 	if !failed.CleanupUnconfirmed {
 		t.Fatalf("fixture run.CleanupUnconfirmed = false before restart, want true")
 	}

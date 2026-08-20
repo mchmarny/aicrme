@@ -694,6 +694,12 @@ func TestStopResolvesUnconfirmedCleanupAndUnblocksStart(t *testing.T) {
 	if resolved.State != StateDone {
 		t.Errorf("State after Stop = %q, want %q", resolved.State, StateDone)
 	}
+	// Fix round 3's NEW-6: a StateDone record claiming an unconfirmed
+	// cleanup is a contradiction -- Stop just confirmed the workload gone,
+	// which is what StateDone here means.
+	if resolved.CleanupUnconfirmed {
+		t.Errorf("CleanupUnconfirmed = true on a StateDone record, want false -- Stop just confirmed the workload absent")
+	}
 
 	if _, err := e.Start(context.Background()); err != nil {
 		t.Errorf("Start() error = %v after Stop resolved the unconfirmed cleanup, want nil", err)

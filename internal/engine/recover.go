@@ -286,8 +286,15 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 	// This only ever fires after an unplanned restart, so it is the single
 	// most useful startup line the console can emit -- the bus events Task 6
-	// adds reach the SPA, not the pod's own logs.
-	slog.Info("recovered a persisted run", "run", r.ID, "state", r.State, "step", r.StepIndex, "rewound", rewound)
+	// adds reach the SPA, not the pod's own logs. cleanupUnconfirmed is
+	// included for the same reason decodeRun already warns about a
+	// truncated record on every read (fix round 3's NEW-5): an operator
+	// watching this pod's own logs after a restart -- the one channel that
+	// works before the SPA has reconnected -- had no signal here that
+	// Ruling 12's guard is set and Start/Discard will both 409 until it is
+	// resolved.
+	slog.Info("recovered a persisted run", "run", r.ID, "state", r.State, "step", r.StepIndex,
+		"rewound", rewound, "cleanupUnconfirmed", r.CleanupUnconfirmed)
 	return nil
 }
 

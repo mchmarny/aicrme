@@ -345,10 +345,12 @@ func TestCleanupFailureWrapsErrUnconfirmedCleanup(t *testing.T) {
 // unconfirmedCleanupErr), which pins engine against itself, not against
 // what this package actually produces. Only a test living here, importing
 // engine (steps already does; the reverse would cycle), can close that gap.
-// waitForEngineState polls e directly (no engine-package internals
-// available from this black-box package) until id reaches want or 2
-// seconds pass.
-func waitForEngineState(t *testing.T, e *engine.Engine, id string, want engine.State) *engine.Run {
+// waitForEngineFailed polls e directly (no engine-package internals
+// available from this black-box package) until id reaches StateFailed or 2
+// seconds pass. Every test in this file that needs to wait wants exactly
+// this state -- a hardcoded target, not a want parameter every call site
+// happened to pass the same value for.
+func waitForEngineFailed(t *testing.T, e *engine.Engine, id string) *engine.Run {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	var got *engine.Run
@@ -358,11 +360,11 @@ func waitForEngineState(t *testing.T, e *engine.Engine, id string, want engine.S
 		if err != nil {
 			t.Fatalf("Get() error = %v", err)
 		}
-		if got.State == want {
+		if got.State == engine.StateFailed {
 			return got
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("run never reached state %q, last state %q", want, got.State)
+			t.Fatalf("run never reached state %q, last state %q", engine.StateFailed, got.State)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -381,7 +383,7 @@ func TestRealCleanupFailureBlocksEngineStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	got := waitForEngineState(t, e, run.ID, engine.StateFailed)
+	got := waitForEngineFailed(t, e, run.ID)
 	if !got.CleanupUnconfirmed {
 		t.Fatalf("run.CleanupUnconfirmed = false after a real Delete-refusing cleanup failure, want true (Err = %q)", got.Err)
 	}
@@ -428,7 +430,7 @@ func TestRetryFailingAtEnsureNamespaceDoesNotClearRuling12Guard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	got := waitForEngineState(t, e, run.ID, engine.StateFailed)
+	got := waitForEngineFailed(t, e, run.ID)
 	if !got.CleanupUnconfirmed {
 		t.Fatalf("fixture run.CleanupUnconfirmed = false after a real Delete-refusing cleanup failure, want true (Err = %q)", got.Err)
 	}
@@ -442,7 +444,7 @@ func TestRetryFailingAtEnsureNamespaceDoesNotClearRuling12Guard(t *testing.T) {
 	if _, retryErr := e.Retry(context.Background(), run.ID); retryErr != nil {
 		t.Fatalf("Retry() error = %v", retryErr)
 	}
-	retried := waitForEngineState(t, e, run.ID, engine.StateFailed)
+	retried := waitForEngineFailed(t, e, run.ID)
 	if !strings.Contains(retried.Err, "namespace") {
 		t.Fatalf("retried run.Err = %q, want it to name the EnsureNamespace failure (fixture check)", retried.Err)
 	}
@@ -464,5 +466,73 @@ func TestRetryFailingAtEnsureNamespaceDoesNotClearRuling12Guard(t *testing.T) {
 	if _, getErr := cs.BatchV1().Jobs(prove.Namespace).
 		Get(context.Background(), prove.WorkloadName(run.ID), metav1.GetOptions{}); getErr != nil {
 		t.Errorf("orphaned Job no longer present after the retry (Get error = %v), but nothing in this run ever confirmed removing it", getErr)
+	}
+}
+
+// TestRealConfirmedCleanupClearsRuling12GuardEndToEnd is fix round 3's
+// NEW-1: engine.ErrCleanupConfirmed had an engine-side fixture only
+// (internal/engine's TestRetryWithConfirmedCleanupClearsGuard, a hand-built
+// error that pins the engine against itself) and no cross-package producer
+// test -- the exact asymmetry TestRealCleanupFailureBlocksEngineStart
+// exists to close for ErrUnconfirmedCleanup, on the OTHER sentinel. If
+// steps/prove.go stopped wrapping ErrCleanupConfirmed on its success path,
+// the guard would become clearable only through Stop, forever -- the wedge
+// the reviewer independently probed and confirmed impossible (flag set,
+// orphan removed out of band, three retries that all fail at
+// EnsureNamespace leave the guard set and Start blocked, then Stop
+// resolves it) -- reintroduced by a rewording nothing here would catch.
+//
+// Attempt 1's Delete is refused (a real orphaned Job is left behind,
+// CleanupUnconfirmed becomes true). The RETRY's Delete and WaitAbsent both
+// succeed this time (the reactor is one-shot), so cleanup() reaches its
+// success path and wraps ErrCleanupConfirmed around the retry's own gang
+// timeout -- and the guard must clear, driven through a real engine.Engine,
+// not a hand-built error.
+func TestRealConfirmedCleanupClearsRuling12GuardEndToEnd(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	deleteAttempts := 0
+	cs.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		deleteAttempts++
+		if deleteAttempts == 1 {
+			return true, nil, errors.New("delete refused")
+		}
+		return false, nil, nil // let the retry's Delete through normally
+	})
+	step := steps.NewProve(prove.NewClient(cs), steps.ProveConfig{GangTimeout: 50 * time.Millisecond})
+	b := bus.New(64)
+	e := engine.New(b, engine.NewMemoryStore(), step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	got := waitForEngineFailed(t, e, run.ID)
+	if !got.CleanupUnconfirmed {
+		t.Fatalf("fixture run.CleanupUnconfirmed = false after a real Delete-refusing cleanup failure, want true (Err = %q)", got.Err)
+	}
+	if _, startErr := e.Start(context.Background()); startErr == nil {
+		t.Fatal("fixture check: Start() succeeded before Retry, want the guard still blocking")
+	}
+
+	if _, retryErr := e.Retry(context.Background(), run.ID); retryErr != nil {
+		t.Fatalf("Retry() error = %v", retryErr)
+	}
+	retried := waitForEngineFailed(t, e, run.ID)
+	if retried.CleanupUnconfirmed {
+		t.Errorf("CleanupUnconfirmed = true after a retry whose own Delete+WaitAbsent succeeded, want false (Err = %q)", retried.Err)
+	}
+	if strings.Contains(retried.Err, "cleanup") {
+		t.Errorf("retried run.Err = %q, a confirmed-clean cleanup must not be reported as a cleanup failure (Ruling 13)", retried.Err)
+	}
+
+	if _, startErr := e.Start(context.Background()); startErr != nil {
+		t.Errorf("Start() error = %v after a retry that confirmed the cleanup, want nil", startErr)
+	}
+
+	// The confirmation is real, not merely reported: the Job the retry's
+	// own Delete removed is actually gone.
+	if _, getErr := cs.BatchV1().Jobs(prove.Namespace).
+		Get(context.Background(), prove.WorkloadName(run.ID), metav1.GetOptions{}); getErr == nil {
+		t.Error("workload still present after a retry that reported its cleanup confirmed")
 	}
 }

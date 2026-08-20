@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/rand"
 	"encoding/base64"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -426,5 +427,144 @@ func TestDecodeRunAcceptsARecordWithoutCleanupUnconfirmed(t *testing.T) {
 	}
 	if out.CleanupUnconfirmed {
 		t.Errorf("CleanupUnconfirmed = true for a record with no cleanupUnconfirmed field, want false")
+	}
+}
+
+// runFieldsExcludedFromEnvelope names every exported Run field that
+// envelope deliberately does NOT carry through the round trip, with why.
+// Empty today -- nothing on Run has ever needed the exclusion. Fix round
+// 3's Ruling 20: this list existing (even empty) is the point. A field
+// added here without a stated reason fails TestEnvelopeRoundTripsEveryRunField
+// below just as loudly as a field never added at all -- deliberate
+// exclusions stay legal, they just have to be a decision made in the open,
+// not a gap nobody was looking at.
+var runFieldsExcludedFromEnvelope = map[string]string{
+	// "FieldName": "why envelope must not carry it",
+}
+
+// setDistinctFieldValue sets v (one field of a zero-value Run, addressed via
+// reflection) to a value that is guaranteed non-zero and, for collection
+// types, non-empty -- so a field encodeRun forgets to populate decodes back
+// to its Go zero value and a straight equality check below catches it. Kept
+// as an explicit, small type switch rather than a fully generic reflection
+// walker: Run has a fixed, short list of field types today, and a future
+// field of a type this function does not handle fails loudly (t.Fatalf)
+// rather than silently comparing two zero values as "equal" and reporting a
+// false pass.
+func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
+	t.Helper()
+	// if/else on v.Kind(), not a switch: golangci-lint's exhaustive linter
+	// requires every reflect.Kind case even with a default arm (the same
+	// reason internal/prove/client.go's PlacedNodes compares Pod phases
+	// with if/else rather than switching on corev1.PodPhase), and this
+	// function only ever needs to handle the handful of kinds Run's own
+	// field types actually use.
+	switch {
+	case v.Kind() == reflect.String:
+		v.SetString("parity-" + name)
+	case v.Kind() == reflect.Int:
+		v.SetInt(7)
+	case v.Kind() == reflect.Bool:
+		v.SetBool(true)
+	case v.Kind() == reflect.Struct:
+		switch v.Interface().(type) {
+		case time.Time:
+			v.Set(reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)))
+		case Workload:
+			v.Set(reflect.ValueOf(Workload{Namespace: "parity-ns", Kind: "Job", Name: "parity-workload"}))
+		default:
+			t.Fatalf("setDistinctFieldValue: field %s has unhandled struct type %s -- extend this switch", name, v.Type())
+		}
+	case v.Kind() == reflect.Map:
+		et := v.Type().Elem()
+		switch {
+		case et.Kind() == reflect.String:
+			v.Set(reflect.ValueOf(map[string]string{"k": "v"}))
+		case et.Kind() == reflect.Slice && et.Elem().Kind() == reflect.Uint8:
+			v.Set(reflect.ValueOf(map[string][]byte{"k": []byte("v")}))
+		default:
+			t.Fatalf("setDistinctFieldValue: field %s has unhandled map type %s -- extend this switch", name, v.Type())
+		}
+	case v.Kind() == reflect.Slice:
+		et := v.Type().Elem()
+		switch et {
+		case reflect.TypeOf(""):
+			v.Set(reflect.ValueOf([]string{"a"}))
+		case reflect.TypeOf(ComponentState{}):
+			v.Set(reflect.ValueOf([]ComponentState{{Name: "nfd", Index: 1, Total: 2, Status: "installed"}}))
+		default:
+			t.Fatalf("setDistinctFieldValue: field %s has unhandled slice element type %s -- extend this switch", name, et)
+		}
+	default:
+		t.Fatalf("setDistinctFieldValue: field %s has unhandled kind %s -- extend this switch", name, v.Kind())
+	}
+}
+
+// TestEnvelopeRoundTripsEveryRunField is fix round 3's Ruling 20. The
+// reviewer's own demonstration is why this has to be a ROUND TRIP, not a
+// weaker check that only compares the two structs' field NAMES: dropping
+// BOTH the `Pending: r.Pending` and `Err: r.Err` lines from encodeRun's
+// populate-literal (a 2-line diff) leaves the entire module green, because
+// envelope still DECLARES both fields -- encodeRun just stops assigning
+// them. A name-only comparison sees two structs that both have a "Pending"
+// and an "Err" field and reports no problem; only an actual round trip
+// notices the value never survived. envelope.go is a hand-maintained
+// projection, there are over a hundred internal/engine call sites that
+// touch a Run without ever comparing it against envelope, and nothing
+// before this checked Run<->envelope parity at all -- this is what would
+// have caught fix round 2's N1 (Run.CleanupUnconfirmed shipping without an
+// envelope producer) before it shipped, and catches the next one for free.
+func TestEnvelopeRoundTripsEveryRunField(t *testing.T) {
+	in := &Run{}
+	rv := reflect.ValueOf(in).Elem()
+	rt := rv.Type()
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		setDistinctFieldValue(t, rv.Field(i), f.Name)
+	}
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	outV := reflect.ValueOf(out).Elem()
+
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if reason, excluded := runFieldsExcludedFromEnvelope[f.Name]; excluded {
+			if reason == "" {
+				t.Errorf("Run.%s is in runFieldsExcludedFromEnvelope with no stated reason", f.Name)
+			}
+			continue
+		}
+
+		inField := rv.Field(i).Interface()
+		outField := outV.Field(i).Interface()
+		if inTime, ok := inField.(time.Time); ok {
+			// time.Time round-trips through JSON's RFC 3339 encoding, which
+			// does not preserve the monotonic reading reflect.DeepEqual
+			// would otherwise compare -- Equal is the correct comparison,
+			// the same one time.Time's own package doc recommends over ==.
+			outTime, _ := outField.(time.Time)
+			if !inTime.Equal(outTime) {
+				t.Errorf("Run.%s = %v after the round trip, want %v", f.Name, outTime, inTime)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(inField, outField) {
+			t.Errorf("Run.%s = %+v after the round trip, want %+v -- envelope.go must carry this field "+
+				"(encodeRun/decodeRun), or add it to runFieldsExcludedFromEnvelope with a stated reason",
+				f.Name, outField, inField)
+		}
 	}
 }

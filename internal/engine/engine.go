@@ -769,25 +769,36 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		// as confirmation let Start proceed over a still-live orphan with
 		// nothing logged. slog calls make both real transitions visible --
 		// a silent flip on a safety guard is how that stayed invisible.
+		//
+		// The decision of WHETHER to log is made under the lock (it reads
+		// the prior value of CleanupUnconfirmed), but the slog calls
+		// themselves run after e.mu.Unlock() -- fix round 3's NEW-4. slog's
+		// default handler does I/O (a Write to stderr), and this file's own
+		// rule, stated at Discard's store.Delete call, is that I/O never
+		// runs under e.mu: the observer's scope accessor calls CurrentID and
+		// Artifact on a per-watch-event path, and both take this same lock.
+		var logUnconfirmed, logConfirmed bool
 		e.mu.Lock()
 		if e.aliveLocked(epoch) {
 			e.current.Components = scratch.Components
 			switch {
 			case errors.Is(err, ErrUnconfirmedCleanup):
-				if !e.current.CleanupUnconfirmed {
-					slog.Warn("run's cleanup could not be confirmed; the cluster may still be holding the workload",
-						"run", runID, "phase", step.Phase())
-				}
+				logUnconfirmed = !e.current.CleanupUnconfirmed
 				e.current.CleanupUnconfirmed = true
 			case errors.Is(err, ErrCleanupConfirmed):
-				if e.current.CleanupUnconfirmed {
-					slog.Info("run's previously unconfirmed cleanup is now confirmed -- the workload is absent",
-						"run", runID, "phase", step.Phase())
-				}
+				logConfirmed = e.current.CleanupUnconfirmed
 				e.current.CleanupUnconfirmed = false
 			}
 		}
 		e.mu.Unlock()
+		if logUnconfirmed {
+			slog.Warn("run's cleanup could not be confirmed; the cluster may still be holding the workload",
+				"run", runID, "phase", step.Phase())
+		}
+		if logConfirmed {
+			slog.Info("run's previously unconfirmed cleanup is now confirmed -- the workload is absent",
+				"run", runID, "phase", step.Phase())
+		}
 
 		// The run is leaving Apply on a failure -- clear the cursor so a
 		// retry (or the terminal state finish is about to record) does not
@@ -1222,9 +1233,20 @@ func (e *Engine) Stop(ctx context.Context, runID string) error {
 	// is accurate regardless of which arm resolved it: it names the exact
 	// object Delete/WaitAbsent above just addressed. A harmless no-op for
 	// arm 1 (Prove's own write already set the same value).
+	//
+	// CleanupUnconfirmed is cleared here too -- fix round 3's NEW-6.
+	// hasUnconfirmedCleanup already requires StateFailed, so a stale true
+	// on a StateDone record never re-blocks anything today, but Stop just
+	// confirmed the workload IS gone (that is what Delete+WaitAbsent
+	// succeeding above means), and a record claiming both "done" and
+	// "cleanup unconfirmed" is a contradiction a future reader -- a JSON
+	// API consumer, a console badge, a later reimplementation that keys
+	// off this field alone -- has no reason to expect. A harmless no-op
+	// for arms 1 and 2, where the field was already false.
 	e.mu.Lock()
 	if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) {
 		e.current.Workload = Workload{Namespace: prove.Namespace, Kind: "Job", Name: prove.WorkloadName(runID)}
+		e.current.CleanupUnconfirmed = false
 	}
 	e.mu.Unlock()
 

@@ -80,14 +80,25 @@ type Run struct {
 	// re-derived from Err: Err is human text that Retry legitimately
 	// overwrites on every attempt, so a guard keyed off it would clear the
 	// moment a retry failed for any unrelated, cleanly-cleaned-up reason
-	// (fix round 1's C2). runStep recomputes this field fresh on every
-	// failure of the SAME run, so a retry that no longer has the problem
-	// correctly unblocks Start, and one that still does correctly reblocks
-	// it. Retry ALSO resets this to false eagerly (engine.go), belt and
-	// braces for the paths that bypass runStep's failure branch entirely
-	// (parking at a decision gate, a shutdown cancellation) -- narrower than
-	// it sounds today, since Prove (this field's one producer) requires no
-	// decisions, but future steps might.
+	// (fix round 1's C2).
+	//
+	// Sticky, not recomputed unconditionally (fix round 2's N2): runStep
+	// moves this field only on positive evidence -- errors.Is against
+	// engine.ErrUnconfirmedCleanup (sets true) or engine.ErrCleanupConfirmed
+	// (clears to false) -- and leaves it exactly as it was on every other
+	// failure, including one whose cleanup logic was never reached at all.
+	// Retry does NOT reset this eagerly: that was fix round 1's shape, and
+	// it reintroduced the same defect one call site over (a retry parked or
+	// canceled before runStep's failure branch ever ran would otherwise
+	// clear a guard nothing had confirmed resolved).
+	//
+	// Persisted by envelope.go, which is a hand-maintained projection of
+	// this type, not a reuse of these json tags -- fix round 2's N1 found
+	// this field had gone a full fix round without a producer there, so a
+	// restart silently dropped the guard. envelope_test.go's parity test
+	// (fix round 3's Ruling 20) now checks every exported Run field is
+	// either carried by envelope or named in its exclusion list, so that
+	// class of gap fails a test instead of shipping again.
 	CleanupUnconfirmed bool      `json:"cleanupUnconfirmed,omitempty"`
 	StartedAt          time.Time `json:"startedAt"`
 	UpdatedAt          time.Time `json:"updatedAt"`
