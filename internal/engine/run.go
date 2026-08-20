@@ -55,6 +55,10 @@ type Run struct {
 	// Components is the latest known state of each component the bundle
 	// installs.
 	Components []ComponentState `json:"components,omitempty"`
+	// Workload names the reference workload an ActiveStep left running, so
+	// the console can label it after a restart. It is a hint, not the
+	// source of truth -- see Workload's doc comment.
+	Workload Workload `json:"workload,omitempty"`
 	// StepIndex is the index of the next step to execute. It exists so a
 	// failed run can be retried from the step that failed rather than from
 	// the top: re-running Discover would redeploy the snapshot agent Job

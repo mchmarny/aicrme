@@ -69,6 +69,11 @@ type envelope struct {
 	// rolled back to the previous image, and bumping the version would turn
 	// a rollback into an unreadable-record degradation for no gain.
 	Truncated []string `json:"truncated,omitempty"`
+	// Workload is the same optional-on-both-sides addition as Truncated:
+	// a record written before this field existed has no "workload" key,
+	// gunzipJSON leaves it as the zero value, and that is a correct decode,
+	// not a degraded one -- so this does not bump envelopeVersion either.
+	Workload Workload `json:"workload,omitempty"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -147,6 +152,7 @@ func encodeRun(r *Run) ([]byte, error) {
 		Err:        r.Err,
 		StartedAt:  r.StartedAt,
 		UpdatedAt:  r.UpdatedAt,
+		Workload:   r.Workload,
 		Artifacts:  make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -235,6 +241,7 @@ func decodeRun(blob []byte) (*Run, error) {
 		UpdatedAt:  env.UpdatedAt,
 		Artifacts:  env.Artifacts,
 		Truncated:  env.Truncated,
+		Workload:   env.Workload,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}
