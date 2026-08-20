@@ -73,7 +73,10 @@ type envelope struct {
 	// a record written before this field existed has no "workload" key,
 	// gunzipJSON leaves it as the zero value, and that is a correct decode,
 	// not a degraded one -- so this does not bump envelopeVersion either.
-	Workload Workload `json:"workload,omitempty"`
+	//
+	// omitzero, not omitempty: see Run.Workload's comment. omitempty would
+	// write the zero-value struct into every record that never went active.
+	Workload Workload `json:"workload,omitzero"`
 }
 
 func gzipJSON(v any) ([]byte, error) {

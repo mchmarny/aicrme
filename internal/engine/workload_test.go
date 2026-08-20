@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -90,5 +92,56 @@ func TestDecodeRunAcceptsARecordWithoutWorkload(t *testing.T) {
 	}
 	if out.Workload != (Workload{}) {
 		t.Errorf("Workload = %+v, want the zero value on a record with no workload field", out.Workload)
+	}
+}
+
+// Run is marshaled straight to the HTTP API, and web/src/api.ts's Run type
+// is documented to mirror it field-for-field. omitempty is a no-op on a
+// struct field -- encoding/json only treats false/0/nil/empty-length values
+// as empty -- so a zero-value Workload would still serialize as
+// "workload":{"namespace":"","kind":"","name":""} on every run that never
+// went active. That matters beyond noise: `if (run.workload)` in the
+// console is truthy for `{}`, so Task 8's "does this run have a workload"
+// check would read true on every run that never had one. The tag must be
+// omitzero, which does treat a zero-value struct as empty.
+func TestRunWorkloadOmitsZeroValueFromJSON(t *testing.T) {
+	blob, err := json.Marshal(Run{ID: "run-zero"})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(blob), `"workload"`) {
+		t.Errorf("json = %s, want no \"workload\" key for a zero-value Workload", blob)
+	}
+
+	blob, err = json.Marshal(Run{ID: "run-active",
+		Workload: Workload{Namespace: "aicrme-prove", Kind: "Job", Name: "prove-run-active"}})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(blob), `"workload"`) {
+		t.Errorf("json = %s, want a \"workload\" key for a populated Workload", blob)
+	}
+}
+
+// The envelope carries the same fix for the same reason encodeRun's own
+// size guard cares about: a zero-value Workload written into every run
+// record that never went active is pure waste against maxPayload, and the
+// contract is "optional on both sides" either way.
+func TestEnvelopeOmitsZeroWorkloadFromJSON(t *testing.T) {
+	blob, err := json.Marshal(envelope{Version: envelopeVersion, ID: "run-zero"})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(blob), `"workload"`) {
+		t.Errorf("json = %s, want no \"workload\" key for a zero-value Workload", blob)
+	}
+
+	blob, err = json.Marshal(envelope{Version: envelopeVersion, ID: "run-active",
+		Workload: Workload{Namespace: "aicrme-prove", Kind: "Job", Name: "prove-run-active"}})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(blob), `"workload"`) {
+		t.Errorf("json = %s, want a \"workload\" key for a populated Workload", blob)
 	}
 }

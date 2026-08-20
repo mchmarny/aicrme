@@ -58,7 +58,13 @@ type Run struct {
 	// Workload names the reference workload an ActiveStep left running, so
 	// the console can label it after a restart. It is a hint, not the
 	// source of truth -- see Workload's doc comment.
-	Workload Workload `json:"workload,omitempty"`
+	//
+	// omitzero, not omitempty: omitempty is a no-op on a struct field (a
+	// zero-value struct is never "empty" by encoding/json's rules), so a
+	// run that never went active would still serialize
+	// "workload":{"namespace":"","kind":"","name":""} -- and
+	// `if (run.workload)` in the console is truthy for that empty object.
+	Workload Workload `json:"workload,omitzero"`
 	// StepIndex is the index of the next step to execute. It exists so a
 	// failed run can be retried from the step that failed rather than from
 	// the top: re-running Discover would redeploy the snapshot agent Job
