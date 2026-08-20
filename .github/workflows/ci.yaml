@@ -10,6 +10,10 @@ permissions:
 jobs:
   qualify:
     runs-on: ubuntu-latest
+    # Without this, GitHub's 6h default applies: an apt-get hang burned two
+    # full 6h runs on 2026-08-19 before anyone noticed. The gate itself takes
+    # ~10m, so anything past 30m is wedged, not slow.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - id: go
@@ -22,7 +26,6 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: sudo apt-get update && sudo apt-get install -y bc
       # shellcheck comes from its own release, NOT apt: apt's version floats
       # with the runner image, and a floating linter means `make lint-shell` can
       # pass locally and fail here on an unchanged file -- which is exactly what

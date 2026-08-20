@@ -39,7 +39,7 @@ test-coverage: test ## Runs tests and enforces the coverage floor
 	esac
 	@coverage=$$(go tool cover -func=coverage.out | grep total: | awk '{print substr($$3, 1, length($$3)-1)}'); \
 	echo "Coverage: $$coverage% (threshold: $(COVERAGE_THRESHOLD)%)"; \
-	if [ $$(echo "$$coverage < $(COVERAGE_THRESHOLD)" | bc) -eq 1 ]; then \
+	if awk -v c="$$coverage" -v t="$(COVERAGE_THRESHOLD)" 'BEGIN{exit !(c<t)}'; then \
 		echo "ERROR: coverage $$coverage% below threshold $(COVERAGE_THRESHOLD)%"; exit 1; \
 	fi
 
