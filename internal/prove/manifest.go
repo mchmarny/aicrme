@@ -39,6 +39,15 @@ func WorkloadName(runID string) string { return "prove-" + runID }
 // OwnedKinds enumerates what Prove creates. Stop and reconciliation act on
 // this list, never on "everything in the namespace", so an object someone
 // else put there is not collateral damage.
+//
+// Not yet true in practice: Client.Delete, Client.WaitAbsent, and
+// Client.ListOwned (client.go) hardcode the Job kind through the typed
+// BatchV1().Jobs() surface rather than iterating this list. That is safe
+// only as long as this returns exactly one entry. Spec §3 anticipates a
+// second -- a Service and a ServiceAccount alongside the Job -- and the day
+// this slice grows, those three methods must grow with it by hand, or
+// whatever the new entry names goes un-deleted by Stop and undiscovered by
+// reconciliation while this list keeps claiming otherwise.
 func OwnedKinds() []schema.GroupVersionResource {
 	return []schema.GroupVersionResource{
 		{Group: "batch", Version: "v1", Resource: "jobs"},
