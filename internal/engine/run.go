@@ -71,10 +71,26 @@ type Run struct {
 	// and take minutes, and re-running Recommend would discard the
 	// decisions the user already made. It advances only after a step
 	// succeeds, so a failure leaves it pointing at the step to retry.
-	StepIndex int       `json:"stepIndex"`
-	Err       string    `json:"error,omitempty"`
-	StartedAt time.Time `json:"startedAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	StepIndex int    `json:"stepIndex"`
+	Err       string `json:"error,omitempty"`
+	// CleanupUnconfirmed is set (from the failing Step's own returned error,
+	// via errors.Is against engine.ErrUnconfirmedCleanup) when a StateFailed
+	// run's own pre-Active cleanup could not itself be confirmed -- Ruling
+	// 12 (spec §8 row 3). Deliberately a structural field, not something
+	// re-derived from Err: Err is human text that Retry legitimately
+	// overwrites on every attempt, so a guard keyed off it would clear the
+	// moment a retry failed for any unrelated, cleanly-cleaned-up reason
+	// (fix round 1's C2). runStep recomputes this field fresh on every
+	// failure of the SAME run, so a retry that no longer has the problem
+	// correctly unblocks Start, and one that still does correctly reblocks
+	// it. Retry ALSO resets this to false eagerly (engine.go), belt and
+	// braces for the paths that bypass runStep's failure branch entirely
+	// (parking at a decision gate, a shutdown cancellation) -- narrower than
+	// it sounds today, since Prove (this field's one producer) requires no
+	// decisions, but future steps might.
+	CleanupUnconfirmed bool      `json:"cleanupUnconfirmed,omitempty"`
+	StartedAt          time.Time `json:"startedAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
 	// Truncated names artifacts the store dropped to fit its size limit (see
 	// encodeRun). It is read-mostly state about the RECORD, not the run: the
 	// engine never sets it, decodeRun populates it on load, and encodeRun

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -46,28 +45,37 @@ const canceledByShutdownMsg = "canceled: console shutting down"
 // real-world bound rather than a shared one.
 const stopWaitAbsentTimeout = 3 * time.Minute
 
-// unconfirmedCleanupMarker is the substring internal/steps' Prove step puts
-// in a run's Err when a pre-Active failure's OWN cleanup attempt could not
-// itself be confirmed (steps/prove.go's cleanup helper, spec §8 row 3: "keep
-// Start blocked" when cleanup cannot complete). engine cannot depend on
-// internal/steps to share this as a real constant -- steps already imports
-// engine, and the reverse would be a cycle -- so this package keys off the
-// wording instead. Deliberately more specific than "cleanup failed" alone:
-// both of steps/prove.go's two cleanup-failure messages ("...; cleanup
-// failed deleting the workload" and "...; cleanup failed waiting for the
-// workload to be gone") carry this exact "; cleanup failed" substring, and
-// an ordinary failure message has no reason to contain it. hasUnconfirmedCleanup
-// is the sole reader; engine_test.go pins the match against both exact
-// messages so a future reword on either side is caught here.
-const unconfirmedCleanupMarker = "; cleanup failed"
+// ErrUnconfirmedCleanup is the sentinel a Step should wrap into the error it
+// returns from Run when its own cleanup after a failure could not itself be
+// confirmed -- steps/prove.go's cleanup helper is today's one producer
+// (spec §8 row 3: "keep Start blocked" when cleanup cannot complete).
+// internal/steps already imports engine (the reverse would cycle), so this
+// is the direction a shared marker can travel; wrapping it (errors.Is, not
+// string matching) is what fix round 1's C3 replaced a substring match
+// with, after a one-character reword of steps/prove.go's message text was
+// shown to leave go test ./... fully green with the guard silently dead.
+//
+// Deliberately checked at runStep's failure branch, on the actual error
+// value a Step returned, and recorded on Run.CleanupUnconfirmed there --
+// not re-derived later from Run.Err. Err is human-readable text that Retry
+// legitimately overwrites on every attempt (fix round 1's C2: a retry
+// failing for an unrelated, cleanly-cleaned-up reason must not still read
+// as an unconfirmed orphan), so the determination has to be made once, from
+// the real error, at the one moment it is still a typed value instead of a
+// string.
+var ErrUnconfirmedCleanup = errors.New("cleanup could not be confirmed")
 
 // hasUnconfirmedCleanup reports whether r is a failed run whose own cleanup
-// attempt could not be confirmed -- see unconfirmedCleanupMarker. Ruling 12
-// (spec §8 row 3): such a run must keep blocking Start, the same as a
+// attempt could not be confirmed -- see Run.CleanupUnconfirmed and
+// ErrUnconfirmedCleanup. Ruling 12 (spec §8 row 3): such a run must keep
+// blocking Start (and Discard -- see Discard's own guard), the same as a
 // genuinely StateActive one, because the cluster may still be holding what
-// that cleanup could not verify it removed.
+// that cleanup could not verify it removed. Stop is deliberately NOT
+// blocked by this -- see stoppable's third arm -- because Stop retrying the
+// same delete-and-confirm-absence Ruling 12 is worried about is the actual
+// remedy, not a second exposure to the same risk.
 func hasUnconfirmedCleanup(r *Run) bool {
-	return r.State == StateFailed && strings.Contains(r.Err, unconfirmedCleanupMarker)
+	return r.State == StateFailed && r.CleanupUnconfirmed
 }
 
 // ErrDraining is what Start and Retry return once CancelAndWait has begun
@@ -727,9 +735,20 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		// is the one field that survives a failed step. Same epoch/identity
 		// guard as the success-path merge below, and it must land before
 		// finish's terminal save, or that save persists the pre-Apply rows.
+		//
+		// CleanupUnconfirmed is set from err itself (still a typed value
+		// here, before msg above threw away everything but its text) --
+		// see ErrUnconfirmedCleanup's doc comment for why Ruling 12's guard
+		// has to be decided at exactly this point rather than re-derived
+		// later from Run.Err. Unconditional assignment, not "set true on
+		// match": a retry of the SAME run that fails for an unrelated,
+		// cleanly-cleaned-up reason must overwrite a stale true with false,
+		// or fix round 1's C2 (Retry clearing Err while this stayed true)
+		// simply moves to a different field.
 		e.mu.Lock()
 		if e.aliveLocked(epoch) {
 			e.current.Components = scratch.Components
+			e.current.CleanupUnconfirmed = errors.Is(err, ErrUnconfirmedCleanup)
 		}
 		e.mu.Unlock()
 
@@ -808,7 +827,23 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 
 func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg string) {
 	e.mu.Lock()
-	if !e.aliveLocked(epoch) {
+	// e.current == nil is checked separately from aliveLocked(epoch): fix
+	// round 1's C1. Discard nils e.current WITHOUT bumping epoch
+	// (deliberately -- see Discard's own doc comment), which was safe only
+	// because Discard rejected every state a live goroutine's own finish
+	// call could still be in flight for. Stop's idempotency arm broke that
+	// invariant from a direction Discard's comment did not anticipate: Stop
+	// calls finish from outside the execute goroutine machinery, for a run
+	// in StateDone -- a state Discard does NOT reject -- so a Discard
+	// racing a second, idempotent Stop call (still blocked in
+	// Delete/WaitAbsent, at the SAME epoch, since Stop never bumps it) can
+	// nil e.current out from under this call. aliveLocked(epoch) alone
+	// cannot see that: epoch is unchanged, so it still reports true, and
+	// the dereference two lines down was a nil-pointer panic that killed
+	// the process (reproduced empirically in fix round 1's review). Once
+	// Discard has cleared the run, there is nothing left for this call to
+	// finish -- returning here is correct, not merely defensive.
+	if !e.aliveLocked(epoch) || e.current == nil {
 		e.mu.Unlock()
 		return
 	}
@@ -881,11 +916,21 @@ func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 	}
 	prevErr := e.current.Err
 	prevRecoveredPending := e.recoveredPending
+	prevCleanupUnconfirmed := e.current.CleanupUnconfirmed
 	// Retry is the intended resume path for a recovered run: accepting it
 	// here is the operator action that clears the bootstrap gate in Start.
 	e.recoveredPending = false
 	e.current.State = StateRunning
 	e.current.Err = ""
+	// Reset alongside Err, not left to runStep's next failure to overwrite:
+	// a retry that PARKS at a decision gate or is canceled by shutdown
+	// never reaches runStep's failure branch at all, and without this reset
+	// a stale true from the run's PREVIOUS failed attempt would wrongly
+	// paint that unrelated outcome as an unconfirmed orphan too. runStep's
+	// failure branch still recomputes this fresh on every actual step
+	// failure (see its own comment); this reset only covers the paths that
+	// bypass runStep's failure branch entirely.
+	e.current.CleanupUnconfirmed = false
 	e.current.UpdatedAt = time.Now().UTC()
 	e.resume = make(chan struct{}, 1)
 	e.epoch++
@@ -918,6 +963,10 @@ func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 			// the rest of the block so this cannot stomp a run that has since
 			// legitimately superseded this one.
 			e.recoveredPending = prevRecoveredPending
+			// Same reasoning again: this rollback restores the run to
+			// exactly the StateFailed record it was before this call, and
+			// Ruling 12's guard is part of that record.
+			e.current.CleanupUnconfirmed = prevCleanupUnconfirmed
 		}
 		e.mu.Unlock()
 		// See Start's identical rationale: no goroutine will ever run for
@@ -949,18 +998,26 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 		return aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
 	}
 	// A live run has an execute goroutine driving it, and every one of that
-	// goroutine's e.current dereferences (execute, awaitDecisions, runStep,
-	// finish) is guarded only by an aliveLocked(epoch) check, never by a
-	// nil check on e.current itself -- nilling it here while that goroutine
-	// still owns the epoch crashes the whole process on its next
-	// checkpoint, not just this caller. This is deliberately not "bump
-	// epoch instead": every guarded dereference above sits in the same
-	// lock hold as its check today, so a bump would also close the gap
-	// right now, but that safety is an incidental property of the current
-	// code, not a structural guarantee -- a future dereference added
-	// between a checkpoint and its use would silently reopen it. Never
-	// nilling a live run holds regardless of that pairing, so it is the
-	// only guard this method relies on.
+	// goroutine's e.current dereferences (execute, awaitDecisions, runStep)
+	// is guarded only by an aliveLocked(epoch) check, never by a nil check
+	// on e.current itself -- nilling it here while that goroutine still
+	// owns the epoch would corrupt its next checkpoint. This is
+	// deliberately not "bump epoch instead": every guarded dereference
+	// above sits in the same lock hold as its check today, so a bump would
+	// also close the gap right now, but that safety is an incidental
+	// property of the current code, not a structural guarantee -- a future
+	// dereference added between a checkpoint and its use would silently
+	// reopen it. Never nilling a live run holds regardless of that pairing,
+	// so it is the only guard this method relies on for isLive callers.
+	//
+	// finish is the one exception, and it is Stop's, not execute's: Stop
+	// (fix round 1's idempotency arm) calls finish for a run in StateDone
+	// -- not live, so this guard does not cover it -- from outside the
+	// execute machinery entirely, at the SAME epoch Discard is free to nil
+	// e.current under. finish itself now nil-checks e.current for exactly
+	// this reason (see finish's own comment, fix round 1's C1); this
+	// guard's job stays scoped to isLive, not extended to cover it, so the
+	// two continue to reason about disjoint states.
 	if isLive(e.current.State) {
 		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run is live; retry, wait for it to finish, or cancel before discarding")
@@ -1024,23 +1081,35 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 	return nil
 }
 
-// stoppable reports whether r is a valid target for Stop: either genuinely
-// StateActive, or StateDone with a workload identity still recorded -- the
-// shape a run has immediately after Stop itself finishes it (see Stop's own
-// e.finish call below). That second arm is what makes Stop idempotent
-// against a real double-click or a racing reconciliation (spec §7:
-// "stopping an already-stopped workload succeeds") without also accepting a
-// run that reached StateDone by ordinary completion and never held a
-// workload at all: only an ActiveStep's own write ever sets Workload
-// (runStep's success-path merge; run.go's doc comment on the field), so a
-// run whose last step was not one carries the zero value here and stays
-// rejected. Workload's CONTENTS play no part in this check, only its
-// presence -- Delete and WaitAbsent below still address the workload by
-// runID alone, exactly as every other prove.Client caller does; leaning on
-// Workload for more than that would contradict its own "hint, not
-// identity" doc comment.
+// stoppable reports whether r is a valid target for Stop:
+//
+//  1. Genuinely StateActive.
+//  2. StateDone with a workload identity still recorded -- the shape a run
+//     has immediately after Stop itself finishes it (see Stop's own
+//     e.finish call below). This is what makes Stop idempotent against a
+//     real double-click or a racing reconciliation (spec §7: "stopping an
+//     already-stopped workload succeeds") without also accepting a run
+//     that reached StateDone by ordinary completion and never held a
+//     workload at all: only an ActiveStep's own write ever sets Workload
+//     (runStep's success-path merge; run.go's doc comment on the field),
+//     so a run whose last step was not one carries the zero value here
+//     and stays rejected.
+//  3. StateFailed with an unconfirmed cleanup (hasUnconfirmedCleanup).
+//     Fix round 1's I1: Ruling 12 blocks Start and Discard on such a run,
+//     but blocking every operation that could resolve it -- including the
+//     one that actually performs the delete-and-confirm-absence the
+//     cleanup itself could not complete -- recreates the operator dead
+//     end this task exists to remove, one state over. Stop retrying that
+//     exact operation is the remedy, not a second exposure to the risk.
+//
+// Workload's CONTENTS play no part in arm 2, only its presence -- Delete
+// and WaitAbsent below still address the workload by runID alone, exactly
+// as every other prove.Client caller does; leaning on Workload for more
+// than that would contradict its own "hint, not identity" doc comment.
 func stoppable(r *Run) bool {
-	return r.State == StateActive || (r.State == StateDone && r.Workload != (Workload{}))
+	return r.State == StateActive ||
+		(r.State == StateDone && r.Workload != (Workload{})) ||
+		hasUnconfirmedCleanup(r)
 }
 
 // Stop is the only way a run leaves StateActive -- operator-initiated,
@@ -1048,15 +1117,17 @@ func stoppable(r *Run) bool {
 // restart (Recover installs a persisted StateActive record as StateActive,
 // unresumed -- see recover.go), not on a timeout, not as a side effect of
 // Start. Same rule as Reset, for the same reason: it destroys something the
-// operator is watching (spec §7).
+// operator is watching (spec §7). It is also the remedy for Ruling 12's
+// third case (stoppable's arm 3): retrying the delete-and-confirm-absence a
+// failed cleanup could not complete.
 //
 // Foreground deletion, then WaitAbsent, and StateDone is set ONLY once both
 // have succeeded -- active_test.go's bite-proof pins this exact ordering:
 // reversing it (finishing at StateDone before confirming absence) is what
 // makes TestFailedStopLeavesRunActive fail alone. On any failure the run is
-// left exactly where it was, StateActive, and the returned error names what
-// failed -- it must never claim to have stopped something it did not (spec
-// §7's one outcome this design most wants to avoid).
+// left exactly where it was, and the returned error names what failed -- it
+// must never claim to have stopped something it did not (spec §7's one
+// outcome this design most wants to avoid).
 //
 // Idempotent per stoppable's second arm above and per prove.Client.Delete's
 // own contract (a missing workload is success -- its doc comment): an
@@ -1085,12 +1156,21 @@ func (e *Engine) Stop(ctx context.Context, runID string) error {
 			"stop: a live cluster client is required to stop the reference workload")
 	}
 	epoch := e.epoch
+	// Copied to a local under the same lock hold as epoch, for the same
+	// reason epoch is: fix round 1's I2. SetProveClient writes this field
+	// under e.mu; reading it again after e.mu.Unlock() below (as the two
+	// calls further down used to) is a benign-today, structurally-wrong
+	// read of mutex-protected state -- benign only because main.go sets it
+	// once before api.New ever runs and nothing else in this binary writes
+	// it concurrently, which is exactly the shape of bug -race can never
+	// catch and a future second writer could turn real.
+	client := e.proveClient
 	e.mu.Unlock()
 
-	if err := e.proveClient.Delete(ctx, runID); err != nil {
+	if err := client.Delete(ctx, runID); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
 	}
-	if err := e.proveClient.WaitAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
+	if err := client.WaitAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
 	}
 
@@ -1098,13 +1178,36 @@ func (e *Engine) Stop(ctx context.Context, runID string) error {
 	// bus event -- the same call every other terminal transition in this
 	// file uses (execute's own StateActive/StateFailed sites). epoch was
 	// captured before the two cluster calls above: nothing can bump e.epoch
-	// while e.current.State is StateActive or the Stop-produced StateDone
-	// stoppable's second arm accepts -- Start's own guard rejects
-	// StateActive outright, and Retry requires StateFailed -- so
-	// aliveLocked(epoch) inside finish is a defensive re-check here, not a
-	// load-bearing one, matching the rationale every other call site in
-	// this file already gives for checking anyway.
+	// while e.current.State is StateActive, the Stop-produced StateDone
+	// stoppable's second arm accepts, or the StateFailed its third arm
+	// accepts -- Start's own guard rejects all three (StateActive
+	// directly, StateFailed-with-unconfirmed-cleanup via Ruling 12, and
+	// StateDone is simply not StateFailed so Retry cannot touch it either)
+	// -- so aliveLocked(epoch) inside finish is a defensive re-check here,
+	// not a load-bearing one, matching the rationale every other call site
+	// in this file already gives for checking anyway. finish itself now
+	// also nil-checks e.current, closing the one way this WAS reachable: a
+	// concurrent Discard of an already-Stopped (StateDone) run -- fix round
+	// 1's C1.
 	e.finish(ctx, epoch, StateDone, "")
+
+	// Mirrors Retry's and Discard's own clearing of the bootstrap gate:
+	// fix round 1's M2. Without this, a Stop that succeeds against a
+	// recovered StateActive run leaves recoveredPending set, and Start
+	// keeps 409ing on "a recovered run is waiting for retry or discard"
+	// even though the run it names is now StateDone and gone -- forcing a
+	// second, differently-named click for no reason. Only cleared on
+	// success, matching Stop's own "on failure, nothing about the run
+	// changes" contract: a failed Delete or WaitAbsent above already
+	// returned before reaching here, so this line is never reached on that
+	// path. Unconditional, not identity-guarded like Start's/Retry's own
+	// rollback branches: recoveredPending blocks EVERY Start while true, so
+	// e.current can only be the recovered run itself for as long as it
+	// stays true, and Stop already required e.current.ID == runID above.
+	e.mu.Lock()
+	e.recoveredPending = false
+	e.mu.Unlock()
+
 	return nil
 }
 

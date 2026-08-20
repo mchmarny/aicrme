@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -160,18 +161,29 @@ func (p *proveStep) awaitGang(ctx context.Context, runID string, emit engine.Emi
 // propagation merely starting the cascade is not enough on its own
 // (prove.Client's own doc comment on Delete/WaitAbsent). If either call
 // fails, the returned error names the cleanup failure distinctly from
-// cause: a run reported "failed" over a cluster that may still be holding
-// GPUs is a worse outcome than an ordinary failure, and the operator needs
-// to be able to tell the two apart. cause itself is returned unchanged once
-// cleanup succeeds.
+// cause (for the operator, in its Error() text) AND wraps
+// engine.ErrUnconfirmedCleanup (for the engine, via errors.Is) -- fix round
+// 1's C3: the engine used to key Ruling 12's guard off a substring of this
+// message's text, and a one-character reword of that text (verified by the
+// reviewer) left the guard silently dead with the whole suite green. The
+// sentinel is what runStep now checks instead, on this error's actual typed
+// value, before it is ever reduced to a string. errors.Join, not a bare
+// Cause reassignment: aicrerrors.Wrap already uses its cause argument for
+// the operator-facing chain (Unwrap), and the sentinel has to be reachable
+// from the SAME chain without displacing it -- Join's multi-error Unwrap
+// satisfies errors.Is against either. cause itself is returned unchanged,
+// carrying no sentinel, once cleanup succeeds: a confirmed-clean cleanup is
+// exactly the case Ruling 12 must NOT block on.
 func (p *proveStep) cleanup(ctx context.Context, runID string, cause error) error {
 	if err := p.client.Delete(ctx, runID); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable,
-			fmt.Sprintf("run %s failed (%v); cleanup failed deleting the workload", runID, cause), err)
+			fmt.Sprintf("run %s failed (%v); cleanup failed deleting the workload", runID, cause),
+			errors.Join(engine.ErrUnconfirmedCleanup, err))
 	}
 	if err := p.client.WaitAbsent(ctx, runID, p.cfg.GangTimeout); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable,
-			fmt.Sprintf("run %s failed (%v); cleanup failed waiting for the workload to be gone", runID, cause), err)
+			fmt.Sprintf("run %s failed (%v); cleanup failed waiting for the workload to be gone", runID, cause),
+			errors.Join(engine.ErrUnconfirmedCleanup, err))
 	}
 	return cause
 }

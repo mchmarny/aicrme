@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -324,6 +326,120 @@ func TestStopIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestStopClearsRecoveredPending is fix round 1's M2: without this, a Stop
+// that succeeds against a recovered StateActive run (spec §9's restart ->
+// recovered StateActive -> Stop flow) leaves recoveredPending set, so the
+// very next Start still 409s on "a recovered run is waiting for retry or
+// discard" -- naming a run that is now StateDone and gone -- forcing a
+// second, differently-named click for no reason. recoveredPending is set
+// here directly rather than by round-tripping through Recover: this test's
+// only concern is whether Stop clears the flag on success, not how Recover
+// sets it (recover_test.go already covers that, white-box in the same
+// package).
+func TestStopClearsRecoveredPending(t *testing.T) {
+	e := newTestEngine(t, &fakeActiveStep{phase: PhaseProve, active: true, workload: stopTestWorkload})
+	e.SetProveClient(prove.NewClient(fake.NewSimpleClientset()))
+	run := startAndWait(t, e)
+
+	e.mu.Lock()
+	e.recoveredPending = true
+	e.mu.Unlock()
+
+	if _, err := e.Start(context.Background()); err == nil {
+		t.Fatal("fixture check: Start() succeeded while recoveredPending, want conflict")
+	}
+
+	if err := e.Stop(context.Background(), run.ID); err != nil {
+		t.Fatalf("Stop() error = %v, want nil", err)
+	}
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Errorf("Start() error = %v after Stop on a recovered run, want nil -- recoveredPending must be cleared", err)
+	}
+}
+
+// TestStopSurvivesConcurrentDiscard is fix round 1's C1 regression: a
+// second, idempotent Stop call (stoppable's StateDone arm) races a Discard
+// of the same, already-finished run. Discard nils e.current WITHOUT
+// bumping the epoch (deliberately -- see Discard's own doc comment), which
+// used to be safe only because Discard rejected every state a live
+// goroutine's finish call could still be in flight for. Stop breaks that:
+// it calls finish from outside the execute machinery, for a run in
+// StateDone, which Discard does NOT reject -- so before finish's own
+// nil-check (this fix round), the blocked Stop below panicked with a nil
+// pointer dereference the instant its WaitAbsent poll returned, taking the
+// whole process down.
+//
+// The panic is recovered rather than left to crash the test binary, so a
+// regression here reads as a normal, attributable test failure.
+func TestStopSurvivesConcurrentDiscard(t *testing.T) {
+	const runID = "run-stop-vs-discard"
+	cs := fake.NewSimpleClientset()
+	e, client := newStopTestEngine(t, runID, cs)
+	ctx := context.Background()
+	if err := client.EnsureNamespace(ctx); err != nil {
+		t.Fatalf("EnsureNamespace() error = %v", err)
+	}
+	if err := client.Apply(ctx, runID); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	run := startAndWait(t, e)
+
+	// First Stop: genuinely deletes the workload and lands the run at
+	// StateDone -- the state Discard is willing to accept.
+	if err := e.Stop(ctx, run.ID); err != nil {
+		t.Fatalf("first Stop() error = %v, want nil", err)
+	}
+
+	// The second, idempotent Stop's WaitAbsent poll is held open here so
+	// Discard has a real window to run underneath it. Once released, the
+	// reactor falls through (returns false) to the real tracker, which
+	// (the workload already being gone) reports absence normally -- this
+	// is not simulating a cluster failure, only stretching out the timing
+	// of a genuinely successful poll.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	cs.PrependReactor("get", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return false, nil, nil
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		var stopErr error
+		defer func() {
+			if r := recover(); r != nil {
+				stopErr = fmt.Errorf("Stop panicked: %v", r)
+			}
+			done <- stopErr
+		}()
+		stopErr = e.Stop(ctx, run.ID)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Stop's WaitAbsent poll was never reached")
+	}
+
+	if err := e.Discard(ctx, run.ID); err != nil {
+		t.Fatalf("Discard() error = %v, want nil -- the run is StateDone, not live", err)
+	}
+
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("second Stop() error = %v, want nil (and NOT a panic)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Stop() never returned")
+	}
+}
+
 // assertFailedStopLeavesRunActive is the shared body of both
 // TestFailedStopLeavesRunActive and TestFailedDeleteLeavesRunActive: call
 // Stop against a client wired to fail, then assert the one outcome spec §7
@@ -432,12 +548,55 @@ func TestStopRejectsNonActiveRun(t *testing.T) {
 	}
 }
 
-// unconfirmedCleanupErr mirrors the wording steps/prove.go's cleanup helper
-// actually produces on a failed Delete, close enough to pin engine.go's
-// hasUnconfirmedCleanup against the real message shape without importing
-// internal/steps (which already imports engine; the reverse would cycle).
+// TestStopFailsGracefullyWithoutLiveCluster is fix round 1's I3: the
+// nil/unready-client guard in Stop had no test, and deleting it entirely
+// left both internal/engine and internal/api green (the reviewer's own
+// demonstration) -- Stop would instead reach a nil *prove.Client and
+// panic, the exact class of process-killing bug C1 (steps/prove.go's own
+// Client.Ready() guard) already fixed once in this phase, at the
+// equivalent call site one layer up. Deliberately does NOT call
+// SetProveClient at all: newTestEngine's engine has no cluster client
+// wired, matching main.go's dev-mode-without-a-pod posture.
+func TestStopFailsGracefullyWithoutLiveCluster(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Stop() panicked: %v -- want a returned error instead", r)
+		}
+	}()
+	e := newTestEngine(t, &fakeActiveStep{phase: PhaseProve, active: true, workload: stopTestWorkload})
+	run := startAndWait(t, e)
+
+	err := e.Stop(context.Background(), run.ID)
+	if err == nil {
+		t.Fatal("Stop() succeeded with no cluster client wired, want ErrCodeUnavailable")
+	}
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeUnavailable {
+		t.Errorf("Stop() error = %v, want ErrCodeUnavailable", err)
+	}
+
+	got, getErr := e.Get(context.Background(), run.ID)
+	if getErr != nil {
+		t.Fatalf("Get() error = %v", getErr)
+	}
+	if got.State != StateActive {
+		t.Errorf("State after a client-less Stop = %q, want %q", got.State, StateActive)
+	}
+}
+
+// unconfirmedCleanupErr wraps the same sentinel steps/prove.go's real
+// cleanup helper wraps (ErrUnconfirmedCleanup), rather than reproducing its
+// message text. Fix round 1's C3: the guard used to key off a substring of
+// that text, and a one-character reword left it silently dead with the
+// whole suite green -- this package's tests must exercise the same
+// errors.Is-based mechanism runStep now uses, or they would still pass
+// against a version of engine.go that reintroduces exactly that defect.
+// internal/steps/prove_test.go's TestCleanupFailureWrapsErrUnconfirmedCleanup
+// is the other half: it drives the REAL steps.NewProve cleanup path and
+// asserts engine's own predicate against the error it actually produces, so
+// the two sides of this cross-package contract are each pinned once.
 func unconfirmedCleanupErr(runID string) error {
-	return errors.New("run " + runID + " failed (boom); cleanup failed deleting the workload")
+	return fmt.Errorf("run %s failed: %w", runID, ErrUnconfirmedCleanup)
 }
 
 // TestStartBlockedByUnconfirmedCleanupFailure is Ruling 12 (spec §8 row 3):
@@ -462,6 +621,50 @@ func TestStartBlockedByUnconfirmedCleanupFailure(t *testing.T) {
 	}
 }
 
+// TestStopResolvesUnconfirmedCleanupAndUnblocksStart is fix round 1's I1:
+// blocking Start (and Discard) over a run with unconfirmed cleanup, while
+// offering no way to actually resolve it, recreates the operator dead end
+// this whole task exists to remove -- Stop, Discard, and Start all 409ing,
+// with nothing left but the unsafe Retry path. Stop retrying the exact
+// delete-and-confirm-absence a failed cleanup could not complete IS the
+// remedy (stoppable's third arm), so it must be the one operation this
+// state does NOT block, and a successful Stop must actually clear Ruling
+// 12's guard rather than leaving the run in limbo.
+func TestStopResolvesUnconfirmedCleanupAndUnblocksStart(t *testing.T) {
+	const runID = "run-cleanup-resolved-by-stop"
+	e := newTestEngine(t, &fakeStep{phase: PhaseProve, err: unconfirmedCleanupErr(runID)})
+	e.newID = func() string { return runID }
+	e.SetProveClient(prove.NewClient(fake.NewSimpleClientset()))
+	run := startAndWait(t, e)
+	if run.State != StateFailed || !run.CleanupUnconfirmed {
+		t.Fatalf("fixture run = %+v, want StateFailed with CleanupUnconfirmed = true", run)
+	}
+	if _, err := e.Start(context.Background()); err == nil {
+		t.Fatal("Start() succeeded before Stop, want the unconfirmed-cleanup guard still blocking")
+	}
+
+	// No Job was ever created against this fake clientset -- Delete and
+	// WaitAbsent are both trivially satisfied against an absent object
+	// (prove.Client.Delete's own "a missing workload is success" contract),
+	// which is exactly the shape a truly orphaned-then-actually-gone
+	// workload has by the time an operator's Stop reaches it.
+	if err := e.Stop(context.Background(), run.ID); err != nil {
+		t.Fatalf("Stop() on an unconfirmed-cleanup run error = %v, want nil", err)
+	}
+
+	resolved, err := e.Get(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if resolved.State != StateDone {
+		t.Errorf("State after Stop = %q, want %q", resolved.State, StateDone)
+	}
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Errorf("Start() error = %v after Stop resolved the unconfirmed cleanup, want nil", err)
+	}
+}
+
 // TestOrdinaryFailureDoesNotBlockStart is the discriminating half of Ruling
 // 12: a run that failed for a reason unrelated to cleanup must not trip the
 // new guard, or every ordinary failure would silently become an orphan
@@ -473,6 +676,79 @@ func TestOrdinaryFailureDoesNotBlockStart(t *testing.T) {
 
 	if _, err := e.Start(context.Background()); err != nil {
 		t.Errorf("Start() error = %v, want nil -- an ordinary failure must not block Start", err)
+	}
+}
+
+// twoAttemptStep fails its first Run with firstErr, and every subsequent
+// Run with laterErr -- so a test can drive Start then Retry through two
+// distinct failure reasons for the SAME run. Locked, not a raw counter:
+// Start's and Retry's execute calls run on different goroutines, and while
+// this file's own startAndWait/waitForRunState-mediated sequencing already
+// provides a real happens-before chain through e.mu, a lock here costs
+// nothing and matches internal/api/runs_test.go's retryProbeStep, which
+// documents the identical reasoning for the identical shape.
+type twoAttemptStep struct {
+	phase    Phase
+	firstErr error
+	laterErr error
+
+	mu      sync.Mutex
+	attempt int
+}
+
+func (s *twoAttemptStep) Phase() Phase       { return s.phase }
+func (s *twoAttemptStep) Requires() []string { return nil }
+func (s *twoAttemptStep) Run(_ context.Context, _ *Run, _ Emit) error {
+	s.mu.Lock()
+	s.attempt++
+	first := s.attempt == 1
+	s.mu.Unlock()
+	if first {
+		return s.firstErr
+	}
+	return s.laterErr
+}
+
+// TestRetryClearsRuling12GuardOnUnrelatedFailure is fix round 1's C2
+// regression. Retry clears Run.Err on every attempt (Retry's own doc
+// comment: "Retry re-executes... "), so a guard keyed off Err's TEXT would
+// clear the moment a retry failed for ANY reason at all -- including one
+// whose own cleanup succeeded cleanly -- freeing Start over a workload the
+// FIRST cleanup never confirmed it removed. Run.CleanupUnconfirmed is
+// recomputed fresh by runStep on every failure of the SAME run instead (see
+// its own comment in engine.go), so this pins the actual fix: a retry that
+// fails for an unrelated, cleanly-cleaned-up reason correctly UNBLOCKS
+// Start, rather than leaving a stale block or -- the bug this pins -- a
+// stale absence of one.
+func TestRetryClearsRuling12GuardOnUnrelatedFailure(t *testing.T) {
+	step := &twoAttemptStep{
+		phase:    PhaseProve,
+		firstErr: unconfirmedCleanupErr("run-c2"),
+		laterErr: errors.New("boom, unrelated to any cleanup"),
+	}
+	e := newTestEngine(t, step)
+	run := startAndWait(t, e)
+	if run.State != StateFailed || !run.CleanupUnconfirmed {
+		t.Fatalf("fixture run = %+v, want StateFailed with CleanupUnconfirmed = true", run)
+	}
+	if _, err := e.Start(context.Background()); err == nil {
+		t.Fatal("Start() succeeded before Retry, want the unconfirmed-cleanup guard still blocking")
+	}
+
+	retriedRun, err := e.Retry(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	if retriedRun.ID != run.ID {
+		t.Errorf("Retry() returned run ID = %q, want %q", retriedRun.ID, run.ID)
+	}
+	retried := waitForRunState(t, e, run.ID, StateFailed)
+	if retried.CleanupUnconfirmed {
+		t.Errorf("CleanupUnconfirmed = true after a retry that failed for an unrelated reason, want false")
+	}
+
+	if _, err := e.Start(context.Background()); err != nil {
+		t.Errorf("Start() error = %v after an unrelated retry failure, want nil -- Ruling 12's guard must not still be blocking a resolved run", err)
 	}
 }
 

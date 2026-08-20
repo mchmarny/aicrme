@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/prove"
@@ -297,5 +298,91 @@ func TestProveOrdinaryFailureIsNotReportedAsCleanupFailure(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "cleanup") {
 		t.Errorf("Run() error = %v, a successful cleanup must not be reported as a cleanup failure", err)
+	}
+	// Fix round 1's C3: the structural half of the same distinction. A
+	// confirmed-clean cleanup must not satisfy engine.ErrUnconfirmedCleanup
+	// either, or Ruling 12 would block Start over every ordinary Prove
+	// failure, not just the unconfirmed ones.
+	if errors.Is(err, engine.ErrUnconfirmedCleanup) {
+		t.Errorf("Run() error = %v, want errors.Is(err, engine.ErrUnconfirmedCleanup) = false for a confirmed-clean cleanup", err)
+	}
+}
+
+// TestCleanupFailureWrapsErrUnconfirmedCleanup pins the producer side of
+// fix round 1's C3 cross-package contract: steps/prove.go's cleanup helper
+// must wrap engine.ErrUnconfirmedCleanup (errors.Is-checkable) whenever
+// EITHER of its own two cluster calls fails, not just carry text that
+// happens to look right. Companion to
+// TestProveReportsCleanupFailureDistinctly (which pins the operator-facing
+// text) and TestRealCleanupFailureBlocksEngineStart below (which pins the
+// consumer side, end to end).
+func TestCleanupFailureWrapsErrUnconfirmedCleanup(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("delete refused")
+	})
+	run := newRun()
+	run.ID = testRunID
+	err := steps.NewProve(prove.NewClient(cs), steps.ProveConfig{GangTimeout: 50 * time.Millisecond}).
+		Run(context.Background(), run, func(bus.Event) {})
+	if err == nil {
+		t.Fatal("Run() succeeded though Delete failed")
+	}
+	if !errors.Is(err, engine.ErrUnconfirmedCleanup) {
+		t.Errorf("Run() error = %v, want errors.Is(err, engine.ErrUnconfirmedCleanup) = true", err)
+	}
+}
+
+// TestRealCleanupFailureBlocksEngineStart is fix round 1's C3 regression,
+// end to end. The engine used to key Ruling 12's guard off a substring of
+// this package's error TEXT, and a one-character reword of that text (a
+// 2-line diff) left the whole go test ./... suite green with the guard
+// silently dead -- because nothing anywhere drove a REAL steps.NewProve
+// cleanup failure through a REAL engine.Engine and checked that the guard
+// actually fired. internal/engine's own tests cannot catch this class of
+// regression: they hand-construct a fakeStep returning an error that
+// WRAPS engine.ErrUnconfirmedCleanup directly (active_test.go's
+// unconfirmedCleanupErr), which pins engine against itself, not against
+// what this package actually produces. Only a test living here, importing
+// engine (steps already does; the reverse would cycle), can close that gap.
+func TestRealCleanupFailureBlocksEngineStart(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("delete refused")
+	})
+	step := steps.NewProve(prove.NewClient(cs), steps.ProveConfig{GangTimeout: 50 * time.Millisecond})
+	b := bus.New(64)
+	e := engine.New(b, engine.NewMemoryStore(), step)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var got *engine.Run
+	for {
+		got, err = e.Get(context.Background(), run.ID)
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if got.State == engine.StateFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run never reached StateFailed, last state %q", got.State)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !got.CleanupUnconfirmed {
+		t.Fatalf("run.CleanupUnconfirmed = false after a real Delete-refusing cleanup failure, want true (Err = %q)", got.Err)
+	}
+
+	if _, startErr := e.Start(context.Background()); startErr == nil {
+		t.Fatal("Start() succeeded after a real, unconfirmed steps.Prove cleanup failure -- Ruling 12's guard is dead")
+	} else {
+		var se *aicrerrors.StructuredError
+		if !errors.As(startErr, &se) || se.Code != aicrerrors.ErrCodeConflict {
+			t.Errorf("Start() error = %v, want ErrCodeConflict", startErr)
+		}
 	}
 }
