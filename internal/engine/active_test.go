@@ -48,9 +48,10 @@ func (f *fakeStep) Run(_ context.Context, r *Run, emit Emit) error {
 // (fakeStep) and "implements it" (fakeActiveStep) must actually be different
 // types, not one type with a flag isActive would never see.
 type fakeActiveStep struct {
-	phase  Phase
-	active bool
-	err    error
+	phase    Phase
+	active   bool
+	err      error
+	workload Workload
 }
 
 func (f *fakeActiveStep) Phase() Phase       { return f.phase }
@@ -58,6 +59,7 @@ func (f *fakeActiveStep) Requires() []string { return nil }
 func (f *fakeActiveStep) Run(_ context.Context, r *Run, emit Emit) error {
 	emit(bus.Event{Kind: bus.KindLog, Message: string(f.phase) + " ran"})
 	r.Artifacts[string(f.phase)] = []byte("done")
+	r.Workload = f.workload
 	return f.err
 }
 func (f *fakeActiveStep) LeavesWorkloadRunning() bool { return f.active }
@@ -92,6 +94,20 @@ func startAndWait(t *testing.T, e *Engine) *Run {
 		default:
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A step's Workload write must survive runStep's merge, the same as
+// Artifacts, Decisions, and Components -- otherwise Prove (Task 5) can set
+// run.Workload on its own scratch copy and have it silently discarded,
+// leaving e.current.Workload at the zero value on a run that just went
+// StateActive with a workload genuinely running in the cluster.
+func TestActiveStepWorkloadSurvivesTheMerge(t *testing.T) {
+	want := Workload{Namespace: "aicrme-prove", Kind: "Job", Name: "prove-run-abc"}
+	e := newTestEngine(t, &fakeActiveStep{phase: PhaseProve, active: true, workload: want})
+	run := startAndWait(t, e)
+	if run.Workload != want {
+		t.Errorf("Workload = %+v, want %+v", run.Workload, want)
 	}
 }
 

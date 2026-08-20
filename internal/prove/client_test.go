@@ -275,6 +275,76 @@ func TestEnsureNamespaceIsIdempotent(t *testing.T) {
 	}
 }
 
+// placedPod is what a scheduler (or, on a fake clientset, a test standing in
+// for one) leaves behind the instant it binds a gang member: the same
+// ownership labels Render gives every pod in the workload's template, plus
+// Spec.NodeName set -- the field PlacedNodes actually reads.
+func placedPod(runID, name, node string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: prove.Namespace,
+			Labels:    prove.Labels(runID),
+		},
+		Spec: corev1.PodSpec{NodeName: node},
+	}
+}
+
+// A pod with no NodeName has not been scheduled yet and must not count as
+// placed, even though it already exists and carries the right labels.
+func TestPlacedNodesReturnsOnlyScheduledPods(t *testing.T) {
+	pending := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "prove-run-abc-1", Namespace: prove.Namespace, Labels: prove.Labels("run-abc"),
+		},
+	}
+	cs := fake.NewSimpleClientset(placedPod("run-abc", "prove-run-abc-0", "gpu-node-0"), pending)
+	got, err := prove.NewClient(cs).PlacedNodes(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatalf("PlacedNodes() error = %v", err)
+	}
+	if len(got) != 1 || got["prove-run-abc-0"] != "gpu-node-0" {
+		t.Errorf("PlacedNodes() = %+v, want exactly the one scheduled pod", got)
+	}
+}
+
+func TestPlacedNodesEmptyWhenNoPods(t *testing.T) {
+	got, err := prove.NewClient(fake.NewSimpleClientset()).PlacedNodes(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatalf("PlacedNodes() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("PlacedNodes() = %+v, want empty", got)
+	}
+}
+
+// A selector built from Labels(runID) -- including the run-id key -- must
+// exclude another run's pods even though they share the ownership pair and
+// the namespace.
+func TestPlacedNodesOnlyMatchesTheGivenRun(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		placedPod("run-abc", "prove-run-abc-0", "gpu-node-0"),
+		placedPod("run-xyz", "prove-run-xyz-0", "gpu-node-1"),
+	)
+	got, err := prove.NewClient(cs).PlacedNodes(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatalf("PlacedNodes() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("PlacedNodes() = %+v, want exactly one pod scoped to run-abc", got)
+	}
+}
+
+func TestPlacedNodesErrorSurfaces(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("no access"))
+	})
+	if _, err := prove.NewClient(cs).PlacedNodes(context.Background(), "run-abc"); err == nil {
+		t.Fatal("PlacedNodes() error = nil, want the Forbidden error to surface")
+	}
+}
+
 func TestEnsureNamespaceErrorSurfaces(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("create", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {

@@ -150,6 +150,31 @@ func (c *Client) WaitAbsent(ctx context.Context, runID string, timeout time.Dura
 	}
 }
 
+// PlacedNodes returns, for runID's gang, the node each already-scheduled pod
+// has been bound to, keyed by pod name. A pod absent from the result has not
+// been placed yet.
+//
+// Reading Spec.NodeName -- the field the scheduler itself writes the instant
+// it binds a pod -- rather than Status.Phase is what makes this trustworthy
+// against a fake clientset that runs no kubelet and would never advance
+// Phase past Pending: NodeName means "scheduled" on a real cluster and a
+// faked one alike, with no controller needing to run for it to mean that.
+func (c *Client) PlacedNodes(ctx context.Context, runID string) (map[string]string, error) {
+	list, err := c.kube.CoreV1().Pods(Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(Labels(runID)).String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("prove: listing pods for run %s: %w", runID, err)
+	}
+	out := make(map[string]string, len(list.Items))
+	for _, pod := range list.Items {
+		if pod.Spec.NodeName != "" {
+			out[pod.Name] = pod.Spec.NodeName
+		}
+	}
+	return out, nil
+}
+
 // ListOwned finds every workload Prove owns by label, never by a persisted
 // run record: terminal saves are best-effort and the run store can degrade
 // to memory (internal/engine/cmstore.go), so a console that could only find

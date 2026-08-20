@@ -692,6 +692,17 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// place, so it is already the complete, current projection -- unlike
 	// Artifacts and Decisions, there is nothing to merge key-by-key.
 	e.current.Components = scratch.Components
+	// Workload is an output, same as Artifacts and Decisions (Ruling 14's
+	// distinction from Components' narration), and merged only here on
+	// success for the same reason: Prove sets it only once its gang has
+	// actually placed, and a step that errors and cleans up after itself has
+	// left nothing to name. Without this line, an ActiveStep's identity
+	// write lands on its own scratch copy and never reaches e.current -- the
+	// run still ends at StateActive (isActive reads the step, not this
+	// field), but Workload would be silently stuck at the zero value on
+	// every real run, defeating the console-relabel-after-restart purpose
+	// the field exists for.
+	e.current.Workload = scratch.Workload
 	// Advance the cursor before this checkpoint is taken, not after: the
 	// save below must carry the advanced StepIndex, and it must complete
 	// before the next step begins (it does, trivially -- this call is

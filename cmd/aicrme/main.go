@@ -28,6 +28,7 @@ import (
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/observer"
+	"github.com/mchmarny/aicrme/internal/prove"
 	"github.com/mchmarny/aicrme/internal/steps"
 	"github.com/mchmarny/aicrme/internal/version"
 	"github.com/mchmarny/aicrme/internal/web"
@@ -443,6 +444,19 @@ func main() {
 			// test can exercise the real deploy.sh and the real helm binary
 			// against a cluster with no GPUs without installing anything.
 			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
+		}),
+		// The final step: a run that reaches here and returns without error
+		// ends at StateActive rather than StateDone (engine.ActiveStep), with
+		// the reference workload deliberately left running. prove.NewClient
+		// wraps the same in-cluster kube client the observer uses for
+		// telemetry -- nil outside a pod (see the block that constructs it,
+		// above), the same dev-mode limitation the rest of this arc already
+		// has once it reaches a step that needs a real cluster.
+		steps.NewProve(prove.NewClient(kube), steps.ProveConfig{
+			// My ruling (design doc's own open question): provisional, to be
+			// revisited against a real make demo once gang placement latency
+			// on a live cluster is measured rather than guessed.
+			GangTimeout: 3 * time.Minute,
 		}),
 	)
 
