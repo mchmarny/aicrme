@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
+	"github.com/mchmarny/aicrme/internal/prove"
 )
 
 // terminalSaveTimeout bounds the detached write finish performs. Terminal
@@ -34,6 +36,39 @@ const decideSaveTimeout = 5 * time.Second
 // call sites share the constant so the wording (and this package's own
 // tests, which match against it) cannot drift apart.
 const canceledByShutdownMsg = "canceled: console shutting down"
+
+// stopWaitAbsentTimeout bounds how long Stop waits for the workload's
+// foreground deletion to finish cascading before reporting failure. Chosen
+// to match steps.defaultGangTimeout's order of magnitude for the same
+// single Job (plus its pods) Prove creates -- engine has no dependency on
+// internal/steps (the reverse would be a cycle: steps already imports
+// engine), so this is a second, independently chosen constant for the same
+// real-world bound rather than a shared one.
+const stopWaitAbsentTimeout = 3 * time.Minute
+
+// unconfirmedCleanupMarker is the substring internal/steps' Prove step puts
+// in a run's Err when a pre-Active failure's OWN cleanup attempt could not
+// itself be confirmed (steps/prove.go's cleanup helper, spec §8 row 3: "keep
+// Start blocked" when cleanup cannot complete). engine cannot depend on
+// internal/steps to share this as a real constant -- steps already imports
+// engine, and the reverse would be a cycle -- so this package keys off the
+// wording instead. Deliberately more specific than "cleanup failed" alone:
+// both of steps/prove.go's two cleanup-failure messages ("...; cleanup
+// failed deleting the workload" and "...; cleanup failed waiting for the
+// workload to be gone") carry this exact "; cleanup failed" substring, and
+// an ordinary failure message has no reason to contain it. hasUnconfirmedCleanup
+// is the sole reader; engine_test.go pins the match against both exact
+// messages so a future reword on either side is caught here.
+const unconfirmedCleanupMarker = "; cleanup failed"
+
+// hasUnconfirmedCleanup reports whether r is a failed run whose own cleanup
+// attempt could not be confirmed -- see unconfirmedCleanupMarker. Ruling 12
+// (spec §8 row 3): such a run must keep blocking Start, the same as a
+// genuinely StateActive one, because the cluster may still be holding what
+// that cleanup could not verify it removed.
+func hasUnconfirmedCleanup(r *Run) bool {
+	return r.State == StateFailed && strings.Contains(r.Err, unconfirmedCleanupMarker)
+}
 
 // ErrDraining is what Start and Retry return once CancelAndWait has begun
 // shutting the engine down. ErrCodeUnavailable is what makes internal/api's
@@ -72,6 +107,17 @@ type Engine struct {
 	// it intermittently.
 	store Store
 	steps []Step
+
+	// proveClient deletes and confirms absence of the workload a run left
+	// running, for Stop -- the only exit from StateActive. Nil by default
+	// (New sets none), matching prove.Client's own nil-outside-a-pod
+	// contract; Stop checks Ready() before using it, the same guard
+	// steps.proveStep.Run already applies, rather than dereferencing a
+	// possibly-nil client. Set once via SetProveClient, before the engine
+	// starts serving Stop requests -- the same "assigned once, before
+	// concurrent readers exist" shape store's own doc comment describes for
+	// Recover's markStoreUnreadable exception.
+	proveClient *prove.Client
 
 	mu      sync.Mutex
 	current *Run
@@ -150,6 +196,22 @@ func randomID() string {
 	return hex.EncodeToString(buf[:])
 }
 
+// SetProveClient wires the cluster client Stop uses to delete and confirm
+// absence of the workload a run left running. Call once, before the engine
+// starts serving Stop requests (main.go, right after New) -- mirrors
+// markStoreUnreadable's "one exception, one lock hold" shape rather than
+// adding a required constructor parameter that every existing caller of New
+// (main.go and every test in this package and internal/api) would otherwise
+// have to thread through for a client only Stop needs. A nil client, or one
+// whose Ready() reports false, is valid and expected outside a cluster --
+// Stop then fails cleanly (ErrCodeUnavailable) rather than panicking, the
+// same posture steps.proveStep.Run already takes for the identical case.
+func (e *Engine) SetProveClient(c *prove.Client) {
+	e.mu.Lock()
+	e.proveClient = c
+	e.mu.Unlock()
+}
+
 // Start creates a run and executes it in the background. It returns as soon as
 // the run is registered; callers observe progress over the bus.
 func (e *Engine) Start(ctx context.Context) (*Run, error) {
@@ -178,6 +240,18 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
 			"a workload from the previous run is still running; stop it before starting a new run")
+	}
+	// Ruling 12 (spec §8 row 3): a failure is not enough to free Start when
+	// that failure's own cleanup could not itself be confirmed -- the
+	// cluster may still be holding what it tried and failed to verify it
+	// removed. Same remedy as StateActive's guard above (stop it), because
+	// from the operator's side it is the same problem: something might
+	// still be running, and Start starting over it is the outcome the whole
+	// discipline exists to prevent.
+	if e.current != nil && hasUnconfirmedCleanup(e.current) {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"a previous run's cleanup could not be confirmed; the workload may still be running -- resolve it before starting a new run")
 	}
 	previous := e.current
 	now := time.Now().UTC()
@@ -900,6 +974,17 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 		return aicrerrors.New(aicrerrors.ErrCodeConflict,
 			"run holds a running workload; stop the workload before discarding")
 	}
+	// Ruling 12's Start guard (above, in Start) is only real if Discard
+	// cannot clear e.current out from under it: discarding a run whose own
+	// cleanup could not be confirmed would nil e.current, and Start's guard
+	// checks e.current -- so a Discard-then-Start would silently reopen
+	// exactly the hole Ruling 12 closes. Same remedy as StateActive's reject
+	// two lines up, for the same underlying reason.
+	if hasUnconfirmedCleanup(e.current) {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"run's cleanup could not be confirmed; the workload may still be running -- resolve it before discarding")
+	}
 	previous := e.current
 	previousRecoveredPending := e.recoveredPending
 	epoch := e.epoch
@@ -936,6 +1021,90 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 		e.mu.Unlock()
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "deleting the persisted run failed", err)
 	}
+	return nil
+}
+
+// stoppable reports whether r is a valid target for Stop: either genuinely
+// StateActive, or StateDone with a workload identity still recorded -- the
+// shape a run has immediately after Stop itself finishes it (see Stop's own
+// e.finish call below). That second arm is what makes Stop idempotent
+// against a real double-click or a racing reconciliation (spec §7:
+// "stopping an already-stopped workload succeeds") without also accepting a
+// run that reached StateDone by ordinary completion and never held a
+// workload at all: only an ActiveStep's own write ever sets Workload
+// (runStep's success-path merge; run.go's doc comment on the field), so a
+// run whose last step was not one carries the zero value here and stays
+// rejected. Workload's CONTENTS play no part in this check, only its
+// presence -- Delete and WaitAbsent below still address the workload by
+// runID alone, exactly as every other prove.Client caller does; leaning on
+// Workload for more than that would contradict its own "hint, not
+// identity" doc comment.
+func stoppable(r *Run) bool {
+	return r.State == StateActive || (r.State == StateDone && r.Workload != (Workload{}))
+}
+
+// Stop is the only way a run leaves StateActive -- operator-initiated,
+// always. Nothing in this file calls it on the operator's behalf: not on
+// restart (Recover installs a persisted StateActive record as StateActive,
+// unresumed -- see recover.go), not on a timeout, not as a side effect of
+// Start. Same rule as Reset, for the same reason: it destroys something the
+// operator is watching (spec §7).
+//
+// Foreground deletion, then WaitAbsent, and StateDone is set ONLY once both
+// have succeeded -- active_test.go's bite-proof pins this exact ordering:
+// reversing it (finishing at StateDone before confirming absence) is what
+// makes TestFailedStopLeavesRunActive fail alone. On any failure the run is
+// left exactly where it was, StateActive, and the returned error names what
+// failed -- it must never claim to have stopped something it did not (spec
+// §7's one outcome this design most wants to avoid).
+//
+// Idempotent per stoppable's second arm above and per prove.Client.Delete's
+// own contract (a missing workload is success -- its doc comment): an
+// operator double-click, or a reconciliation racing one, sees nil either
+// way.
+func (e *Engine) Stop(ctx context.Context, runID string) error {
+	e.mu.Lock()
+	// Same guard as Start/Retry/Discard, same reason: requireNotDraining
+	// gates the outer mux, but a request that cleared that check
+	// microseconds before Drain() still reaches here.
+	if e.draining {
+		e.mu.Unlock()
+		return ErrDraining
+	}
+	if e.current == nil || e.current.ID != runID {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
+	}
+	if !stoppable(e.current) {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeConflict, "run has no active workload to stop")
+	}
+	if e.proveClient == nil || !e.proveClient.Ready() {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeUnavailable,
+			"stop: a live cluster client is required to stop the reference workload")
+	}
+	epoch := e.epoch
+	e.mu.Unlock()
+
+	if err := e.proveClient.Delete(ctx, runID); err != nil {
+		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
+	}
+	if err := e.proveClient.WaitAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
+		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
+	}
+
+	// finish is what actually persists StateDone and publishes the terminal
+	// bus event -- the same call every other terminal transition in this
+	// file uses (execute's own StateActive/StateFailed sites). epoch was
+	// captured before the two cluster calls above: nothing can bump e.epoch
+	// while e.current.State is StateActive or the Stop-produced StateDone
+	// stoppable's second arm accepts -- Start's own guard rejects
+	// StateActive outright, and Retry requires StateFailed -- so
+	// aliveLocked(epoch) inside finish is a defensive re-check here, not a
+	// load-bearing one, matching the rationale every other call site in
+	// this file already gives for checking anyway.
+	e.finish(ctx, epoch, StateDone, "")
 	return nil
 }
 

@@ -412,6 +412,10 @@ func main() {
 	if kube == nil {
 		slog.Warn("no cluster client; any run that reaches Prove will fail until aicrme runs in-cluster")
 	}
+	// One instance, shared between the Prove step below and eng.SetProveClient
+	// further down -- see that call's comment for why a second construction
+	// site is worth avoiding even though both would be equivalent today.
+	proveClient := prove.NewClient(kube)
 
 	eng := engine.New(b, runStore,
 		steps.NewDiscover(client, steps.DiscoverConfig{
@@ -457,17 +461,28 @@ func main() {
 		}),
 		// The final step: a run that reaches here and returns without error
 		// ends at StateActive rather than StateDone (engine.ActiveStep), with
-		// the reference workload deliberately left running. prove.NewClient
+		// the reference workload deliberately left running. proveClient
 		// wraps the same in-cluster kube client the observer uses for
 		// telemetry, nil outside a pod -- see the Warn above for why that no
 		// longer risks the process.
-		steps.NewProve(prove.NewClient(kube), steps.ProveConfig{
+		steps.NewProve(proveClient, steps.ProveConfig{
 			// My ruling (design doc's own open question): provisional, to be
 			// revisited against a real make demo once gang placement latency
 			// on a live cluster is measured rather than guessed.
 			GangTimeout: 3 * time.Minute,
 		}),
 	)
+	// Stop (Task 7) is the only way a run leaves StateActive, and it needs
+	// the same client the Prove step above just used to create the
+	// workload -- one instance, shared, rather than a second one wrapping
+	// the same kube: both are stateless beyond that one field, but a second
+	// construction site is a second place for the two to silently diverge
+	// if either ever grows real state. Set after New, not threaded through
+	// it: engine.New's signature is shared by every test in this binary's
+	// dependency tree (internal/engine and internal/api together construct
+	// it at ~80 call sites), and Stop is the only caller that needs a
+	// cluster client at all.
+	eng.SetProveClient(proveClient)
 
 	srv, err := api.New(api.Config{
 		Username:   envOr("AICRME_USERNAME", "admin"),
