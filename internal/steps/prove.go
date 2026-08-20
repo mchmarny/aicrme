@@ -67,13 +67,28 @@ func (p *proveStep) Requires() []string { return nil }
 func (p *proveStep) LeavesWorkloadRunning() bool { return true }
 
 func (p *proveStep) Run(ctx context.Context, run *engine.Run, emit engine.Emit) error {
+	// kube can be nil outside a pod (main.go's dev-mode fallback); every
+	// other Client method dereferences it immediately and panics rather than
+	// degrading, so this failed run -- not the whole process -- is the
+	// outcome of reaching Prove without a live cluster.
+	if !p.client.Ready() {
+		return aicrerrors.New(aicrerrors.ErrCodeUnavailable,
+			"prove: a live cluster client is required to run the reference workload")
+	}
+
 	if err := p.client.EnsureNamespace(ctx); err != nil {
 		return err
 	}
 
 	emit(bus.Event{Kind: bus.KindLog, Message: "applying the reference workload"})
 	if err := p.client.Apply(ctx, run.ID); err != nil {
-		return err
+		// A Create can fail client-side (timeout, connection reset, a proxy
+		// 502) after the API server has already accepted it, leaving the
+		// Job in the cluster with nothing telling this run it exists. Spec
+		// section 8 row 1: a partial apply must still clean up. cleanup is
+		// safe to call unconditionally here -- Client.Delete treats NotFound
+		// as success, so a genuinely never-created Job costs one 404.
+		return p.cleanup(ctx, run.ID, err)
 	}
 
 	if err := p.awaitGang(ctx, run.ID, emit); err != nil {

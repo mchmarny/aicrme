@@ -49,6 +49,21 @@ func unrelatedJob() *batchv1.Job {
 	}
 }
 
+func TestClientReadyWithLiveKube(t *testing.T) {
+	if !prove.NewClient(fake.NewSimpleClientset()).Ready() {
+		t.Error("Ready() = false, want true for a live kube client")
+	}
+}
+
+// A caller (steps.proveStep.Run) must be able to tell a nil kube apart from
+// a live one before issuing any other call -- every other method
+// dereferences kube immediately and panics on nil rather than degrading.
+func TestClientReadyWithNilKube(t *testing.T) {
+	if prove.NewClient(nil).Ready() {
+		t.Error("Ready() = true, want false for a nil kube client")
+	}
+}
+
 // Idempotent: stopping an already-stopped workload succeeds. An operator who
 // clicks Stop twice, or a reconciliation that races one, must not see an
 // error.
@@ -278,7 +293,9 @@ func TestEnsureNamespaceIsIdempotent(t *testing.T) {
 // placedPod is what a scheduler (or, on a fake clientset, a test standing in
 // for one) leaves behind the instant it binds a gang member: the same
 // ownership labels Render gives every pod in the workload's template, plus
-// Spec.NodeName set -- the field PlacedNodes actually reads.
+// Spec.NodeName set -- the field PlacedNodes actually reads. Phase defaults
+// to Running (the common healthy case); tests exercising the liveness
+// qualifier override it.
 func placedPod(runID, name, node string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -286,7 +303,8 @@ func placedPod(runID, name, node string) *corev1.Pod {
 			Namespace: prove.Namespace,
 			Labels:    prove.Labels(runID),
 		},
-		Spec: corev1.PodSpec{NodeName: node},
+		Spec:   corev1.PodSpec{NodeName: node},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 }
 
@@ -305,6 +323,43 @@ func TestPlacedNodesReturnsOnlyScheduledPods(t *testing.T) {
 	}
 	if len(got) != 1 || got["prove-run-abc-0"] != "gpu-node-0" {
 		t.Errorf("PlacedNodes() = %+v, want exactly the one scheduled pod", got)
+	}
+}
+
+// A pod already bound to a node but not yet started is Pending, not
+// Running -- a live scheduler leaves a pod in exactly this state for a
+// window after binding, before any kubelet has started its containers.
+// Excluding Pending would make placement detection slower than the signal
+// it exists to read.
+func TestPlacedNodesCountsPendingAsPlaced(t *testing.T) {
+	pod := placedPod("run-abc", "prove-run-abc-0", "gpu-node-0")
+	pod.Status.Phase = corev1.PodPending
+	cs := fake.NewSimpleClientset(pod)
+	got, err := prove.NewClient(cs).PlacedNodes(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatalf("PlacedNodes() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("PlacedNodes() = %+v, want the Pending-but-bound pod counted as placed", got)
+	}
+}
+
+// Spec.NodeName survives into Succeeded and Failed -- reading it alone
+// would report a dead gang member as placed, and with workload.yaml's
+// backoffLimit: 0 a Failed pod is never replaced, so the Job is
+// permanently dead even though the gang would read as fully placed.
+func TestPlacedNodesExcludesTerminatedPods(t *testing.T) {
+	failed := placedPod("run-abc", "prove-run-abc-0", "gpu-node-0")
+	failed.Status.Phase = corev1.PodFailed
+	succeeded := placedPod("run-abc", "prove-run-abc-1", "gpu-node-1")
+	succeeded.Status.Phase = corev1.PodSucceeded
+	cs := fake.NewSimpleClientset(failed, succeeded)
+	got, err := prove.NewClient(cs).PlacedNodes(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatalf("PlacedNodes() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("PlacedNodes() = %+v, want both terminated pods excluded", got)
 	}
 }
 

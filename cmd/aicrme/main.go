@@ -403,6 +403,16 @@ func main() {
 	namespace := envOr("AICRME_NAMESPACE", "aicrme")
 	runStore := newRunStore(ctx, kube, namespace, envOr("AICRME_DEPLOYMENT_NAME", "aicrme"))
 
+	// Same nil kube as the telemetry warning above and newRunStore's own --
+	// the third and most consequential-sounding of the three, since a run
+	// that reaches Prove without it fails outright rather than merely
+	// degrading. Prove itself already guards against a nil client (Client.Ready,
+	// checked first in proveStep.Run) and fails just that one run rather than
+	// the process, so this is visibility for the operator, not the guard.
+	if kube == nil {
+		slog.Warn("no cluster client; any run that reaches Prove will fail until aicrme runs in-cluster")
+	}
+
 	eng := engine.New(b, runStore,
 		steps.NewDiscover(client, steps.DiscoverConfig{
 			Namespace: namespace,
@@ -449,9 +459,8 @@ func main() {
 		// ends at StateActive rather than StateDone (engine.ActiveStep), with
 		// the reference workload deliberately left running. prove.NewClient
 		// wraps the same in-cluster kube client the observer uses for
-		// telemetry -- nil outside a pod (see the block that constructs it,
-		// above), the same dev-mode limitation the rest of this arc already
-		// has once it reaches a step that needs a real cluster.
+		// telemetry, nil outside a pod -- see the Warn above for why that no
+		// longer risks the process.
 		steps.NewProve(prove.NewClient(kube), steps.ProveConfig{
 			// My ruling (design doc's own open question): provisional, to be
 			// revisited against a real make demo once gang placement latency

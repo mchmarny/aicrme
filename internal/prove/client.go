@@ -22,10 +22,19 @@ type Client struct {
 }
 
 // NewClient wraps an existing clientset. Tests pass fake.NewSimpleClientset;
-// production wiring passes the real one.
+// production wiring passes the real one -- which can be nil outside a pod
+// (rest.InClusterConfig fails on a developer laptop), so a caller must check
+// Ready before issuing any other call.
 func NewClient(kube kubernetes.Interface) *Client {
 	return &Client{kube: kube}
 }
+
+// Ready reports whether this Client has a live cluster connection. Every
+// other method dereferences kube immediately on call and panics on a nil
+// one rather than degrading -- callers that cannot guarantee a non-nil kube
+// (main.go's dev-mode fallback) must check this first and fail their own
+// caller cleanly instead.
+func (c *Client) Ready() bool { return c.kube != nil }
 
 // OwnedWorkload is what ListOwned returns for a discovered workload: enough
 // identity for the console to name it, offer Stop, or adopt it into a
@@ -150,15 +159,20 @@ func (c *Client) WaitAbsent(ctx context.Context, runID string, timeout time.Dura
 	}
 }
 
-// PlacedNodes returns, for runID's gang, the node each already-scheduled pod
-// has been bound to, keyed by pod name. A pod absent from the result has not
-// been placed yet.
+// PlacedNodes returns, for runID's gang, the node each already-scheduled AND
+// still-live pod has been bound to, keyed by pod name. A pod absent from the
+// result has either not been placed yet or has already terminated.
 //
 // Reading Spec.NodeName -- the field the scheduler itself writes the instant
-// it binds a pod -- rather than Status.Phase is what makes this trustworthy
-// against a fake clientset that runs no kubelet and would never advance
-// Phase past Pending: NodeName means "scheduled" on a real cluster and a
-// faked one alike, with no controller needing to run for it to mean that.
+// it binds a pod -- rather than Status.Phase alone is what makes placement
+// itself trustworthy against a fake clientset that runs no kubelet and would
+// never advance Phase past Pending: NodeName means "scheduled" on a real
+// cluster and a faked one alike, with no controller needing to run for it to
+// mean that. But NodeName alone is not sufficient: it survives into
+// Succeeded and Failed, so without the Phase check below, a gang member that
+// already died -- and, with workload.yaml's backoffLimit: 0, will never be
+// replaced -- would still be counted as placed, reporting a permanently
+// failed Job as a successfully running gang.
 func (c *Client) PlacedNodes(ctx context.Context, runID string) (map[string]string, error) {
 	list, err := c.kube.CoreV1().Pods(Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(Labels(runID)).String(),
@@ -168,9 +182,13 @@ func (c *Client) PlacedNodes(ctx context.Context, runID string) (map[string]stri
 	}
 	out := make(map[string]string, len(list.Items))
 	for _, pod := range list.Items {
-		if pod.Spec.NodeName != "" {
-			out[pod.Name] = pod.Spec.NodeName
+		if pod.Spec.NodeName == "" {
+			continue
 		}
+		if pod.Status.Phase != corev1.PodPending && pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		out[pod.Name] = pod.Spec.NodeName
 	}
 	return out, nil
 }
