@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER_NAME
+  namespace: PLACEHOLDER_NAMESPACE
+  labels:
+PLACEHOLDER_LABELS
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+PLACEHOLDER_POD_LABELS
+      annotations:
+        # kai-scheduler gangs on this. Two pods, all-or-nothing: the demo's
+        # claim is that the cluster can place a multi-node GPU job, and a job
+        # that limps along one pod at a time would not show that.
+        kai.scheduler/queue: default
+    spec:
+      schedulerName: kai-scheduler
+      restartPolicy: Never
+      # The gang can only fit where nvidia.com/gpu is advertised, and the
+      # nodes that advertise it are routinely tainted. Without these the gang
+      # is admitted, grouped, and then never placed: measured on a real KWOK
+      # cluster, where kai-scheduler answered "no nodes with enough resources
+      # were found: 4 node(s) had untolerated taint(s)" and Prove timed out,
+      # cleaned up, and failed the run -- on the only path Phase 3 has.
+      #
+      # kwok.x-k8s.io/node=fake is on every simulated node test/e2e/lib.sh
+      # creates, which is what `make demo` and every e2e job stand up.
+      # nvidia.com/gpu is what GKE puts on a GPU node pool (and what EKS and
+      # AKS optionally put on theirs), so this is not simulation-only
+      # scaffolding -- a reference GPU workload that tolerates neither cannot
+      # run on a large fraction of real GPU clusters either.
+      #
+      # Named taints, never a catch-all `operator: Exists` with no key: this
+      # step's entire claim is that a GPU-aware scheduler chose GPU nodes, and
+      # a pod that tolerates everything makes that claim unfalsifiable.
+      tolerations:
+        - key: kwok.x-k8s.io/node
+          operator: Equal
+          value: fake
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: allreduce
+          image: busybox:1.36
+          command: ["sh", "-c", "echo placement proven; sleep infinity"]
+          resources:
+            limits:
+              nvidia.com/gpu: 8

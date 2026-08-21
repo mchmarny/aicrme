@@ -28,6 +28,7 @@ import (
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/observer"
+	"github.com/mchmarny/aicrme/internal/prove"
 	"github.com/mchmarny/aicrme/internal/steps"
 	"github.com/mchmarny/aicrme/internal/version"
 	"github.com/mchmarny/aicrme/internal/web"
@@ -54,6 +55,15 @@ const defaultWorkDir = "/var/lib/aicrme"
 // the script's own default. Its backoff is quadratic and each attempt
 // surfaces as a warn event, so the wait is visible rather than silent.
 const defaultApplyRetries = 5
+
+// defaultProveGangTimeout is how long the Prove step waits for kai-scheduler
+// to place every member of its gang. Measured rather than guessed: on the
+// KWOK demo cluster both members were bound within two seconds of the Job
+// being created, so this is generous by two orders of magnitude -- which is
+// the right side to be generous on for real hardware, where the gang waits on
+// image pulls and node readiness too. Overridable only through
+// proveGangTimeout's env knob, for the e2e.
+const defaultProveGangTimeout = 3 * time.Minute
 
 // runShutdownTimeout bounds how long shutdown waits for an in-flight run to
 // stop. The worst case is killGrace (internal/applier/exec.go, 10s: the
@@ -402,6 +412,20 @@ func main() {
 	namespace := envOr("AICRME_NAMESPACE", "aicrme")
 	runStore := newRunStore(ctx, kube, namespace, envOr("AICRME_DEPLOYMENT_NAME", "aicrme"))
 
+	// Same nil kube as the telemetry warning above and newRunStore's own --
+	// the third and most consequential-sounding of the three, since a run
+	// that reaches Prove without it fails outright rather than merely
+	// degrading. Prove itself already guards against a nil client (Client.Ready,
+	// checked first in proveStep.Run) and fails just that one run rather than
+	// the process, so this is visibility for the operator, not the guard.
+	if kube == nil {
+		slog.Warn("no cluster client; any run that reaches Prove will fail until aicrme runs in-cluster")
+	}
+	// One instance, shared between the Prove step below and eng.SetProveClient
+	// further down -- see that call's comment for why a second construction
+	// site is worth avoiding even though both would be equivalent today.
+	proveClient := prove.NewClient(kube)
+
 	eng := engine.New(b, runStore,
 		steps.NewDiscover(client, steps.DiscoverConfig{
 			Namespace: namespace,
@@ -444,7 +468,29 @@ func main() {
 			// against a cluster with no GPUs without installing anything.
 			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
 		}),
+		// The final step: a run that reaches here and returns without error
+		// ends at StateActive rather than StateDone (engine.ActiveStep), with
+		// the reference workload deliberately left running. proveClient
+		// wraps the same in-cluster kube client the observer uses for
+		// telemetry, nil outside a pod -- see the Warn above for why that no
+		// longer risks the process.
+		steps.NewProve(proveClient, steps.ProveConfig{
+			// The design doc's own open question, now answered against a real
+			// cluster rather than guessed -- see defaultProveGangTimeout.
+			GangTimeout: proveGangTimeout(),
+		}),
 	)
+	// Stop (Task 7) is the only way a run leaves StateActive, and it needs
+	// the same client the Prove step above just used to create the
+	// workload -- one instance, shared, rather than a second one wrapping
+	// the same kube: both are stateless beyond that one field, but a second
+	// construction site is a second place for the two to silently diverge
+	// if either ever grows real state. Set after New, not threaded through
+	// it: engine.New's signature is shared by every test in this binary's
+	// dependency tree (internal/engine and internal/api together construct
+	// it at ~80 call sites), and Stop is the only caller that needs a
+	// cluster client at all.
+	eng.SetProveClient(proveClient)
 
 	srv, err := api.New(api.Config{
 		Username:   envOr("AICRME_USERNAME", "admin"),
@@ -481,6 +527,25 @@ func main() {
 	}
 	if eng.StoreUnreadable() {
 		slog.Warn("persisted run checkpoint was unreadable or failed validation; starting without it")
+	}
+
+	// Immediately after Recover and, like it, before ListenAndServe below:
+	// the record Recover just installed (or failed to find) is only half the
+	// state -- the workload it describes outlives this process independently,
+	// and the store can lose the record while the workload keeps holding
+	// GPUs. Reconciling settles the two against each other and, in the case
+	// that matters most, adopts a workload with no surviving record so the
+	// operator gets a Stop button back rather than a cluster only kubectl can
+	// clean up.
+	//
+	// Never fatal: an unreachable API server here costs the console its
+	// bearings on a leftover workload, which is worth a loud warning and not
+	// worth refusing to start over. The call itself is bounded (one List) and
+	// deliberately decides nothing when that List fails -- see its own doc
+	// comment for why a failed list must not be read as "gone".
+	if err := eng.ReconcileWorkloads(ctx, proveClient); err != nil {
+		slog.Warn("could not reconcile reference workloads left in the cluster; one may still be running untracked",
+			"error", err)
 	}
 
 	// Every fatal startup check is above this point; only degrade-and-warn
@@ -581,6 +646,35 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// proveGangTimeout returns how long the Prove step waits for its gang to be
+// placed: AICRME_PROVE_GANG_TIMEOUT when it holds a positive Go duration, and
+// defaultProveGangTimeout otherwise.
+//
+// The override exists for one caller, test/e2e/prove.sh, which deliberately
+// makes placement impossible and would otherwise wait out the full default
+// to observe the cleanup that follows. Deliberately env-only and NOT a chart
+// value, exactly like AICRME_SNAPSHOT_NODE_SELECTOR: putting it in
+// values.yaml would advertise a knob that only makes sense on a cluster where
+// nothing can be placed at all.
+//
+// An unparseable or non-positive value degrades to the default rather than
+// refusing to start (same posture as parseNodeSelector): a mistyped override
+// for a simulated cluster should not be able to take the console down.
+func proveGangTimeout() time.Duration {
+	const key = "AICRME_PROVE_GANG_TIMEOUT"
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultProveGangTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("ignoring an unparseable gang-timeout override",
+			"key", key, "value", v, "using", defaultProveGangTimeout)
+		return defaultProveGangTimeout
+	}
+	return d
 }
 
 // parseNodeSelector turns a "key=value,key2=value2" list into a node

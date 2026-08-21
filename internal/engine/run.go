@@ -55,16 +55,53 @@ type Run struct {
 	// Components is the latest known state of each component the bundle
 	// installs.
 	Components []ComponentState `json:"components,omitempty"`
+	// Workload names the reference workload an ActiveStep left running, so
+	// the console can label it after a restart. It is a hint, not the
+	// source of truth -- see Workload's doc comment.
+	//
+	// omitzero, not omitempty: omitempty is a no-op on a struct field (a
+	// zero-value struct is never "empty" by encoding/json's rules), so a
+	// run that never went active would still serialize
+	// "workload":{"namespace":"","kind":"","name":""} -- and
+	// `if (run.workload)` in the console is truthy for that empty object.
+	Workload Workload `json:"workload,omitzero"`
 	// StepIndex is the index of the next step to execute. It exists so a
 	// failed run can be retried from the step that failed rather than from
 	// the top: re-running Discover would redeploy the snapshot agent Job
 	// and take minutes, and re-running Recommend would discard the
 	// decisions the user already made. It advances only after a step
 	// succeeds, so a failure leaves it pointing at the step to retry.
-	StepIndex int       `json:"stepIndex"`
-	Err       string    `json:"error,omitempty"`
-	StartedAt time.Time `json:"startedAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	StepIndex int    `json:"stepIndex"`
+	Err       string `json:"error,omitempty"`
+	// CleanupUnconfirmed is set (from the failing Step's own returned error,
+	// via errors.Is against engine.ErrUnconfirmedCleanup) when a StateFailed
+	// run's own pre-Active cleanup could not itself be confirmed -- Ruling
+	// 12 (spec §8 row 3). Deliberately a structural field, not something
+	// re-derived from Err: Err is human text that Retry legitimately
+	// overwrites on every attempt, so a guard keyed off it would clear the
+	// moment a retry failed for any unrelated, cleanly-cleaned-up reason
+	// (fix round 1's C2).
+	//
+	// Sticky, not recomputed unconditionally (fix round 2's N2): runStep
+	// moves this field only on positive evidence -- errors.Is against
+	// engine.ErrUnconfirmedCleanup (sets true) or engine.ErrCleanupConfirmed
+	// (clears to false) -- and leaves it exactly as it was on every other
+	// failure, including one whose cleanup logic was never reached at all.
+	// Retry does NOT reset this eagerly: that was fix round 1's shape, and
+	// it reintroduced the same defect one call site over (a retry parked or
+	// canceled before runStep's failure branch ever ran would otherwise
+	// clear a guard nothing had confirmed resolved).
+	//
+	// Persisted by envelope.go, which is a hand-maintained projection of
+	// this type, not a reuse of these json tags -- fix round 2's N1 found
+	// this field had gone a full fix round without a producer there, so a
+	// restart silently dropped the guard. envelope_test.go's parity test
+	// (fix round 3's Ruling 20) now checks every exported Run field is
+	// either carried by envelope or named in its exclusion list, so that
+	// class of gap fails a test instead of shipping again.
+	CleanupUnconfirmed bool      `json:"cleanupUnconfirmed,omitempty"`
+	StartedAt          time.Time `json:"startedAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
 	// Truncated names artifacts the store dropped to fit its size limit (see
 	// encodeRun). It is read-mostly state about the RECORD, not the run: the
 	// engine never sets it, decodeRun populates it on load, and encodeRun

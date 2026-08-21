@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/kubernetes/fake"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
@@ -630,6 +633,99 @@ func TestRecoverInstallsARunPersistedBeforeAnyStepRan(t *testing.T) {
 	}
 }
 
+// waitForPersistedState polls store directly -- not the engine's in-memory
+// Get -- until id's STORED record reports want or 2 seconds pass. Fix round
+// 3's NEW-2: finish sets Run.State under e.mu but Saves the checkpoint only
+// AFTER releasing it (engine.go), so a caller that treats an in-memory Get
+// reflecting the terminal state as proof the CHECKPOINT is written races
+// that Save. Confirmed non-hypothetical: this exact race made
+// TestUnconfirmedCleanupSurvivesRestart fail once under `-race ./...`
+// (recovering Err "interrupted by a console restart", StepIndex 0,
+// CleanupUnconfirmed false -- the PRIOR, pre-failure checkpoint), and
+// widening the window by 50ms made it fail every time. A restart test's
+// whole point is what a SECOND process reading the STORE would see, so it
+// must wait on the store, not on the first process's own memory.
+func waitForPersistedState(t *testing.T, store engine.Store, id string, want engine.State) *engine.Run {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var r *engine.Run
+	var err error
+	for {
+		r, err = store.Load(context.Background(), id)
+		if err == nil && r.State == want {
+			return r
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("persisted record never reached state %q, last err=%v run=%+v", want, err, r)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestUnconfirmedCleanupSurvivesRestart is fix round 2's N1 regression:
+// envelope.go is a hand-maintained projection -- its own doc comment says
+// it deliberately does not reuse Run's json tags -- and Run.CleanupUnconfirmed
+// went a full fix round without a producer there, so a pod restart silently
+// dropped Ruling 12's guard while the OLD Run.Err text it replaced would
+// have survived just fine. This is why NewMemoryStore cannot be used here:
+// its Save/Load clone the Run struct directly in-process and never touch
+// encodeRun/decodeRun at all, so it would report this field surviving
+// correctly whether or not envelope.go actually carries it. The real
+// ConfigMap-backed store, and a genuinely SECOND *engine.Engine instance
+// over the same persisted record, is what simulates the pod restart spec
+// §9's own recovered-StateActive flow describes.
+func TestUnconfirmedCleanupSurvivesRestart(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	store := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+
+	proveStep := newFakeStep(engine.PhaseProve)
+	proveStep.err = fmt.Errorf("run failed: %w", engine.ErrUnconfirmedCleanup)
+	before := engine.New(bus.New(64), store, newFakeStep(engine.PhaseBundle), proveStep)
+
+	run, err := before.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	// waitForPersistedState, not waitState -- see its own doc comment
+	// (fix round 3's NEW-2). before.Discard below reads e.current directly
+	// (not the store), so it is unaffected by this race either way, but the
+	// Recover() call after it is exactly the read this race can corrupt.
+	failed := waitForPersistedState(t, store, run.ID, engine.StateFailed)
+	if !failed.CleanupUnconfirmed {
+		t.Fatalf("fixture run.CleanupUnconfirmed = false before restart, want true")
+	}
+	if discardErr := before.Discard(context.Background(), run.ID); discardErr == nil {
+		t.Fatal("fixture check: Discard() succeeded before restart, want the unconfirmed-cleanup guard blocking")
+	}
+
+	// A genuinely second engine instance over the same underlying
+	// ConfigMap, not a second call on `before` -- the shape an actual pod
+	// restart produces.
+	after := engine.New(bus.New(64), store, newFakeStep(engine.PhaseBundle), newFakeStep(engine.PhaseProve))
+	if recoverErr := after.Recover(context.Background()); recoverErr != nil {
+		t.Fatalf("Recover() error = %v", recoverErr)
+	}
+	recovered, err := after.Get(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if recovered.State != engine.StateFailed || !recovered.CleanupUnconfirmed {
+		t.Fatalf("recovered run = %+v, want StateFailed with CleanupUnconfirmed = true", recovered)
+	}
+
+	// Discard is not gated by recoveredPending (Retry and Discard are the
+	// only two things that clear it), so this specifically exercises
+	// Ruling 12's guard surviving the restart, not a different gate.
+	if discardErr := after.Discard(context.Background(), run.ID); discardErr == nil {
+		t.Error("Discard() succeeded on the recovered run -- Ruling 12's guard did not survive the restart")
+	}
+	// End to end: whatever the exact gate, the operator must still not be
+	// able to start a new run over the unresolved orphan post-restart.
+	if _, startErr := after.Start(context.Background()); startErr == nil {
+		t.Error("Start() succeeded on the recovered run -- a new run started over an unconfirmed orphan after a restart")
+	}
+}
+
 // TestStartWithNoStepsDoesNotPanic pins the guard: an engine built with no
 // steps (test-only -- main.go always assembles a real step slice, and
 // internal/api's test suite constructs engines this way deliberately, to
@@ -892,12 +988,33 @@ func TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState(t *testing.T) {
 					}
 				}
 
-				// Discard is the affordance that must exist for EVERY state,
-				// including the terminal ones Retry refuses outright. This is
-				// Scenario B: a completed run's record survives, the next
-				// helm upgrade recovers it, and Retry answers "run is not in
-				// a failed state" -- so if Discard did not work here the
-				// console would be bricked by an ordinary upgrade.
+				// Discard is the affordance that must exist for every state
+				// Retry refuses outright -- Scenario B: a completed run's
+				// record survives, the next helm upgrade recovers it, Retry
+				// answers "run is not in a failed state", and without Discard
+				// the console would be bricked by an ordinary upgrade.
+				//
+				// StateActive is the one exception, and a restart does not
+				// remove it: a recovered StateActive record names a workload
+				// that may still be running in the cluster exactly as it
+				// would for a live process's own StateActive run, so
+				// Discard's job here is to refuse and name the same remedy --
+				// see TestDiscardRejectsActiveRun, which pins the identical
+				// invariant for the live-process case this loop cannot reach.
+				if state == engine.StateActive {
+					err := e.Discard(context.Background(), testRunID)
+					if err == nil {
+						t.Fatal("Discard() succeeded on a recovered active run -- it would orphan the workload")
+					}
+					var se *aicrerrors.StructuredError
+					if !errors.As(err, &se) || se.Code != aicrerrors.ErrCodeConflict {
+						t.Errorf("Discard() error = %v, want ErrCodeConflict", err)
+					}
+					if !strings.Contains(err.Error(), "stop") {
+						t.Errorf("Discard() error = %q, want it to name stopping the workload", err)
+					}
+					return
+				}
 				if err := e.Discard(context.Background(), testRunID); err != nil {
 					t.Fatalf("Discard() error = %v, want a recovered run discardable in every state", err)
 				}

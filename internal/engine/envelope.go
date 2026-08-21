@@ -69,6 +69,30 @@ type envelope struct {
 	// rolled back to the previous image, and bumping the version would turn
 	// a rollback into an unreadable-record degradation for no gain.
 	Truncated []string `json:"truncated,omitempty"`
+	// Workload is the same optional-on-both-sides addition as Truncated:
+	// a record written before this field existed has no "workload" key,
+	// gunzipJSON leaves it as the zero value, and that is a correct decode,
+	// not a degraded one -- so this does not bump envelopeVersion either.
+	//
+	// omitzero, not omitempty: see Run.Workload's comment. omitempty would
+	// write the zero-value struct into every record that never went active.
+	Workload Workload `json:"workload,omitzero"`
+	// CleanupUnconfirmed is the same optional-on-both-sides addition as
+	// Truncated and Workload: a record written before this field existed has
+	// no "cleanupUnconfirmed" key, gunzipJSON leaves it false, and that is a
+	// correct decode for every record that predates Ruling 12 (nothing
+	// before this field could have set it true), not a degraded one -- so
+	// this does not bump envelopeVersion either.
+	//
+	// Fix round 2's N1: this envelope is a hand-maintained projection, not
+	// Run's own json tags (see the type's doc comment) -- Run.CleanupUnconfirmed
+	// existed for a full fix round without a producer here, so a pod restart
+	// silently dropped Ruling 12's guard while carrying the OLD, now-removed
+	// Run.Err text it replaced. decodeRun's caller (Recover) leaves a
+	// recovered StateFailed run's State exactly as stored (recover.go only
+	// touches isLive/StateIdle states), so this field surviving the round
+	// trip is what makes the guard survive a restart at all.
+	CleanupUnconfirmed bool `json:"cleanupUnconfirmed,omitempty"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -136,18 +160,20 @@ func gunzipJSON(blob []byte, v any) error {
 // dropped from the state machine would be worse than refusing.
 func encodeRun(r *Run) ([]byte, error) {
 	env := envelope{
-		Version:    envelopeVersion,
-		ID:         r.ID,
-		State:      r.State,
-		Phase:      r.Phase,
-		Decisions:  r.Decisions,
-		Pending:    r.Pending,
-		Components: r.Components,
-		StepIndex:  r.StepIndex,
-		Err:        r.Err,
-		StartedAt:  r.StartedAt,
-		UpdatedAt:  r.UpdatedAt,
-		Artifacts:  make(map[string][]byte, len(r.Artifacts)),
+		Version:            envelopeVersion,
+		ID:                 r.ID,
+		State:              r.State,
+		Phase:              r.Phase,
+		Decisions:          r.Decisions,
+		Pending:            r.Pending,
+		Components:         r.Components,
+		StepIndex:          r.StepIndex,
+		Err:                r.Err,
+		StartedAt:          r.StartedAt,
+		UpdatedAt:          r.UpdatedAt,
+		Workload:           r.Workload,
+		CleanupUnconfirmed: r.CleanupUnconfirmed,
+		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
 		// on the first try and produce a record claiming completeness while
@@ -223,18 +249,20 @@ func decodeRun(blob []byte) (*Run, error) {
 			fmt.Sprintf("unsupported run schema version %d (this build writes %d)", env.Version, envelopeVersion))
 	}
 	r := &Run{
-		ID:         env.ID,
-		State:      env.State,
-		Phase:      env.Phase,
-		Decisions:  env.Decisions,
-		Pending:    env.Pending,
-		Components: env.Components,
-		StepIndex:  env.StepIndex,
-		Err:        env.Err,
-		StartedAt:  env.StartedAt,
-		UpdatedAt:  env.UpdatedAt,
-		Artifacts:  env.Artifacts,
-		Truncated:  env.Truncated,
+		ID:                 env.ID,
+		State:              env.State,
+		Phase:              env.Phase,
+		Decisions:          env.Decisions,
+		Pending:            env.Pending,
+		Components:         env.Components,
+		StepIndex:          env.StepIndex,
+		Err:                env.Err,
+		StartedAt:          env.StartedAt,
+		UpdatedAt:          env.UpdatedAt,
+		Artifacts:          env.Artifacts,
+		Truncated:          env.Truncated,
+		Workload:           env.Workload,
+		CleanupUnconfirmed: env.CleanupUnconfirmed,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

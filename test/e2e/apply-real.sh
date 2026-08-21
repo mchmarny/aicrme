@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # End-to-end: the FULL Apply chain against a KWOK-simulated cluster with
 # --dry-run OFF -- a real `helm upgrade --install` of every component in the
-# resolved recipe, asserted through to state=done and workload convergence.
+# resolved recipe, asserted through to state=active and workload convergence.
+#
+# state=active, not done: Prove is the run's final step and deliberately
+# leaves its reference workload running (internal/engine's ActiveStep), so a
+# successful run now ends terminal-but-active. Waiting for `done` here, as
+# this script did before that step existed, would have run this job's whole
+# poll budget out over a run that had already succeeded. What the Prove step
+# itself does with that workload -- placement, restart, Stop, cleanup after a
+# gang that never places -- is test/e2e/prove.sh's subject, not this one's.
 #
 # WHY THIS EXISTS ALONGSIDE apply-dryrun.sh, WHICH IT DOES NOT REPLACE
 # apply-dryrun.sh pins the marker grammar and the known dry-run ceiling
@@ -378,7 +386,7 @@ curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
 # attempts, WITHOUT --best-effort) plus a slow runner's image pulls, which are
 # the variable this script adds over the dry-run job -- a real install pulls
 # every component's images, which --dry-run never does.
-echo "--- poll until done or failed (Apply)"
+echo "--- poll until active or failed (Apply, then Prove)"
 STATE=""
 CURL_FAILS=0
 POLLS=0
@@ -401,7 +409,7 @@ for _ in $(seq 1 240); do
   fi
   CURL_FAILS=0
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
-  [[ "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
+  [[ "${STATE}" == "active" || "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
   POLLS=$((POLLS + 1))
   # A heartbeat straight to stdout every ~60s. Everything else this script
   # captures is written to disk and surfaced later, which is worthless when the
@@ -420,11 +428,11 @@ for _ in $(seq 1 240); do
 done
 
 [[ "${STATE}" == "failed" ]] && fail_run "${RUN_JSON}"
-[[ "${STATE}" == "done" ]] || {
-  echo "Apply did not reach a terminal state within the deadline (state=${STATE})" >&2
+[[ "${STATE}" == "active" ]] || {
+  echo "the run did not reach state=active within the deadline (state=${STATE})" >&2
   fail_run "${RUN_JSON}"
 }
-echo "run reached state=done"
+echo "run reached state=active"
 
 # Derived from the run, never hardcoded: the component count moves with every
 # AICR release, and the handoff is explicit that assertions must follow the
@@ -662,4 +670,4 @@ SYNTH_CONTIGUOUS="$(jq -n '[1,2,4] as $a | (($a | max) - ($a | min) + 1) == ($a 
 
 dump_run_baseline
 
-echo "PASS: apply-real e2e green (run ${RUN_ID}; ${TOTAL} components installed for real, state=done, every workload at desired replicas, ${CLUSTER_TOTAL} cluster events attributed and contiguous)"
+echo "PASS: apply-real e2e green (run ${RUN_ID}; ${TOTAL} components installed for real, state=active, every workload at desired replicas, ${CLUSTER_TOTAL} cluster events attributed and contiguous)"
