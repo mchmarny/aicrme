@@ -91,6 +91,14 @@ Ownership is computed at Reset time as `run.Components` minus the snapshot, so i
 whether Apply succeeded or failed partway. **Anything Reset cannot prove it created is skipped
 and named in the report** — never uninstalled on a guess.
 
+**When the snapshot itself fails**, it is recorded per namespace rather than aborting Apply. A
+`helm list` that errors for one namespace makes every release in *that* namespace unprovable,
+so Reset skips those and names them; the rest are unaffected. Failing the whole install because
+a snapshot call hiccuped would trade a certain cost for a hypothetical one, and Apply is the
+long pole of the demo. The consequence is stated plainly at the confirm gate: a run whose
+snapshot is partial cannot be fully reset later, and the operator learns that before installing,
+not after.
+
 ### Where the per-release namespace comes from
 
 `deploy.sh` prints one header per deployment action carrying exactly what an uninstall needs:
@@ -307,6 +315,7 @@ carrying a weaker contract would be backwards.
 | Workload stop fails | Abort before any uninstall. Guard set. Nothing removed. |
 | A single `helm uninstall` fails | Record it, continue with the rest, guard set at the end. |
 | A release is not owned | Skip it, name it in the report. Not a failure. |
+| The pre-Apply snapshot failed for a namespace | Every release in it is unprovable: skip and name. Reported at Apply's confirm gate too, before the install runs. |
 | A namespace is not owned, or its UID changed | Leave it, name it. Not a failure. |
 | Namespace emptiness cannot be determined | Leave it, name the error. Fail closed. |
 | A namespace delete fails or hangs | Record it, continue. Terminating namespaces are expected residue. |
