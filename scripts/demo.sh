@@ -129,8 +129,14 @@ EOF
   then ask you two questions (intent, platform) and install the
   resolved recipe for real -- roughly 5 minutes for 14 actions.
 
-  Validate and Prove are not built yet (Phase 3), so the arc ends
-  at a completed Apply.
+  It then runs the reference workload: a 2-pod gang at 8 GPUs each,
+  placed by kai-scheduler. The run ends ACTIVE, with the workload
+  left running and "Stop workload" as the only way out.
+
+  Validate is deferred on measurement (docs/phase-2-handoff.md).
+  Nothing here executes a container -- see DEMO.md's "What this
+  demo cannot show you" for what the placement does and does not
+  prove.
 
   stop it:  make demo-down
 ================================================================

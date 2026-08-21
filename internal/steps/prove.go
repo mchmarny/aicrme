@@ -80,6 +80,28 @@ type proveStep struct {
 // its gang to place, and leaves it running on success. It implements
 // engine.ActiveStep, so a run that reaches this step and returns without
 // error ends at StateActive rather than StateDone.
+//
+// WHAT THIS STEP DOES NOT PROVE, on the only substrate it has today
+// Three gaps, measured on the KWOK demo cluster rather than reasoned about,
+// and repeated in DEMO.md and docs/phase-2-handoff.md because they bound
+// what the console may claim on a simulated cluster:
+//
+//   - The workload body never executes. KWOK marks a gang pod Succeeded in
+//     the same second it binds it, without starting the container, so
+//     workload.yaml's command is never run and its image is never pulled.
+//     "Gang placed" is the entire claim; nothing computed anything.
+//   - The gang never holds its GPUs simultaneously. Each member's resources
+//     are released the instant KWOK completes it, which is why both members
+//     routinely land on the SAME simulated node. Co-location here is a
+//     property of the substrate, not a scheduling fault.
+//   - DRA is not exercised at all. The workload requests scalar
+//     nvidia.com/gpu and the simulated nodes publish no ResourceSlices, so
+//     the DRA driver the recipe installs is never asked to bind a device.
+//
+// All three close only on real hardware (Phase 4). test/e2e/prove.sh asserts
+// what IS provable here -- that a GPU-aware scheduler, itself running on a
+// node that really executes, admitted a gang and bound every member of it --
+// and deliberately asserts nothing beyond it.
 func NewProve(c *prove.Client, cfg ProveConfig) engine.Step {
 	if cfg.GangTimeout == 0 {
 		cfg.GangTimeout = defaultGangTimeout

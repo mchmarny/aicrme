@@ -89,12 +89,29 @@ The condition copy reads *"cluster activity while `<action>` installs"* and neve
 action **caused** it. That is deliberate: `deploy.sh` keeps converging after it exits, so the
 correlation is temporal and the console does not claim more than it knows.
 
-**5. Done.** The arc currently ends here, at a completed Apply.
+**5. Prove.** The console applies its reference workload — a 2-pod gang, 8 `nvidia.com/gpu`
+each, `schedulerName: kai-scheduler` — into its own `aicrme-prove` namespace and waits for the
+gang to be placed. On a KWOK cluster that takes about two seconds.
+
+The screen shows the placement decision itself, one line per gang member naming the node it was
+bound to, and it labels the cluster **simulated, no GPU hardware** without apology: nothing here
+computed a result and the screen claims none. What is real is that a GPU-aware scheduler
+admitted a gang and bound every member of it.
+
+**6. The run stays active.** This is the one state the arc ends in that is not "finished": every
+step is done and the workload is deliberately still there. **Stop workload** is the only way out
+— Discard is refused while a workload is running, and Retry only applies to a failed run. Stop
+deletes the workload and waits until its pods are actually gone before closing the run.
 
 ## Things worth trying
 
 - **Kill the console mid-Apply** (`kubectl -n aicrme delete pod -l app.kubernetes.io/name=aicrme`).
   It comes back knowing what happened rather than losing the run — restart recovery, Phase 2b-ii.
+- **Kill the console while the workload is running.** It comes back on the Prove screen with the
+  run still active and Stop still working: the record is recovered from its ConfigMap and then
+  reconciled against what is actually in the cluster. Delete the record instead
+  (`kubectl -n aicrme delete cm aicrme-runs`) and restart, and the console *adopts* the workload
+  it finds — it will never silently delete something it did not start.
 - **Cancel a run** and watch it shut down gracefully rather than abandoning work.
 - **Retry a failed run** — it resumes from the step that failed, and every component's
   `install.sh` is `helm upgrade --install`, so already-installed components are no-ops.
@@ -104,8 +121,8 @@ correlation is temporal and the console does not claim more than it knows.
 | | |
 |---|---|
 | **Validate** | Deferred on measurement, not preference — AICR's `ValidateState` reports `passed` for checks that never executed on any cluster with simulated GPU nodes. See `docs/phase-2-handoff.md`. |
-| **Prove** | Phase 3, in design. This is why the arc ends at Apply rather than at a workload producing a result. |
-| **Reset** | Phase 5. Use `make demo-down` to tear the cluster down. |
+| **A workload that computes anything** | Phase 4, on real hardware. Prove places a gang; the containers never execute here (see below). |
+| **Reset** | Phase 5. Use `make demo-down` to tear the cluster down. When it lands it must stop the Prove workload before uninstalling the components underneath it. |
 
 ## Check on it / tear it down
 
@@ -136,5 +153,21 @@ and their status is synthesized. So this environment proves the install chain, t
 resolution, and the telemetry — and it cannot prove anything that requires a container to
 actually execute on a GPU. Those claims wait for real hardware in Phase 4.
 
-Relatedly, the fake nodes advertise scalar `nvidia.com/gpu` capacity only and publish **no DRA
-`ResourceSlices`** (verified 2026-08-19: `kubectl get resourceslices` returns nothing).
+Three specific consequences for the Prove step, measured on this cluster rather than assumed:
+
+- **The workload body never runs.** KWOK marks a gang pod `Succeeded` in the *same second* it
+  binds it, without starting the container — observed at 10:28:39/40 with the Job reporting
+  `completionTime` 10:28:40. So `echo placement proven` is never printed by anything, and the
+  container image is never even pulled.
+- **The gang never holds its GPUs at once.** Because each member completes instantly, its
+  resources are released before the next is bound — which is why both members routinely land on
+  the *same* simulated node here. That is normal on this substrate and is not a scheduling fault;
+  a real cluster, where the pods keep running, cannot do it.
+- **DRA is entirely unexercised.** The workload requests scalar `nvidia.com/gpu`, and the fake
+  nodes advertise scalar capacity only, publishing **no DRA `ResourceSlices`** (verified
+  2026-08-19: `kubectl get resourceslices` returns nothing). The DRA driver the recipe installs
+  is therefore never asked to bind a device by anything the console runs.
+
+What this environment *does* prove about Prove: a GPU-aware scheduler admitted a gang, evaluated
+it as a group, and bound every member of it to a node advertising GPUs. `test/e2e/prove.sh`
+asserts exactly that and no more.

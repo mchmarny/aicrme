@@ -263,7 +263,7 @@ in this console.
 |---|---|
 | Training + Kubeflow | `TrainJob` running NCCL all-reduce across 2 nodes / 16 GPUs, live busbw GB/s against theoretical line rate |
 | Inference + Dynamo/NIM | Model served, endpoint live, and a chat box in the UI the audience can type into |
-| Kind/KWOK | No GPUs, so no throughput claim. Shows the allocation decision instead: kai-scheduler gang-placing a 2x8 job with DRA binding specific devices. Labeled "simulated cluster, no GPU hardware" without apology. |
+| Kind/KWOK | No GPUs, so no throughput claim. Shows the allocation decision instead: kai-scheduler gang-placing a 2x8 job. Labeled "simulated cluster, no GPU hardware" without apology. **Two corrections from building it (Phase 3):** DRA is not part of this — the workload requests scalar `nvidia.com/gpu` and the simulated nodes publish no `ResourceSlices` — and the two pods routinely land on the *same* simulated node, because KWOK completes each one in the second it binds it and releases its resources before the next is scheduled. |
 
 The payoff is the callback to Discover: **0 of 64 usable, to 64 of 64 at 387 GB/s.**
 
@@ -292,7 +292,15 @@ badly leaves the cluster exactly as it is and says so.
 Teardown button that first stops any running Prove workload, then runs `helm uninstall` in
 reverse order plus namespace cleanup, so the demo is repeatable on the same cluster without
 rebuilding it. Tearing down components while a GPU workload still holds devices is the obvious
-failure mode here, so workload shutdown is a hard precondition rather than a parallel step. Advertised as best-effort: CRDs and
+failure mode here, so workload shutdown is a hard precondition rather than a parallel step.
+
+**Concretely, as of Phase 3:** Reset must call `Engine.Stop` (or the same
+delete-then-wait-for-absence path `internal/prove.Client` gives it) and see it *succeed* before
+it uninstalls anything. Stop is not best-effort — it deletes the workload with foreground
+propagation and does not return until the pods are actually gone — and a Reset that proceeded on
+a failed Stop would be uninstalling `kai-scheduler` and the GPU operator out from under a gang
+that is still holding devices. A failed Stop must abort the Reset and say so, exactly as it
+leaves the run active and says so today. Advertised as best-effort: CRDs and
 finalizers routinely leave residue, which is why `deploy.sh` already carries stale-webhook and
 terminating-namespace preflight. A fresh cluster remains the guaranteed path.
 
@@ -418,7 +426,7 @@ Each phase is independently demoable.
 | 0 | Skeleton: repo, CI, chart, auth, SSE bus, embedded SPA shell. Installs on Kind and does nothing. |
 | 1 | Discover and Recommend against Kind/KWOK. Both wizard screens real. |
 | 2 | Applier, cockpit, observer. The bulk of the work. |
-| 3 | Prove, simulated on Kind. Full arc end to end with no hardware. **Validate was scoped out on 2026-08-18** — measured, not assumed; see the Validate section below. |
+| 3 | Prove, simulated on Kind. Full arc end to end with no hardware. **Validate was scoped out on 2026-08-18** — measured, not assumed; see the Validate section below. **Delivered:** a real gang, placed by kai-scheduler on simulated GPU nodes, with the run ending terminal-but-active and Stop as its only exit (`test/e2e/prove.sh`). What it does *not* deliver is a workload that computes anything: KWOK completes every pod in the second it binds it, so the container never runs — see the Prove section's own note and `DEMO.md`. |
 | 4 | Real hardware: EKS, then GKE. Real finale, real timings, slow-step map calibrated. |
 | 5 | AKS, reset, export to GitOps, verification screen polish. |
 
