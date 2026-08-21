@@ -84,8 +84,18 @@ function Console({ onUnauthorized }: { onUnauthorized: () => void }) {
           event, so nothing in the stream tells this effect that POST
           /api/runs has stopped answering 409. Bumping the same token the
           error path uses re-runs it, which is what lets the console start a
-          fresh run without the operator reloading the page. */}
-      <Wizard events={events} onDiscarded={() => setRetryToken(n => n + 1)} />
+          fresh run without the operator reloading the page.
+
+          A stop is the same problem for a different gate: it does publish
+          ("run done", via engine.finish), but this effect watches the token,
+          not the stream, and the run it just ended was refusing new runs on
+          two counts -- the live workload and, for a recovered run, the
+          recovery gate Stop clears on success. */}
+      <Wizard
+        events={events}
+        onDiscarded={() => setRetryToken(n => n + 1)}
+        onStopped={() => setRetryToken(n => n + 1)}
+      />
     </main>
   )
 }

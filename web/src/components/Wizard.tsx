@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AicrEvent } from '../useEvents'
-import { ApiError, decide as decideApi, discardRun, fetchOptions, retryRun, type Options } from '../api'
+import { ApiError, decide as decideApi, discardRun, fetchOptions, retryRun, stopRun, type Options } from '../api'
 import { deriveComponents } from '../pipeline'
 import { Cockpit } from './Cockpit'
 import { Discover, type CapabilityReport } from './Discover'
+import { Prove } from './Prove'
 import { Recommend, type RecipeSummary } from './Recommend'
 import { Timeline } from './Timeline'
 
@@ -25,7 +26,7 @@ import { Timeline } from './Timeline'
  * GET /api/runs/{id}/artifacts/... endpoint was the alternative and was not
  * necessary.
  */
-type RunPhase = 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'done'
+type RunPhase = 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'active' | 'done'
 
 export interface RunState {
   runId?: string
@@ -127,6 +128,13 @@ export function deriveRunState(events: AicrEvent[]): RunState {
       case 'phase':
         if (e.message === 'run done') out.state = 'done'
         else if (e.message === 'run failed') out.state = 'failed'
+        // engine.finish publishes "run " + state for every state it reaches,
+        // and StateActive is terminal-but-active: every step finished and the
+        // Prove workload is deliberately still running. Without this branch
+        // it fell through to 'running' below, which is what left an active
+        // run rendering an ordinary phase body with no Stop control and --
+        // for a recovered one -- a Discard button the engine now rejects.
+        else if (e.message === 'run active') out.state = 'active'
         else out.state = 'running'
         // engine.Retry (internal/engine/engine.go) publishes this exact
         // message before relaunching execute for the same run ID. Replaying
@@ -325,8 +333,19 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
  * succeeds, without a page reload. Discard publishes no bus event -- it
  * deletes the run rather than transitioning it -- so nothing in the stream
  * would otherwise tell App.tsx that POST /api/runs has stopped 409ing.
+ *
+ * onStopped is the same signal for the same reason, one state over. A
+ * successful Stop clears every gate that was refusing new runs -- the active
+ * workload itself, and the recovery gate engine.Stop clears on success -- so
+ * without it the console sits on a stopped run with no way forward but a page
+ * reload, which is precisely the dead end the recovery panel was built to
+ * remove.
  */
-export function Wizard({ events, onDiscarded }: { events: AicrEvent[]; onDiscarded?: () => void }) {
+export function Wizard({ events, onDiscarded, onStopped }: {
+  events: AicrEvent[]
+  onDiscarded?: () => void
+  onStopped?: () => void
+}) {
   const run = useMemo(() => deriveRunState(events), [events])
   const [options, setOptions] = useState<Options | null>(null)
   const [optionsError, setOptionsError] = useState('')
@@ -423,6 +442,26 @@ export function Wizard({ events, onDiscarded }: { events: AicrEvent[]; onDiscard
     }
   }
 
+  // The only exit from an active run. It can take minutes on a real cluster
+  // -- engine.Stop deletes the workload and then waits for its pods to
+  // actually be gone -- which is what `busy` is for: the button disables for
+  // the whole round trip rather than inviting a second click that would race
+  // the first (harmless server-side, since Stop is idempotent, but it would
+  // leave the operator with no idea which call the screen is reflecting).
+  async function handleStop() {
+    if (!run.runId) return
+    setActionError('')
+    setBusy(true)
+    try {
+      await stopRun(run.runId)
+      onStopped?.()
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : (err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   // Only reachable from the recovery panel: engine.Discard refuses a live
   // run, and a recovered one is the only non-live run the console ever shows.
   async function handleDiscard() {
@@ -493,6 +532,15 @@ export function Wizard({ events, onDiscarded }: { events: AicrEvent[]; onDiscard
   const cockpit = !recovered && (run.phase === 'bundle' || run.phase === 'apply')
 
   function renderBody() {
+    // Before the recovery branch, deliberately. A recovered active run is
+    // still holding a workload in the cluster, and the recovery panel offers
+    // exactly the two actions the engine rejects for it (Retry needs a failed
+    // run; Discard refuses one with a workload running). Stop is the only
+    // thing that works, so the screen that carries Stop has to win here or
+    // the operator is stranded on a panel of dead buttons.
+    if (run.state === 'active') {
+      return <Prove events={events} run={run} busy={busy} onStop={handleStop} />
+    }
     if (recovered) {
       // The discard already succeeded; the panel's buttons would 404 now, and
       // App.tsx's POST /api/runs is in flight. Say so rather than re-offering
@@ -509,6 +557,12 @@ export function Wizard({ events, onDiscarded }: { events: AicrEvent[]; onDiscard
           onDiscard={handleDiscard}
         />
       )
+    }
+    // A run that reached Prove and has since been stopped. Without this it
+    // fell through to the report branch below and redrew the Discover screen
+    // over a finished demo, which reads as the console having started over.
+    if (run.phase === 'prove') {
+      return <Prove events={events} run={run} busy={busy} onStop={handleStop} />
     }
     if (cockpit) {
       return <Cockpit events={events} run={run} onDecide={handleDecide} onRetry={handleRetry} />

@@ -206,6 +206,35 @@ describe('Wizard', () => {
     expect(afterRetry.error).toBeUndefined()
   })
 
+  /**
+   * The live path onto the payoff screen, with no restart involved.
+   *
+   * engine.finish publishes "run " + state for every state it reaches, and
+   * StateActive is a state it now reaches (internal/engine's ActiveStep).
+   * Before this branch existed it fell through to 'running', so a run that
+   * had finished with a workload deliberately left running rendered as one
+   * still in flight -- on the Discover screen, since nothing else claimed the
+   * prove phase -- with no way to stop what it started.
+   */
+  it('lands an active run on the Prove screen with a Stop control', () => {
+    const proveRun: AicrEvent[] = [
+      { id: 1, runId: 'runP', at: '2026-08-21T00:00:00Z', kind: 'phase', level: 'info', phase: 'prove', message: 'phase started' },
+      { id: 2, runId: 'runP', at: '2026-08-21T00:00:01Z', kind: 'log', level: 'info', phase: 'prove', message: 'applying the reference workload' },
+      { id: 3, runId: 'runP', at: '2026-08-21T00:00:02Z', kind: 'cluster', level: 'info', phase: 'prove', message: 'gang member prove-runP-0 placed on node kwok-gpu-0' },
+      { id: 4, runId: 'runP', at: '2026-08-21T00:00:03Z', kind: 'cluster', level: 'info', phase: 'prove', message: 'gang member prove-runP-1 placed on node kwok-gpu-1' },
+      { id: 5, runId: 'runP', at: '2026-08-21T00:00:04Z', kind: 'phase', level: 'info', message: 'run active' },
+    ]
+
+    expect(deriveRunState(proveRun).state).toBe('active')
+
+    render(<Wizard events={proveRun} />)
+    expect(screen.getByTestId('prove')).toBeDefined()
+    expect(screen.getByRole('button', { name: /stop workload/i })).toBeDefined()
+    expect(screen.getByTestId('prove-placements').textContent).toMatch(/kwok-gpu-1/)
+    // Not the recovery panel: this run was never recovered.
+    expect(screen.queryByTestId('prove-recovered')).toBeNull()
+  })
+
   it('shows a caveat rather than presenting an exhausted-retry provisional set as final', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const fetchMock = mockFetch(url => {
@@ -306,10 +335,13 @@ describe('Wizard: a recovered run', () => {
     { label: 'already failed', state: 'failed', error: 'network-operator failed: no matches for kind "NodeFeatureRule"', retryable: true },
     // Scenario B: nothing interrupted it, and engine.Retry refuses it.
     { label: 'done', state: 'done', retryable: false },
-    // StateActive derives to 'running' client-side -- "run active" is not a
-    // message deriveRunState recognizes -- and Retry refuses it too, so
-    // discard has to be reachable from a state that does not look terminal.
-    { label: 'active', state: 'active', retryable: false },
+    // `active` is deliberately absent from this matrix. It used to be here,
+    // asserting the same Discard button as every other state, from before
+    // Stop existed -- and the engine now REJECTS Discard for a run with a
+    // workload still running (internal/engine's TestDiscardRejectsActiveRun),
+    // so that assertion pinned a button guaranteed to 409. The recovered
+    // active run has its own test below, where Stop is the affordance and
+    // Discard's absence is the assertion.
   ]
 
   for (const phase of phases) {
@@ -456,6 +488,65 @@ describe('Wizard: a recovered run', () => {
   it('shows no truncation warning for an intact recovered record', () => {
     render(<Wizard events={recoveryEvents('apply', 'failed', 'interrupted by a console restart')} />)
     expect(screen.queryByTestId('recovery-truncated')).toBeNull()
+  })
+
+  /**
+   * The recovered-active dead end, pinned from the console's side.
+   *
+   * A pod restart while the reference workload is running recovers the record
+   * as StateActive (internal/engine/recover.go leaves terminal states alone),
+   * and the workload is genuinely still there holding accelerators. Both
+   * recovery actions are rejected for it: Retry requires StateFailed, and
+   * Discard refuses a run with a workload running rather than orphaning it.
+   * Stop is the only thing the engine accepts, so it has to be the only thing
+   * this screen offers -- a panel of two dead buttons is how an operator ends
+   * up reaching for kubectl.
+   */
+  it('offers Stop and not Discard for a recovered active run', () => {
+    render(<Wizard events={recoveryEvents('prove', 'active')} />)
+
+    expect(screen.getByRole('button', { name: /stop workload/i })).toBeDefined()
+    expect(screen.queryByTestId('recovery-discard')).toBeNull()
+    expect(screen.queryByTestId('recovery-retry')).toBeNull()
+    expect(screen.queryByTestId('recovered-run')).toBeNull()
+    // The screen still says where the workload came from, because the
+    // timeline rail is replaying recovery's own "retry or discard it" marker
+    // alongside it.
+    expect(screen.getByTestId('prove-recovered')).toBeDefined()
+  })
+
+  it('stops through POST and lets the console start a new run without a reload', async () => {
+    const fetchMock = mockFetch(url => {
+      if (url !== `/api/runs/${RECOVERED_RUN_ID}/stop`) throw new Error(`unexpected fetch: ${url}`)
+      return new Response(JSON.stringify({ id: RECOVERED_RUN_ID, state: 'done' }), { status: 200 })
+    })
+    const onStopped = vi.fn()
+
+    render(<Wizard events={recoveryEvents('prove', 'active')} onStopped={onStopped} />)
+    fireEvent.click(screen.getByTestId('prove-stop'))
+
+    await waitFor(() => expect(onStopped).toHaveBeenCalled())
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/runs/${RECOVERED_RUN_ID}/stop`, { method: 'POST' })
+  })
+
+  // engine.Stop leaves the run exactly where it was on any failure and says
+  // what failed. A console that cleared the screen anyway would be claiming a
+  // workload was stopped while it is still running -- the one outcome the
+  // whole Stop design is built to avoid.
+  it('surfaces a failed stop and keeps offering the button', async () => {
+    mockFetch(url => {
+      if (url !== `/api/runs/${RECOVERED_RUN_ID}/stop`) throw new Error(`unexpected fetch: ${url}`)
+      return new Response(JSON.stringify({ error: 'stopping the workload failed' }), { status: 503 })
+    })
+    const onStopped = vi.fn()
+
+    render(<Wizard events={recoveryEvents('prove', 'active')} onStopped={onStopped} />)
+    fireEvent.click(screen.getByTestId('prove-stop'))
+
+    await waitFor(() => expect(screen.getByText(/Failed to stop the workload/)).toBeDefined())
+    expect(onStopped).not.toHaveBeenCalled()
+    expect(screen.getByTestId('prove-stop')).toBeDefined()
   })
 
   it('leaves an ordinary failure on the cockpit rather than the recovery panel', () => {

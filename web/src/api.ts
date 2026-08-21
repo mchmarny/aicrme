@@ -93,6 +93,25 @@ export async function discardRun(runId: string): Promise<void> {
 }
 
 /**
+ * stopRun is the only exit from an active run (POST /api/runs/{id}/stop ->
+ * engine.Stop). Nothing else in this module can end one: Discard is rejected
+ * outright while a workload is running, and Retry requires a failed run. The
+ * engine deletes the workload, waits until it is actually gone, and only then
+ * finishes the run -- so a resolved promise here means the pods, and the GPUs
+ * they held, are released.
+ *
+ * The request can outlast the tab that issued it: the handler detaches its
+ * context (internal/api/prove.go) because tearing a GPU workload down on a
+ * real cluster takes long enough that a closed tab would otherwise leave the
+ * operator with no idea whether it happened.
+ */
+export async function stopRun(runId: string): Promise<Run> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/stop`, { method: 'POST' })
+  if (!res.ok) throw new ApiError(res.status, 'Failed to stop the workload')
+  return res.json()
+}
+
+/**
  * bundleUrl is a plain href rather than a fetch: the browser's own download
  * handling gets the filename from Content-Disposition, and the session
  * cookie rides along on the navigation.
