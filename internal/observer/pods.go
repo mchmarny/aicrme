@@ -348,6 +348,16 @@ func (o *Observer) onPodChange(pod *corev1.Pod) {
 			// for a seeded-only Event entry exactly as it can for a
 			// seeded-only podCondition (Task 6 fix round 2, Important 1(new)).
 			resolvedEvents = o.resolveEventsLocked(key, false) // Ruling 23
+			// ...and the same for a Warning about the CONTROLLER that owns
+			// this pod (docs/ux-feedback.md item 2). A ReplicaSet's
+			// FailedCreate is about its inability to create a pod; this pod
+			// existing and being healthy is that inability ending, observed
+			// through an informer this package already runs rather than a new
+			// one. narratedOnly: false for the same reason the line above
+			// passes it -- this is a genuine improvement, not a deletion.
+			if owner, hasOwner := controllerEventKey(pod); hasOwner {
+				resolvedEvents = append(resolvedEvents, o.resolveEventsLocked(owner, false)...)
+			}
 			return
 		}
 

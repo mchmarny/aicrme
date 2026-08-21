@@ -35,7 +35,29 @@ follow a live run.
 
 ---
 
-## 2. A stale, already-converged warning sits on a healthy row on the success screen
+## 2. A stale, already-converged warning sits on a healthy row on the success screen — SHIPPED 2026-08-21
+
+**Fixed.** A Warning about a controller (ReplicaSet, DaemonSet) now resolves when a pod that
+controller owns becomes healthy: the pod's controller `ownerReference` carries the same
+Kind/Name/UID the Warning's `InvolvedObject` does, so the Pod informer this package already runs
+supplies the recovery signal — no new informer, no name matching. See
+`internal/observer/events.go`'s `controllerEventKey` and `onPodChange`'s owner resolve.
+
+**One residual, stated rather than left to be rediscovered:** a pod that is created but
+*unschedulable* does not clear its controller's `FailedCreate`, because `onPodChange` only takes
+the full-recovery branch when the pod has no trouble of its own. Creation did succeed in that
+case, so the `FailedCreate` is stale — but the row is legitimately red anyway (Unschedulable is
+live and true), and both clear together once the pod schedules. That errs toward showing a
+condition rather than hiding one, which is the direction `internal/bus/cluster.go` prefers.
+
+A Warning involving a **Deployment** still has no resolution path: a Deployment's pods are owned
+by its ReplicaSet, not by it, so this mechanism does not reach it. Deployment-involved Warnings
+are rare (its own events are almost all Normal `ScalingReplicaSet`), and inventing a signal for
+them was not worth a second mechanism.
+
+The entry below is kept verbatim as the record of what was observed and why it mattered.
+
+---
 
 **Observed:** 2026-08-19, Mark, first local `make demo` run, on the "Bundle installed" screen.
 

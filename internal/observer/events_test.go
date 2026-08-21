@@ -52,6 +52,157 @@ func testEvent(involvedUID types.UID, name, evType string) *corev1.Event {
 	}
 }
 
+// reasonFailedCreate is the Warning a ReplicaSet or DaemonSet reports when it
+// cannot create a pod -- the reason in the real, observed defect this file's
+// controller-owner tests exist for (docs/ux-feedback.md item 2).
+const reasonFailedCreate = "FailedCreate"
+
+// testControllerName is the ReplicaSet in the observed defect, named the way
+// a real one is: the Deployment's name plus its pod-template hash.
+const testControllerName = "kai-scheduler-default-b5c69699f"
+
+// testControllerEvent builds the Warning an owning CONTROLLER reports, rather
+// than the pod-involved one testEvent builds: InvolvedObject is the
+// ReplicaSet/DaemonSet itself, which is exactly why nothing keyed on a Pod
+// identity can ever resolve it.
+//
+// The message is the one a human actually saw on a green success screen
+// (docs/ux-feedback.md item 2), kept verbatim so the fixture cannot drift
+// into a shape the defect never had.
+func testControllerEvent(kind string, uid types.UID, name string) *corev1.Event {
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Namespace: podTestNamespace, Name: name},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      kind,
+			Namespace: podTestNamespace,
+			Name:      testControllerName,
+			UID:       uid,
+		},
+		Reason:  reasonFailedCreate,
+		Type:    corev1.EventTypeWarning,
+		Count:   1,
+		Message: `Error creating: pods "kai-scheduler-default-b5c69699f-" is forbidden: error looking up service account kai-scheduler/scheduler: serviceaccount "scheduler" not found`,
+	}
+}
+
+// withController sets pod's controller ownerReference, the link that makes a
+// controller-involved Warning resolvable through a pod this observer already
+// watches: kind, name and UID here are the SAME three fields
+// eventInvolvedKey reads off InvolvedObject.
+func withController(pod *corev1.Pod, kind, name string, uid types.UID) *corev1.Pod {
+	yes := true
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		Kind:       kind,
+		Name:       name,
+		UID:        uid,
+		Controller: &yes,
+	}}
+	return pod
+}
+
+// TestControllerWarningResolvesWhenAnOwnedPodRecovers is docs/ux-feedback.md
+// item 2, which a human hit within minutes of first using the product: a
+// success screen reading "Every component installed successfully", every row
+// INSTALLED, and one row still carrying a red FailedCreate that had in fact
+// converged minutes earlier.
+//
+// The stranding class is the one this package has now hit five times -- a
+// condition tracked under one identity, resolvable only through a signal that
+// arrives under a DIFFERENT identity. Ruling 23 closed it across the
+// Pod/Event boundary by observing that eventInvolvedKey(ev) is byte-identical
+// to podKey(pod) for a POD-involved Event. A ReplicaSet-involved Event has no
+// such twin: every one of resolveEventsLocked's call sites either builds its
+// key with podKey (kind: Pod by construction) or guards on
+// `key.kind != kindPod`, so a FailedCreate keyed {ReplicaSet, ns, name, uid}
+// is unreachable by all three and survives until namespace teardown -- which
+// publishes nothing, so the row freezes visible (Ruling 38).
+//
+// The signal that closes it is already in hand: the controller ownerReference
+// on a pod this observer is already watching carries the same Kind/Name/UID
+// that the Warning's InvolvedObject does. "The controller that could not
+// create a pod has now produced a healthy one" is a genuine recovery, and it
+// is observable without a new informer.
+//
+// The mutation this fails under: dropping the owner-keyed resolve from
+// onPodChange's full-recovery branch.
+func TestControllerWarningResolvesWhenAnOwnedPodRecovers(t *testing.T) {
+	const rsUID = types.UID("rs-uid")
+	o, sub := newTestObserver(t)
+
+	o.onEventAdd(testControllerEvent("ReplicaSet", rsUID, "rs.a"), false)
+	arose := decodeClusterData(t, sub)
+	if arose.Reason != reasonFailedCreate || arose.Resolved {
+		t.Fatalf("setup: FailedCreate arising = %+v, want Reason=%q Resolved=false", arose, reasonFailedCreate)
+	}
+	if arose.Kind != "ReplicaSet" {
+		t.Fatalf("setup: arising Kind = %q, want ReplicaSet -- the fixture is not the defect's shape", arose.Kind)
+	}
+
+	// The ReplicaSet gets its pod created, and that pod becomes healthy. This
+	// is the whole recovery signal: the create the Warning was about works now.
+	o.onPodUpdate(nil, withController(withRunning(testPod("pod-uid")), "ReplicaSet", testControllerName, rsUID))
+
+	resolved := decodeClusterData(t, sub)
+	if resolved.Reason != reasonFailedCreate || !resolved.Resolved {
+		t.Fatalf("resolution = %+v, want Reason=%q Resolved=true", resolved, reasonFailedCreate)
+	}
+	if resolved.UID != string(rsUID) {
+		t.Errorf("resolution UID = %q, want the ReplicaSet's %q -- Supersedes matches on UID+Reason", resolved.UID, rsUID)
+	}
+	if resolved.Name != testControllerName {
+		t.Errorf("resolution Name = %q, want %q", resolved.Name, testControllerName)
+	}
+	assertNoEvent(t, sub) // the healthy pod itself narrates nothing
+}
+
+// The same claim for a DaemonSet, which owns its pods directly rather than
+// through a ReplicaSet -- the case docs/phase-2-handoff.md recorded as open
+// ("a DaemonSet FailedCreate survives the DaemonSet's own deletion"). One
+// mechanism has to cover both or the fix is a special case for one kind.
+func TestDaemonSetWarningResolvesWhenAnOwnedPodRecovers(t *testing.T) {
+	const dsUID = types.UID("ds-uid")
+	o, sub := newTestObserver(t)
+
+	o.onEventAdd(testControllerEvent(kindDaemonSet, dsUID, "ds.a"), false)
+	if arose := decodeClusterData(t, sub); arose.Resolved {
+		t.Fatalf("setup: FailedCreate arising = %+v, want Resolved=false", arose)
+	}
+
+	o.onPodUpdate(nil, withController(withRunning(testPod("pod-uid")), kindDaemonSet, testControllerName, dsUID))
+
+	resolved := decodeClusterData(t, sub)
+	if resolved.Reason != reasonFailedCreate || !resolved.Resolved || resolved.Kind != kindDaemonSet {
+		t.Fatalf("resolution = %+v, want a resolved DaemonSet FailedCreate", resolved)
+	}
+}
+
+// The discrimination half: a pod recovering must resolve only ITS OWN
+// controller's Warnings. Without this, "resolve the owner too" could be
+// implemented as "resolve everything in the namespace" and still pass the two
+// tests above, while clearing a genuinely open condition on an unrelated
+// controller -- a clean row hiding a live failure, which internal/bus's own
+// comment calls the worse direction.
+func TestControllerWarningIsNotResolvedByAnUnrelatedPod(t *testing.T) {
+	o, sub := newTestObserver(t)
+
+	o.onEventAdd(testControllerEvent("ReplicaSet", "rs-uid", "rs.a"), false)
+	if arose := decodeClusterData(t, sub); arose.Resolved {
+		t.Fatalf("setup: FailedCreate arising = %+v, want Resolved=false", arose)
+	}
+
+	// A healthy pod owned by a DIFFERENT ReplicaSet, and one owned by nothing.
+	o.onPodUpdate(nil, withController(withRunning(testPod("other-uid")), "ReplicaSet", "some-other-rs", "other-rs-uid"))
+	o.onPodUpdate(nil, withRunning(testPod("orphan-uid")))
+
+	assertNoEvent(t, sub)
+	o.mu.Lock()
+	remaining := len(o.events)
+	o.mu.Unlock()
+	if remaining != 1 {
+		t.Errorf("o.events holds %d keys, want the unrelated ReplicaSet's Warning still tracked", remaining)
+	}
+}
+
 // newScopedEventTestObserver mirrors pods_test.go's newScopedPodTestObserver
 // exactly, waiting on the Event informer's own HasSynced rather than the
 // Pod's -- see that function's doc comment for why driving scoped.reconcile

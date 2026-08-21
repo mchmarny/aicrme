@@ -59,6 +59,35 @@ func eventInvolvedKey(ev *corev1.Event) stateKey {
 	return stateKey{kind: io.Kind, namespace: ev.Namespace, name: io.Name, uid: io.UID}
 }
 
+// controllerEventKey returns the o.events key a Warning about pod's own
+// CONTROLLER would have been recorded under, or false when pod has no
+// controller.
+//
+// It sits directly below eventInvolvedKey because it must mirror it field for
+// field, and the two drifting apart is the only way this can silently stop
+// working: kind/name/uid come from the controller ownerReference, which names
+// the same object InvolvedObject does (Kubernetes writes both from the same
+// controller), and namespace comes from the POD's namespace for the same
+// reason eventInvolvedKey takes it from ev.Namespace rather than
+// io.Namespace -- a namespaced controller's Events are created in the
+// controller's own namespace, which is also where its pods live. A
+// cluster-scoped controller cannot own a namespaced pod, so M1's
+// divergence case does not arise here.
+//
+// This is what makes a controller-involved Warning resolvable at all. Ruling
+// 23 closed the Pod/Event boundary by observing that eventInvolvedKey(ev) is
+// byte-identical to podKey(pod) for a pod-involved Event; a ReplicaSet- or
+// DaemonSet-involved Event has no such twin, and every resolveEventsLocked
+// call site either builds its key with podKey or guards on kind == Pod. This
+// gives the same shared identity one level up the ownership chain.
+func controllerEventKey(pod *corev1.Pod) (stateKey, bool) {
+	ref := metav1.GetControllerOf(pod)
+	if ref == nil {
+		return stateKey{}, false
+	}
+	return stateKey{kind: ref.Kind, namespace: pod.Namespace, name: ref.Name, uid: ref.UID}, true
+}
+
 // eventContainer extracts a container name from InvolvedObject.FieldPath,
 // which the API server populates as e.g. "spec.containers{trainer}" when an
 // Event is scoped to one container rather than the whole Pod. "" (most
@@ -363,13 +392,21 @@ func (o *Observer) onEventUpdate(_, newObj any) {
 // resolveEventsLocked is Ruling 23's (Task 6 fix round 1, Important 1)
 // cross-boundary resolution: it returns Resolved: true ClusterData for
 // Warning Reasons this observer has recorded about key, then unconditionally
-// evicts the WHOLE key from o.events -- key is expected to be podKey(pod)'s
-// value, since the only caller-known genuine "this resource is better/gone
-// now" signal an Event-only informer never gets on its own is the SAME pod's
-// own recovery (pods.go's onPodChange, full recovery) or deletion
-// (handlers.go's onDelete Pod case) -- eventInvolvedKey(ev) is byte-identical
-// to podKey(pod) for a pod-involved Event, so a Pod-side signal can speak for
-// both.
+// evicts the WHOLE key from o.events. An Event-only informer never gets a
+// "this resource is better now" signal of its own, so every caller supplies
+// one from the Pod side, under an identity the Event side shares:
+//
+//   - podKey(pod), for a POD-involved Warning -- eventInvolvedKey(ev) is
+//     byte-identical to it, so the pod's own recovery (pods.go's onPodChange,
+//     full recovery) or deletion (handlers.go's onDelete Pod case) speaks for
+//     both.
+//   - controllerEventKey(pod), for a Warning about the CONTROLLER that owns a
+//     recovering pod (docs/ux-feedback.md item 2) -- the ownerReference names
+//     the same Kind/Name/UID InvolvedObject does.
+//
+// key is therefore NOT always a Pod key, which an earlier version of this
+// comment asserted. Nothing in the body depended on that; the Namespace
+// paragraph below did, and is restated accordingly.
 //
 // narratedOnly reproduces, on the Event side, the SAME asymmetry
 // podCondition.narrated's own doc comment establishes for Pods (Task 6 fix
@@ -404,13 +441,15 @@ func (o *Observer) onEventUpdate(_, newObj any) {
 // "Locked": callers must already hold o.mu, matching this codebase's
 // existing convention (stopNamespaceLocked, aliveLocked) for a function whose
 // contract requires a lock the caller -- not this function -- acquires. All
-// THREE call sites already hold o.mu for their OWN reasons (Minor 4,
+// THREE calling FUNCTIONS already hold o.mu for their OWN reasons (Minor 4,
 // pre-merge fix: this paragraph had the identical "both" miscount the
 // Namespace-field comment above did) -- pods.go's onPodChange, inside its
-// withNamespaceLive+o.mu closure; handlers.go's onDelete Pod case, inside
-// its own lock/unlock around o.pods; and events.go's onEventChange, inside
-// the plain o.mu.Lock()/Unlock() pair immediately around its own call
-// (Ruling 26) -- before any of them reaches here, so taking a second lock
+// withNamespaceLive+o.mu closure, which since ux-feedback item 2 calls this
+// TWICE under that one hold (the pod's own key, then its controller's);
+// handlers.go's onDelete Pod case, inside its own lock/unlock around o.pods;
+// and events.go's onEventChange, inside the plain o.mu.Lock()/Unlock() pair
+// immediately around its own call (Ruling 26). Four call expressions, three
+// functions -- before any of them reaches here, so taking a second lock
 // here would either deadlock (sync.Mutex is not reentrant) or, if it were a
 // different mutex, still be pointless serialization for state (o.events)
 // this same lock already protects everywhere else in the package.
@@ -437,27 +476,25 @@ func (o *Observer) resolveEventsLocked(key stateKey, narratedOnly bool) []bus.Cl
 			// eventInvolvedKey's field, which M1 (Task 6) deliberately keys
 			// off ev.Namespace (the Event API object's own namespace), not
 			// io.Namespace, so the sweep and the write gate agree (M1's own
-			// doc comment). The two sources AGREE for every key this
-			// function is ever actually called with today, across all
-			// THREE call sites (Minor 4, pre-merge fix: an earlier version
-			// of this comment said "both" and named podKey(pod) for the one
-			// that matters least): pods.go's onPodChange and handlers.go's
-			// onDelete Pod case both construct key via podKey(pod) directly
-			// (kind: kindPod by definition); events.go's onEventChange
-			// passes key itself -- eventInvolvedKey(ev), the very source
-			// this comment exists to explain, NOT podKey(pod) -- but only
-			// after its own `if key.kind != kindPod { return }` guard three
-			// lines above the call (Ruling 26) has already ensured
-			// key.kind == kindPod for whatever reaches here. eventInvolvedKey
-			// takes kind from io.Kind and namespace from ev.Namespace, so
-			// key.kind == kindPod (true at all three sites, by construction
-			// or by that guard) implies io was a NAMESPACED Pod, which by
-			// Kubernetes convention implies ev.Namespace == io.Namespace --
-			// so the two sources cannot actually diverge at any key this
-			// function ever sees. They would diverge only for a
-			// cluster-scoped resource's key (io.Namespace == "" but
-			// ev.Namespace real, M1's whole point) -- unreachable here
-			// specifically because of that guard.
+			// doc comment). The two sources AGREE for every key this function
+			// is ever actually called with, and the reason is one property
+			// shared by all four call expressions rather than the
+			// kind == kindPod one an earlier version of this comment relied
+			// on (it predates controllerEventKey, which passes a ReplicaSet
+			// or DaemonSet key): every key reaching here names a NAMESPACED
+			// resource. pods.go's onPodChange and handlers.go's onDelete Pod
+			// case build theirs with podKey(pod); events.go's onEventChange
+			// passes eventInvolvedKey(ev) itself, but only past its own
+			// `if key.kind != kindPod { return }` guard (Ruling 26); and
+			// onPodChange's owner resolve builds controllerEventKey(pod),
+			// whose namespace is the pod's own -- a cluster-scoped controller
+			// cannot own a namespaced pod, so that key names a namespaced
+			// resource too. Kubernetes creates an Event in the same namespace
+			// as the namespaced object it is about, so ev.Namespace ==
+			// io.Namespace for all of them. The two sources diverge only for
+			// a CLUSTER-SCOPED resource's key (io.Namespace == "" but
+			// ev.Namespace real, M1's whole point), which no call site can
+			// produce.
 			Namespace: key.namespace,
 			Name:      key.name,
 			UID:       string(key.uid),
