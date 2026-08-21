@@ -521,6 +521,25 @@ func main() {
 		slog.Warn("persisted run checkpoint was unreadable or failed validation; starting without it")
 	}
 
+	// Immediately after Recover and, like it, before ListenAndServe below:
+	// the record Recover just installed (or failed to find) is only half the
+	// state -- the workload it describes outlives this process independently,
+	// and the store can lose the record while the workload keeps holding
+	// GPUs. Reconciling settles the two against each other and, in the case
+	// that matters most, adopts a workload with no surviving record so the
+	// operator gets a Stop button back rather than a cluster only kubectl can
+	// clean up.
+	//
+	// Never fatal: an unreachable API server here costs the console its
+	// bearings on a leftover workload, which is worth a loud warning and not
+	// worth refusing to start over. The call itself is bounded (one List) and
+	// deliberately decides nothing when that List fails -- see its own doc
+	// comment for why a failed list must not be read as "gone".
+	if err := eng.ReconcileWorkloads(ctx, proveClient); err != nil {
+		slog.Warn("could not reconcile reference workloads left in the cluster; one may still be running untracked",
+			"error", err)
+	}
+
 	// Every fatal startup check is above this point; only degrade-and-warn
 	// paths remain below. Deferring stop() and client.Close() only now is
 	// what keeps this function clean under gocritic's exitAfterDefer -- a
