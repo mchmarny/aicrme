@@ -259,6 +259,58 @@ func TestProveCleansUpWhenGangNeverPlaces(t *testing.T) {
 	}
 }
 
+// A gang that never places has to SAY so, with the budget it was given and
+// how much of the gang made it. Nothing pinned this wording before -- every
+// timeout test above asserts only that Run failed -- which is how a real run
+// came to record client-go's rate limiter refusing a call as its entire
+// error, naming neither the timeout nor the 0/2 placement that was the
+// actual diagnosis.
+func TestProveGangTimeoutNamesTheDeadlineAndTheCount(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	run := newRun()
+	run.ID = testRunID
+	err := steps.NewProve(prove.NewClient(cs), steps.ProveConfig{GangTimeout: 100 * time.Millisecond}).
+		Run(context.Background(), run, func(bus.Event) {})
+	if err == nil {
+		t.Fatal("Run() succeeded though the gang never placed")
+	}
+	for _, want := range []string{"did not place within", "100ms", "0/2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Run() error = %q, want it to contain %q", err.Error(), want)
+		}
+	}
+}
+
+// The same claim when the placement READ is what notices the deadline first.
+//
+// A List still in flight when the budget expires fails with the deadline's
+// own error, and that used to be returned verbatim: measured on a real KWOK
+// cluster, the run's recorded failure was "client rate limiter Wait returned
+// an error: rate: Wait(n=1) would exceed context deadline" -- a true
+// statement about plumbing that hid the fact that nothing had been placed at
+// all. The reactor below reproduces that shape exactly: a read that outlives
+// the budget and then fails.
+func TestProveReportsATimedOutPlacementReadAsTheGangTimeout(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		time.Sleep(80 * time.Millisecond)
+		return true, nil, errors.New("client rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline")
+	})
+	run := newRun()
+	run.ID = testRunID
+	err := steps.NewProve(prove.NewClient(cs), steps.ProveConfig{GangTimeout: 50 * time.Millisecond}).
+		Run(context.Background(), run, func(bus.Event) {})
+	if err == nil {
+		t.Fatal("Run() succeeded though the placement read failed after the deadline")
+	}
+	if !strings.Contains(err.Error(), "did not place within") {
+		t.Errorf("Run() error = %q, want the gang timeout rather than the read's own error", err.Error())
+	}
+	if strings.Contains(err.Error(), "rate limiter") {
+		t.Errorf("Run() error = %q, leaks the plumbing that happened to notice the deadline", err.Error())
+	}
+}
+
 // If cleanup itself fails, the error must say so rather than reporting a
 // clean failure over an uncleaned cluster.
 //

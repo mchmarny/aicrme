@@ -159,9 +159,9 @@ func (c *Client) WaitAbsent(ctx context.Context, runID string, timeout time.Dura
 	}
 }
 
-// PlacedNodes returns, for runID's gang, the node each already-scheduled AND
-// still-live pod has been bound to, keyed by pod name. A pod absent from the
-// result has either not been placed yet or has already terminated.
+// PlacedNodes returns, for runID's gang, the node each already-scheduled and
+// not-failed pod has been bound to, keyed by pod name. A pod absent from the
+// result has either not been placed yet or has already failed.
 //
 // Reading Spec.NodeName -- the field the scheduler itself writes the instant
 // it binds a pod -- rather than Status.Phase alone is what makes placement
@@ -173,6 +173,20 @@ func (c *Client) WaitAbsent(ctx context.Context, runID string, timeout time.Dura
 // already died -- and, with workload.yaml's backoffLimit: 0, will never be
 // replaced -- would still be counted as placed, reporting a permanently
 // failed Job as a successfully running gang.
+//
+// The check excludes PodFailed only, which is narrower than it first was.
+// Excluding Succeeded too looks equally safe and is not: KWOK marks a pod
+// Succeeded in the same second it binds it -- measured on the demo cluster,
+// where both gang members were bound at 10:28:39/40 and the Job reported
+// completionTime 10:28:40, with no observable Running window at any poll
+// interval. Since KWOK's simulated GPU nodes are a PREREQUISITE of the only
+// path this console can demo on (a plain KWOK cluster cannot resolve a
+// recipe at all), that exclusion made the Prove step time out at three
+// minutes on every simulated run while the scheduler had in fact placed the
+// gang perfectly. Failure is the thing worth excluding here; a pod the
+// substrate completed instantly is not a failure, and the placement decision
+// -- which is the whole claim this step makes on a simulated cluster -- had
+// already been made and recorded on the object.
 func (c *Client) PlacedNodes(ctx context.Context, runID string) (map[string]string, error) {
 	list, err := c.kube.CoreV1().Pods(Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(Labels(runID)).String(),
@@ -185,7 +199,7 @@ func (c *Client) PlacedNodes(ctx context.Context, runID string) (map[string]stri
 		if pod.Spec.NodeName == "" {
 			continue
 		}
-		if pod.Status.Phase != corev1.PodPending && pod.Status.Phase != corev1.PodRunning {
+		if pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		out[pod.Name] = pod.Spec.NodeName

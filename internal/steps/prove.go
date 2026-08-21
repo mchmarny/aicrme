@@ -35,10 +35,41 @@ const defaultGangTimeout = 3 * time.Minute
 // shape that has only ever had one value.
 const gangSize = 2
 
-// placementPollInterval bounds how quickly Run notices a pod has been
-// scheduled, the same role prove.Client's own waitAbsentPollInterval plays
-// for deletion.
-const placementPollInterval = 20 * time.Millisecond
+// maxPlacementPollInterval caps how long awaitGang waits between placement
+// reads, and minPlacementPollInterval floors it so a tiny test budget can
+// never produce a zero-duration ticker.
+const (
+	maxPlacementPollInterval = 2 * time.Second
+	minPlacementPollInterval = time.Millisecond
+)
+
+// placementPollInterval returns how often awaitGang re-reads placement for a
+// given gang budget: a tenth of it, clamped.
+//
+// This was a flat 20ms -- mirroring prove.Client's own waitAbsentPollInterval,
+// which is correct for a wait measured in milliseconds and abusive for one
+// measured in minutes. Against the three-minute default it issues roughly
+// 9000 List calls at ~50/second, and client-go's own rate limiter (5 QPS by
+// default) starts refusing them long before the deadline. That is not a
+// theoretical cost: on a real KWOK cluster the run failed with "client rate
+// limiter Wait returned an error: rate: Wait(n=1) would exceed context
+// deadline" as its entire recorded error, hiding the fact that nothing had
+// been placed at all. No fake-clientset test can see it -- the fake has no
+// rate limiter.
+//
+// A tenth of the budget keeps a 50ms test responsive and a 3-minute wait
+// cheap (90 calls, ~0.5 QPS), without adding a knob a caller would have to
+// know to set.
+func placementPollInterval(budget time.Duration) time.Duration {
+	d := budget / 10
+	if d > maxPlacementPollInterval {
+		return maxPlacementPollInterval
+	}
+	if d < minPlacementPollInterval {
+		return minPlacementPollInterval
+	}
+	return d
+}
 
 type proveStep struct {
 	client *prove.Client
@@ -124,13 +155,23 @@ func (p *proveStep) awaitGang(ctx context.Context, runID string, emit engine.Emi
 	timeoutCtx, cancel := context.WithTimeout(ctx, p.cfg.GangTimeout)
 	defer cancel()
 
-	ticker := time.NewTicker(placementPollInterval)
+	ticker := time.NewTicker(placementPollInterval(p.cfg.GangTimeout))
 	defer ticker.Stop()
 
 	placed := make(map[string]string, gangSize)
 	for {
 		nodes, err := p.client.PlacedNodes(timeoutCtx, runID)
 		if err != nil {
+			// A read that fails because the budget ran out mid-call is this
+			// wait ending, not the cluster failing, and the operator needs
+			// the placement count rather than the plumbing that noticed. The
+			// real KWOK run this fix came from reported client-go's rate
+			// limiter refusing a call as the run's whole error, which named
+			// neither the timeout nor the 0/2 placement that was the actual
+			// diagnosis.
+			if timeoutCtx.Err() != nil {
+				return p.gangTimeoutErr(runID, len(placed))
+			}
 			return fmt.Errorf("prove: checking gang placement for run %s: %w", runID, err)
 		}
 		for pod, node := range nodes {
@@ -147,12 +188,22 @@ func (p *proveStep) awaitGang(ctx context.Context, runID string, emit engine.Emi
 
 		select {
 		case <-timeoutCtx.Done():
-			return aicrerrors.New(aicrerrors.ErrCodeTimeout,
-				fmt.Sprintf("gang for run %s did not place within %s (%d/%d members placed)",
-					runID, p.cfg.GangTimeout, len(placed), gangSize))
+			return p.gangTimeoutErr(runID, len(placed))
 		case <-ticker.C:
 		}
 	}
+}
+
+// gangTimeoutErr is what an expired placement budget reports, from either of
+// the two places the expiry can be noticed (a read that straddles the
+// deadline, or the wait itself). One function, so both say the same thing:
+// how long was allowed and how much of the gang made it, which is what an
+// operator needs to tell "the cluster is full" apart from "nothing is
+// scheduling at all".
+func (p *proveStep) gangTimeoutErr(runID string, placed int) error {
+	return aicrerrors.New(aicrerrors.ErrCodeTimeout,
+		fmt.Sprintf("gang for run %s did not place within %s (%d/%d members placed)",
+			runID, p.cfg.GangTimeout, placed, gangSize))
 }
 
 // cleanup deletes the workload this step just created and failed to place,

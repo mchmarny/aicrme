@@ -241,6 +241,33 @@ func TestEnvOr(t *testing.T) {
 	}
 }
 
+// A bad duration override must degrade to the default rather than take the
+// console down: this knob exists for simulated clusters, and the console
+// starting is not the convenience -- the override is.
+func TestProveGangTimeout(t *testing.T) {
+	const key = "AICRME_PROVE_GANG_TIMEOUT"
+
+	if got := proveGangTimeout(); got != defaultProveGangTimeout {
+		t.Errorf("proveGangTimeout(unset) = %v, want the default %v", got, defaultProveGangTimeout)
+	}
+
+	t.Setenv(key, "45s")
+	if got := proveGangTimeout(); got != 45*time.Second {
+		t.Errorf("proveGangTimeout(45s) = %v, want 45s -- test/e2e/prove.sh sets exactly this", got)
+	}
+
+	// A mistyped override for a simulated cluster must degrade to the
+	// default, never take the console down: a zero or negative budget would
+	// reach time.NewTicker as a panic, and an unparseable one has no meaning
+	// to honor.
+	for _, bad := range []string{"", "soon", "45", "-5s", "0s"} {
+		t.Setenv(key, bad)
+		if got := proveGangTimeout(); got != defaultProveGangTimeout {
+			t.Errorf("proveGangTimeout(%q) = %v, want the default %v", bad, got, defaultProveGangTimeout)
+		}
+	}
+}
+
 func TestEnsureWorkDirsCreatesEveryCacheDir(t *testing.T) {
 	root := t.TempDir()
 	if err := ensureWorkDirs(root); err != nil {

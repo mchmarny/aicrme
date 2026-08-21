@@ -133,3 +133,34 @@ jobs:
           path: .e2e-diag/
           if-no-files-found: warn
           retention-days: 7
+
+  prove:
+    runs-on: ubuntu-latest
+    # A real install (~6m locally) plus the Prove assertions on top: one gang
+    # placed, a console restart over it, a Stop that fails and one that
+    # succeeds, and a second run whose gang deliberately never places (bounded
+    # by AICRME_PROVE_GANG_TIMEOUT, which the script sets to 45s rather than
+    # waiting out the three-minute production default). Measured end to end at
+    # 13 minutes locally, of which ~4 was the install; the rest of this budget
+    # is the same slow-runner headroom apply-real carries, since this job pulls
+    # the same component images.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # Same reclaim as apply-real, for the same reason: this job performs a
+      # real install and pulls every component's images.
+      - name: reclaim runner disk for image pulls
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/android "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          df -h / | tail -1
+      - id: go
+        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: test/e2e/prove.sh

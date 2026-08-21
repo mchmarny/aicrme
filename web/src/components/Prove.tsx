@@ -104,8 +104,13 @@ export function Prove({ events, run, busy, onStop }: {
     <section data-testid="prove" className="mx-auto max-w-2xl space-y-5">
       <div>
         <h2 className="text-2xl font-semibold text-slate-100">
+          {/* "placed", not "running": on a simulated cluster KWOK completes
+              every pod in the same second it binds it, so a heading that
+              claimed a running computation would be false on the substrate
+              this screen most often renders against. Placement is the claim
+              that holds on both. */}
           {active
-            ? 'A gang-scheduled workload is running on your cluster'
+            ? 'Your cluster placed a gang-scheduled workload'
             : 'The reference workload has stopped'}
         </h2>
         <Claim run={run} />

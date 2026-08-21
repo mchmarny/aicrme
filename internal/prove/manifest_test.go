@@ -133,6 +133,54 @@ func TestWorkloadGangSchedulesTwoPodsAtEightGPUsEachOnKaiScheduler(t *testing.T)
 			t.Errorf("nvidia.com/gpu limit = %v, want 8", got)
 		}
 	})
+
+	// Measured, not theorized: without these two the gang is admitted and
+	// grouped by kai-scheduler and then never placed, because every node
+	// advertising nvidia.com/gpu on the demo path carries
+	// kwok.x-k8s.io/node=fake:NoSchedule (test/e2e/lib.sh's e2e_node_yaml).
+	// A real run on a KWOK cluster answered "no nodes with enough resources
+	// were found: 4 node(s) had untolerated taint(s)" and Prove timed out,
+	// cleaned up, and failed the run. No fake-clientset test can see this:
+	// nothing in a fake cluster evaluates a taint.
+	//
+	// Pinned as a set, and pinned to KEYS rather than to "some tolerations
+	// exist", because a catch-all toleration would satisfy the loose version
+	// while destroying the claim this workload makes -- that a GPU-aware
+	// scheduler chose GPU nodes, not that a pod was allowed anywhere.
+	t.Run("tolerations", func(t *testing.T) {
+		raw, ok := podSpec["tolerations"].([]any)
+		if !ok {
+			t.Fatalf("spec.template.spec.tolerations missing or not a list: %#v", podSpec["tolerations"])
+		}
+		got := map[string]map[string]any{}
+		for i, item := range raw {
+			tol, isMap := item.(map[string]any)
+			if !isMap {
+				t.Fatalf("tolerations[%d] not a mapping: %#v", i, item)
+			}
+			key, _ := tol["key"].(string)
+			if key == "" {
+				t.Fatalf("tolerations[%d] has no key -- a keyless toleration matches every taint: %#v", i, tol)
+			}
+			got[key] = tol
+		}
+
+		kwok, ok := got["kwok.x-k8s.io/node"]
+		if !ok {
+			t.Fatalf("no toleration for kwok.x-k8s.io/node; the simulated GPU nodes every demo and e2e run uses are unschedulable without it (have %v)", got)
+		}
+		if kwok["value"] != "fake" || kwok["effect"] != "NoSchedule" {
+			t.Errorf("kwok toleration = %#v, want value=fake effect=NoSchedule", kwok)
+		}
+
+		gpu, ok := got["nvidia.com/gpu"]
+		if !ok {
+			t.Fatalf("no toleration for nvidia.com/gpu; a GKE GPU node pool is tainted with it (have %v)", got)
+		}
+		if gpu["operator"] != "Exists" || gpu["effect"] != "NoSchedule" {
+			t.Errorf("nvidia.com/gpu toleration = %#v, want operator=Exists effect=NoSchedule", gpu)
+		}
+	})
 }
 
 // Fix round 1 (review F2): Render must build both label blocks from

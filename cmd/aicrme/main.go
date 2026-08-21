@@ -56,6 +56,15 @@ const defaultWorkDir = "/var/lib/aicrme"
 // surfaces as a warn event, so the wait is visible rather than silent.
 const defaultApplyRetries = 5
 
+// defaultProveGangTimeout is how long the Prove step waits for kai-scheduler
+// to place every member of its gang. Measured rather than guessed: on the
+// KWOK demo cluster both members were bound within two seconds of the Job
+// being created, so this is generous by two orders of magnitude -- which is
+// the right side to be generous on for real hardware, where the gang waits on
+// image pulls and node readiness too. Overridable only through
+// proveGangTimeout's env knob, for the e2e.
+const defaultProveGangTimeout = 3 * time.Minute
+
 // runShutdownTimeout bounds how long shutdown waits for an in-flight run to
 // stop. The worst case is killGrace (internal/applier/exec.go, 10s: the
 // process-group SIGTERM -> SIGKILL escalation) plus terminalSaveTimeout
@@ -466,10 +475,9 @@ func main() {
 		// telemetry, nil outside a pod -- see the Warn above for why that no
 		// longer risks the process.
 		steps.NewProve(proveClient, steps.ProveConfig{
-			// My ruling (design doc's own open question): provisional, to be
-			// revisited against a real make demo once gang placement latency
-			// on a live cluster is measured rather than guessed.
-			GangTimeout: 3 * time.Minute,
+			// The design doc's own open question, now answered against a real
+			// cluster rather than guessed -- see defaultProveGangTimeout.
+			GangTimeout: proveGangTimeout(),
 		}),
 	)
 	// Stop (Task 7) is the only way a run leaves StateActive, and it needs
@@ -638,6 +646,35 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// proveGangTimeout returns how long the Prove step waits for its gang to be
+// placed: AICRME_PROVE_GANG_TIMEOUT when it holds a positive Go duration, and
+// defaultProveGangTimeout otherwise.
+//
+// The override exists for one caller, test/e2e/prove.sh, which deliberately
+// makes placement impossible and would otherwise wait out the full default
+// to observe the cleanup that follows. Deliberately env-only and NOT a chart
+// value, exactly like AICRME_SNAPSHOT_NODE_SELECTOR: putting it in
+// values.yaml would advertise a knob that only makes sense on a cluster where
+// nothing can be placed at all.
+//
+// An unparseable or non-positive value degrades to the default rather than
+// refusing to start (same posture as parseNodeSelector): a mistyped override
+// for a simulated cluster should not be able to take the console down.
+func proveGangTimeout() time.Duration {
+	const key = "AICRME_PROVE_GANG_TIMEOUT"
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultProveGangTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("ignoring an unparseable gang-timeout override",
+			"key", key, "value", v, "using", defaultProveGangTimeout)
+		return defaultProveGangTimeout
+	}
+	return d
 }
 
 // parseNodeSelector turns a "key=value,key2=value2" list into a node

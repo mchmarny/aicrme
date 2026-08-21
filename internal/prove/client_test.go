@@ -348,18 +348,44 @@ func TestPlacedNodesCountsPendingAsPlaced(t *testing.T) {
 // would report a dead gang member as placed, and with workload.yaml's
 // backoffLimit: 0 a Failed pod is never replaced, so the Job is
 // permanently dead even though the gang would read as fully placed.
-func TestPlacedNodesExcludesTerminatedPods(t *testing.T) {
+// A failed gang member is not a placed one: workload.yaml sets
+// backoffLimit: 0, so nothing will replace it, and counting it would report a
+// permanently failed Job as a successfully running gang.
+func TestPlacedNodesExcludesFailedPods(t *testing.T) {
 	failed := placedPod("run-abc", "prove-run-abc-0", "gpu-node-0")
 	failed.Status.Phase = corev1.PodFailed
-	succeeded := placedPod("run-abc", "prove-run-abc-1", "gpu-node-1")
-	succeeded.Status.Phase = corev1.PodSucceeded
-	cs := fake.NewSimpleClientset(failed, succeeded)
+	cs := fake.NewSimpleClientset(failed)
 	got, err := prove.NewClient(cs).PlacedNodes(context.Background(), "run-abc")
 	if err != nil {
 		t.Fatalf("PlacedNodes() error = %v", err)
 	}
 	if len(got) != 0 {
-		t.Errorf("PlacedNodes() = %+v, want both terminated pods excluded", got)
+		t.Errorf("PlacedNodes() = %+v, want the failed pod excluded", got)
+	}
+}
+
+// The other half of that distinction, and the one a fake clientset gave the
+// wrong answer to for a whole task: a pod the substrate completed the instant
+// it was bound is still a placement decision.
+//
+// This is not hypothetical. KWOK -- whose simulated GPU nodes are a
+// prerequisite of the only path this console can demo on -- marks a pod
+// Succeeded in the same second it binds it: measured on the demo cluster,
+// both gang members bound at 10:28:39/40 with the Job reporting
+// completionTime 10:28:40 and no observable Running window at any poll
+// interval. While Succeeded was excluded alongside Failed, every simulated
+// run timed out at three minutes reporting 0/2 placed, over a gang the
+// scheduler had in fact placed immediately.
+func TestPlacedNodesCountsAPodCompletedTheInstantItWasBound(t *testing.T) {
+	succeeded := placedPod("run-abc", "prove-run-abc-1", "gpu-node-1")
+	succeeded.Status.Phase = corev1.PodSucceeded
+	cs := fake.NewSimpleClientset(succeeded)
+	got, err := prove.NewClient(cs).PlacedNodes(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatalf("PlacedNodes() error = %v", err)
+	}
+	if got["prove-run-abc-1"] != "gpu-node-1" {
+		t.Errorf("PlacedNodes() = %+v, want the completed pod counted on gpu-node-1", got)
 	}
 }
 
