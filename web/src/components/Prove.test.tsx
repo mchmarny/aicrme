@@ -101,6 +101,36 @@ describe('Prove', () => {
     expect(screen.getByRole('button', { name: /stop workload/i })).toBeDefined()
   })
 
+  // Wizard renders this screen for the whole prove phase, so the in-progress
+  // state is a real one -- and telling an operator watching the gang be placed
+  // that it "has stopped" would be the screen contradicting the events next
+  // to it.
+  it('says the workload is being placed while the run is still running', () => {
+    render(
+      <Prove events={[]} run={runState({ state: 'running' })} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByRole('heading', { name: /placing the reference workload/i })).toBeDefined()
+    expect(screen.queryByTestId('prove-stopped')).toBeNull()
+    expect(screen.queryByRole('button', { name: /stop workload/i })).toBeNull()
+  })
+
+  // The claim this screen must never make: a run that failed at Prove may have
+  // failed its own cleanup too, and the console cannot tell from the event
+  // stream. "Nothing is holding your accelerators" would be an assertion about
+  // something it did not observe.
+  it('claims nothing about what a failed run left behind', () => {
+    render(
+      <Prove events={[]} run={runState({ state: 'failed' })} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByTestId('prove-failed')).toBeDefined()
+    expect(screen.queryByTestId('prove-stopped')).toBeNull()
+    expect(screen.queryByText(/still holding the cluster's accelerators/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: /stop workload/i })).toBeNull()
+    // No allocation claim either: nothing was placed, so there is nothing for
+    // the simulated/real branch to be about.
+    expect(screen.queryByTestId('prove-simulated')).toBeNull()
+  })
+
   it('disables Stop while a stop is already in flight', () => {
     render(<Prove events={placementEvents()} run={runState()} busy={true} onStop={vi.fn()} />)
 

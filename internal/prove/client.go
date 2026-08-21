@@ -174,7 +174,12 @@ func (c *Client) WaitAbsent(ctx context.Context, runID string, timeout time.Dura
 // replaced -- would still be counted as placed, reporting a permanently
 // failed Job as a successfully running gang.
 //
-// The check excludes PodFailed only, which is narrower than it first was.
+// The check excludes PodFailed only, which is narrower than it first was --
+// and deliberately so for PodUnknown too, which the earlier phase test also
+// excluded: Unknown means the node stopped reporting, not that the pod was
+// never placed, so treating a brief control-plane partition as "the gang did
+// not place" would fail a run over something the scheduler had already
+// decided.
 // Excluding Succeeded too looks equally safe and is not: KWOK marks a pod
 // Succeeded in the same second it binds it -- measured on the demo cluster,
 // where both gang members were bound at 10:28:39/40 and the Job reported

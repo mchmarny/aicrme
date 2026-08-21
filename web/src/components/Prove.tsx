@@ -98,7 +98,15 @@ export function Prove({ events, run, busy, onStop }: {
   onStop: () => void
 }) {
   const placed = placements(events, run.runId)
+  // Four states reach this screen, and each of them makes a different claim
+  // true. Wizard renders it for the whole prove phase, not only for an active
+  // run, so a two-way active/not-active split would tell an operator watching
+  // the gang be placed that it "has stopped", and would tell one whose run
+  // just failed here that nothing is holding their accelerators -- which the
+  // console cannot know when its own cleanup could not be confirmed.
   const active = run.state === 'active'
+  const stopped = run.state === 'done'
+  const failed = run.state === 'failed'
 
   return (
     <section data-testid="prove" className="mx-auto max-w-2xl space-y-5">
@@ -109,11 +117,16 @@ export function Prove({ events, run, busy, onStop }: {
               claimed a running computation would be false on the substrate
               this screen most often renders against. Placement is the claim
               that holds on both. */}
-          {active
-            ? 'Your cluster placed a gang-scheduled workload'
-            : 'The reference workload has stopped'}
+          {active && 'Your cluster placed a gang-scheduled workload'}
+          {stopped && 'The reference workload has stopped'}
+          {failed && 'The reference workload did not run'}
+          {!active && !stopped && !failed && 'Placing the reference workload…'}
         </h2>
-        <Claim run={run} />
+        {/* The claim is about what the placement below means, so it is shown
+            only when there is a placement to mean anything about. A run that
+            failed before anything was bound has nothing to say here, and the
+            error above it is already saying the true thing. */}
+        {placed.length > 0 && <Claim run={run} />}
       </div>
 
       {/* A recovered or adopted run reached this screen without the operator
@@ -136,13 +149,13 @@ export function Prove({ events, run, busy, onStop }: {
         </ul>
       ) : (
         <p className="text-sm text-slate-500">
-          {active
-            ? 'Waiting for the scheduler to place every member of the gang…'
-            : 'No placement decisions were recorded for this run.'}
+          {failed
+            ? 'No gang member was ever bound to a node.'
+            : 'Waiting for the scheduler to place every member of the gang…'}
         </p>
       )}
 
-      {active ? (
+      {active && (
         <div className="space-y-2">
           <button
             data-testid="prove-stop"
@@ -157,10 +170,27 @@ export function Prove({ events, run, busy, onStop }: {
             for its pods to actually be gone before the run is closed.
           </p>
         </div>
-      ) : (
+      )}
+
+      {stopped && (
         <p data-testid="prove-stopped" className="text-sm text-slate-400">
           The workload was deleted and its pods are gone. Nothing this console started is
           still holding the cluster's accelerators.
+        </p>
+      )}
+
+      {/* Deliberately makes no claim about what is left in the cluster. The
+          step cleans up after itself and usually confirms the workload gone,
+          but when it cannot the engine says so by refusing to start a new run
+          (internal/engine's unconfirmed-cleanup guard) -- and that fact is not
+          in the event stream this screen derives from. Claiming "nothing is
+          holding your accelerators" here would be the console asserting
+          something it did not observe. */}
+      {failed && (
+        <p data-testid="prove-failed" className="text-sm text-slate-400">
+          This run failed at the Prove step; the error above is what it reported. The step
+          removes what it created before failing, and if it could not confirm that, the
+          console will refuse to start a new run until you resolve it.
         </p>
       )}
     </section>
