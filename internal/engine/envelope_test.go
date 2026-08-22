@@ -472,6 +472,17 @@ func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
 			v.Set(reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)))
 		case Workload:
 			v.Set(reflect.ValueOf(Workload{Namespace: "parity-ns", Kind: "Job", Name: "parity-workload"}))
+		case Residue:
+			// Incomplete true and a fully-populated item: the guard and the
+			// inventory are separate producers in envelope.go's projection,
+			// and losing either one has its own distinct consequence.
+			v.Set(reflect.ValueOf(Residue{
+				Incomplete: true,
+				Items: []ResidueItem{{
+					Kind: KindRelease, Name: "parity-release", Namespace: "parity-ns",
+					Removed: true, Skip: "parity-skip", Err: "parity-err",
+				}},
+			}))
 		case Ownership:
 			// Both slices non-empty, and every NamespaceRef field distinct
 			// from its zero value -- an envelope that carried Ownership but

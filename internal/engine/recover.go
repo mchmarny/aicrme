@@ -85,7 +85,7 @@ func validRunID(id string) bool {
 // happens to survive JSON decoding, must not be trusted implicitly.
 func validState(s State) bool {
 	switch s {
-	case StateIdle, StateRunning, StateAwaitingDecision, StateFailed, StateActive, StateDone:
+	case StateIdle, StateRunning, StateAwaitingDecision, StateFailed, StateActive, StateDone, StateResetting:
 		return true
 	default:
 		return false
@@ -257,6 +257,18 @@ func (e *Engine) Recover(ctx context.Context) error {
 	// step.Requires() against the decisions already recorded.
 	r.Pending = nil
 
+	// A teardown interrupted by a restart is the one live state whose
+	// residue is genuinely unknown: the goroutine that would have recorded
+	// what it removed died with the pod, so the record names neither what
+	// went nor what stayed. Marking it incomplete is the honest answer and
+	// the fail-closed one -- Start, Retry and Discard all refuse until
+	// another Reset has actually established the cluster's state.
+	//
+	// Checked before the rewind below, because it must not depend on where
+	// StepIndex happened to be pointing.
+	if r.State == StateResetting {
+		r.Residue.Incomplete = true
+	}
 	if isLive(r.State) || r.State == StateIdle {
 		r.State = StateFailed
 		r.Err = recoveredErr

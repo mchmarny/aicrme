@@ -105,6 +105,16 @@ type envelope struct {
 	//
 	// omitzero, not omitempty: see Run.Ownership's comment.
 	Ownership Ownership `json:"ownership,omitzero"`
+	// Residue is the same optional-on-both-sides addition, and the one that
+	// matters most for a rollback: it carries hasIncompleteTeardown's guard,
+	// so a record whose Reset failed keeps refusing Start, Retry and Discard
+	// across a pod restart. That is the CleanupUnconfirmed lesson (fix round
+	// 2's N1) applied before the fact rather than after it -- and
+	// envelope_test.go's parity test is what will catch it if a later field
+	// is added here without a producer.
+	//
+	// omitzero, not omitempty: see Run.Residue's comment.
+	Residue Residue `json:"residue,omitzero"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -186,6 +196,7 @@ func encodeRun(r *Run) ([]byte, error) {
 		Workload:           r.Workload,
 		CleanupUnconfirmed: r.CleanupUnconfirmed,
 		Ownership:          r.Ownership,
+		Residue:            r.Residue,
 		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -277,6 +288,7 @@ func decodeRun(blob []byte) (*Run, error) {
 		Workload:           env.Workload,
 		CleanupUnconfirmed: env.CleanupUnconfirmed,
 		Ownership:          env.Ownership,
+		Residue:            env.Residue,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

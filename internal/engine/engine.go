@@ -142,6 +142,13 @@ type Engine struct {
 	// Recover's markStoreUnreadable exception.
 	proveClient *prove.Client
 
+	// teardown removes the releases and namespaces a run installed, for
+	// Reset. Nil by default and nil outside a cluster, the same shape as
+	// proveClient; Reset refuses with 503 rather than dereferencing it.
+	// Declared as an interface here because internal/teardown imports THIS
+	// package -- see the Teardown interface in reset.go.
+	teardown Teardown
+
 	mu      sync.Mutex
 	current *Run
 	resume  chan struct{}
@@ -276,6 +283,16 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
 			"a previous run's cleanup could not be confirmed; the workload may still be running -- resolve it before starting a new run")
 	}
+	// A Reset that did not finish leaves the cluster half-torn-down, and a
+	// new run would install into it: helm would adopt whatever survived the
+	// teardown, and the ownership snapshot this run takes would record
+	// those leftovers as pre-existing, making them permanently unremovable.
+	// Reset again is the remedy and is deliberately still allowed.
+	if e.current != nil && hasIncompleteTeardown(e.current) {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"a previous run's reset did not finish; parts of it are still installed -- reset it again before starting a new run")
+	}
 	previous := e.current
 	now := time.Now().UTC()
 	r := &Run{
@@ -341,8 +358,13 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 	return snapshot, nil
 }
 
+// isLive means "a goroutine owns this run". StateResetting qualifies for
+// exactly that reason -- Reset launches one, the same way Start and Retry
+// do -- which is also what makes Start, Discard and a second Reset all
+// refuse it for free, and what makes Recover treat an interrupted teardown
+// as an interrupted run.
 func isLive(s State) bool {
-	return s == StateRunning || s == StateAwaitingDecision
+	return s == StateRunning || s == StateAwaitingDecision || s == StateResetting
 }
 
 // isTerminal reports whether s is a state finish() actually reaches. finish
@@ -962,6 +984,16 @@ func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not in a failed state")
 	}
+	// New relative to Ruling 12, which only had to consider Start and
+	// Discard. A failed Reset lands in StateFailed, which is precisely the
+	// state Retry accepts -- so without this, the console would offer to
+	// re-run Apply over a cluster it has just half-removed, reinstalling
+	// components on top of releases whose uninstall had failed midway.
+	if hasIncompleteTeardown(e.current) {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"this run's reset did not finish; parts of it are still installed -- reset it again rather than retrying the install")
+	}
 	prevErr := e.current.Err
 	prevRecoveredPending := e.recoveredPending
 	// Retry is the intended resume path for a recovered run: accepting it
@@ -1089,6 +1121,16 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeConflict,
 			"run's cleanup could not be confirmed; the workload may still be running -- resolve it before discarding")
+	}
+	// The sharpest of the three. Discard deletes the record, and after a
+	// failed Reset that record is the ONLY inventory of what is still
+	// installed -- Run.Residue names every release and namespace the
+	// teardown could not remove. Discarding would leave the cluster exactly
+	// as it is and destroy the only description of it.
+	if hasIncompleteTeardown(e.current) {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"run's reset did not finish; this record is the only list of what is still installed -- reset it again before discarding")
 	}
 	previous := e.current
 	previousRecoveredPending := e.recoveredPending
