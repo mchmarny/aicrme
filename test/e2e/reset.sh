@@ -47,6 +47,8 @@ BYSTANDER_NS="${BYSTANDER_NS:-cert-manager}"
 # has something to refuse.
 BYSTANDER_KEPT_NS="${BYSTANDER_KEPT_NS:-node-feature-discovery}"
 
+RUN_ID=""
+FAIL_RUN_ID=""
 JAR="$(mktemp -t aicrme-reset-jar.XXXXXX)"
 PF_PID=""
 CHART_DIR=""
@@ -67,8 +69,17 @@ cleanup() {
     helm list -A >&2 2>&1 || true
     echo "--- namespaces ---" >&2
     kubectl get ns >&2 2>&1 || true
-    echo "--- run record ---" >&2
-    curl -fsS --max-time 10 -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID:-none}" >&2 2>&1 || true
+    echo "--- run records ---" >&2
+    # Both, and each tolerated as absent: a clean Reset DELETES the record,
+    # so the first run is legitimately a 404 by the time the second one is
+    # under test. Printing only RUN_ID (this script's first shape) meant the
+    # diagnostics for a second-run failure were a bare 404.
+    for id in "${RUN_ID:-}" "${FAIL_RUN_ID:-}"; do
+      [[ -z "${id}" ]] && continue
+      echo "run ${id}:" >&2
+      curl -fsS --max-time 10 -b "${JAR}" "http://${ADDR}/api/runs/${id}" >&2 2>&1 || echo "  (no record)" >&2
+      echo >&2
+    done
   fi
   [[ -n "${PF_PID}" ]] && kill "${PF_PID}" 2>/dev/null
   rm -f "${JAR}"
@@ -362,10 +373,26 @@ echo "namespaces reported as skipped with a stated reason: ${NAMED}"
 echo "assertion 3: PASS"
 
 echo "--- assert 4: a FAILED reset blocks Start, Retry and Discard, and Reset again succeeds"
-# A webhook that refuses every namespace DELETE. Only a real API server can
-# produce this: admission is exactly what a fake clientset does not run. The
-# service does not exist and failurePolicy is Fail, so every delete is
-# rejected without anything having to be listening.
+FAIL_RUN_ID="$(drive_to_installed)"
+echo "second run id: ${FAIL_RUN_ID}"
+STATE=""
+for _ in $(seq 1 240); do
+  STATE="$(run_state "${FAIL_RUN_ID}")"
+  [[ "${STATE}" == "active" || "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
+  sleep 10
+done
+[[ "${STATE}" == "active" ]] || {
+  echo "second run record: $(run_json "${FAIL_RUN_ID}" | jq -c '{state,phase,error}')" >&2
+  fail "the second run did not reach state=active (state=${STATE})"
+}
+
+# The webhook goes up HERE, after the install and before the teardown --
+# not before the install, which is where this script first put it. It
+# refuses every namespace DELETE cluster-wide with failurePolicy: Fail, and
+# deploy.sh's own preflight deletes terminating namespaces, so a webhook
+# live during Apply breaks the install rather than the reset. Only a real
+# API server can produce this at all: admission is exactly what a fake
+# clientset does not run.
 kubectl apply -f - <<EOF
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -389,16 +416,6 @@ webhooks:
         resources: ["namespaces"]
         scope: Cluster
 EOF
-
-FAIL_RUN_ID="$(drive_to_installed)"
-echo "second run id: ${FAIL_RUN_ID}"
-STATE=""
-for _ in $(seq 1 240); do
-  STATE="$(run_state "${FAIL_RUN_ID}")"
-  [[ "${STATE}" == "active" || "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
-  sleep 10
-done
-[[ "${STATE}" == "active" ]] || fail "the second run did not reach state=active (state=${STATE})"
 
 post_status "/api/runs/${FAIL_RUN_ID}/reset" -d '{"confirm":"reset"}' >/dev/null
 BLOCKED_STATE="$(await_terminal "${FAIL_RUN_ID}" 180)"
