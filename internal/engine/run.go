@@ -156,6 +156,18 @@ type NamespaceRef struct {
 	// makes every release in the namespace unprovable, so Reset skips them
 	// and says why -- an unanswered question is not evidence of ownership.
 	SnapshotErr string `json:"snapshotErr,omitempty"`
+	// CreatedUID is the UID of the namespace THIS RUN created, read back
+	// after Apply. It is the only UID that can decide a deletion, which is
+	// why it exists alongside UID rather than reusing it: UID is what was
+	// there BEFORE Apply, and a namespace that was already there is never
+	// deleted, so UID is diagnostic only and never decides anything.
+	//
+	// Empty means "this run did not create a namespace at this name, or
+	// could not confirm that it did" -- a component that failed before its
+	// namespace was created, a chart that ships its own Namespace manifest
+	// and had it removed by helm uninstall, or an API error on the read
+	// back. All three are the same instruction to Reset: do not delete.
+	CreatedUID string `json:"createdUid,omitempty"`
 }
 
 // Ownership is the pre-Apply cluster state Reset reasons from. Its zero

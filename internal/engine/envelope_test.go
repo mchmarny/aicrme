@@ -479,9 +479,10 @@ func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
 			// DeepEqual-identical value and report a false pass.
 			v.Set(reflect.ValueOf(Ownership{
 				Releases: []ReleaseRef{{Name: "parity-release", Namespace: "parity-release-ns"}},
-				Namespaces: []NamespaceRef{
-					{Name: "parity-ns", UID: "parity-uid", Existed: true, SnapshotErr: "parity-err"},
-				},
+				Namespaces: []NamespaceRef{{
+					Name: "parity-ns", UID: "parity-uid", Existed: true,
+					SnapshotErr: "parity-err", CreatedUID: "parity-created-uid",
+				}},
 			}))
 		default:
 			t.Fatalf("setDistinctFieldValue: field %s has unhandled struct type %s -- extend this switch", name, v.Type())

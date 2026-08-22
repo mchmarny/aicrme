@@ -99,6 +99,47 @@ func snapshotNamespace(ctx context.Context, h HelmLister, k kubernetes.Interface
 	return releases, ref
 }
 
+// confirmCreatedNamespaces records the UID of each namespace this run
+// created. It runs AFTER Apply, because that UID does not exist before it:
+// a namespace absent from the pre-Apply snapshot has no object to read, and
+// the one Apply goes on to create is the only object a later deletion may
+// legitimately address (design section 5).
+//
+// Without it the ownership rule is one step short. "Absent before, present
+// now, and empty" would also describe a namespace someone else deleted and
+// recreated at the same name in the interim -- a different object wearing a
+// name this run happens to recognize.
+//
+// Only namespaces this run could have created are read: one that already
+// existed is never deleted, so recording a UID for it would be evidence for
+// a decision that is never made, and would blur the very distinction the
+// field exists to draw.
+//
+// Every failure leaves CreatedUID empty, which reads as "do not delete".
+// Nothing here can fail the Apply step -- it runs after the install has
+// already succeeded or failed on its own terms, and the worst outcome of a
+// missing UID is a namespace left behind for a human to remove.
+func confirmCreatedNamespaces(ctx context.Context, k kubernetes.Interface, own *engine.Ownership) {
+	if k == nil {
+		return
+	}
+	for i := range own.Namespaces {
+		ns := &own.Namespaces[i]
+		if ns.Existed || ns.SnapshotErr != "" {
+			continue
+		}
+		obj, err := k.CoreV1().Namespaces().Get(ctx, ns.Name, metav1.GetOptions{})
+		if err != nil {
+			// NotFound included: the component may have failed before
+			// creating it, or the chart shipped its own Namespace manifest
+			// (AICR downgrades --create-namespace for exactly those). Both
+			// are ordinary, and both mean the same thing here.
+			continue
+		}
+		ns.CreatedUID = string(obj.UID)
+	}
+}
+
 // unsnapshotted names the namespaces whose ownership could not be
 // established, in the order they were recorded (sorted). Empty is the
 // healthy case.

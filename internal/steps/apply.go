@@ -76,11 +76,25 @@ func (a *apply) Run(ctx context.Context, run *engine.Run, emit engine.Emit) erro
 
 	emit(bus.Event{Kind: bus.KindLog, Message: "applying the bundle"})
 
-	return a.applier.Apply(ctx, applier.Options{
+	err := a.applier.Apply(ctx, applier.Options{
 		BundleDir: dir,
 		Retries:   a.cfg.Retries,
 		DryRun:    a.cfg.DryRun,
 	}, trackComponents(run, emit))
+
+	// Deliberately before the error is returned, and deliberately with
+	// context.WithoutCancel. A failed Apply is when Reset matters MOST --
+	// it is the case that leaves a half-installed cluster -- so the
+	// evidence Reset needs must be gathered on that path too. And a run
+	// cancelled mid-install has installed the most namespaces it will ever
+	// have while having recorded the fewest, which is precisely when a
+	// cancelled ctx would otherwise skip this read.
+	//
+	// snapshotOwnership above is the pre-Apply half; this is the half that
+	// can only be known afterward.
+	confirmCreatedNamespaces(context.WithoutCancel(ctx), a.cfg.Kube, &run.Ownership)
+
+	return err
 }
 
 // trackComponents wraps emit so every KindComponent event -- deploy.sh's
