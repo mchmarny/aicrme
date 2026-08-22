@@ -121,10 +121,17 @@ type Run struct {
 // overwritten in place. Persisting this is what lets a recovered run redraw
 // the pipeline, without persisting the event stream that produced it.
 type ComponentState struct {
-	Name   string `json:"name"`
-	Index  int    `json:"index"`
-	Total  int    `json:"total"`
-	Status string `json:"status"`
+	Name  string `json:"name"`
+	Index int    `json:"index"`
+	Total int    `json:"total"`
+	// Namespace is the helm release's target namespace, carried from
+	// deploy.sh's own per-action header ("[1/14] cert-manager  →
+	// cert-manager"). Recorded because Reset addresses a release as
+	// (name, namespace) and has no other durable source for the second
+	// half: the bundle directory that holds it lives in the pod's emptyDir
+	// and is gone after any restart.
+	Namespace string `json:"namespace,omitempty"`
+	Status    string `json:"status"`
 }
 
 // Clone returns a deep copy safe to hand to callers outside the engine lock.

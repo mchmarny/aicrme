@@ -305,10 +305,11 @@ func (e *Engine) Recover(ctx context.Context) error {
 // internal/engine must not depend on internal/applier, which is a caller of
 // this package (via internal/steps), not a dependency of it.
 type bootstrapComponentData struct {
-	Name   string `json:"name"`
-	Index  int    `json:"index,omitempty"`
-	Total  int    `json:"total,omitempty"`
-	Status string `json:"status"`
+	Name      string `json:"name"`
+	Index     int    `json:"index,omitempty"`
+	Total     int    `json:"total,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Status    string `json:"status"`
 }
 
 // recoveryMarkerMsg is the KindRecovered event's message. Worded for every
@@ -366,7 +367,11 @@ func (e *Engine) publishRecoveryBootstrap(r *Run) {
 		// ComponentState and bootstrapComponentData share the same field
 		// names, order, and types (only their json tags differ), so a
 		// direct conversion is what staticcheck's S1016 asks for in place
-		// of a struct literal that just copies the same four fields.
+		// of a struct literal that just copies the same fields. The
+		// conversion is also the guard: adding a field to ComponentState
+		// and not to this type is a build error rather than a bootstrap
+		// event that silently drops it (envelope_test.go's nested parity
+		// test says the same thing for the persisted side).
 		data, _ := json.Marshal(bootstrapComponentData(c))
 		e.bus.Publish(bus.Event{
 			RunID: r.ID, Kind: bus.KindComponent, Phase: string(r.Phase),

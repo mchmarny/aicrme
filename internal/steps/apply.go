@@ -78,11 +78,14 @@ func trackComponents(run *engine.Run, emit engine.Emit) engine.Emit {
 }
 
 // upsertComponent keeps run.Components at one row per component, keyed by
-// name. Index and Total are only present on a component's header ("started")
-// marker -- reInstalled/reFailed/reRetry in internal/applier/parse.go carry
-// neither -- so a later status update carries the header's counts forward
-// rather than zeroing them, matching web/src/pipeline.ts's deriveComponents,
-// which does the same for the live (non-persisted) rendering.
+// name. Index, Total and Namespace are only present on a component's header
+// ("started") marker -- reInstalled/reFailed/reRetry in
+// internal/applier/parse.go carry none of them -- so a later status update
+// carries the header's values forward rather than zeroing them, matching
+// web/src/pipeline.ts's deriveComponents, which does the same for the live
+// (non-persisted) rendering. Namespace matters most here: it is the half of
+// a helm release's identity Reset cannot reconstruct from anywhere else
+// once the bundle's emptyDir is gone.
 func upsertComponent(run *engine.Run, data applier.ComponentData) {
 	for i := range run.Components {
 		if run.Components[i].Name != data.Name {
@@ -96,12 +99,16 @@ func upsertComponent(run *engine.Run, data applier.ComponentData) {
 		if data.Total != 0 {
 			row.Total = data.Total
 		}
+		if data.Namespace != "" {
+			row.Namespace = data.Namespace
+		}
 		return
 	}
 	run.Components = append(run.Components, engine.ComponentState{
-		Name:   data.Name,
-		Index:  data.Index,
-		Total:  data.Total,
-		Status: data.Status,
+		Name:      data.Name,
+		Index:     data.Index,
+		Total:     data.Total,
+		Namespace: data.Namespace,
+		Status:    data.Status,
 	})
 }

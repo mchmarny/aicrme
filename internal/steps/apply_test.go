@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"strings"
 	"testing"
 
@@ -117,6 +118,46 @@ func TestApplyMaintainsComponentState(t *testing.T) {
 	}
 	if got := byName["kai-scheduler"]; got.Status != applier.StatusFailed || got.Index != 2 || got.Total != 2 {
 		t.Errorf("kai-scheduler row = %+v, want status=%q index=2 total=2", got, applier.StatusFailed)
+	}
+}
+
+// TestApplyRecordsEachComponentsNamespace: deploy.sh's own header carries
+// the target namespace ("┌─ [1/14] cert-manager  →  cert-manager"),
+// applier.ComponentData already parses it, and the engine dropped it. Reset
+// needs it: a release name alone does not identify a helm release, and the
+// bundle directory that would otherwise supply it dies with the pod's
+// emptyDir.
+//
+// Driven through a real transcript rather than by calling trackComponents
+// directly, because this file is package steps_test -- and because the
+// header is the ONLY marker that carries a namespace, which is the whole
+// reason the value has to survive a later status marker that does not.
+func TestApplyRecordsEachComponentsNamespace(t *testing.T) {
+	transcript := strings.Join([]string{
+		"┌─ [1/2] cert-manager  →  cert-manager",
+		"┌─ [2/2] nfd  →  node-feature-discovery",
+		// A later status marker carries neither index nor namespace; the
+		// header's values must survive it, exactly as Index/Total already do.
+		"└─ ✓ nfd installed",
+	}, "\n") + "\n"
+	exec := &recordingExec{transcript: transcript}
+	step := steps.NewApply(applier.New(exec), steps.ApplyConfig{})
+
+	run := newRun()
+	run.Decisions["apply"] = "yes"
+	run.Artifacts["bundle.path"] = []byte("/b")
+
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	got := map[string]string{}
+	for _, c := range run.Components {
+		got[c.Name] = c.Namespace
+	}
+	want := map[string]string{"cert-manager": "cert-manager", "nfd": "node-feature-discovery"}
+	if !maps.Equal(got, want) {
+		t.Errorf("component namespaces = %v, want %v", got, want)
 	}
 }
 
