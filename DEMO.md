@@ -148,6 +148,14 @@ Reset removes only what it can prove this run created, and names everything it l
 - **Anything it could not check.** An RBAC denial or an unreachable API is not evidence that
   something is safe to delete, so the object stays and the run says why.
 
+In practice this means **most namespaces survive a Reset**, and that is not a bug. Measured on
+the KWOK demo cluster: all 13 releases were removed, and 8 of 10 namespaces were kept — four
+because an operator had left a leader-election `Lease` behind, one for a webhook-hook `Secret`,
+one for a `Deployment`, and two because they existed before the run. Those objects are created
+at runtime rather than by the chart, so `helm uninstall` does not remove them, and a namespace
+holding one is not empty. The releases are what matter for a repeat demo; the empty-ish
+namespaces are harmless and `kubectl delete ns` clears them if you want them gone.
+
 If a Reset does not finish, the console offers only Reset again: the run record is the only
 inventory of what is still installed, so Start, Retry and Discard are all refused until the
 cluster's state is known again.

@@ -1050,5 +1050,43 @@ git commit -S -m "test(e2e): Reset removes what the run created and leaves what 
 ## Unresolved questions
 
 1. **Uninstall timeout per release** — 5 minutes, provisional, to be revisited against a real Reset.
-2. **Discovery cost** for the emptiness check across ten namespaces. If slow, cache the discovery document per Reset — do not narrow to a kind list, which is what made revision 1 unsafe.
+2. ~~**Discovery cost** for the emptiness check across ten namespaces.~~ **Settled:** the discovery document is fetched once per Reset, not once per namespace (`teardown.Namespaces`, pinned by `TestNamespacesDiscoversOnceForTheWholeTeardown`). The kind list was NOT narrowed.
 3. **Does the kai-scheduler wedge** (`docs/phase-3-status.md`) survive a Reset-then-Apply cycle? Task 11 is where to find out.
+
+### 4. NEW, from the first real Reset — leader-election Leases keep most namespaces alive
+
+Measured on Kind + KWOK, 2026-08-22. All 13 created releases were removed and the seeded
+bystander was correctly skipped, but only **2 of 10 namespaces** were deleted. The other eight
+were kept, each correctly named:
+
+| Namespace | Why it was kept |
+|---|---|
+| `cert-manager`, `node-feature-discovery` | existed before the install — correct, and the point of the test |
+| `gpu-operator` | `still holds Lease 53822513.nvidia.com` |
+| `kubeflow` | `still holds Lease 6d4f6a47.jobset.x-k8s.io` |
+| `nvidia-network-operator` | `still holds Lease 12620820.mellanox.com` |
+| `skyhook` | `still holds Lease 3c22c1ae.nvidia.com` |
+| `kai-scheduler` | `still holds Deployment admission` |
+| `monitoring` | `still holds Secret kube-prometheus-admission` |
+
+Every one of these is residue of the release that was just uninstalled, not a bystander: a
+leader-election Lease and a webhook-hook Secret are created at RUNTIME by the operator, so they
+are not chart-managed and `helm uninstall` does not remove them. The rule as specified is
+working exactly as written — "created by this run and left EMPTY" — and it is being honest.
+
+**The open question is a product one, not a correctness one:** is this conservative enough to
+be right, or too conservative to be useful? Two directions, and the choice is the operator's to
+make, not this plan's:
+
+- **Leave it.** The behaviour is safe, every skip is named, and the operator can remove the
+  namespaces by hand. The design's own warning applies: an over-broad exclusion is exactly how
+  revision 1 of this rule became unsafe.
+- **Exclude `coordination.k8s.io/Lease` by kind.** A Lease is a lock, not a workload, and it is
+  destroyed with the namespace either way — the same argument already made for Events. This
+  would recover `gpu-operator`, `kubeflow`, `nvidia-network-operator` and `skyhook`, i.e. half
+  the namespaces. It would NOT recover `kai-scheduler` or `monitoring`, which hold a real
+  Deployment and a real Secret.
+
+Deliberately NOT changed as part of this slice. Widening the exclusion list is the one
+modification the spec singles out as the way this rule becomes unsafe again, and it should be a
+decision taken on its own merits rather than smuggled in under a green e2e.
