@@ -467,6 +467,14 @@ func main() {
 			// test can exercise the real deploy.sh and the real helm binary
 			// against a cluster with no GPUs without installing anything.
 			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
+			// The pre-Apply ownership snapshot's two seams. helm runs
+			// through the same BashExec deploy.sh does, so there is one
+			// place in this binary that spawns a subprocess. kube is nil
+			// outside a pod, the same nil the Warn above covers -- the
+			// snapshot records that as a per-namespace failure, which
+			// leaves a later Reset removing nothing rather than guessing.
+			Helm: steps.NewHelmLister(applier.BashExec{}),
+			Kube: kube,
 		}),
 		// The final step: a run that reaches here and returns without error
 		// ends at StateActive rather than StateDone (engine.ActiveStep), with
