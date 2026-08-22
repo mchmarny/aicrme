@@ -55,7 +55,7 @@ type ReleaseOutcome struct {
 // Two contexts, and the difference is load-bearing (spec section 8). ctx
 // runs each command and carries its deadline. cancel is checked only
 // BETWEEN commands: internal/applier/exec.go's BashExec SIGTERMs the whole
-// process group the instant its context is cancelled, so running helm under
+// process group the instant its context is canceled, so running helm under
 // the cancellable context would interrupt an uninstall mid-flight and
 // strand the release half-removed -- the exact residue this package exists
 // to eliminate. Operator cancellation is therefore cooperative: the
@@ -75,6 +75,7 @@ type ReleaseOutcome struct {
 // a component missing from it would be a component nobody knows to check.
 func Releases(ctx, cancel context.Context, e Exec, comps []engine.ComponentState,
 	own engine.Ownership, opts Options, emit func(ReleaseOutcome)) []ReleaseOutcome {
+
 	ordered := slices.Clone(comps)
 	// Stable, so components that share an index (or have none, on a record
 	// written before Apply reported one) keep a deterministic relative
@@ -90,7 +91,7 @@ func Releases(ctx, cancel context.Context, e Exec, comps []engine.ComponentState
 		out := ReleaseOutcome{Name: c.Name, Namespace: c.Namespace}
 		switch {
 		case stopped:
-			out.Skip = "teardown was cancelled before this release was reached"
+			out.Skip = "teardown was canceled before this release was reached"
 		case c.Namespace == "":
 			// A release is addressed as (name, namespace). Half of that
 			// identity names nothing, and guessing the other half is how a

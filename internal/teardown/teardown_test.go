@@ -190,7 +190,7 @@ func TestReleasesContinuesPastAFailure(t *testing.T) {
 
 // Operator cancellation is cooperative: the in-flight uninstall completes,
 // and the NEXT one does not start. internal/applier/exec.go's BashExec
-// SIGTERMs the whole process group the moment its context is cancelled, so
+// SIGTERMs the whole process group the moment its context is canceled, so
 // handing it the cancellable context would interrupt helm mid-uninstall --
 // which is how a release ends up half-removed, the exact residue Reset
 // exists to eliminate.
@@ -213,11 +213,11 @@ func TestReleasesCancellationDoesNotInterruptTheInFlightCommand(t *testing.T) {
 		t.Errorf("ran %d commands, want exactly 1 -- the in-flight one completes, the next does not start", len(e.calls))
 	}
 	if e.interrupted {
-		t.Error("the in-flight command saw a cancelled context")
+		t.Error("the in-flight command saw a canceled context")
 	}
 }
 
-// A cancelled teardown still has to say what it did not do. The outcome
+// A canceled teardown still has to say what it did not do. The outcome
 // list is the residue inventory -- an operator handed a partial teardown
 // with no record of the remainder has nothing to act on.
 func TestReleasesReportsWhatCancellationLeftBehind(t *testing.T) {
@@ -236,7 +236,7 @@ func TestReleasesReportsWhatCancellationLeftBehind(t *testing.T) {
 		teardown.Options{Timeout: time.Minute}, noEmit)
 
 	if len(out) != 2 {
-		t.Fatalf("outcomes = %+v, want one row per component even when cancelled", out)
+		t.Fatalf("outcomes = %+v, want one row per component even when canceled", out)
 	}
 	// Reverse order: b ran, a was skipped.
 	if out[0].Name != "b" || out[0].Skip != "" || out[0].Err != "" {

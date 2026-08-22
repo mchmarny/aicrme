@@ -86,9 +86,9 @@ func (a *apply) Run(ctx context.Context, run *engine.Run, emit engine.Emit) erro
 	// context.WithoutCancel. A failed Apply is when Reset matters MOST --
 	// it is the case that leaves a half-installed cluster -- so the
 	// evidence Reset needs must be gathered on that path too. And a run
-	// cancelled mid-install has installed the most namespaces it will ever
+	// canceled mid-install has installed the most namespaces it will ever
 	// have while having recorded the fewest, which is precisely when a
-	// cancelled ctx would otherwise skip this read.
+	// canceled ctx would otherwise skip this read.
 	//
 	// snapshotOwnership above is the pre-Apply half; this is the half that
 	// can only be known afterward.
