@@ -435,3 +435,61 @@ func TestEnsureNamespaceErrorSurfaces(t *testing.T) {
 		t.Fatal("EnsureNamespace() error = nil, want the Forbidden error to surface")
 	}
 }
+
+// EnsureAbsent is Stop's delete-then-confirm sequence as one callable unit,
+// so Reset can require the same guarantee without going through Stop --
+// whose stoppable() guard rejects both an ordinary failed run and a run
+// already moved to StateResetting.
+func TestEnsureAbsentDeletesAndConfirms(t *testing.T) {
+	cs := fake.NewSimpleClientset(existingJob("run-abc"))
+	c := prove.NewClient(cs)
+
+	if err := c.EnsureAbsent(context.Background(), "run-abc", time.Second); err != nil {
+		t.Fatalf("EnsureAbsent() error = %v", err)
+	}
+	if _, err := cs.BatchV1().Jobs(prove.Namespace).
+		Get(context.Background(), prove.WorkloadName("run-abc"), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("workload Get() = %v, want NotFound", err)
+	}
+}
+
+// Nothing to delete is success: a run that never reached Prove has no
+// workload, and Reset must not treat that as a precondition failure.
+func TestEnsureAbsentSucceedsWhenNothingWasEverApplied(t *testing.T) {
+	if err := prove.NewClient(fake.NewSimpleClientset()).
+		EnsureAbsent(context.Background(), "run-never-proved", time.Second); err != nil {
+		t.Errorf("EnsureAbsent() error = %v, want nil", err)
+	}
+}
+
+// A delete the API server refused has not made anything absent, and
+// EnsureAbsent must not go on to report success. This is the half Reset
+// depends on most: it is what stops a teardown uninstalling the components
+// beneath a workload that is still holding GPUs.
+func TestEnsureAbsentReportsAFailedDelete(t *testing.T) {
+	cs := fake.NewSimpleClientset(existingJob("run-abc"))
+	cs.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("etcdserver: request timed out")
+	})
+
+	err := prove.NewClient(cs).EnsureAbsent(context.Background(), "run-abc", time.Second)
+	if err == nil {
+		t.Fatal("EnsureAbsent() error = nil, want the delete failure surfaced")
+	}
+}
+
+// A workload the API server never finishes removing is not absent either.
+// Delete succeeding only means the cascade STARTED.
+func TestEnsureAbsentReportsAWorkloadThatOutlivesTheWait(t *testing.T) {
+	cs := fake.NewSimpleClientset(existingJob("run-abc"))
+	// Delete reports success without removing anything, which is exactly
+	// what a foreground delete blocked on a finalizer looks like.
+	cs.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, nil
+	})
+
+	err := prove.NewClient(cs).EnsureAbsent(context.Background(), "run-abc", 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("EnsureAbsent() error = nil, want a timeout -- Delete returning nil is not proof of absence")
+	}
+}

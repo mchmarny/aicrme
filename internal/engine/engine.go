@@ -1215,10 +1215,13 @@ func (e *Engine) Stop(ctx context.Context, runID string) error {
 	client := e.proveClient
 	e.mu.Unlock()
 
-	if err := client.Delete(ctx, runID); err != nil {
-		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
-	}
-	if err := client.WaitAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
+	// Delete-then-confirm, as one call. Reset needs the identical guarantee
+	// and cannot reach it through Stop -- stoppable() rejects an ordinary
+	// StateFailed run and rejects StateResetting outright -- so the sequence
+	// lives in prove.Client and both callers require it there. The wrapping
+	// is unchanged, so the operator-facing message for either half is the
+	// same text it has always been.
+	if err := client.EnsureAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
 	}
 
