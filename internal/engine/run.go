@@ -42,6 +42,16 @@ const (
 	StateActive State = "active"
 	// StateDone is terminal and quiescent.
 	StateDone State = "done"
+	// StateResetting means an operator-confirmed teardown is in flight: the
+	// run's workload is being stopped, its releases uninstalled, and the
+	// namespaces it created removed. Live, in the isLive sense -- a
+	// goroutine owns the run -- so Start, Retry and Discard all refuse it,
+	// and Stop refuses it too (stoppable accepts none of its three arms).
+	//
+	// Only Reset ever sets it, and Reset is only ever reached by an
+	// operator's confirmed click. Nothing in this package moves a run here
+	// on its own: not a failure, not a restart, not a timeout.
+	StateResetting State = "resetting"
 )
 
 // Run is the full state of one console run.
@@ -114,6 +124,144 @@ type Run struct {
 	// fail at the step it resumes on. The record was honest about the loss;
 	// this is what makes the console honest too.
 	Truncated []string `json:"truncated,omitempty"`
+	// Ownership is what the cluster looked like immediately BEFORE this
+	// run's Apply, and it is the only thing that separates a release this
+	// console created from one it adopted. AICR's generated install.sh runs
+	// `helm upgrade --install`, so a release a human already had at the
+	// same (name, namespace) is upgraded, prints a deploy header like any
+	// other action, and lands in Components indistinguishable from one this
+	// run created. Reset uninstalls only what is ABSENT here.
+	//
+	// Recorded before Apply because that is the only moment the answer
+	// exists: --install and --create-namespace both erase the distinction
+	// the instant they run.
+	//
+	// omitzero, not omitempty: see Workload's comment -- omitempty is a
+	// no-op on a struct field, so every run that never reached Apply would
+	// otherwise serialize an empty ownership object.
+	Ownership Ownership `json:"ownership,omitzero"`
+	// Residue is what the last Reset did not remove, and why. It is the
+	// operator's inventory of what is left on the cluster, and it is the
+	// reason a failed Reset must not be discardable: discarding deletes the
+	// only record of what is still installed.
+	//
+	// omitzero, not omitempty: see Workload's comment.
+	Residue Residue `json:"residue,omitzero"`
+}
+
+// ResidueItem is what happened to one thing a Reset considered. Exactly one
+// of Removed, Skip and Err is meaningful: removed, deliberately left, or
+// tried and failed.
+type ResidueItem struct {
+	// Kind is "release" or "namespace".
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
+	Removed   bool   `json:"removed,omitempty"`
+	// Skip is why this was deliberately left in place -- an ownership
+	// answer, not a failure. Most of what a Reset considers is legitimately
+	// not its to remove, and an operator cannot act on a silence.
+	Skip string `json:"skip,omitempty"`
+	// Err is why removing it did not succeed.
+	Err string `json:"error,omitempty"`
+}
+
+// Residue is the record of one Reset's outcome.
+//
+// Its zero value means no Reset has run, which is the state of every run
+// that has never been reset and of every record written before this field
+// existed.
+type Residue struct {
+	// Incomplete is the guard behind hasIncompleteTeardown: a teardown that
+	// did not finish cleanly leaves a cluster in a state no operation
+	// except another Reset should act on. Start would install over a
+	// half-removed cluster, Retry would re-run Apply over one, and Discard
+	// would delete the only inventory of what is left -- so all three
+	// refuse while this is set, and Reset does not.
+	//
+	// Set for an error or an interruption, never for a skip: skipping what
+	// this run did not create is the designed outcome, not a failure.
+	Incomplete bool `json:"incomplete,omitempty"`
+	// Items is every release and namespace the teardown considered,
+	// including the ones it removed -- the summary the operator is shown is
+	// counted from this, so an item missing from it is one nobody knows to
+	// check.
+	Items []ResidueItem `json:"items,omitempty"`
+}
+
+// Removed counts the items of one kind this Reset actually removed.
+func (r Residue) Removed(kind string) int {
+	n := 0
+	for _, it := range r.Items {
+		if it.Kind == kind && it.Removed {
+			n++
+		}
+	}
+	return n
+}
+
+// Considered counts the items of one kind this Reset looked at, removed or
+// not. Reset always reports counts rather than a bare verdict, so an
+// operator can tell a clean teardown from a partial one without reading the
+// timeline (design section 6).
+func (r Residue) Considered(kind string) int {
+	n := 0
+	for _, it := range r.Items {
+		if it.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// ReleaseRef identifies one helm release the way helm itself does: a name is
+// only unique within a namespace, so neither half alone identifies anything.
+type ReleaseRef struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+// NamespaceRef is one namespace's pre-Apply state.
+type NamespaceRef struct {
+	Name string `json:"name"`
+	// UID is the namespace's object UID at snapshot time, empty when it did
+	// not exist. It is what makes "the namespace this run created" a claim
+	// about an OBJECT rather than about a name: a namespace deleted and
+	// recreated between Apply and Reset wears the same name and belongs to
+	// whoever recreated it.
+	UID string `json:"uid,omitempty"`
+	// Existed records whether the namespace was present pre-Apply. A
+	// namespace that existed is never deleted by Reset, whatever is in it.
+	Existed bool `json:"existed,omitempty"`
+	// SnapshotErr is non-empty when this namespace could not be snapshotted
+	// at all. It does not fail Apply (see steps.snapshotOwnership), but it
+	// makes every release in the namespace unprovable, so Reset skips them
+	// and says why -- an unanswered question is not evidence of ownership.
+	SnapshotErr string `json:"snapshotErr,omitempty"`
+	// CreatedUID is the UID of the namespace THIS RUN created, read back
+	// after Apply. It is the only UID that can decide a deletion, which is
+	// why it exists alongside UID rather than reusing it: UID is what was
+	// there BEFORE Apply, and a namespace that was already there is never
+	// deleted, so UID is diagnostic only and never decides anything.
+	//
+	// Empty means "this run did not create a namespace at this name, or
+	// could not confirm that it did" -- a component that failed before its
+	// namespace was created, a chart that ships its own Namespace manifest
+	// and had it removed by helm uninstall, or an API error on the read
+	// back. All three are the same instruction to Reset: do not delete.
+	CreatedUID string `json:"createdUid,omitempty"`
+}
+
+// Ownership is the pre-Apply cluster state Reset reasons from. Its zero
+// value is meaningful and safe: no evidence, so nothing is provably this
+// run's, so Reset removes nothing. That is also what a record written before
+// this field existed decodes to.
+type Ownership struct {
+	// Releases are the helm releases present BEFORE Apply ran. Anything
+	// here was adopted, not created.
+	Releases []ReleaseRef `json:"releases,omitempty"`
+	// Namespaces is per-namespace state BEFORE Apply ran.
+	Namespaces []NamespaceRef `json:"namespaces,omitempty"`
 }
 
 // ComponentState is the latest known state of one component the bundle
@@ -121,10 +269,17 @@ type Run struct {
 // overwritten in place. Persisting this is what lets a recovered run redraw
 // the pipeline, without persisting the event stream that produced it.
 type ComponentState struct {
-	Name   string `json:"name"`
-	Index  int    `json:"index"`
-	Total  int    `json:"total"`
-	Status string `json:"status"`
+	Name  string `json:"name"`
+	Index int    `json:"index"`
+	Total int    `json:"total"`
+	// Namespace is the helm release's target namespace, carried from
+	// deploy.sh's own per-action header ("[1/14] cert-manager  →
+	// cert-manager"). Recorded because Reset addresses a release as
+	// (name, namespace) and has no other durable source for the second
+	// half: the bundle directory that holds it lives in the pod's emptyDir
+	// and is gone after any restart.
+	Namespace string `json:"namespace,omitempty"`
+	Status    string `json:"status"`
 }
 
 // Clone returns a deep copy safe to hand to callers outside the engine lock.
@@ -141,5 +296,12 @@ func (r *Run) Clone() *Run {
 	out.Pending = append([]string(nil), r.Pending...)
 	out.Components = append([]ComponentState(nil), r.Components...)
 	out.Truncated = append([]string(nil), r.Truncated...)
+	// Ownership's two slices hold value types, so copying the slices is a
+	// full deep copy. They are copied at all because *r above shares their
+	// backing arrays, and Reset's whole safety argument rests on a caller
+	// outside the lock never being able to edit this evidence.
+	out.Ownership.Releases = append([]ReleaseRef(nil), r.Ownership.Releases...)
+	out.Ownership.Namespaces = append([]NamespaceRef(nil), r.Ownership.Namespaces...)
+	out.Residue.Items = append([]ResidueItem(nil), r.Residue.Items...)
 	return &out
 }

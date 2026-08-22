@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/mchmarny/aicrme/internal/observer"
 	"github.com/mchmarny/aicrme/internal/prove"
 	"github.com/mchmarny/aicrme/internal/steps"
+	"github.com/mchmarny/aicrme/internal/teardown"
 	"github.com/mchmarny/aicrme/internal/version"
 	"github.com/mchmarny/aicrme/internal/web"
 )
@@ -398,6 +400,12 @@ func main() {
 	// warning about persistence for the same nil kube, so this does not
 	// repeat that half of the consequence.
 	var kube kubernetes.Interface
+	// dynamicClient is Reset's alone: teardown's emptiness check enumerates
+	// namespaced kinds from discovery and lists each one, which a typed
+	// client cannot do -- it has no method for a kind it was not generated
+	// against, and a CRD is exactly the bystander that must not be missed.
+	// Nil whenever kube is, and gated together below for that reason.
+	var dynamicClient dynamic.Interface
 	// rest.InClusterConfig does no network I/O -- env vars and two file
 	// reads -- so inside a pod kube is essentially always non-nil here; it
 	// is Start below, not this block, that first talks to the API server.
@@ -405,8 +413,16 @@ func main() {
 		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
 	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
 		slog.Warn("kubernetes client init failed; live cluster telemetry disabled", "error", clientErr)
+	} else if d, dynErr := dynamic.NewForConfig(cfg); dynErr != nil {
+		// Deliberately fatal to BOTH clients rather than leaving kube set
+		// and dynamicClient nil: Reset's ownership rule needs the dynamic
+		// client to establish that a namespace is empty, and a console that
+		// ran everything else normally and then could not answer that
+		// question would fail at the least convenient moment. Degrading
+		// wholesale is the same posture the two branches above take.
+		slog.Warn("dynamic client init failed; live cluster telemetry disabled", "error", dynErr)
 	} else {
-		kube = c
+		kube, dynamicClient = c, d
 	}
 
 	namespace := envOr("AICRME_NAMESPACE", "aicrme")
@@ -467,6 +483,14 @@ func main() {
 			// test can exercise the real deploy.sh and the real helm binary
 			// against a cluster with no GPUs without installing anything.
 			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
+			// The pre-Apply ownership snapshot's two seams. helm runs
+			// through the same BashExec deploy.sh does, so there is one
+			// place in this binary that spawns a subprocess. kube is nil
+			// outside a pod, the same nil the Warn above covers -- the
+			// snapshot records that as a per-namespace failure, which
+			// leaves a later Reset removing nothing rather than guessing.
+			Helm: steps.NewHelmLister(applier.BashExec{}),
+			Kube: kube,
 		}),
 		// The final step: a run that reaches here and returns without error
 		// ends at StateActive rather than StateDone (engine.ActiveStep), with
@@ -491,6 +515,21 @@ func main() {
 	// it at ~80 call sites), and Stop is the only caller that needs a
 	// cluster client at all.
 	eng.SetProveClient(proveClient)
+
+	// Reset's cluster-removal half, wired the same way and for the same
+	// reason: engine.New's signature is shared by ~80 construction sites
+	// across internal/engine and internal/api, and Reset is the only caller
+	// that needs any of this. Nil kube leaves teardownClient nil, and
+	// engine.Reset refuses with 503 rather than dereferencing it -- the same
+	// nil this file's Warn above already covers.
+	if kube != nil {
+		eng.SetTeardown(teardown.NewEngineTeardown(
+			teardown.BashExec{},
+			kube,
+			teardown.NewDiscoverer(kube.Discovery()),
+			dynamicClient,
+		))
+	}
 
 	srv, err := api.New(api.Config{
 		Username:   envOr("AICRME_USERNAME", "admin"),

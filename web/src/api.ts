@@ -25,7 +25,7 @@ export async function login(username: string, password: string): Promise<void> {
 /** Run mirrors Go's engine.Run field-for-field (internal/engine/run.go). Artifacts is Go json:"-" and never appears here. */
 export interface Run {
   id: string
-  state: 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'active' | 'done'
+  state: 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'active' | 'done' | 'resetting'
   phase: string
   decisions: Record<string, string>
   pending?: string[]
@@ -118,4 +118,29 @@ export async function stopRun(runId: string): Promise<Run> {
  */
 export function bundleUrl(runId: string): string {
   return `/api/runs/${encodeURIComponent(runId)}/bundle`
+}
+
+/**
+ * resetRun tears down what one run installed: its workload, the helm
+ * releases it created, and the namespaces it created and left empty
+ * (POST /api/runs/{id}/reset -> engine.Reset).
+ *
+ * The confirmation body is required by the server, not decorative here: it
+ * is what stops a URL alone -- a stray retry, a pasted address -- starting
+ * a teardown of someone's cluster. See internal/api/reset.go.
+ *
+ * Resolves as soon as the teardown is accepted and its state persisted, NOT
+ * when it finishes: a helm uninstall per component with --wait runs for
+ * minutes, so the engine backgrounds the work and the console follows it on
+ * the event stream. The request outlives the tab that issued it for the
+ * same reason stopRun's does.
+ */
+export async function resetRun(runId: string): Promise<Run> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/reset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirm: 'reset' }),
+  })
+  if (!res.ok) throw new ApiError(res.status, 'Failed to reset the run')
+  return res.json()
 }

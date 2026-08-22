@@ -159,6 +159,27 @@ func (c *Client) WaitAbsent(ctx context.Context, runID string, timeout time.Dura
 	}
 }
 
+// EnsureAbsent deletes runID's workload and does not return until the API
+// server has confirmed it gone. It is the guarantee Stop makes, factored
+// out so a second caller (engine.Reset) can require it without going
+// through Stop's own state guard -- stoppable() rejects both an ordinary
+// StateFailed run and a run already moved to StateResetting.
+//
+// Idempotent in both halves: Delete treats NotFound as success, and
+// WaitAbsent returns immediately for an object that was never there. A run
+// that never reached Prove therefore satisfies this trivially.
+//
+// Both halves are required. Delete alone only means the API server has
+// STARTED cascading (see Delete and WaitAbsent), and a teardown that
+// uninstalled components beneath a workload still holding GPUs is the
+// failure this whole sequence exists to prevent.
+func (c *Client) EnsureAbsent(ctx context.Context, runID string, timeout time.Duration) error {
+	if err := c.Delete(ctx, runID); err != nil {
+		return err
+	}
+	return c.WaitAbsent(ctx, runID, timeout)
+}
+
 // PlacedNodes returns, for runID's gang, the node each already-scheduled and
 // not-failed pod has been bound to, keyed by pod name. A pod absent from the
 // result has either not been placed yet or has already failed.

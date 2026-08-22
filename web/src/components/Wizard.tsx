@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AicrEvent } from '../useEvents'
-import { ApiError, decide as decideApi, discardRun, fetchOptions, retryRun, stopRun, type Options } from '../api'
+import { ApiError, decide as decideApi, discardRun, fetchOptions, resetRun, retryRun, stopRun, type Options } from '../api'
 import { deriveComponents } from '../pipeline'
 import { Cockpit } from './Cockpit'
 import { Discover, type CapabilityReport } from './Discover'
 import { Prove } from './Prove'
+import { Reset, ResetGate } from './Reset'
 import { Recommend, type RecipeSummary } from './Recommend'
 import { Timeline } from './Timeline'
 
@@ -26,7 +27,7 @@ import { Timeline } from './Timeline'
  * GET /api/runs/{id}/artifacts/... endpoint was the alternative and was not
  * necessary.
  */
-type RunPhase = 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'active' | 'done'
+type RunPhase = 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'active' | 'done' | 'resetting'
 
 export interface RunState {
   runId?: string
@@ -55,6 +56,39 @@ export interface RunState {
    * lets the console be.
    */
   truncated?: string[]
+  /**
+   * The last Reset's outcome for this run, from engine.ResetSummaryData on
+   * the terminal teardown log event (internal/engine/reset.go). Undefined
+   * until a Reset has finished.
+   *
+   * `incomplete` is what the console keys every action off after a failed
+   * teardown: the engine refuses Start, Retry and Discard while it holds
+   * (hasIncompleteTeardown), so offering any of them would be three buttons
+   * that all answer 409. It also arrives on the recovery marker, because
+   * after a restart that marker is the only event in the stream carrying it.
+   */
+  residue?: ResidueSummary
+}
+
+/** ResidueItem mirrors Go's engine.ResidueItem (internal/engine/run.go). */
+export interface ResidueItem {
+  kind: 'release' | 'namespace'
+  name: string
+  namespace?: string
+  removed?: boolean
+  skip?: string
+  error?: string
+}
+
+/** ResidueSummary mirrors Go's engine.ResetSummaryData. */
+export interface ResidueSummary {
+  incomplete: boolean
+  summary: string
+  items?: ResidueItem[]
+}
+
+function isResidueSummary(data: unknown): data is ResidueSummary {
+  return typeof data === 'object' && data !== null && 'incomplete' in data && 'summary' in data
 }
 
 /**
@@ -68,6 +102,15 @@ export interface RunState {
  * internal/engine/recover_test.go pins the producing side exactly.
  */
 export const RECOVERY_INTERRUPTED_ERROR = 'interrupted by a console restart'
+
+/**
+ * RESIDUE_RECOVERED_SUMMARY stands in for the summary a completed Reset
+ * would have published. A teardown interrupted by a restart published no
+ * summary -- the goroutine that would have died with the pod -- so the
+ * console says what it actually knows rather than inventing counts.
+ */
+export const RESIDUE_RECOVERED_SUMMARY =
+  'a previous reset did not finish; what it removed was never recorded'
 
 function isCapabilityReport(data: unknown): data is CapabilityReport {
   return typeof data === 'object' && data !== null && 'headline' in data && 'gaps' in data
@@ -83,9 +126,10 @@ function isRecipeSummary(data: unknown): data is RecipeSummary {
  * its presence is the signal -- an empty array would be indistinguishable
  * from "not carried".
  */
-function isRecoveryMarkerData(data: unknown): data is { truncated: string[] } {
-  return typeof data === 'object' && data !== null && 'truncated' in data
-    && Array.isArray((data as { truncated: unknown }).truncated)
+function isRecoveryMarkerData(data: unknown): data is { truncated?: string[]; residueIncomplete?: boolean } {
+  if (typeof data !== 'object' || data === null) return false
+  return ('truncated' in data && Array.isArray((data as { truncated: unknown }).truncated))
+    || 'residueIncomplete' in data
 }
 
 /**
@@ -135,6 +179,11 @@ export function deriveRunState(events: AicrEvent[]): RunState {
         // run rendering an ordinary phase body with no Stop control and --
         // for a recovered one -- a Discard button the engine now rejects.
         else if (e.message === 'run active') out.state = 'active'
+        // engine.Reset publishes "run resetting" for exactly this branch --
+        // see its own comment. Without it a teardown falls through to
+        // 'running' below and renders as an install in progress, with the
+        // actions that go with one.
+        else if (e.message === 'run resetting') out.state = 'resetting'
         else out.state = 'running'
         // engine.Retry (internal/engine/engine.go) publishes this exact
         // message before relaunching execute for the same run ID. Replaying
@@ -165,10 +214,20 @@ export function deriveRunState(events: AicrEvent[]): RunState {
       // gains the flag.
       case 'recovered':
         out.recovered = true
-        if (isRecoveryMarkerData(e.data)) out.truncated = e.data.truncated
+        if (isRecoveryMarkerData(e.data)) {
+          out.truncated = e.data.truncated
+          // After a restart this marker is the only event carrying the
+          // fact that a teardown was interrupted or had failed. Without it
+          // the console offers Start, Retry and Discard on a half-removed
+          // cluster and collects three 409s.
+          if (e.data.residueIncomplete) {
+            out.residue = { incomplete: true, summary: RESIDUE_RECOVERED_SUMMARY }
+          }
+        }
         break
     }
 
+    if (e.kind === 'log' && isResidueSummary(e.data)) out.residue = e.data
     if (e.kind === 'log' && e.phase === 'discover' && isCapabilityReport(e.data)) out.report = e.data
     if (e.kind === 'log' && e.phase === 'recommend' && isRecipeSummary(e.data)) out.recipe = e.data
   }
@@ -462,6 +521,22 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     }
   }
 
+  // The teardown. Backgrounded server-side, so this resolves as soon as it
+  // is accepted -- `busy` covers only that round trip, and the operation
+  // itself is followed on the event stream like any other phase.
+  async function handleReset() {
+    if (!run.runId) return
+    setActionError('')
+    setBusy(true)
+    try {
+      await resetRun(run.runId)
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : (err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   // Only reachable from the recovery panel: engine.Discard refuses a live
   // run, and a recovered one is the only non-live run the console ever shows.
   async function handleDiscard() {
@@ -532,6 +607,29 @@ export function Wizard({ events, onDiscarded, onStopped }: {
   const cockpit = !recovered && (run.phase === 'bundle' || run.phase === 'apply')
 
   function renderBody() {
+    // First of all, before even the active branch. A teardown in flight is
+    // the only thing happening to this run, and every other screen would
+    // offer actions the engine refuses while StateResetting holds.
+    if (run.state === 'resetting') {
+      return <Reset events={events} run={run} />
+    }
+    // Second. A run whose reset did not finish has exactly one action the
+    // engine will accept: hasIncompleteTeardown blocks Start, Retry and
+    // Discard, so the recovery panel below -- which offers two of those
+    // three -- would be a panel of buttons that all answer 409.
+    if (run.residue?.incomplete) {
+      return (
+        <div className="space-y-4">
+          <Reset events={events} run={run} />
+          <ResetGate
+            run={run}
+            components={deriveComponents(events, run.recipe?.components.map(c => c.name))}
+            busy={busy}
+            onReset={handleReset}
+          />
+        </div>
+      )
+    }
     // Before the recovery branch, deliberately. A recovered active run is
     // still holding a workload in the cluster, and the recovery panel offers
     // exactly the two actions the engine rejects for it (Retry needs a failed
@@ -539,7 +637,17 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     // thing that works, so the screen that carries Stop has to win here or
     // the operator is stranded on a panel of dead buttons.
     if (run.state === 'active') {
-      return <Prove events={events} run={run} busy={busy} onStop={handleStop} />
+      return (
+        <div className="space-y-6">
+          <Prove events={events} run={run} busy={busy} onStop={handleStop} />
+          <ResetGate
+            run={run}
+            components={deriveComponents(events, run.recipe?.components.map(c => c.name))}
+            busy={busy}
+            onReset={handleReset}
+          />
+        </div>
+      )
     }
     if (recovered) {
       // The discard already succeeded; the panel's buttons would 404 now, and
@@ -562,7 +670,17 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     // fell through to the report branch below and redrew the Discover screen
     // over a finished demo, which reads as the console having started over.
     if (run.phase === 'prove') {
-      return <Prove events={events} run={run} busy={busy} onStop={handleStop} />
+      return (
+        <div className="space-y-6">
+          <Prove events={events} run={run} busy={busy} onStop={handleStop} />
+          <ResetGate
+            run={run}
+            components={deriveComponents(events, run.recipe?.components.map(c => c.name))}
+            busy={busy}
+            onReset={handleReset}
+          />
+        </div>
+      )
     }
     if (cockpit) {
       return <Cockpit events={events} run={run} onDecide={handleDecide} onRetry={handleRetry} />

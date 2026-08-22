@@ -472,6 +472,29 @@ func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
 			v.Set(reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)))
 		case Workload:
 			v.Set(reflect.ValueOf(Workload{Namespace: "parity-ns", Kind: "Job", Name: "parity-workload"}))
+		case Residue:
+			// Incomplete true and a fully-populated item: the guard and the
+			// inventory are separate producers in envelope.go's projection,
+			// and losing either one has its own distinct consequence.
+			v.Set(reflect.ValueOf(Residue{
+				Incomplete: true,
+				Items: []ResidueItem{{
+					Kind: KindRelease, Name: "parity-release", Namespace: "parity-ns",
+					Removed: true, Skip: "parity-skip", Err: "parity-err",
+				}},
+			}))
+		case Ownership:
+			// Both slices non-empty, and every NamespaceRef field distinct
+			// from its zero value -- an envelope that carried Ownership but
+			// dropped, say, SnapshotErr would otherwise round-trip a
+			// DeepEqual-identical value and report a false pass.
+			v.Set(reflect.ValueOf(Ownership{
+				Releases: []ReleaseRef{{Name: "parity-release", Namespace: "parity-release-ns"}},
+				Namespaces: []NamespaceRef{{
+					Name: "parity-ns", UID: "parity-uid", Existed: true,
+					SnapshotErr: "parity-err", CreatedUID: "parity-created-uid",
+				}},
+			}))
 		default:
 			t.Fatalf("setDistinctFieldValue: field %s has unhandled struct type %s -- extend this switch", name, v.Type())
 		}
@@ -565,6 +588,110 @@ func TestEnvelopeRoundTripsEveryRunField(t *testing.T) {
 			t.Errorf("Run.%s = %+v after the round trip, want %+v -- envelope.go must carry this field "+
 				"(encodeRun/decodeRun), or add it to runFieldsExcludedFromEnvelope with a stated reason",
 				f.Name, outField, inField)
+		}
+	}
+}
+
+func baseRunForEnvelope(t *testing.T) *Run {
+	t.Helper()
+	now := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	return &Run{ID: "0123456789abcdef", State: StateDone, Phase: PhaseApply, StartedAt: now, UpdatedAt: now}
+}
+
+// The ownership snapshot is the only evidence that separates a release this
+// console created from one it adopted via `helm upgrade --install`, and it
+// is worthless if it does not survive a restart -- Reset runs long after
+// Apply, frequently in a different pod.
+func TestEnvelopeRoundTripsOwnership(t *testing.T) {
+	in := baseRunForEnvelope(t)
+	in.Ownership = Ownership{
+		Releases: []ReleaseRef{{Name: "gpu-operator", Namespace: "gpu-operator"}},
+		Namespaces: []NamespaceRef{
+			{Name: "gpu-operator", UID: "ns-uid-1", Existed: true},
+			{Name: "kai-scheduler", Existed: false},
+			{Name: "monitoring", Existed: false, SnapshotErr: "connection refused"},
+		},
+	}
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if !reflect.DeepEqual(out.Ownership, in.Ownership) {
+		t.Errorf("Ownership round-tripped as %#v, want %#v", out.Ownership, in.Ownership)
+	}
+}
+
+// TestEnvelopeRoundTripsEveryComponentStateField is the nested half of
+// Ruling 20's parity guard. The top-level test above walks Run's own
+// fields, so a value dropped from ComponentState -- which Run carries as a
+// slice -- is invisible to it: it would persist as its zero value, survive
+// the whole suite, and surface as a Reset that uninstalls from the wrong
+// namespace after a restart. That is the CleanupUnconfirmed defect exactly
+// (fix round 2's N1), one level of nesting down.
+//
+// What actually holds today, stated because it is what decides whether this
+// test can bite: envelope.Components is []ComponentState, the SAME type, so
+// a field ADDED to ComponentState is carried for free and this test cannot
+// fail for that reason -- verified by adding a field and watching it still
+// pass. The hazard it does catch is the one envelope.go's own doc comment
+// invites: the moment envelope forks a parallel component type, or encodeRun
+// projects the slice through anything that drops a field, this fails and
+// names the field. Verified by making encodeRun blank one nested field and
+// confirming the failure message.
+//
+// The engine's other nested projection, bootstrapComponentData in
+// recover.go, is guarded by the compiler instead: recover.go converts
+// ComponentState to it directly, so divergent fields are a build error, not
+// a silent drop. Whoever adds a field to ComponentState updates both.
+func TestEnvelopeRoundTripsEveryComponentStateField(t *testing.T) {
+	var cs ComponentState
+	rv := reflect.ValueOf(&cs).Elem()
+	rt := rv.Type()
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		setDistinctFieldValue(t, rv.Field(i), f.Name)
+	}
+
+	in := &Run{
+		ID:         "0123456789abcdef",
+		State:      StateDone,
+		Phase:      PhaseApply,
+		StartedAt:  time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		UpdatedAt:  time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		Components: []ComponentState{cs},
+	}
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if len(out.Components) != 1 {
+		t.Fatalf("decoded Components = %d rows, want 1", len(out.Components))
+	}
+
+	outV := reflect.ValueOf(&out.Components[0]).Elem()
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		want := rv.Field(i).Interface()
+		got := outV.Field(i).Interface()
+		if !reflect.DeepEqual(want, got) {
+			t.Errorf("ComponentState.%s round-tripped as %#v, want %#v -- envelope.go does not carry it",
+				f.Name, got, want)
 		}
 	}
 }

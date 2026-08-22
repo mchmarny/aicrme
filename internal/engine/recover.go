@@ -85,7 +85,7 @@ func validRunID(id string) bool {
 // happens to survive JSON decoding, must not be trusted implicitly.
 func validState(s State) bool {
 	switch s {
-	case StateIdle, StateRunning, StateAwaitingDecision, StateFailed, StateActive, StateDone:
+	case StateIdle, StateRunning, StateAwaitingDecision, StateFailed, StateActive, StateDone, StateResetting:
 		return true
 	default:
 		return false
@@ -257,6 +257,18 @@ func (e *Engine) Recover(ctx context.Context) error {
 	// step.Requires() against the decisions already recorded.
 	r.Pending = nil
 
+	// A teardown interrupted by a restart is the one live state whose
+	// residue is genuinely unknown: the goroutine that would have recorded
+	// what it removed died with the pod, so the record names neither what
+	// went nor what stayed. Marking it incomplete is the honest answer and
+	// the fail-closed one -- Start, Retry and Discard all refuse until
+	// another Reset has actually established the cluster's state.
+	//
+	// Checked before the rewind below, because it must not depend on where
+	// StepIndex happened to be pointing.
+	if r.State == StateResetting {
+		r.Residue.Incomplete = true
+	}
 	if isLive(r.State) || r.State == StateIdle {
 		r.State = StateFailed
 		r.Err = recoveredErr
@@ -305,10 +317,11 @@ func (e *Engine) Recover(ctx context.Context) error {
 // internal/engine must not depend on internal/applier, which is a caller of
 // this package (via internal/steps), not a dependency of it.
 type bootstrapComponentData struct {
-	Name   string `json:"name"`
-	Index  int    `json:"index,omitempty"`
-	Total  int    `json:"total,omitempty"`
-	Status string `json:"status"`
+	Name      string `json:"name"`
+	Index     int    `json:"index,omitempty"`
+	Total     int    `json:"total,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Status    string `json:"status"`
 }
 
 // recoveryMarkerMsg is the KindRecovered event's message. Worded for every
@@ -327,6 +340,14 @@ const recoveryMarkerMsg = "recovered a previous run; retry or discard it before 
 // record that was itself honest.
 type recoveryMarkerData struct {
 	Truncated []string `json:"truncated,omitempty"`
+	// ResidueIncomplete says a teardown was in flight or had already failed
+	// when this record was written. It travels here for the same reason
+	// Truncated does: the console offers actions the engine will refuse
+	// unless it knows, and after a restart this marker is the only event in
+	// the stream carrying the fact. Without it the console would offer
+	// Start, Retry and Discard on a half-torn-down cluster and get three
+	// 409s, with no explanation of what to do instead.
+	ResidueIncomplete bool `json:"residueIncomplete,omitempty"`
 }
 
 // publishRecoveryBootstrap tells the SPA about a recovered run over the bus
@@ -355,8 +376,10 @@ func (e *Engine) publishRecoveryBootstrap(r *Run) {
 	// needing what the store dropped. Omitted entirely for the ordinary case,
 	// so the field's presence means something.
 	var data json.RawMessage
-	if len(r.Truncated) > 0 {
-		data, _ = json.Marshal(recoveryMarkerData{Truncated: r.Truncated})
+	if len(r.Truncated) > 0 || r.Residue.Incomplete {
+		data, _ = json.Marshal(recoveryMarkerData{
+			Truncated: r.Truncated, ResidueIncomplete: r.Residue.Incomplete,
+		})
 	}
 	e.bus.Publish(bus.Event{
 		RunID: r.ID, Kind: bus.KindRecovered, Phase: string(r.Phase),
@@ -366,7 +389,11 @@ func (e *Engine) publishRecoveryBootstrap(r *Run) {
 		// ComponentState and bootstrapComponentData share the same field
 		// names, order, and types (only their json tags differ), so a
 		// direct conversion is what staticcheck's S1016 asks for in place
-		// of a struct literal that just copies the same four fields.
+		// of a struct literal that just copies the same fields. The
+		// conversion is also the guard: adding a field to ComponentState
+		// and not to this type is a build error rather than a bootstrap
+		// event that silently drops it (envelope_test.go's nested parity
+		// test says the same thing for the persisted side).
 		data, _ := json.Marshal(bootstrapComponentData(c))
 		e.bus.Publish(bus.Event{
 			RunID: r.ID, Kind: bus.KindComponent, Phase: string(r.Phase),

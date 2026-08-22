@@ -142,6 +142,13 @@ type Engine struct {
 	// Recover's markStoreUnreadable exception.
 	proveClient *prove.Client
 
+	// teardown removes the releases and namespaces a run installed, for
+	// Reset. Nil by default and nil outside a cluster, the same shape as
+	// proveClient; Reset refuses with 503 rather than dereferencing it.
+	// Declared as an interface here because internal/teardown imports THIS
+	// package -- see the Teardown interface in reset.go.
+	teardown Teardown
+
 	mu      sync.Mutex
 	current *Run
 	resume  chan struct{}
@@ -276,6 +283,16 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
 			"a previous run's cleanup could not be confirmed; the workload may still be running -- resolve it before starting a new run")
 	}
+	// A Reset that did not finish leaves the cluster half-torn-down, and a
+	// new run would install into it: helm would adopt whatever survived the
+	// teardown, and the ownership snapshot this run takes would record
+	// those leftovers as pre-existing, making them permanently unremovable.
+	// Reset again is the remedy and is deliberately still allowed.
+	if e.current != nil && hasIncompleteTeardown(e.current) {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"a previous run's reset did not finish; parts of it are still installed -- reset it again before starting a new run")
+	}
 	previous := e.current
 	now := time.Now().UTC()
 	r := &Run{
@@ -341,8 +358,13 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 	return snapshot, nil
 }
 
+// isLive means "a goroutine owns this run". StateResetting qualifies for
+// exactly that reason -- Reset launches one, the same way Start and Retry
+// do -- which is also what makes Start, Discard and a second Reset all
+// refuse it for free, and what makes Recover treat an interrupted teardown
+// as an interrupted run.
 func isLive(s State) bool {
-	return s == StateRunning || s == StateAwaitingDecision
+	return s == StateRunning || s == StateAwaitingDecision || s == StateResetting
 }
 
 // isTerminal reports whether s is a state finish() actually reaches. finish
@@ -781,6 +803,16 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		e.mu.Lock()
 		if e.aliveLocked(epoch) {
 			e.current.Components = scratch.Components
+			// Ownership merges on the failure path for the same reason
+			// Components does, only more so. It is evidence, not an output:
+			// Apply records it BEFORE it installs anything, so by the time
+			// a step fails the snapshot is already complete and describes
+			// the cluster as it was. And a failed Apply is exactly when
+			// Reset matters most -- it is the case that leaves a
+			// half-installed cluster -- so losing the evidence here would
+			// leave the one run that most needs a teardown with nothing it
+			// can prove it owns.
+			e.current.Ownership = scratch.Ownership
 			switch {
 			case errors.Is(err, ErrUnconfirmedCleanup):
 				logUnconfirmed = !e.current.CleanupUnconfirmed
@@ -844,6 +876,18 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// every real run, defeating the console-relabel-after-restart purpose
 	// the field exists for.
 	e.current.Workload = scratch.Workload
+	// Ownership, same shape as Workload and for the same class of reason:
+	// without this line internal/steps.snapshotOwnership's write lands on
+	// the scratch copy and is discarded, and every Reset skips everything
+	// for want of evidence that was in fact collected correctly. That is
+	// what test/e2e/reset.sh caught on its first real run -- the run record
+	// carried fourteen installed components and no ownership at all -- and
+	// nothing in the unit suite could: internal/steps' tests call step.Run
+	// directly on a run they own, so the merge is not on their path.
+	//
+	// Merged on BOTH paths, unlike Workload. See the failure-path merge
+	// above for why.
+	e.current.Ownership = scratch.Ownership
 	// Advance the cursor before this checkpoint is taken, not after: the
 	// save below must carry the advanced StepIndex, and it must complete
 	// before the next step begins (it does, trivially -- this call is
@@ -961,6 +1005,16 @@ func (e *Engine) Retry(ctx context.Context, runID string) (*Run, error) {
 	if e.current.State != StateFailed {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict, "run is not in a failed state")
+	}
+	// New relative to Ruling 12, which only had to consider Start and
+	// Discard. A failed Reset lands in StateFailed, which is precisely the
+	// state Retry accepts -- so without this, the console would offer to
+	// re-run Apply over a cluster it has just half-removed, reinstalling
+	// components on top of releases whose uninstall had failed midway.
+	if hasIncompleteTeardown(e.current) {
+		e.mu.Unlock()
+		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"this run's reset did not finish; parts of it are still installed -- reset it again rather than retrying the install")
 	}
 	prevErr := e.current.Err
 	prevRecoveredPending := e.recoveredPending
@@ -1090,6 +1144,16 @@ func (e *Engine) Discard(ctx context.Context, runID string) error {
 		return aicrerrors.New(aicrerrors.ErrCodeConflict,
 			"run's cleanup could not be confirmed; the workload may still be running -- resolve it before discarding")
 	}
+	// The sharpest of the three. Discard deletes the record, and after a
+	// failed Reset that record is the ONLY inventory of what is still
+	// installed -- Run.Residue names every release and namespace the
+	// teardown could not remove. Discarding would leave the cluster exactly
+	// as it is and destroy the only description of it.
+	if hasIncompleteTeardown(e.current) {
+		e.mu.Unlock()
+		return aicrerrors.New(aicrerrors.ErrCodeConflict,
+			"run's reset did not finish; this record is the only list of what is still installed -- reset it again before discarding")
+	}
 	previous := e.current
 	previousRecoveredPending := e.recoveredPending
 	epoch := e.epoch
@@ -1215,10 +1279,13 @@ func (e *Engine) Stop(ctx context.Context, runID string) error {
 	client := e.proveClient
 	e.mu.Unlock()
 
-	if err := client.Delete(ctx, runID); err != nil {
-		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
-	}
-	if err := client.WaitAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
+	// Delete-then-confirm, as one call. Reset needs the identical guarantee
+	// and cannot reach it through Stop -- stoppable() rejects an ordinary
+	// StateFailed run and rejects StateResetting outright -- so the sequence
+	// lives in prove.Client and both callers require it there. The wrapping
+	// is unchanged, so the operator-facing message for either half is the
+	// same text it has always been.
+	if err := client.EnsureAbsent(ctx, runID, stopWaitAbsentTimeout); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "stopping the workload failed", err)
 	}
 
