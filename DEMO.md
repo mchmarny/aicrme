@@ -115,6 +115,9 @@ deletes the workload and waits until its pods are actually gone before closing t
 - **Cancel a run** and watch it shut down gracefully rather than abandoning work.
 - **Retry a failed run** — it resumes from the step that failed, and every component's
   `install.sh` is `helm upgrade --install`, so already-installed components are no-ops.
+- **Reset the run** — tear down exactly what this run installed, on the same cluster, so the
+  next demo does not need a rebuilt one. This replaces `make demo-down` for a repeat demo: the
+  cluster survives, only the run's own footprint goes.
 
 ## What is not built yet
 
@@ -122,9 +125,34 @@ deletes the workload and waits until its pods are actually gone before closing t
 |---|---|
 | **Validate** | Deferred on measurement, not preference — AICR's `ValidateState` reports `passed` for checks that never executed on any cluster with simulated GPU nodes. See `docs/phase-2-handoff.md`. |
 | **A workload that computes anything** | Phase 4, on real hardware. Prove places a gang; the containers never execute here (see below). |
-| **Reset** | Phase 5. Use `make demo-down` to tear the cluster down. When it lands it must stop the Prove workload before uninstalling the components underneath it. |
 
 ## Check on it / tear it down
+
+**To repeat the demo on the same cluster**, use the console's own **Reset**. It stops the Prove
+workload, waits until it is confirmed gone, uninstalls the run's helm releases in reverse
+install order, and deletes the namespaces the run created and left empty. It takes two clicks —
+the second one is made against a list of exactly what will be removed.
+
+Reset removes only what it can prove this run created, and names everything it leaves:
+
+- **A release that already existed** at the same name and namespace before the run started.
+  AICR's generated `install.sh` is `helm upgrade --install`, so such a release was *adopted*,
+  not created, and uninstalling it would remove something you installed. The console records
+  what was there before it installs anything, which is the only moment that answer exists.
+- **A namespace it did not create**, or that still holds anything at all — including a Secret,
+  a ConfigMap, an RBAC rule or a custom resource. Emptiness is established from the API
+  server's own list of namespaced kinds, not a fixed list of workload types.
+- **CRDs.** `helm uninstall` does not remove them, and neither does Reset. They are
+  cluster-scoped, shared, and removing them takes every custom resource on the cluster with
+  them.
+- **Anything it could not check.** An RBAC denial or an unreachable API is not evidence that
+  something is safe to delete, so the object stays and the run says why.
+
+If a Reset does not finish, the console offers only Reset again: the run record is the only
+inventory of what is still installed, so Start, Retry and Discard are all refused until the
+cluster's state is known again.
+
+**To remove the cluster entirely:**
 
 ```sh
 make demo-status   # is it running, what is the URL and password

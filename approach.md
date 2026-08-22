@@ -294,15 +294,44 @@ reverse order plus namespace cleanup, so the demo is repeatable on the same clus
 rebuilding it. Tearing down components while a GPU workload still holds devices is the obvious
 failure mode here, so workload shutdown is a hard precondition rather than a parallel step.
 
-**Concretely, as of Phase 3:** Reset must call `Engine.Stop` (or the same
-delete-then-wait-for-absence path `internal/prove.Client` gives it) and see it *succeed* before
-it uninstalls anything. Stop is not best-effort — it deletes the workload with foreground
-propagation and does not return until the pods are actually gone — and a Reset that proceeded on
-a failed Stop would be uninstalling `kai-scheduler` and the GPU operator out from under a gang
-that is still holding devices. A failed Stop must abort the Reset and say so, exactly as it
-leaves the run active and says so today. Advertised as best-effort: CRDs and
+**Delivered in Phase 5.** `engine.Reset` requires the confirmed workload stop before it
+uninstalls anything — via `prove.Client.EnsureAbsent`, the delete-then-wait-for-absence
+sequence factored out of `Engine.Stop` so Reset can require the identical guarantee without
+going through Stop's own state guard. Stop is not best-effort: it deletes the workload with
+foreground propagation and does not return until the pods are actually gone. A Reset that
+proceeded on a failed stop would be uninstalling `kai-scheduler` and the GPU operator out from
+under a gang that is still holding devices, so a failure there aborts the teardown before a
+single release is touched and says so.
+
+**Ownership is snapshot-based, because `helm upgrade --install` adopts.** This is the finding
+that shaped the whole slice. AICR's generated `install.sh` runs `helm upgrade --install`, so a
+release a human already had at the same (name, namespace) is upgraded rather than rejected,
+prints a deploy header like any other action, and lands in `run.Components` completely
+indistinguishable from one this run created. `--create-namespace` does the same for namespaces.
+Neither leaves a marker behind, so there is no way to ask the cluster afterward what was
+already there.
+
+The answer therefore has to be recorded BEFORE Apply runs — that is the only moment it exists.
+`internal/steps.snapshotOwnership` records, per recipe namespace, the releases already present
+(`helm list --all`, so a release left failed by an earlier attempt still counts as pre-existing)
+and whether the namespace existed with its UID; a second pass after Apply records the UID of
+each namespace the run went on to create, which is the only UID a later deletion may
+legitimately match against. Reset uninstalls only what is absent from that snapshot, and
+anything it cannot account for is skipped and named rather than removed on a guess. The
+snapshot never fails the install: a namespace it cannot read is recorded as unprovable, which
+makes every release in it off limits to Reset — the fail-closed direction.
+
+Emptiness for the namespace half is established by walking the API server's own discovery
+document, not a fixed list of workload kinds. An earlier revision checked six kinds and would
+have deleted a namespace holding Services, Secrets, ConfigMaps, RBAC, CronJobs, PDBs or any
+custom resource.
+
+Still advertised as best-effort, and the boundary is stated rather than implied: CRDs are
+cluster-scoped and shared, `helm uninstall` does not remove them and neither does Reset;
 finalizers routinely leave residue, which is why `deploy.sh` already carries stale-webhook and
-terminating-namespace preflight. A fresh cluster remains the guaranteed path.
+terminating-namespace preflight. A fresh cluster remains the guaranteed path. What Reset
+guarantees is narrower and more useful: it never removes something it cannot prove this run
+created.
 
 ---
 
