@@ -340,6 +340,14 @@ const recoveryMarkerMsg = "recovered a previous run; retry or discard it before 
 // record that was itself honest.
 type recoveryMarkerData struct {
 	Truncated []string `json:"truncated,omitempty"`
+	// ResidueIncomplete says a teardown was in flight or had already failed
+	// when this record was written. It travels here for the same reason
+	// Truncated does: the console offers actions the engine will refuse
+	// unless it knows, and after a restart this marker is the only event in
+	// the stream carrying the fact. Without it the console would offer
+	// Start, Retry and Discard on a half-torn-down cluster and get three
+	// 409s, with no explanation of what to do instead.
+	ResidueIncomplete bool `json:"residueIncomplete,omitempty"`
 }
 
 // publishRecoveryBootstrap tells the SPA about a recovered run over the bus
@@ -368,8 +376,10 @@ func (e *Engine) publishRecoveryBootstrap(r *Run) {
 	// needing what the store dropped. Omitted entirely for the ordinary case,
 	// so the field's presence means something.
 	var data json.RawMessage
-	if len(r.Truncated) > 0 {
-		data, _ = json.Marshal(recoveryMarkerData{Truncated: r.Truncated})
+	if len(r.Truncated) > 0 || r.Residue.Incomplete {
+		data, _ = json.Marshal(recoveryMarkerData{
+			Truncated: r.Truncated, ResidueIncomplete: r.Residue.Incomplete,
+		})
 	}
 	e.bus.Publish(bus.Event{
 		RunID: r.ID, Kind: bus.KindRecovered, Phase: string(r.Phase),

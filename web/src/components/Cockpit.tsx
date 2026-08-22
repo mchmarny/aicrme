@@ -10,6 +10,14 @@ const statusClass: Record<ComponentState['status'], string> = {
   installed: 'text-emerald-400',
   retrying: 'text-amber-400',
   failed: 'text-red-400',
+  // Teardown statuses. `removed` is deliberately NOT emerald: a removal
+  // succeeding is not the same good news as an install succeeding, and
+  // colouring the two alike would make a torn-down cluster read as a
+  // healthy one at a glance. `skipped` is amber because a skipped release
+  // is something the operator now has to deal with by hand.
+  removing: 'text-slate-300',
+  removed: 'text-slate-400',
+  skipped: 'text-amber-400',
 }
 
 /**
@@ -43,6 +51,7 @@ function ComponentRow({ c, terminalState }: { c: ComponentState; terminalState?:
         {c.status === 'retrying' && (
           <span className="text-xs text-amber-400">attempt {c.attempt}/{c.maxAttempts}</span>
         )}
+        {c.reason && <span className="text-xs text-slate-400">{c.reason}</span>}
         {c.status === 'failed' && c.attempt !== undefined && (
           <span className="text-xs text-red-400">after {c.attempt} attempts</span>
         )}

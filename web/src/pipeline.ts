@@ -9,10 +9,31 @@ export interface ComponentData {
   namespace?: string
   index?: number
   total?: number
-  status: 'started' | 'installed' | 'failed' | 'retrying'
+  /**
+   * 'removed' and 'skipped' come from a teardown, not from deploy.sh --
+   * they are engine.publishResidueItem's statuses (internal/engine/reset.go),
+   * and 'failed' is shared by both operations. 'removing' is never sent: it
+   * is derived here for a row a teardown has not reported on yet (see
+   * deriveComponents), because internal/teardown emits one event per release
+   * AFTER helm returns and a thirteen-component teardown would otherwise
+   * show nothing at all for minutes.
+   */
+  status: 'started' | 'installed' | 'failed' | 'retrying' | 'removing' | 'removed' | 'skipped'
   attempt?: number
   maxAttempts?: number
   retryInSeconds?: number
+  /**
+   * 'teardown' marks an event as a removal rather than an install. It is a
+   * field on the payload rather than something inferred from the run's
+   * state, because an event carries no state -- and a teardown inferred
+   * wrongly renders as an install running backwards, which is precisely the
+   * thing an operator watching a destructive operation must not see.
+   */
+  operation?: 'teardown'
+  /** 'release' or 'namespace'. Only teardown events carry it. */
+  kind?: 'release' | 'namespace'
+  /** Why a teardown skipped this, or why removing it failed. */
+  reason?: string
 }
 
 /** FailureInfo mirrors Go's applier.FailureData. */
@@ -78,6 +99,11 @@ export interface ClusterCondition {
 
 function isComponentData(data: unknown): data is ComponentData {
   return typeof data === 'object' && data !== null && 'name' in data && 'status' in data
+}
+
+/** isTeardown reports whether a component event came from a Reset. */
+function isTeardown(data: ComponentData): boolean {
+  return data.operation === 'teardown'
 }
 
 function isFailureData(data: unknown): data is FailureInfo {
@@ -381,6 +407,7 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
   // order within this pass never matters to the result.
   const tracked = new Map<string, TrackedCondition>()
   let lastRealComponent: string | undefined
+  let teardownSeen = false
 
   for (const e of relevantTo(events)) {
     if (e.kind === 'phase' && e.message === RUN_RETRYING_MESSAGE) {
@@ -393,6 +420,12 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
     }
     if (e.kind !== 'component' || !isComponentData(e.data)) continue
     const data = e.data
+    // A teardown reports on namespaces as well as releases. Namespaces were
+    // never deploy.sh steps, so they have no row here and would appear as
+    // phantom components numbered off the end of the pipeline. The Reset
+    // screen lists them in its own section instead.
+    if (isTeardown(data) && data.kind === 'namespace') continue
+    if (isTeardown(data)) teardownSeen = true
     const existing = byName.get(data.name)
     const generated = recipeKnown && !recipeSet.has(data.name)
 
@@ -407,6 +440,9 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
       // screen can still say "failed on attempt 2 of 2" rather than losing
       // the denominator on the very last event.
       maxAttempts: data.maxAttempts ?? existing?.maxAttempts,
+      operation: data.operation ?? existing?.operation,
+      kind: data.kind ?? existing?.kind,
+      reason: data.reason,
       generated,
       parent: generated ? (existing?.parent ?? lastRealComponent) : undefined,
       startedAt: existing?.startedAt ?? (data.status === 'started' ? e.at : undefined),
@@ -426,10 +462,26 @@ export function deriveComponents(events: AicrEvent[], recipeComponentNames: stri
     if (!generated) lastRealComponent = data.name
   }
 
-  return order.map(name => ({
+  const rows = order.map(name => ({
     ...byName.get(name)!,
     conditions: [...tracked.values()].filter(t => t.component === name).map(t => t.data),
   }))
+  if (!teardownSeen) return rows
+
+  // Reverse install order, because that is the order the teardown actually
+  // works in: internal/teardown uninstalls newest-first, since install order
+  // encodes dependency (cert-manager issues the certificates gpu-operator's
+  // webhooks present). Descending index, not `rows.reverse()`: a row that
+  // never got a header carries no index, and reversing the array would place
+  // it by arrival rather than by where it belongs.
+  const ordered = [...rows].sort((a, b) => (b.index ?? 0) - (a.index ?? 0))
+  return ordered.map(row => row.operation === 'teardown'
+    ? row
+    // Not yet reported on by this teardown. internal/teardown emits one
+    // event per release only after helm returns, so without this every row
+    // below the one in flight would sit showing 'installed' for minutes --
+    // reading as though the teardown had not started.
+    : { ...row, operation: 'teardown' as const, status: 'removing' as const })
 }
 
 /**

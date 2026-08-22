@@ -165,10 +165,17 @@ func (e *Engine) Reset(ctx context.Context, runID string) error {
 		return err
 	}
 
+	// "run " + state, exactly the shape finish publishes for every other
+	// state. web/src/components/Wizard.tsx's deriveRunState switches on that
+	// literal, and its default arm is 'running' -- so a differently-worded
+	// message here would render a teardown as an ordinary install in
+	// progress, complete with the actions that go with one.
 	e.bus.Publish(bus.Event{
 		RunID: runID, Kind: bus.KindPhase, Level: bus.LevelWarn,
-		Message: "resetting: stopping the workload, then removing what this run installed",
+		Message: "run " + string(StateResetting),
 	})
+	e.publishReset(runID, bus.LevelWarn,
+		"resetting: stopping the workload, then removing what this run installed")
 	go func() {
 		defer close(done)
 		defer cancel()
@@ -235,12 +242,12 @@ func (e *Engine) runReset(ctx, cancelCtx context.Context, epoch uint64, runID st
 		// The record stays. It is the only inventory of what is still
 		// installed, and hasIncompleteTeardown is what stops Discard
 		// deleting it.
-		e.publishReset(runID, bus.LevelError, summary)
+		e.publishResetSummary(runID, bus.LevelError, summary, final.Residue)
 		e.finish(ctx, epoch, StateFailed, summary)
 		return
 	}
 
-	e.publishReset(runID, bus.LevelInfo, summary)
+	e.publishResetSummary(runID, bus.LevelInfo, summary, final.Residue)
 	e.finish(ctx, epoch, StateDone, "")
 
 	// Only now, and only when clean: the console is free to start a new run
@@ -329,6 +336,32 @@ func resetSummary(res Residue) string {
 
 func (e *Engine) publishReset(runID string, level bus.Level, msg string) {
 	e.bus.Publish(bus.Event{RunID: runID, Kind: bus.KindLog, Level: level, Message: msg})
+}
+
+// ResetSummaryData is the terminal teardown event's Data payload. It carries
+// the whole inventory, not just the counts, because the console has no other
+// way to learn it: the SPA derives everything from the event stream, and a
+// failed Reset's residue is precisely what the operator has to act on.
+//
+// Incomplete is duplicated here rather than inferred from the item list: an
+// interrupted teardown can have no failed items at all (what was never
+// attempted has no item saying so), so counting errors would report a clean
+// teardown for exactly the case that most needs the guard shown.
+type ResetSummaryData struct {
+	Incomplete bool          `json:"incomplete"`
+	Summary    string        `json:"summary"`
+	Items      []ResidueItem `json:"items,omitempty"`
+}
+
+func (e *Engine) publishResetSummary(runID string, level bus.Level, msg string, res Residue) {
+	// ResetSummaryData holds only strings, bools and ints, so Marshal
+	// cannot fail.
+	data, _ := json.Marshal(ResetSummaryData{
+		Incomplete: res.Incomplete, Summary: msg, Items: res.Items,
+	})
+	e.bus.Publish(bus.Event{
+		RunID: runID, Kind: bus.KindLog, Level: level, Message: msg, Data: data,
+	})
 }
 
 // residueData is the wire shape a teardown KindComponent event carries.
