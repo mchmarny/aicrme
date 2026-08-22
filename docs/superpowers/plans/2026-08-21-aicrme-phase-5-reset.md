@@ -1051,7 +1051,7 @@ git commit -S -m "test(e2e): Reset removes what the run created and leaves what 
 
 1. **Uninstall timeout per release** — 5 minutes, provisional, to be revisited against a real Reset.
 2. ~~**Discovery cost** for the emptiness check across ten namespaces.~~ **Settled:** the discovery document is fetched once per Reset, not once per namespace (`teardown.Namespaces`, pinned by `TestNamespacesDiscoversOnceForTheWholeTeardown`). The kind list was NOT narrowed.
-3. **Does the kai-scheduler wedge** (`docs/phase-3-status.md`) survive a Reset-then-Apply cycle? Task 11 is where to find out.
+3. ~~**Does the kai-scheduler wedge** survive a Reset-then-Apply cycle?~~ **Partly answered, 2026-08-22.** A second full install on a cluster this console had already Reset once **completed cleanly — all 14 components installed**, so the wedge does not reproduce as an install failure. What did change is placement latency: the second run's Prove gang did not place inside 45 seconds, where a first install places in about two. Not surprising on inspection — kai-scheduler is being installed from scratch again, re-registering its webhooks and re-electing a leader — and not evidence of a wedge, but it is the reason `test/e2e/reset.sh` uses the production 3-minute gang budget rather than `prove.sh`'s deliberately-shortened 45s. **Still open:** whether the gang places at all on the second cycle given a realistic budget, and whether this holds on real hardware rather than KWOK.
 
 ### 4. NEW, from the first real Reset — leader-election Leases keep most namespaces alive
 

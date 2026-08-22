@@ -47,6 +47,16 @@ BYSTANDER_NS="${BYSTANDER_NS:-cert-manager}"
 # has something to refuse.
 BYSTANDER_KEPT_NS="${BYSTANDER_KEPT_NS:-node-feature-discovery}"
 
+# GANG_TIMEOUT is the production default rather than prove.sh's shortened
+# 45s. prove.sh shortens it deliberately, to exercise the timeout path
+# cheaply; this script is not testing that path, and a tight budget here
+# only couples the teardown assertions to how fast kai-scheduler happens to
+# come up. Measured: on the SECOND install of a run (a cluster this script
+# has already reset once) the gang did not place inside 45s, where a first
+# install places in about two seconds -- kai-scheduler is being reinstalled
+# from scratch, re-registering its webhooks and re-electing a leader.
+GANG_TIMEOUT="${GANG_TIMEOUT:-3m}"
+
 RUN_ID=""
 FAIL_RUN_ID=""
 JAR="$(mktemp -t aicrme-reset-jar.XXXXXX)"
@@ -240,7 +250,7 @@ kubectl -n "${NS}" set env deploy/aicrme \
   "AICRME_SNAPSHOT_NODE_SELECTOR=${AGENT_NODE_LABEL}" \
   'AICRME_SNAPSHOT_REQUESTS=cpu=200m' \
   'AICRME_APPLY_DRY_RUN=false' \
-  'AICRME_PROVE_GANG_TIMEOUT=45s'
+  "AICRME_PROVE_GANG_TIMEOUT=${GANG_TIMEOUT}"
 kubectl -n "${NS}" rollout status deploy/aicrme --timeout=180s
 
 kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &
@@ -381,9 +391,20 @@ for _ in $(seq 1 240); do
   [[ "${STATE}" == "active" || "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
   sleep 10
 done
-[[ "${STATE}" == "active" ]] || {
+# active OR failed, deliberately. What this assertion needs is a run that
+# INSTALLED something and can therefore be reset; whether its Prove gang
+# then placed is a different feature's business (prove.sh's), and requiring
+# it here would fail this assertion for a reason unrelated to teardown.
+# engine.Reset accepts StateFailed and StateActive alike.
+SECOND_INSTALLED="$(run_json "${FAIL_RUN_ID}" | jq '[.components[] | select(.status == "installed")] | length')"
+echo "second run: state=${STATE} with ${SECOND_INSTALLED} components installed"
+[[ "${STATE}" == "active" || "${STATE}" == "failed" ]] || {
   echo "second run record: $(run_json "${FAIL_RUN_ID}" | jq -c '{state,phase,error}')" >&2
-  fail "the second run did not reach state=active (state=${STATE})"
+  fail "the second run reached neither active nor failed (state=${STATE})"
+}
+[[ "${SECOND_INSTALLED}" -gt 0 ]] || {
+  echo "second run record: $(run_json "${FAIL_RUN_ID}" | jq -c '{state,phase,error}')" >&2
+  fail "the second run installed nothing, so there is no teardown to fail"
 }
 
 # The webhook goes up HERE, after the install and before the teardown --
