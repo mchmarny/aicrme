@@ -949,3 +949,96 @@ func TestOwnershipSurvivesAFailedStep(t *testing.T) {
 			run.Ownership, want)
 	}
 }
+
+// runFieldsNotMergedFromSteps names every exported Run field that runStep
+// deliberately does NOT carry back from a step's scratch copy, and why. The
+// parity test below requires an entry for each one, so a field added to Run
+// cannot silently join this list -- it either gets a merge or gets a stated
+// reason.
+var runFieldsNotMergedFromSteps = map[string]string{
+	"ID":        "the engine's identity for the run; a step has no business changing which run it is",
+	"State":     "the state machine's own, set by finish and the operation methods, never by a step",
+	"Phase":     "derived from the step slice, not from a step's copy of the run",
+	"StepIndex": "the execution cursor; runStep advances it itself, after the step returns",
+	"Pending":   "awaitDecisions owns it -- it names the decisions a gate is blocked on",
+	"Err":       "set from the step's returned error, which is the authoritative source, not a field on its scratch copy",
+	"StartedAt": "stamped once by Start",
+	"UpdatedAt": "stamped by whichever engine operation last touched the run",
+	"Truncated": "state about the RECORD, not the run: decodeRun populates it on load and encodeRun carries it forward",
+	"CleanupUnconfirmed": "decided from the step's returned error via errors.Is (Ruling 12), not read off the scratch copy -- " +
+		"see runStep's failure branch for why the distinction is load-bearing",
+	"Residue": "written by engine.Reset directly on e.current; no step produces it",
+}
+
+// mergeParityStep sets every exported field of the Run it is handed to a
+// distinct value, so the test below can tell a merged field from a dropped
+// one by comparison rather than by inspection.
+type mergeParityStep struct {
+	phase Phase
+	t     *testing.T
+	want  *Run
+}
+
+func (m *mergeParityStep) Phase() Phase       { return m.phase }
+func (m *mergeParityStep) Requires() []string { return nil }
+func (m *mergeParityStep) Run(_ context.Context, r *Run, _ Emit) error {
+	rv := reflect.ValueOf(r).Elem()
+	rt := rv.Type()
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		setDistinctFieldValue(m.t, rv.Field(i), f.Name)
+	}
+	m.want = r.Clone()
+	return nil
+}
+
+// TestRunStepMergesEveryFieldAStepCanWrite is Ruling 20's guard applied to
+// the OTHER hand-maintained projection in this package.
+//
+// envelope.go was audited for parity because a field added there without a
+// producer silently persisted as its zero value. runStep is the same shape
+// of hazard and had no such guard: it hands each step a scratch clone and
+// copies named fields back, so a field a step writes but this merge does not
+// mention is discarded at the exact moment it was produced -- no error, no
+// warning, and every unit test in internal/steps still green, because those
+// tests call step.Run directly on a run they own and never see the clone.
+//
+// That is not hypothetical. Run.Ownership shipped without a producer here,
+// and test/e2e/reset.sh found it on a real cluster: fourteen components
+// installed, no ownership recorded, every Reset silently a no-op. This test
+// is what makes the next one a unit failure instead.
+func TestRunStepMergesEveryFieldAStepCanWrite(t *testing.T) {
+	step := &mergeParityStep{phase: PhaseApply, t: t}
+	e := newTestEngine(t, step)
+
+	run := startAndWait(t, e)
+
+	if step.want == nil {
+		t.Fatal("the step never ran")
+	}
+	wv := reflect.ValueOf(step.want).Elem()
+	gv := reflect.ValueOf(run).Elem()
+	rt := wv.Type()
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if reason, excluded := runFieldsNotMergedFromSteps[f.Name]; excluded {
+			if reason == "" {
+				t.Errorf("Run.%s is in runFieldsNotMergedFromSteps with no stated reason", f.Name)
+			}
+			continue
+		}
+		want := wv.Field(i).Interface()
+		got := gv.Field(i).Interface()
+		if !reflect.DeepEqual(want, got) {
+			t.Errorf("Run.%s = %+v after the step, want %+v -- runStep must merge this field back "+
+				"from the step's scratch copy, or add it to runFieldsNotMergedFromSteps with a stated reason",
+				f.Name, got, want)
+		}
+	}
+}
