@@ -196,6 +196,12 @@ type: application
 version: 0.1.0
 appVersion: "1"
 EOF
+# One object, so the release has real content and `helm install --wait` has
+# something to wait for. Deliberately NOT asserted on after the fact: the
+# name collision means AICR's install upgrades this release with the real
+# cert-manager chart, and a helm upgrade removes objects absent from the new
+# chart. What survives -- and what assertion 1 checks -- is the release
+# record itself.
 cat >"${CHART_DIR}/templates/configmap.yaml" <<'EOF'
 apiVersion: v1
 kind: ConfigMap
@@ -291,11 +297,26 @@ BYSTANDER_ALIVE="$(helm_releases "${BYSTANDER_NS}" | grep -cx "${BYSTANDER_RELEA
 echo "bystander releases matching ${BYSTANDER_RELEASE} in ${BYSTANDER_NS}: ${BYSTANDER_ALIVE}"
 [[ "${BYSTANDER_ALIVE}" -eq 1 ]] \
   || fail "the bystander release ${BYSTANDER_NS}/${BYSTANDER_RELEASE} is gone -- Reset removed something a human installed"
-# Its contents too: an uninstall-then-reinstall would leave the name present
-# and the ConfigMap's owner rewritten.
-BYSTANDER_OWNER="$(kubectl -n "${BYSTANDER_NS}" get configmap bystander-marker -o jsonpath='{.data.owner}' 2>/dev/null || true)"
-[[ "${BYSTANDER_OWNER}" == "a human, not this console" ]] \
-  || fail "the bystander's own ConfigMap did not survive intact (owner=${BYSTANDER_OWNER:-<gone>})"
+# The release RECORD is what this asserts on, not the objects in it. The
+# bystander's own ConfigMap is gone by now and that is correct: the name
+# collision this test is built on means AICR's install ran
+# `helm upgrade --install cert-manager` over it with the real chart, and an
+# upgrade replaces a release's manifest -- an object absent from the new
+# chart is removed by helm, during Apply, long before Reset runs. Asserting
+# on it would be asserting on what the INSTALL did.
+#
+# The strong assertion is the run's own account: Reset must say it skipped
+# the release, and say why. A release left standing because the teardown
+# never ran at all would satisfy the check above but not this one.
+SKIP_REASON="$(echo "${RESIDUE}" | jq -r --arg n "${BYSTANDER_RELEASE}" --arg ns "${BYSTANDER_NS}" \
+  '[.items[]? | select(.kind == "release" and .name == $n and .namespace == $ns) | .skip // ""] | first // ""')"
+echo "reported skip reason: ${SKIP_REASON:-<none>}"
+[[ "${SKIP_REASON}" == *"already existed"* ]] \
+  || fail "Reset did not report skipping ${BYSTANDER_RELEASE} for ownership (reason=${SKIP_REASON:-<none>})"
+# And it must have been reported as skipped, not as removed.
+BYSTANDER_REMOVED="$(echo "${RESIDUE}" | jq --arg n "${BYSTANDER_RELEASE}" --arg ns "${BYSTANDER_NS}" \
+  '[.items[]? | select(.kind == "release" and .name == $n and .namespace == $ns and .removed == true)] | length')"
+[[ "${BYSTANDER_REMOVED}" -eq 0 ]] || fail "Reset reported REMOVING the bystander release"
 # Self-check on an inverted input: the same matcher against a release name
 # this cluster cannot have must match nothing, or it is not discriminating.
 BOGUS="$(helm_releases "${BYSTANDER_NS}" | grep -cx "__no-such-release__" || true)"
