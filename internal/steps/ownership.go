@@ -163,10 +163,21 @@ func NewHelmLister(e applier.Exec) HelmLister { return &helmLister{exec: e} }
 
 // List returns every release in the namespace, in every state.
 //
-// --all is load-bearing: plain `helm list` shows only deployed releases,
-// hiding failed, pending and superseded ones. A release left failed by an
-// earlier attempt is still one this run did not create, and hiding it from
-// the snapshot would make it fair game for Reset to uninstall.
+// Every state is load-bearing, not just the deployed ones: a release left
+// failed, pending or superseded by an earlier attempt is still a release
+// this run did not create, and hiding it from the snapshot would make it
+// fair game for Reset to uninstall.
+//
+// Spelled as the explicit status filters rather than `--all`, which is
+// shorter and means the same thing -- under helm 3. Helm 4 REMOVED --all
+// from `list` (it lists every status by default) and rejects it outright:
+// `Error: unknown flag: --all`. This binary pins helm 3.19.0 (Dockerfile's
+// HELM_VERSION), so --all works today, and the failure mode if that pin
+// ever moves is quiet and bad -- every namespace records a SnapshotErr,
+// every release becomes unprovable, and Reset removes nothing while
+// reporting itself clean. The status flags below exist in both majors and
+// mean all-of-them in both, so the snapshot survives the bump. Found by
+// test/e2e/reset.sh, whose own helm on the host was already 4.x.
 //
 // No Dir is set: helm reads its cache, config and data paths from the
 // HELM_* and XDG variables the deployment already sets (see workSubdirs in
@@ -174,8 +185,12 @@ func NewHelmLister(e applier.Exec) HelmLister { return &helmLister{exec: e} }
 func (h *helmLister) List(ctx context.Context, namespace string) ([]string, error) {
 	var buf bytes.Buffer
 	spec := applier.Spec{
-		Argv: []string{"helm", "list", "--namespace", namespace, "--all", "--short"},
-		Env:  []string{"NO_COLOR=1"},
+		Argv: []string{
+			"helm", "list", "--namespace", namespace,
+			"--deployed", "--failed", "--pending", "--superseded", "--uninstalled", "--uninstalling",
+			"--short",
+		},
+		Env: []string{"NO_COLOR=1"},
 	}
 	if err := h.exec.Run(ctx, spec, &buf); err != nil {
 		// The namespace and helm's own stderr both go in: this error becomes

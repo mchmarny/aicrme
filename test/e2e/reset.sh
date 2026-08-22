@@ -64,7 +64,7 @@ cleanup() {
   if [[ "${exit_code}" -ne 0 ]]; then
     e2e_diagnose "${NS}"
     echo "--- helm releases, all namespaces ---" >&2
-    helm list -A --all >&2 2>&1 || true
+    helm list -A >&2 2>&1 || true
     echo "--- namespaces ---" >&2
     kubectl get ns >&2 2>&1 || true
     echo "--- run record ---" >&2
@@ -77,6 +77,19 @@ cleanup() {
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
 trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
+
+# helm_releases lists every release in a namespace, in every status, in a
+# way that works under BOTH helm majors. `helm list --all` is the obvious
+# spelling and is helm 3 only: helm 4 removed the flag from `list` (it lists
+# every status by default) and rejects it with "unknown flag: --all", which
+# is how this script silently reported the bystander gone on its first real
+# run. The explicit status filters exist in both. internal/steps' own helm
+# invocation carries the same set for the same reason.
+helm_releases() {
+  helm list --namespace "$1" \
+    --deployed --failed --pending --superseded --uninstalled --uninstalling \
+    --short 2>/dev/null || true
+}
 
 run_json() {
   curl -fsS --max-time 10 -b "${JAR}" "http://${ADDR}/api/runs/$1" 2>/dev/null || true
@@ -274,7 +287,7 @@ RESIDUE="$(echo "${RESET_JSON}" | jq -c '.residue // {}')"
 echo "residue: ${RESIDUE}"
 
 echo "--- assert 1: the bystander release survived, and the run said it skipped it"
-BYSTANDER_ALIVE="$(helm list -n "${BYSTANDER_NS}" --all -q | grep -cx "${BYSTANDER_RELEASE}" || true)"
+BYSTANDER_ALIVE="$(helm_releases "${BYSTANDER_NS}" | grep -cx "${BYSTANDER_RELEASE}" || true)"
 echo "bystander releases matching ${BYSTANDER_RELEASE} in ${BYSTANDER_NS}: ${BYSTANDER_ALIVE}"
 [[ "${BYSTANDER_ALIVE}" -eq 1 ]] \
   || fail "the bystander release ${BYSTANDER_NS}/${BYSTANDER_RELEASE} is gone -- Reset removed something a human installed"
@@ -285,7 +298,7 @@ BYSTANDER_OWNER="$(kubectl -n "${BYSTANDER_NS}" get configmap bystander-marker -
   || fail "the bystander's own ConfigMap did not survive intact (owner=${BYSTANDER_OWNER:-<gone>})"
 # Self-check on an inverted input: the same matcher against a release name
 # this cluster cannot have must match nothing, or it is not discriminating.
-BOGUS="$(helm list -n "${BYSTANDER_NS}" --all -q | grep -cx "__no-such-release__" || true)"
+BOGUS="$(helm_releases "${BYSTANDER_NS}" | grep -cx "__no-such-release__" || true)"
 [[ "${BOGUS}" -eq 0 ]] || fail "assertion 1's matcher matched a release that cannot exist"
 echo "assertion 1: PASS"
 
@@ -299,7 +312,7 @@ while IFS=$'\t' read -r name namespace; do
   if [[ "${name}" == "${BYSTANDER_RELEASE}" && "${namespace}" == "${BYSTANDER_NS}" ]]; then
     continue
   fi
-  if helm list -n "${namespace}" --all -q 2>/dev/null | grep -qx "${name}"; then
+  if helm_releases "${namespace}" 2>/dev/null | grep -qx "${name}"; then
     REMAINING=$((REMAINING + 1))
     STILL_THERE="${STILL_THERE} ${namespace}/${name}"
   fi
@@ -308,7 +321,7 @@ echo "releases this run created and still present: ${REMAINING} of ${INSTALLED_C
 [[ "${REMAINING}" -eq 0 ]] || fail "Reset left these behind:${STILL_THERE}"
 # Self-check: the same loop must find the bystander present, or it is not
 # actually looking at the cluster.
-helm list -n "${BYSTANDER_NS}" --all -q | grep -qx "${BYSTANDER_RELEASE}" \
+helm_releases "${BYSTANDER_NS}" | grep -qx "${BYSTANDER_RELEASE}" \
   || fail "assertion 2's matcher cannot see a release that IS present"
 echo "assertion 2: PASS"
 

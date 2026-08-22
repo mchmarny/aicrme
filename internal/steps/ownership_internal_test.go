@@ -245,11 +245,15 @@ func (r *recordingSpecExec) Run(_ context.Context, spec applier.Spec, out io.Wri
 	return r.err
 }
 
-// --all is load-bearing: `helm list` without it hides failed, pending and
+// Every status is load-bearing: plain `helm list` hides failed, pending and
 // superseded releases, and a release left in any of those states by an
-// earlier attempt is still one this run did not create. Omitting it would
+// earlier attempt is still one this run did not create. Omitting them would
 // make that release invisible to the snapshot and therefore fair game for
 // Reset to uninstall.
+//
+// Asserted as the explicit flags rather than --all because the two are only
+// equivalent under helm 3: helm 4 removed --all from `list` and rejects it.
+// See helmLister.List for why that matters here.
 func TestHelmListerAsksHelmForEveryReleaseState(t *testing.T) {
 	e := &recordingSpecExec{stdout: "gpu-operator\nsomebody-elses-thing\n"}
 
@@ -265,7 +269,11 @@ func TestHelmListerAsksHelmForEveryReleaseState(t *testing.T) {
 	if len(e.specs) != 1 {
 		t.Fatalf("ran %d commands, want 1", len(e.specs))
 	}
-	wantArgv := []string{"helm", "list", "--namespace", "gpu-operator", "--all", "--short"}
+	wantArgv := []string{
+		"helm", "list", "--namespace", "gpu-operator",
+		"--deployed", "--failed", "--pending", "--superseded", "--uninstalled", "--uninstalling",
+		"--short",
+	}
 	if !reflect.DeepEqual(e.specs[0].Argv, wantArgv) {
 		t.Errorf("argv = %v, want %v", e.specs[0].Argv, wantArgv)
 	}
