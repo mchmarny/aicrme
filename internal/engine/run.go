@@ -114,6 +114,60 @@ type Run struct {
 	// fail at the step it resumes on. The record was honest about the loss;
 	// this is what makes the console honest too.
 	Truncated []string `json:"truncated,omitempty"`
+	// Ownership is what the cluster looked like immediately BEFORE this
+	// run's Apply, and it is the only thing that separates a release this
+	// console created from one it adopted. AICR's generated install.sh runs
+	// `helm upgrade --install`, so a release a human already had at the
+	// same (name, namespace) is upgraded, prints a deploy header like any
+	// other action, and lands in Components indistinguishable from one this
+	// run created. Reset uninstalls only what is ABSENT here.
+	//
+	// Recorded before Apply because that is the only moment the answer
+	// exists: --install and --create-namespace both erase the distinction
+	// the instant they run.
+	//
+	// omitzero, not omitempty: see Workload's comment -- omitempty is a
+	// no-op on a struct field, so every run that never reached Apply would
+	// otherwise serialize an empty ownership object.
+	Ownership Ownership `json:"ownership,omitzero"`
+}
+
+// ReleaseRef identifies one helm release the way helm itself does: a name is
+// only unique within a namespace, so neither half alone identifies anything.
+type ReleaseRef struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+// NamespaceRef is one namespace's pre-Apply state.
+type NamespaceRef struct {
+	Name string `json:"name"`
+	// UID is the namespace's object UID at snapshot time, empty when it did
+	// not exist. It is what makes "the namespace this run created" a claim
+	// about an OBJECT rather than about a name: a namespace deleted and
+	// recreated between Apply and Reset wears the same name and belongs to
+	// whoever recreated it.
+	UID string `json:"uid,omitempty"`
+	// Existed records whether the namespace was present pre-Apply. A
+	// namespace that existed is never deleted by Reset, whatever is in it.
+	Existed bool `json:"existed,omitempty"`
+	// SnapshotErr is non-empty when this namespace could not be snapshotted
+	// at all. It does not fail Apply (see steps.snapshotOwnership), but it
+	// makes every release in the namespace unprovable, so Reset skips them
+	// and says why -- an unanswered question is not evidence of ownership.
+	SnapshotErr string `json:"snapshotErr,omitempty"`
+}
+
+// Ownership is the pre-Apply cluster state Reset reasons from. Its zero
+// value is meaningful and safe: no evidence, so nothing is provably this
+// run's, so Reset removes nothing. That is also what a record written before
+// this field existed decodes to.
+type Ownership struct {
+	// Releases are the helm releases present BEFORE Apply ran. Anything
+	// here was adopted, not created.
+	Releases []ReleaseRef `json:"releases,omitempty"`
+	// Namespaces is per-namespace state BEFORE Apply ran.
+	Namespaces []NamespaceRef `json:"namespaces,omitempty"`
 }
 
 // ComponentState is the latest known state of one component the bundle
@@ -148,5 +202,11 @@ func (r *Run) Clone() *Run {
 	out.Pending = append([]string(nil), r.Pending...)
 	out.Components = append([]ComponentState(nil), r.Components...)
 	out.Truncated = append([]string(nil), r.Truncated...)
+	// Ownership's two slices hold value types, so copying the slices is a
+	// full deep copy. They are copied at all because *r above shares their
+	// backing arrays, and Reset's whole safety argument rests on a caller
+	// outside the lock never being able to edit this evidence.
+	out.Ownership.Releases = append([]ReleaseRef(nil), r.Ownership.Releases...)
+	out.Ownership.Namespaces = append([]NamespaceRef(nil), r.Ownership.Namespaces...)
 	return &out
 }

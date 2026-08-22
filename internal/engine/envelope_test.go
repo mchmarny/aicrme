@@ -472,6 +472,17 @@ func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
 			v.Set(reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)))
 		case Workload:
 			v.Set(reflect.ValueOf(Workload{Namespace: "parity-ns", Kind: "Job", Name: "parity-workload"}))
+		case Ownership:
+			// Both slices non-empty, and every NamespaceRef field distinct
+			// from its zero value -- an envelope that carried Ownership but
+			// dropped, say, SnapshotErr would otherwise round-trip a
+			// DeepEqual-identical value and report a false pass.
+			v.Set(reflect.ValueOf(Ownership{
+				Releases: []ReleaseRef{{Name: "parity-release", Namespace: "parity-release-ns"}},
+				Namespaces: []NamespaceRef{
+					{Name: "parity-ns", UID: "parity-uid", Existed: true, SnapshotErr: "parity-err"},
+				},
+			}))
 		default:
 			t.Fatalf("setDistinctFieldValue: field %s has unhandled struct type %s -- extend this switch", name, v.Type())
 		}
@@ -566,6 +577,40 @@ func TestEnvelopeRoundTripsEveryRunField(t *testing.T) {
 				"(encodeRun/decodeRun), or add it to runFieldsExcludedFromEnvelope with a stated reason",
 				f.Name, outField, inField)
 		}
+	}
+}
+
+func baseRunForEnvelope(t *testing.T) *Run {
+	t.Helper()
+	now := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	return &Run{ID: "0123456789abcdef", State: StateDone, Phase: PhaseApply, StartedAt: now, UpdatedAt: now}
+}
+
+// The ownership snapshot is the only evidence that separates a release this
+// console created from one it adopted via `helm upgrade --install`, and it
+// is worthless if it does not survive a restart -- Reset runs long after
+// Apply, frequently in a different pod.
+func TestEnvelopeRoundTripsOwnership(t *testing.T) {
+	in := baseRunForEnvelope(t)
+	in.Ownership = Ownership{
+		Releases: []ReleaseRef{{Name: "gpu-operator", Namespace: "gpu-operator"}},
+		Namespaces: []NamespaceRef{
+			{Name: "gpu-operator", UID: "ns-uid-1", Existed: true},
+			{Name: "kai-scheduler", Existed: false},
+			{Name: "monitoring", Existed: false, SnapshotErr: "connection refused"},
+		},
+	}
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if !reflect.DeepEqual(out.Ownership, in.Ownership) {
+		t.Errorf("Ownership round-tripped as %#v, want %#v", out.Ownership, in.Ownership)
 	}
 }
 

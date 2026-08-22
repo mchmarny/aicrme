@@ -93,6 +93,18 @@ type envelope struct {
 	// touches isLive/StateIdle states), so this field surviving the round
 	// trip is what makes the guard survive a restart at all.
 	CleanupUnconfirmed bool `json:"cleanupUnconfirmed,omitempty"`
+	// Ownership is the same optional-on-both-sides addition as Truncated,
+	// Workload and CleanupUnconfirmed, and does not bump envelopeVersion for
+	// the same reason. The decode of a record written before this field
+	// existed is not merely tolerable, it is CORRECT: the zero value means
+	// "no ownership evidence", and internal/teardown reads that as "prove
+	// nothing, remove nothing", which is the fail-closed direction. A
+	// version bump would instead make every pre-existing record unreadable,
+	// turning a run that is safe to Reset conservatively into one no
+	// operator action can reach.
+	//
+	// omitzero, not omitempty: see Run.Ownership's comment.
+	Ownership Ownership `json:"ownership,omitzero"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -173,6 +185,7 @@ func encodeRun(r *Run) ([]byte, error) {
 		UpdatedAt:          r.UpdatedAt,
 		Workload:           r.Workload,
 		CleanupUnconfirmed: r.CleanupUnconfirmed,
+		Ownership:          r.Ownership,
 		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -263,6 +276,7 @@ func decodeRun(blob []byte) (*Run, error) {
 		Truncated:          env.Truncated,
 		Workload:           env.Workload,
 		CleanupUnconfirmed: env.CleanupUnconfirmed,
+		Ownership:          env.Ownership,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}
