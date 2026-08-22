@@ -568,3 +568,73 @@ func TestEnvelopeRoundTripsEveryRunField(t *testing.T) {
 		}
 	}
 }
+
+// TestEnvelopeRoundTripsEveryComponentStateField is the nested half of
+// Ruling 20's parity guard. The top-level test above walks Run's own
+// fields, so a value dropped from ComponentState -- which Run carries as a
+// slice -- is invisible to it: it would persist as its zero value, survive
+// the whole suite, and surface as a Reset that uninstalls from the wrong
+// namespace after a restart. That is the CleanupUnconfirmed defect exactly
+// (fix round 2's N1), one level of nesting down.
+//
+// What actually holds today, stated because it is what decides whether this
+// test can bite: envelope.Components is []ComponentState, the SAME type, so
+// a field ADDED to ComponentState is carried for free and this test cannot
+// fail for that reason -- verified by adding a field and watching it still
+// pass. The hazard it does catch is the one envelope.go's own doc comment
+// invites: the moment envelope forks a parallel component type, or encodeRun
+// projects the slice through anything that drops a field, this fails and
+// names the field. Verified by making encodeRun blank one nested field and
+// confirming the failure message.
+//
+// The engine's other nested projection, bootstrapComponentData in
+// recover.go, is guarded by the compiler instead: recover.go converts
+// ComponentState to it directly, so divergent fields are a build error, not
+// a silent drop. Whoever adds a field to ComponentState updates both.
+func TestEnvelopeRoundTripsEveryComponentStateField(t *testing.T) {
+	var cs ComponentState
+	rv := reflect.ValueOf(&cs).Elem()
+	rt := rv.Type()
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		setDistinctFieldValue(t, rv.Field(i), f.Name)
+	}
+
+	in := &Run{
+		ID:         "0123456789abcdef",
+		State:      StateDone,
+		Phase:      PhaseApply,
+		StartedAt:  time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		UpdatedAt:  time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		Components: []ComponentState{cs},
+	}
+
+	blob, err := encodeRun(in)
+	if err != nil {
+		t.Fatalf("encodeRun() error = %v", err)
+	}
+	out, err := decodeRun(blob)
+	if err != nil {
+		t.Fatalf("decodeRun() error = %v", err)
+	}
+	if len(out.Components) != 1 {
+		t.Fatalf("decoded Components = %d rows, want 1", len(out.Components))
+	}
+
+	outV := reflect.ValueOf(&out.Components[0]).Elem()
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		want := rv.Field(i).Interface()
+		got := outV.Field(i).Interface()
+		if !reflect.DeepEqual(want, got) {
+			t.Errorf("ComponentState.%s round-tripped as %#v, want %#v -- envelope.go does not carry it",
+				f.Name, got, want)
+		}
+	}
+}
