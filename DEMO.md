@@ -117,7 +117,8 @@ deletes the workload and waits until its pods are actually gone before closing t
   `install.sh` is `helm upgrade --install`, so already-installed components are no-ops.
 - **Reset the run** — tear down exactly what this run installed, on the same cluster, so the
   next demo does not need a rebuilt one. This replaces `make demo-down` for a repeat demo: the
-  cluster survives, only the run's own footprint goes.
+  cluster survives, only the run's own footprint goes. Read the caveat below first — a repeat
+  demo reinstalls cleanly but does **not** currently get as far as a placed gang.
 
 ## What is not built yet
 
@@ -155,6 +156,16 @@ one for a `Deployment`, and two because they existed before the run. Those objec
 at runtime rather than by the chart, so `helm uninstall` does not remove them, and a namespace
 holding one is not empty. The releases are what matter for a repeat demo; the empty-ish
 namespaces are harmless and `kubectl delete ns` clears them if you want them gone.
+
+**A repeat demo reinstalls, but its gang does not place — known, measured, unfixed.** On the
+same KWOK cluster, the run after a Reset installed all 14 components cleanly and then failed in
+Prove: the gang did not place inside the 3-minute budget, where a first install places in about
+two seconds. The likely reason is the same runtime-object blind spot: kai-scheduler's
+`SchedulingShard/default` and the `kai-scheduler-default` Deployment it owns are created by the
+operator rather than by the chart, so `helm uninstall` leaves them, and the second cycle runs a
+scheduler from the first alongside freshly-installed controllers. **If you need a second demo to
+reach a placed gang, rebuild the cluster** (`make demo-down && make demo`) rather than relying on
+Reset. Reset is sound for clearing releases; it is not yet a full substitute for a fresh cluster.
 
 If a Reset does not finish, the console offers only Reset again: the run record is the only
 inventory of what is still installed, so Start, Retry and Discard are all refused until the
