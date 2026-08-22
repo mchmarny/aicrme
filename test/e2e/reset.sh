@@ -361,28 +361,7 @@ echo "namespaces reported as skipped with a stated reason: ${NAMED}"
   || fail "${BYSTANDER_KEPT_NS} was kept but not named in the residue"
 echo "assertion 3: PASS"
 
-echo "--- assert 4: the console accepts a new run afterward"
-# The point of a clean Reset: every gate that was refusing new runs is
-# cleared -- the record is deleted, recoveredPending is cleared, and no
-# residue guard is set. A 409 here would mean the operator has to discard
-# something before they can demo again, which is the wedge Reset exists to
-# remove.
-NEW_RUN="$(post /api/runs)"
-NEW_ID="$(echo "${NEW_RUN}" | jq -r '.id')"
-[[ -n "${NEW_ID}" && "${NEW_ID}" != "null" ]] || fail "POST /api/runs was refused after a clean reset: ${NEW_RUN}"
-echo "a new run was accepted: ${NEW_ID}"
-# Cancelled and discarded immediately: assertion 5 drives its own run, and a
-# live one would make its POST /api/runs 409 for a reason unrelated to what
-# it is testing.
-NEW_STATE="$(await_state "${NEW_ID}" awaiting_decision 90)"
-[[ "${NEW_STATE}" == "awaiting_decision" || "${NEW_STATE}" == "failed" ]] \
-  || fail "the new run reached ${NEW_STATE}, expected a decision gate"
-DISCARDED="$(delete_status "/api/runs/${NEW_ID}")"
-[[ "${DISCARDED}" == "204" || "${DISCARDED}" == "200" ]] \
-  || fail "could not discard the probe run (status ${DISCARDED})"
-echo "assertion 4: PASS"
-
-echo "--- assert 5: a FAILED reset blocks Start, Retry and Discard, and Reset again succeeds"
+echo "--- assert 4: a FAILED reset blocks Start, Retry and Discard, and Reset again succeeds"
 # A webhook that refuses every namespace DELETE. Only a real API server can
 # produce this: admission is exactly what a fake clientset does not run. The
 # service does not exist and failurePolicy is Fail, so every delete is
@@ -432,7 +411,7 @@ if [[ "${INCOMPLETE}" != "true" ]]; then
   # ship their own Namespace manifests would have nothing left for the
   # namespace step to delete, so there would be no failure to provoke. Say
   # so rather than asserting on a condition that never arose.
-  echo "SKIP: this recipe left no console-created namespace for the webhook to block; assertion 5 not exercised" >&2
+  echo "SKIP: this recipe left no console-created namespace for the webhook to block; assertion 4 not exercised" >&2
 else
   START_STATUS="$(post_status /api/runs)"
   RETRY_STATUS="$(post_status "/api/runs/${FAIL_RUN_ID}/retry")"
@@ -451,10 +430,31 @@ else
   AGAIN_INCOMPLETE="$(run_json "${FAIL_RUN_ID}" | jq -r '.residue.incomplete // false')"
   echo "second reset settled at state=${AGAIN_STATE} incomplete=${AGAIN_INCOMPLETE}"
   [[ "${AGAIN_INCOMPLETE}" != "true" ]] || fail "the second Reset did not clear the guard"
-  FINAL_START="$(post_status /api/runs)"
-  [[ "${FINAL_START}" == "200" ]] || fail "Start returned ${FINAL_START} after the residue was cleared, want 200"
-  echo "assertion 5: PASS"
+  echo "assertion 4: PASS"
 fi
+
+echo "--- assert 5: the console accepts a new run afterward"
+# LAST, deliberately -- numbered 5 because it runs fifth, not because it
+# is the fifth thing the plan listed. It is the only assertion that leaves a run in flight,
+# and there is no way to clean one up: a run parked at a decision gate is
+# live, and engine.Discard refuses a live run with 409 -- correctly, since
+# discarding one would nil e.current out from under its own goroutine.
+# Running this last means the run it starts needs no cleanup at all; the
+# EXIT trap deletes the cluster underneath it.
+#
+# The point of a clean Reset: every gate that was refusing new runs is
+# cleared -- the record is deleted, recoveredPending is cleared, and no
+# residue guard is set. A 409 here would mean the operator has to discard
+# something before they can demo again, which is the wedge Reset exists to
+# remove.
+NEW_RUN="$(post /api/runs)"
+NEW_ID="$(echo "${NEW_RUN}" | jq -r '.id')"
+[[ -n "${NEW_ID}" && "${NEW_ID}" != "null" ]] || fail "POST /api/runs was refused after a clean reset: ${NEW_RUN}"
+NEW_STATE="$(await_state "${NEW_ID}" awaiting_decision 90)"
+[[ "${NEW_STATE}" == "awaiting_decision" ]] \
+  || fail "the new run reached ${NEW_STATE}, expected a decision gate -- the console is not usable again"
+echo "a new run was accepted and reached its first gate: ${NEW_ID}"
+echo "assertion 5: PASS"
 
 echo
 echo "PASS: Reset removed what the run created and left what it did not"
