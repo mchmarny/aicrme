@@ -29,12 +29,23 @@ type fakeTeardown struct {
 	gotNamespaces []string
 	releasesRan   bool
 	namespacesRan bool
+	// onReleases runs inside Releases, standing in for an operator
+	// cancelling while an uninstall is in flight.
+	onReleases func()
+	// cmdCtxErr and cancelCtxErr are each context's state immediately after
+	// onReleases -- i.e. what the teardown would see mid-command.
+	cmdCtxErr    error
+	cancelCtxErr error
 }
 
-func (f *fakeTeardown) Releases(_, _ context.Context, comps []ComponentState, _ Ownership,
+func (f *fakeTeardown) Releases(ctx, cancelCtx context.Context, comps []ComponentState, _ Ownership,
 	emit func(ResidueItem)) []ResidueItem {
 
 	f.releasesRan = true
+	if f.onReleases != nil {
+		f.onReleases()
+		f.cmdCtxErr, f.cancelCtxErr = ctx.Err(), cancelCtx.Err()
+	}
 	f.gotComponents = comps
 	for _, it := range f.releases {
 		emit(it)
@@ -430,4 +441,37 @@ func seedIncompleteTeardown(t *testing.T, e *Engine) *Run {
 	}
 	e.mu.Unlock()
 	return run
+}
+
+// The two contexts Reset hands the teardown must be DIFFERENT contexts, and
+// only the second may be cancellable. internal/applier's BashExec SIGTERMs
+// the whole process group the instant its context is done, so running helm
+// under the cancellable one interrupts an uninstall mid-flight and strands
+// the release half-removed -- which is the exact residue Reset exists to
+// eliminate, produced by the operation meant to prevent it.
+//
+// internal/teardown is written to that contract and tested against it, but
+// nothing there can see what Reset actually passes: this is the only place
+// the two ends meet.
+func TestResetDoesNotCancelTheCommandContext(t *testing.T) {
+	td := &fakeTeardown{releases: []ResidueItem{removedRelease("gpu-operator", "gpu-operator")}}
+	e := newResetEngine(t, td)
+	run := resettableRun(t, e, StateDone)
+	// Cancel from inside the teardown, standing in for an operator
+	// cancelling while an uninstall is in flight.
+	td.onReleases = func() {
+		e.mu.Lock()
+		cancel := e.cancel
+		e.mu.Unlock()
+		cancel()
+	}
+
+	resetAndWait(t, e, run.ID)
+
+	if td.cancelCtxErr == nil {
+		t.Fatal("the cancellation context was not cancelled -- this test proves nothing")
+	}
+	if td.cmdCtxErr != nil {
+		t.Errorf("the command context was cancelled too (%v) -- helm would be SIGTERMed mid-uninstall", td.cmdCtxErr)
+	}
 }

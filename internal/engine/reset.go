@@ -9,6 +9,7 @@ import (
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
+	"github.com/mchmarny/aicrme/internal/prove"
 )
 
 // resetWorkloadTimeout bounds the confirmed stop of the run's workload
@@ -41,9 +42,11 @@ type Teardown interface {
 	// Releases uninstalls each component's release, in reverse install
 	// order, skipping every release the run cannot prove it created.
 	//
-	// ctx runs each command; cancel is checked only BETWEEN commands, so an
-	// operator's cancellation never interrupts an uninstall mid-flight.
-	// See internal/teardown for why that distinction is load-bearing.
+	// ctx runs each command and is DETACHED -- Reset never cancels it. cancel
+	// is the one an operator's cancellation reaches, and implementations must
+	// check it only BETWEEN commands, so an uninstall in flight is never
+	// interrupted. See Reset's goroutine and internal/teardown for why that
+	// distinction is load-bearing on both sides.
 	Releases(ctx, cancel context.Context, comps []ComponentState, own Ownership, emit func(ResidueItem)) []ResidueItem
 
 	// Namespaces deletes each namespace the run created and left empty.
@@ -157,7 +160,13 @@ func (e *Engine) Reset(ctx context.Context, runID string) error {
 		// bumped.
 		e.mu.Lock()
 		if e.current != nil && e.current.ID == runID && e.aliveLocked(epoch) {
-			e.current.State = snapshotStateBeforeReset(snapshot)
+			// StateFailed rather than the state it came from: the
+			// checkpoint is the only durable record that a teardown was
+			// attempted, and a run silently returned to StateActive or
+			// StateDone would look untouched. The run itself is fine --
+			// nothing was removed -- so no residue guard is set, and Retry
+			// and Discard both stay available.
+			e.current.State = StateFailed
 			e.current.UpdatedAt = time.Now().UTC()
 		}
 		e.mu.Unlock()
@@ -179,25 +188,29 @@ func (e *Engine) Reset(ctx context.Context, runID string) error {
 	go func() {
 		defer close(done)
 		defer cancel()
-		e.runReset(runCtx, runCtx, epoch, runID, prover, client)
+		// TWO DIFFERENT CONTEXTS, and the difference is the whole point.
+		//
+		// cmdCtx is detached and never cancelled. internal/applier's
+		// BashExec SIGTERMs the entire process group the instant its
+		// context is done, so running helm under runCtx would interrupt an
+		// uninstall mid-flight and strand the release half-removed -- the
+		// exact residue Reset exists to eliminate, produced by the
+		// operation meant to prevent it. Each command is bounded instead by
+		// helm's own --timeout, which internal/teardown passes explicitly.
+		//
+		// runCtx is what an operator's cancellation reaches, and
+		// internal/teardown checks it only BETWEEN commands: the in-flight
+		// uninstall finishes, the next one never starts.
+		cmdCtx := context.WithoutCancel(runCtx)
+		e.runReset(cmdCtx, runCtx, epoch, runID, prover, client)
 	}()
 	return nil
 }
 
-// snapshotStateBeforeReset is where a run goes if Reset's own checkpoint
-// fails. StateFailed rather than the state it came from: the checkpoint is
-// the only durable record that a teardown was attempted, and a run silently
-// returned to StateActive or StateDone would look untouched. The run is
-// genuinely fine -- nothing was removed -- so no residue guard is set, and
-// Retry and Discard both stay available.
-func snapshotStateBeforeReset(_ *Run) State { return StateFailed }
-
 // runReset is the teardown itself, in the three steps the design requires
 // (section 4), in this order and not in parallel.
 func (e *Engine) runReset(ctx, cancelCtx context.Context, epoch uint64, runID string,
-	prover interface {
-		EnsureAbsent(ctx context.Context, runID string, timeout time.Duration) error
-	}, client Teardown) {
+	prover *prove.Client, client Teardown) {
 
 	run := e.snapshotRun(epoch, runID)
 	if run == nil {
