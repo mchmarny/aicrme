@@ -30,7 +30,7 @@ type fakeTeardown struct {
 	releasesRan   bool
 	namespacesRan bool
 	// onReleases runs inside Releases, standing in for an operator
-	// cancelling while an uninstall is in flight.
+	// canceling while an uninstall is in flight.
 	onReleases func()
 	// cmdCtxErr and cancelCtxErr are each context's state immediately after
 	// onReleases -- i.e. what the teardown would see mid-command.
@@ -458,7 +458,7 @@ func TestResetDoesNotCancelTheCommandContext(t *testing.T) {
 	e := newResetEngine(t, td)
 	run := resettableRun(t, e, StateDone)
 	// Cancel from inside the teardown, standing in for an operator
-	// cancelling while an uninstall is in flight.
+	// canceling while an uninstall is in flight.
 	td.onReleases = func() {
 		e.mu.Lock()
 		cancel := e.cancel
@@ -469,9 +469,9 @@ func TestResetDoesNotCancelTheCommandContext(t *testing.T) {
 	resetAndWait(t, e, run.ID)
 
 	if td.cancelCtxErr == nil {
-		t.Fatal("the cancellation context was not cancelled -- this test proves nothing")
+		t.Fatal("the cancellation context was not canceled -- this test proves nothing")
 	}
 	if td.cmdCtxErr != nil {
-		t.Errorf("the command context was cancelled too (%v) -- helm would be SIGTERMed mid-uninstall", td.cmdCtxErr)
+		t.Errorf("the command context was canceled too (%v) -- helm would be SIGTERMed mid-uninstall", td.cmdCtxErr)
 	}
 }

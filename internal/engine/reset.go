@@ -190,7 +190,7 @@ func (e *Engine) Reset(ctx context.Context, runID string) error {
 		defer cancel()
 		// TWO DIFFERENT CONTEXTS, and the difference is the whole point.
 		//
-		// cmdCtx is detached and never cancelled. internal/applier's
+		// cmdCtx is detached and never canceled. internal/applier's
 		// BashExec SIGTERMs the entire process group the instant its
 		// context is done, so running helm under runCtx would interrupt an
 		// uninstall mid-flight and strand the release half-removed -- the

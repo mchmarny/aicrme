@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -880,5 +881,71 @@ func TestDiscardBlockedByUnconfirmedCleanupFailure(t *testing.T) {
 	}
 	if got, ok := e.CurrentID(); !ok || got != run.ID {
 		t.Errorf("CurrentID() = %q, %v after rejected Discard, want %q, true", got, ok, run.ID)
+	}
+}
+
+// ownershipStep writes the evidence internal/steps.snapshotOwnership
+// produces, then optionally fails -- the two paths runStep merges
+// differently, and Ownership must survive both.
+type ownershipStep struct {
+	phase Phase
+	own   Ownership
+	err   error
+}
+
+func (o *ownershipStep) Phase() Phase       { return o.phase }
+func (o *ownershipStep) Requires() []string { return nil }
+func (o *ownershipStep) Run(_ context.Context, r *Run, _ Emit) error {
+	r.Ownership = o.own
+	r.Components = []ComponentState{{Name: "gpu-operator", Namespace: "gpu-operator", Index: 1, Total: 1}}
+	return o.err
+}
+
+func ownershipFixture() Ownership {
+	return Ownership{
+		Releases:   []ReleaseRef{{Name: "somebody-elses-thing", Namespace: "gpu-operator"}},
+		Namespaces: []NamespaceRef{{Name: "gpu-operator", Existed: true, UID: "uid-1"}},
+	}
+}
+
+// A step's Ownership write must survive runStep's merge, exactly as
+// Artifacts, Decisions, Components and Workload do.
+//
+// This is not hypothetical: it shipped. test/e2e/reset.sh's first real run
+// found a record carrying fourteen installed components and no ownership at
+// all, because runStep is a hand-maintained merge and this field had no
+// producer in it -- the same defect class as fix round 2's N1 (envelope.go)
+// and Ruling 20's parity guard, one merge site over. internal/steps' own
+// tests cannot catch it: they call step.Run directly on a run they own, so
+// the scratch copy the engine actually passes is not on their path.
+func TestOwnershipSurvivesTheMerge(t *testing.T) {
+	want := ownershipFixture()
+	e := newTestEngine(t, &ownershipStep{phase: PhaseApply, own: want})
+
+	run := startAndWait(t, e)
+
+	if !reflect.DeepEqual(run.Ownership, want) {
+		t.Errorf("Ownership = %+v after the merge, want %+v -- runStep must carry it", run.Ownership, want)
+	}
+}
+
+// And on the failure path, which is the one that matters most: a failed
+// Apply is the case that leaves a half-installed cluster, so it is exactly
+// the run that most needs a Reset -- and a Reset with no evidence removes
+// nothing.
+func TestOwnershipSurvivesAFailedStep(t *testing.T) {
+	want := ownershipFixture()
+	e := newTestEngine(t, &ownershipStep{
+		phase: PhaseApply, own: want, err: errors.New("deploy.sh failed: exit status 1"),
+	})
+
+	run := startAndWait(t, e)
+
+	if run.State != StateFailed {
+		t.Fatalf("State = %q, want %q", run.State, StateFailed)
+	}
+	if !reflect.DeepEqual(run.Ownership, want) {
+		t.Errorf("Ownership = %+v after a failed step, want %+v -- the run that most needs a reset would have no evidence",
+			run.Ownership, want)
 	}
 }

@@ -803,6 +803,16 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		e.mu.Lock()
 		if e.aliveLocked(epoch) {
 			e.current.Components = scratch.Components
+			// Ownership merges on the failure path for the same reason
+			// Components does, only more so. It is evidence, not an output:
+			// Apply records it BEFORE it installs anything, so by the time
+			// a step fails the snapshot is already complete and describes
+			// the cluster as it was. And a failed Apply is exactly when
+			// Reset matters most -- it is the case that leaves a
+			// half-installed cluster -- so losing the evidence here would
+			// leave the one run that most needs a teardown with nothing it
+			// can prove it owns.
+			e.current.Ownership = scratch.Ownership
 			switch {
 			case errors.Is(err, ErrUnconfirmedCleanup):
 				logUnconfirmed = !e.current.CleanupUnconfirmed
@@ -866,6 +876,18 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// every real run, defeating the console-relabel-after-restart purpose
 	// the field exists for.
 	e.current.Workload = scratch.Workload
+	// Ownership, same shape as Workload and for the same class of reason:
+	// without this line internal/steps.snapshotOwnership's write lands on
+	// the scratch copy and is discarded, and every Reset skips everything
+	// for want of evidence that was in fact collected correctly. That is
+	// what test/e2e/reset.sh caught on its first real run -- the run record
+	// carried fourteen installed components and no ownership at all -- and
+	// nothing in the unit suite could: internal/steps' tests call step.Run
+	// directly on a run they own, so the merge is not on their path.
+	//
+	// Merged on BOTH paths, unlike Workload. See the failure-path merge
+	// above for why.
+	e.current.Ownership = scratch.Ownership
 	// Advance the cursor before this checkpoint is taken, not after: the
 	// save below must carry the advanced StepIndex, and it must complete
 	// before the next step begins (it does, trivially -- this call is
