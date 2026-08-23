@@ -193,8 +193,21 @@ Platform options are filtered to those with an overlay matching this cluster's c
 Everything else - service, accelerator, OS, component set, versions, values - is derived by the
 AICR recipe engine. The resulting component list is present and reviewable but folded:
 
-> **16 components**, every version pinned and signed - gpu-operator v26.3.3,
+> **16 components**, every version pinned - gpu-operator v26.3.3,
 > kai-scheduler v0.14.1, kubeflow-trainer 2.2.0, +13
+
+**"Signed" was removed from this line, and from the two screens that rendered it, on
+2026-08-23.** Nothing backed it. `aicr.ComponentRef` — and `recipe.ComponentRef` beneath it —
+carry name, kind, version, source, chart and namespace, with no digest and no signature field,
+so the console has no per-component signing evidence to render. `steps.Bundle` passes no
+`Attester` to `MakeBundle`, which AICR documents as selecting the no-op attester, so the
+generated bundle is not attested either. AICR's one attestation path,
+`Client.EmitRecipeEvidence`, builds its predicate from a completed `ValidateState` run — the
+step scoped out on 2026-08-18. Backing the claim would mean reinstating Validate AND standing
+up keyless signing, so the honest move on a screen whose whole job is pre-approval disclosure
+was to make the claim smaller. **Pinned is true and stays:** versions come from the pinned
+embedded catalog, and `assertMatchesApproved` fails the run if a re-resolve drifts from what
+the operator approved.
 
 Footnoted with the validation provenance: this recipe is exercised nightly in AICR's test
 matrix for these coordinates.

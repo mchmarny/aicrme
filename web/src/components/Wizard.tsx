@@ -255,7 +255,7 @@ function ResolvedRecommend({ recipe }: { recipe: RecipeSummary | null }) {
   return (
     <section className="mx-auto max-w-2xl space-y-4">
       <p className="text-slate-300">
-        Decisions submitted — <strong>{recipe.componentCount} components</strong> resolved, every version pinned and signed.
+        Decisions submitted — <strong>{recipe.componentCount} components</strong> resolved, every version pinned.
       </p>
       <ul className="space-y-1 font-mono text-xs text-slate-400">
         {recipe.components.map(c => (

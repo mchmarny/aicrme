@@ -88,6 +88,19 @@ describe('Wizard', () => {
     expect(JSON.parse(init!.body as string)).toEqual({ intent: 'training', platform: 'kubeflow' })
   })
 
+  // The recipe summary made the same unbacked "signed" claim the confirm
+  // gate did, so it gets the same guard -- see Cockpit.test.tsx for why
+  // nothing in AICR's recipe surface can support the word.
+  // getAllByText, not getByText: this stream reaches the apply phase, so the
+  // recipe summary and the Cockpit's own gate line are both on screen and
+  // both make the claim. Asserting on one of them would leave the other free
+  // to keep saying "signed".
+  it('says the resolved versions are pinned, and does not claim they are signed', async () => {
+    render(<Wizard events={events} />)
+    await waitFor(() => expect(screen.getAllByText(/every version pinned/).length).toBeGreaterThan(0))
+    expect(screen.queryAllByText(/signed/i)).toHaveLength(0)
+  })
+
   // Regression guard: this test used to render the full, completed stream
   // and assert the two radiogroups were still present --
   // locking in a defect where a finished run kept an enabled Continue button
@@ -96,7 +109,7 @@ describe('Wizard', () => {
   // awaiting_decision, the ask-form must not reappear.
   it('does not re-ask the two questions once the run has already decided and resolved', async () => {
     render(<Wizard events={events} />)
-    await waitFor(() => expect(screen.getByText(/every version pinned and signed/)).toBeDefined())
+    await waitFor(() => expect(screen.getAllByText(/every version pinned/).length).toBeGreaterThan(0))
     expect(screen.queryAllByRole('radiogroup')).toHaveLength(0)
     expect(screen.queryByRole('button', { name: /continue/i })).toBeNull()
     expect(screen.getByText(/gpu-operator v26.3.3/)).toBeDefined()

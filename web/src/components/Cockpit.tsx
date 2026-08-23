@@ -79,7 +79,7 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
         <h2 className="text-2xl font-semibold text-slate-100">Review the bundle before it touches the cluster</h2>
         <p className="mt-1 text-sm text-slate-400">
           {recipe
-            ? `${recipe.componentCount} components, every version pinned and signed.`
+            ? `${recipe.componentCount} components, every version pinned.`
             : 'Resolving the bundle…'}
         </p>
       </div>

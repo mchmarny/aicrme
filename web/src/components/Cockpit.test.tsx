@@ -44,6 +44,23 @@ describe('Cockpit', () => {
     expect(onDecide).toHaveBeenCalledWith({ apply: 'yes' })
   })
 
+  // The confirm gate is the one screen whose entire job is honesty: it is
+  // where the operator approves a cluster-wide install. It used to say
+  // "every version pinned and signed", and the second half was not backed by
+  // anything. aicr.ComponentRef -- and recipe.ComponentRef beneath it --
+  // carry Name/Kind/Version/Source/Chart/Namespace and no digest or
+  // signature; steps.Bundle passes no Attester, so the bundle is not
+  // attested either; and AICR's only attestation path
+  // (Client.EmitRecipeEvidence) needs a completed ValidateState run, which
+  // this console deliberately does not do. "Pinned" is true and stays.
+  it('gate: claims versions are pinned, and does not claim they are signed', () => {
+    const run = baseRun({ state: 'awaiting_decision', phase: 'apply' })
+    render(<Cockpit events={[]} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    expect(screen.getByText(/every version pinned/)).toBeDefined()
+    expect(screen.queryByText(/signed/i)).toBeNull()
+  })
+
   it('running: renders component rows with status, and a retrying component shows its attempt count', () => {
     const events: AicrEvent[] = [
       componentEvent(1, 'cert-manager', { index: 1, total: 4, status: 'started' }),
