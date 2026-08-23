@@ -107,6 +107,40 @@ up() {
   local extra=()
   [[ -n "${PULL_SECRET}" ]] && extra+=(--set "imagePullSecrets[0].name=${PULL_SECRET}")
 
+  # Pin the console to a GPU-FREE node pool when one exists.
+  #
+  # The recipe installs nodewright-customizations, which on EKS and AKS
+  # restarts the GPU nodes. A console sitting on one is killed part-way
+  # through the install that rebooted it, and the run it was driving has to be
+  # recovered and retried. GKE's COS image does not restart, so this is
+  # portability insurance -- but the cost of being wrong is a broken demo on
+  # the two clouds we have not tried yet.
+  #
+  # Written to a values file rather than --set: the pool label keys are
+  # cloud.google.com/gke-nodepool and eks.amazonaws.com/nodegroup, and helm's
+  # --set requires every dot in a key to be backslash-escaped, which is a
+  # quoting trap nobody should have to debug at demo time.
+  local pool_key pool_val values_file=""
+  read -r pool_key pool_val <<<"$(kubectl get nodes -o json 2>/dev/null | jq -r '
+    [ .items[]
+      | select(((.status.allocatable // {})["nvidia.com/gpu"]) == null)
+      | .metadata.labels
+      | to_entries[]
+      | select(.key == "cloud.google.com/gke-nodepool"
+            or .key == "eks.amazonaws.com/nodegroup"
+            or .key == "agentpool")
+    ] | if length > 0 then "\(.[0].key) \(.[0].value)" else "" end')"
+  if [[ -n "${pool_key}" && -n "${pool_val}" ]]; then
+    values_file="$(mktemp -t aicrme-values.XXXXXX.yaml)"
+    printf 'nodeSelector:\n  %s: "%s"\n' "${pool_key}" "${pool_val}" >"${values_file}"
+    extra+=(-f "${values_file}")
+    echo "==> pinning the console to GPU-free pool ${pool_val} (${pool_key})"
+  else
+    echo "==> no GPU-free node pool found; the console will schedule anywhere."
+    echo "    On EKS/AKS that risks it landing on a GPU node that"
+    echo "    nodewright-customizations later restarts, mid-install."
+  fi
+
   echo "==> installing the chart into ${NS}"
   helm upgrade --install aicrme charts/aicrme -n "${NS}" --create-namespace \
     --set image.repository="${IMAGE_REPO}" \

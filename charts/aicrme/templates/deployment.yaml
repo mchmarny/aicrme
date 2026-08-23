@@ -41,6 +41,19 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.nodeSelector }}
+      # Pin the console away from nodes its own install disrupts. On EKS and
+      # AKS, nodewright-customizations RESTARTS the GPU nodes, and a console
+      # sitting on one is killed part-way through the very install that
+      # rebooted it. GKE's COS image does not restart, so this is portability
+      # insurance rather than a fix for any one cloud.
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ include "aicrme.serviceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       # Must agree with the Dockerfile's `USER 10001` / `adduser -u 10001`.
