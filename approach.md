@@ -489,13 +489,18 @@ Each phase is independently demoable.
 
 ## Risks
 
-1. **SDK surface.** `pkg/client/v1`, the surface AICR is freezing for v1, covers recipe,
-   bundle, query, evidence and health - but not snapshot or validate. The console must import
-   `pkg/snapshotter` and `pkg/validator` directly, which are outside that freeze, so AICR
-   refactors can break it. Mitigation: pin the aicr module version and bump deliberately. The
-   better fix is upstreaming `Snapshot()` and `Validate()` into `pkg/client/v1` as a small PR,
-   which also serves AICR's own roadmap goal of an integrator persona who can embed the SDK
-   without reading source.
+1. **SDK surface. Largely closed upstream as of v0.19.0.** This risk was written when
+   `pkg/client/v1` covered recipe, bundle, query, evidence and health but neither snapshot nor
+   validate, forcing direct imports of `pkg/snapshotter` and `pkg/validator` from outside the
+   freeze. **Both are now on the facade** — `Client.CollectSnapshot` and `Client.ValidateState` —
+   and this console uses the first through it. `pkg/validator` is no longer imported at all.
+   `pkg/snapshotter` still is, but only to decode the `Snapshot` type; the agent runs entirely
+   through the facade. The mitigation landed upstream without this project having to ask for it.
+
+   **What remains:** the facade's `AgentConfig` is a hand-written mirror and omits
+   `AKSGPUPoolsPath`, which is why AKS is deferred rather than built around it — see
+   `docs/aicr-upstream-asks.md`. Pinning the module version and bumping deliberately
+   (now automated: `renovate.json`) stays the standing mitigation.
 
 2. **Blast radius.** Cluster-admin, as above. Mitigated by framing, defaults, and disclosure,
    not by technical control.
