@@ -433,7 +433,12 @@ func main() {
 	// One instance, shared between the Prove step below and eng.SetProveClient
 	// further down -- see that call's comment for why a second construction
 	// site is worth avoiding even though both would be equivalent today.
-	proveClient := prove.NewClient(kube)
+	// The same taints the snapshot agent needs. Both have to land on THIS
+	// cluster's GPU nodes, and a cluster whose GPU pool carries a
+	// non-standard taint breaks both in the same way -- so one knob, read
+	// once, handed to both rather than two that can disagree.
+	gpuTolerations := parseTolerations(os.Getenv("AICRME_GPU_TOLERATIONS"))
+	proveClient := prove.NewClient(kube, gpuTolerations...)
 
 	eng := engine.New(b, runStore,
 		steps.NewDiscover(client, steps.DiscoverConfig{
@@ -459,7 +464,7 @@ func main() {
 			NodeSelector: parseNodeSelector(os.Getenv("AICRME_SNAPSHOT_NODE_SELECTOR")),
 			// Added to the built-in nvidia.com/gpu toleration, for a cluster
 			// whose GPU pool carries a different taint. See parseTolerations.
-			ExtraTolerations: parseTolerations(os.Getenv("AICRME_SNAPSHOT_TOLERATIONS")),
+			ExtraTolerations: gpuTolerations,
 			// Unset (nil) on every real deployment, where AICR's own 1000m
 			// CPU default applies. Exists so the KWOK e2e can fit the agent
 			// onto the one real node it is pinned to -- see the Requests
@@ -763,7 +768,7 @@ func parseResourceRequests(s string) corev1.ResourceList {
 	return out
 }
 
-// parseTolerations reads AICRME_SNAPSHOT_TOLERATIONS: a comma-separated list
+// parseTolerations reads AICRME_GPU_TOLERATIONS: a comma-separated list
 // of "key=value:effect" or "key:effect", the same spelling AICR's own
 // --tolerations flag takes.
 //
@@ -793,7 +798,7 @@ func parseTolerations(s string) []corev1.Toleration {
 		key, value, hasValue := strings.Cut(keyValue, "=")
 		key = strings.TrimSpace(key)
 		if key == "" {
-			slog.Warn("AICRME_SNAPSHOT_TOLERATIONS: skipping entry with no key",
+			slog.Warn("AICRME_GPU_TOLERATIONS: skipping entry with no key",
 				"entry", spec, "value", s)
 			continue
 		}
@@ -808,7 +813,7 @@ func parseTolerations(s string) []corev1.Toleration {
 		out = append(out, tol)
 	}
 	if len(out) == 0 {
-		slog.Warn("AICRME_SNAPSHOT_TOLERATIONS set but produced no usable toleration; "+
+		slog.Warn("AICRME_GPU_TOLERATIONS set but produced no usable toleration; "+
 			"the agent keeps only its built-in nvidia.com/gpu toleration", "value", s)
 	}
 	return out

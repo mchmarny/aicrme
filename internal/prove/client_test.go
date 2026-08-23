@@ -493,3 +493,50 @@ func TestEnsureAbsentReportsAWorkloadThatOutlivesTheWait(t *testing.T) {
 		t.Fatal("EnsureAbsent() error = nil, want a timeout -- Delete returning nil is not proof of absence")
 	}
 }
+
+// The reference workload must be able to land on THIS cluster's GPU nodes.
+// workload.yaml carries the two taints that cover the common cases -- KWOK's
+// fake nodes and nvidia.com/gpu -- and a platform team routinely uses
+// neither. The first real GKE H100 cluster this console met taints its GPU
+// pool dedicated=gpu-workload, and kai-scheduler refused the gang outright:
+// "no nodes with enough resources were found: 2 node(s) had untolerated
+// taint(s)".
+//
+// The built-ins must survive alongside the operator's, or fixing one cluster
+// silently breaks KWOK and every e2e that depends on it.
+func TestApplyAddsOperatorTolerationsAndKeepsTheBuiltIns(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	c := prove.NewClient(cs, corev1.Toleration{
+		Key: "dedicated", Operator: corev1.TolerationOpEqual,
+		Value: "gpu-workload", Effect: corev1.TaintEffectNoSchedule,
+	})
+	if err := c.Apply(context.Background(), "run-tol"); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+
+	job, err := cs.BatchV1().Jobs(prove.Namespace).
+		Get(context.Background(), prove.WorkloadName("run-tol"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	var operator, gpu, kwok bool
+	for _, tol := range job.Spec.Template.Spec.Tolerations {
+		switch {
+		case tol.Key == "dedicated" && tol.Value == "gpu-workload":
+			operator = true
+		case tol.Key == "nvidia.com/gpu":
+			gpu = true
+		case tol.Key == "kwok.x-k8s.io/node":
+			kwok = true
+		}
+		if tol.Key == "" && tol.Operator == corev1.TolerationOpExists {
+			t.Error("a catch-all toleration makes the placement claim unfalsifiable -- see workload.yaml")
+		}
+	}
+	if !operator {
+		t.Error("the operator's GPU taint is absent; the gang cannot reach this cluster's GPU nodes")
+	}
+	if !gpu || !kwok {
+		t.Errorf("built-in tolerations were lost (nvidia.com/gpu=%v kwok=%v)", gpu, kwok)
+	}
+}

@@ -19,14 +19,27 @@ import (
 // to the API server -- manifest.go only ever renders bytes.
 type Client struct {
 	kube kubernetes.Interface
+	// extraTolerations are added to the reference workload's pod so it can
+	// land on THIS cluster's GPU nodes. workload.yaml carries the two taints
+	// that cover the common cases (KWOK's fake nodes, and nvidia.com/gpu),
+	// and a platform team routinely uses neither: the first real GKE H100
+	// cluster this console met taints its GPU pool dedicated=gpu-workload,
+	// and kai-scheduler refused the gang with "2 node(s) had untolerated
+	// taint(s)".
+	//
+	// Named taints only, never a catch-all Exists -- see workload.yaml's own
+	// comment. This step's entire claim is that a GPU-aware scheduler chose
+	// GPU nodes, and a pod that tolerates everything makes that claim
+	// unfalsifiable.
+	extraTolerations []corev1.Toleration
 }
 
 // NewClient wraps an existing clientset. Tests pass fake.NewSimpleClientset;
 // production wiring passes the real one -- which can be nil outside a pod
 // (rest.InClusterConfig fails on a developer laptop), so a caller must check
 // Ready before issuing any other call.
-func NewClient(kube kubernetes.Interface) *Client {
-	return &Client{kube: kube}
+func NewClient(kube kubernetes.Interface, extraTolerations ...corev1.Toleration) *Client {
+	return &Client{kube: kube, extraTolerations: extraTolerations}
 }
 
 // Ready reports whether this Client has a live cluster connection. Every
@@ -100,6 +113,12 @@ func (c *Client) Apply(ctx context.Context, runID string) error {
 	if decodeErr := yaml.Unmarshal(out, &job); decodeErr != nil {
 		return fmt.Errorf("prove: decoding rendered workload for run %s: %w", runID, decodeErr)
 	}
+	// Appended after decode rather than templated into workload.yaml: the
+	// manifest is rendered by string replacement, and a YAML list spliced in
+	// by textual substitution is a whole class of indentation bug for
+	// something the typed object expresses directly.
+	job.Spec.Template.Spec.Tolerations = append(
+		job.Spec.Template.Spec.Tolerations, c.extraTolerations...)
 	_, err = c.kube.BatchV1().Jobs(Namespace).Create(ctx, &job, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("prove: applying workload for run %s: %w", runID, err)
