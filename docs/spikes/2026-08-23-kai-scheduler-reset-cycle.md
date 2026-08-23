@@ -79,6 +79,27 @@ Two candidates, both cheap to test, neither tested here:
   It is consistent with a stale cache or a conversion mismatch against the surviving CRD, but
   neither was confirmed, and that is kai-scheduler's internals rather than this console's.
 
+## Prior art this spike missed, and what it adds
+
+`docs/phase-3-status.md` recorded the same family of failure during Phase 3, under
+"Observations worth keeping": re-applying the recipe onto a cluster where kai-scheduler was
+already running left the older `kai-scheduler-default` pod alive while the chart-managed
+controllers rolled, and that pod then logged
+`Failed to update pod group status ...: Unauthorized` at ~50/second — **and nothing scheduled
+until it was restarted.** The mechanism was not chased at the time.
+
+That is a sharper clue than anything measured here, and it points somewhere this spike did not
+look: **authorization**, not caching. A pod that outlives the reinstall of its own
+ServiceAccount and RBAC keeps a token the new install no longer honours. It also independently
+corroborates Arm C — "nothing scheduled until it was restarted" is exactly what Arm C measured,
+two months apart, on a different path into the same state.
+
+Stated carefully, because the two observations are not identical: in Phase 3 the *scheduler* was
+stale and unauthorized; here the *pod-grouper* was freshly created and still read `NotFound`.
+The common thread is a kai-scheduler control plane whose parts were replaced at different times,
+not one specific stale component. Anyone chasing this further should start from the
+`Unauthorized` line, not from the cache theory.
+
 ## Reproducing
 
 `/tmp/claude/kai-spike.sh` (arms 1–B) and `/tmp/claude/kai-armc.sh` (arm C) were throwaway

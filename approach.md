@@ -531,11 +531,14 @@ Each phase is independently demoable.
    is being shown to customers, whether it eventually moves to an NVIDIA org (which would
    trigger the OSRB path), and whether it gets a release and CI budget of its own.
 
-2. **Upstreaming `Snapshot()` and `Validate()` into `pkg/client/v1`.** Risk 1 below is the main
-   structural weakness, and the clean fix is a small AICR PR. Since this project is explicitly
-   orthogonal to the AICR roadmap, that PR has to be justified on AICR's own terms - which it
-   can be, as it serves the integrator persona in ROADMAP section 3. Worth deciding early,
-   because the alternative is pinning an aicr version and absorbing breakage on every bump.
+2. ~~**Upstreaming `Snapshot()` and `Validate()` into `pkg/client/v1`.**~~ **Closed — AICR
+   shipped it.** `Client.CollectSnapshot` and `Client.ValidateState` are both on the facade as
+   of v0.19.0, and this console uses the first through it. No PR was needed, and the structural
+   weakness this question existed to resolve is largely gone; see Risk 1 for what remains. The
+   remaining facade gap found since — `AgentConfig` not mirroring `AKSGPUPoolsPath` — was fixed
+   on AICR `main` for v0.20.0 within a day of being found. `docs/aicr-upstream-asks.md` carries
+   the one ask still outstanding: a machine-readable event stream from `deploy.sh`, which is
+   what would retire `internal/applier/parse.go`.
 
 3. **Whether the demo needs a scripted narration mode.** Not a v0.1 question, but the Prove
    screen staying live and interactive suggests a presenter might eventually want speaker
