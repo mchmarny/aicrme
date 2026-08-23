@@ -1080,7 +1080,24 @@ causal link (re-run and capture the Prove error, then delete `SchedulingShard/de
 cycles and see whether the gang places). Fixing it is a kai-scheduler teardown question, not a
 Reset-correctness one: Reset behaved exactly as specified and named everything it kept.
 
-**Still open:** whether any of this holds on real hardware rather than KWOK.
+**Closed, 2026-08-23, by a four-arm experiment on Kind + KWOK.** The candidate mechanism above
+was half right and the cause is now measured, not guessed. kai-scheduler's pod-grouper cannot
+read back the PodGroup it just created (`podgroups.scheduling.run.ai ... not found`, against an
+object `kubectl` shows present), so the scheduler logs `There are <0> PodGroupInfos` and the
+gang never binds. A control arm that retried Prove changing nothing also failed, which rules
+out settling time.
+
+**A bounded remedy works:** recreating `SchedulingShard/default` and running
+`kubectl rollout restart deploy -n kai-scheduler` made the gang place within ten seconds. It is
+a restart, not a deletion — no CRD is removed and no ownership claim is widened, which is what
+makes it a candidate for automation where deleting CRDs would not be.
+
+Not isolated: that arm changed the shard and the controllers together. Full write-up, including
+what refuted the earlier "the pods never restarted" reading, is in
+`docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md`.
+
+**Still open:** whether any of this holds on real hardware rather than KWOK, and which half of
+the remedy is actually load-bearing.
 
 ### 4. NEW, from the first real Reset — leader-election Leases keep most namespaces alive
 

@@ -157,15 +157,32 @@ at runtime rather than by the chart, so `helm uninstall` does not remove them, a
 holding one is not empty. The releases are what matter for a repeat demo; the empty-ish
 namespaces are harmless and `kubectl delete ns` clears them if you want them gone.
 
-**A repeat demo reinstalls, but its gang does not place — known, measured, unfixed.** On the
-same KWOK cluster, the run after a Reset installed all 14 components cleanly and then failed in
-Prove: the gang did not place inside the 3-minute budget, where a first install places in about
-two seconds. The likely reason is the same runtime-object blind spot: kai-scheduler's
-`SchedulingShard/default` and the `kai-scheduler-default` Deployment it owns are created by the
-operator rather than by the chart, so `helm uninstall` leaves them, and the second cycle runs a
-scheduler from the first alongside freshly-installed controllers. **If you need a second demo to
-reach a placed gang, rebuild the cluster** (`make demo-down && make demo`) rather than relying on
-Reset. Reset is sound for clearing releases; it is not yet a full substitute for a fresh cluster.
+**A repeat demo reinstalls, but its gang does not place — known, measured, with a one-line
+workaround.** On the same KWOK cluster, the run after a Reset installed all 14 components
+cleanly and then failed in Prove: the gang did not place inside the 3-minute budget, where a
+first install places in about two seconds.
+
+The cause is the runtime-object blind spot. kai-scheduler's Deployments are materialized by its
+operator from custom resources rather than templated by the chart, so `helm uninstall` leaves
+them; the next install recreates most of them but *not* `kai-scheduler-default`, because the
+`SchedulingShard` that owns it survived and the operator saw its desired state already met. The
+second cycle therefore runs a scheduler from the first against controllers from the second, its
+pod-grouper cannot read back the PodGroup it just created, the scheduler sees zero PodGroups,
+and the gang waits forever.
+
+**The workaround, measured to place the gang within ten seconds:**
+
+```sh
+kubectl delete schedulingshard default              # the next reconcile rebuilds it
+kubectl rollout restart deploy -n kai-scheduler     # no controller keeps a pre-reset cache
+```
+
+Then Retry the run. This is a restart, not a deletion of anything cluster-scoped — no CRD is
+removed. Rebuilding the cluster (`make demo-down && make demo`) also works and is the safer
+choice if you are about to demo in front of someone.
+
+Full measurements, including the arm that ruled out "it just needed more time", are in
+`docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md`.
 
 If a Reset does not finish, the console offers only Reset again: the run record is the only
 inventory of what is still installed, so Start, Retry and Discard are all refused until the
