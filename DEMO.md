@@ -127,6 +127,40 @@ deletes the workload and waits until its pods are actually gone before closing t
 | **Validate** | Deferred on measurement, not preference — AICR's `ValidateState` reports `passed` for checks that never executed on any cluster with simulated GPU nodes. See `docs/phase-2-handoff.md`. |
 | **A workload that computes anything** | Phase 4, on real hardware. Prove places a gang; the containers never execute here (see below). |
 
+## Running on a real cluster
+
+`make demo` owns its cluster — it runs `kind create cluster`, loads the image into the nodes,
+and installs with `pullPolicy: Never` so nothing is ever pulled. None of that works on GKE, EKS
+or AKS. Use `scripts/demo-remote.sh`, which creates nothing and pulls the image like any real
+deployment:
+
+```sh
+docker login ghcr.io                       # once
+kubectl config use-context <your-cluster>  # this script installs into the CURRENT context
+scripts/demo-remote.sh up                  # build, push, install, then print the URL
+scripts/demo-remote.sh down                # uninstalls the console; the CLUSTER SURVIVES
+```
+
+It refuses a `kind-*` context outright, tags the image with the current commit so a running pod
+traces back to a commit, and prints every GPU node with its taints before installing anything.
+
+**The image must be pullable.** Either make the ghcr.io package public, or create a pull secret
+and name it — the chart takes it, and never handles the credential itself:
+
+```sh
+kubectl -n aicrme create secret docker-registry ghcr \
+  --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>
+PULL_SECRET=ghcr scripts/demo-remote.sh up
+```
+
+**One thing to watch on a managed cluster.** The snapshot agent Job tolerates `nvidia.com/gpu`
+and nothing else, which covers GKE's `nvidia.com/gpu=present:NoSchedule` and the EKS/AKS
+equivalents. A GPU pool carrying some *other* taint will strand it, and Discover then sits
+Pending for its full ten-minute timeout. `demo-remote.sh up` prints the taints first and warns
+when it sees one it does not recognise. The toleration is deliberately narrow rather than a
+blanket `Exists`: a blanket one also accepts KWOK's fake-node taint, and KWOK reports success
+for pods it never runs, which would make Discover lie.
+
 ## Check on it / tear it down
 
 **To repeat the demo on the same cluster**, use the console's own **Reset**. It stops the Prove

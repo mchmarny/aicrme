@@ -3,6 +3,14 @@ image:
   tag: ""          # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
+# imagePullSecrets names pre-existing Secrets for a private image.repository.
+# Empty for Kind and KWOK, which load the image into the nodes and never pull,
+# and empty for a public ghcr.io package. Create the Secret yourself and name
+# it here -- the chart never handles a credential:
+#   kubectl -n aicrme create secret docker-registry ghcr \
+#     --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>
+imagePullSecrets: []
+
 service:
   type: ClusterIP  # LoadBalancer exposes a cluster-admin console; see NOTES.txt
   port: 8080

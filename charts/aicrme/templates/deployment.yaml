@@ -33,6 +33,14 @@ spec:
         # changed checksum (and roll the pod) despite nothing really changing.
         checksum/secret: {{ include "aicrme.authPassword" . | sha256sum }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      # Only needed when image.repository is a private registry. The Kind and
+      # KWOK paths load the image into the nodes directly and never pull, so
+      # this is empty there; a real cluster pulling a private ghcr.io package
+      # is the case it exists for.
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ include "aicrme.serviceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       # Must agree with the Dockerfile's `USER 10001` / `adduser -u 10001`.
