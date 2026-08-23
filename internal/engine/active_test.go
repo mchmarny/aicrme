@@ -904,7 +904,7 @@ func (o *ownershipStep) Run(_ context.Context, r *Run, _ Emit) error {
 func ownershipFixture() Ownership {
 	return Ownership{
 		Releases:   []ReleaseRef{{Name: "somebody-elses-thing", Namespace: "gpu-operator"}},
-		Namespaces: []NamespaceRef{{Name: "gpu-operator", Existed: true, UID: "uid-1"}},
+		Namespaces: []NamespaceRef{{Name: "gpu-operator", Existed: true}},
 	}
 }
 

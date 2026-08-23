@@ -45,16 +45,40 @@ export function failedItems(run: RunState): ResidueItem[] {
   return (run.residue?.items ?? []).filter(i => i.error)
 }
 
+/**
+ * cleanupCommand is what the operator runs to finish the job by hand, or
+ * undefined when there is nothing for them to do.
+ *
+ * Only namespaces this run created get one. Reset deletes no namespaces at
+ * all -- whoever applied the bundle owns the cleanup of what it applied, and
+ * a namespace deleted out from under something is unrecoverable where one
+ * left standing is a single command -- so every namespace it names is work
+ * that has landed on the operator. Naming it without supplying the command
+ * makes them reconstruct it; supplying one for a namespace that PREDATES the
+ * install would be advising them to destroy something the console
+ * deliberately did not touch.
+ */
+export function cleanupCommand(i: ResidueItem): string | undefined {
+  if (i.kind !== 'namespace' || !i.created) return undefined
+  return `kubectl delete namespace ${i.name}`
+}
+
 function ItemList({ items, tone }: { items: ResidueItem[]; tone: string }) {
   return (
     <ul className="mt-2 space-y-1">
-      {items.map(i => (
-        <li key={`${i.kind}/${i.namespace ?? ''}/${i.name}`} className={`font-mono text-xs ${tone}`}>
-          <span>{i.kind} {i.name}</span>
-          {i.namespace && <span className="text-slate-500"> in {i.namespace}</span>}
-          <span className="text-slate-400"> — {i.skip ?? i.error}</span>
-        </li>
-      ))}
+      {items.map(i => {
+        const command = cleanupCommand(i)
+        return (
+          <li key={`${i.kind}/${i.namespace ?? ''}/${i.name}`} className={`font-mono text-xs ${tone}`}>
+            <span>{i.kind} {i.name}</span>
+            {i.namespace && <span className="text-slate-500"> in {i.namespace}</span>}
+            <span className="text-slate-400"> — {i.skip ?? i.error}</span>
+            {command && (
+              <div className="mt-0.5 select-all text-slate-500">{command}</div>
+            )}
+          </li>
+        )
+      })}
     </ul>
   )
 }
@@ -102,9 +126,9 @@ export function ResetGate({
   return (
     <div data-testid="reset-confirm" className="space-y-4 rounded border border-red-500/40 p-4">
       <p className="text-sm text-slate-300">
-        This uninstalls what this run installed, in reverse order, and removes the
-        namespaces it created and left empty. Anything it cannot prove this run
-        created is left in place and named.
+        This uninstalls the releases this run installed, in reverse order. Anything it
+        cannot prove this run created is left in place and named. Namespaces are never
+        deleted — they are listed afterwards, with the command to remove them.
       </p>
 
       <div>

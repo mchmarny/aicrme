@@ -130,9 +130,14 @@ deletes the workload and waits until its pods are actually gone before closing t
 ## Check on it / tear it down
 
 **To repeat the demo on the same cluster**, use the console's own **Reset**. It stops the Prove
-workload, waits until it is confirmed gone, uninstalls the run's helm releases in reverse
-install order, and deletes the namespaces the run created and left empty. It takes two clicks —
-the second one is made against a list of exactly what will be removed.
+workload, waits until it is confirmed gone, and uninstalls the run's helm releases in reverse
+install order. It takes two clicks — the second one is made against a list of exactly what will
+be removed.
+
+**Uninstall is best effort, and the remainder is yours.** Whoever applies a bundle owns the
+cleanup of what it applied; that is the entire job of a CD tool, and here that deployer is a
+bash script. So Reset does the part it can prove is safe, then tells you the rest with the
+command to finish it.
 
 Reset removes only what it can prove this run created, and names everything it leaves:
 
@@ -140,22 +145,20 @@ Reset removes only what it can prove this run created, and names everything it l
   AICR's generated `install.sh` is `helm upgrade --install`, so such a release was *adopted*,
   not created, and uninstalling it would remove something you installed. The console records
   what was there before it installs anything, which is the only moment that answer exists.
-- **A namespace it did not create**, or that still holds anything at all — including a Secret,
-  a ConfigMap, an RBAC rule or a custom resource. Emptiness is established from the API
-  server's own list of namespaced kinds, not a fixed list of workload types.
+- **Every namespace, always.** Reset deletes none of them. It lists each one it touched and
+  says whether this run created it, and for the ones it did the console shows the
+  `kubectl delete namespace …` to run. A namespace left standing costs you one command; a
+  namespace deleted out from under something that was still using it cannot be undone.
 - **CRDs.** `helm uninstall` does not remove them, and neither does Reset. They are
   cluster-scoped, shared, and removing them takes every custom resource on the cluster with
-  them.
+  them. Argo CD and Flux decline for the same reason.
 - **Anything it could not check.** An RBAC denial or an unreachable API is not evidence that
   something is safe to delete, so the object stays and the run says why.
 
-In practice this means **most namespaces survive a Reset**, and that is not a bug. Measured on
-the KWOK demo cluster: all 13 releases were removed, and 8 of 10 namespaces were kept — four
-because an operator had left a leader-election `Lease` behind, one for a webhook-hook `Secret`,
-one for a `Deployment`, and two because they existed before the run. Those objects are created
-at runtime rather than by the chart, so `helm uninstall` does not remove them, and a namespace
-holding one is not empty. The releases are what matter for a repeat demo; the empty-ish
-namespaces are harmless and `kubectl delete ns` clears them if you want them gone.
+For a genuinely clean slate, AICR's own `tools/cleanup` goes further than this console does —
+it removes AICR-owned CRDs and namespaces, with `--dry-run`, `--keep-crds` and `--exclude-ns`.
+It is contributor tooling for testing and demos, which is exactly this situation, and it is the
+right tool when you want everything gone rather than only what one run added.
 
 **A repeat demo reinstalls, but its gang does not place — known, measured, with a one-line
 workaround.** On the same KWOK cluster, the run after a Reset installed all 14 components

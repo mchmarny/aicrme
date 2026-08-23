@@ -7,8 +7,6 @@ import (
 
 	"github.com/mchmarny/aicrme/internal/applier"
 	"github.com/mchmarny/aicrme/internal/engine"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 )
 
 // defaultUninstallTimeout is the per-release budget handed to helm's
@@ -25,16 +23,18 @@ const defaultUninstallTimeout = 5 * time.Minute
 // has to import it -- this package already imports engine, for the
 // ComponentState and Ownership every decision here is founded on, and the
 // dependency has to run one way.
+//
+// One dependency, the process seam. It held a clientset, a discovery client
+// and a dynamic client until namespace deletion was removed: deciding whether
+// a namespace was empty enough to delete needed all three, and reporting a
+// namespace needs none of them.
 type Engine struct {
 	exec Exec
-	kube kubernetes.Interface
-	disc Discoverer
-	dyn  dynamic.Interface
 }
 
 // NewEngineTeardown returns the production engine.Teardown.
-func NewEngineTeardown(e Exec, kube kubernetes.Interface, d Discoverer, dyn dynamic.Interface) *Engine {
-	return &Engine{exec: e, kube: kube, disc: d, dyn: dyn}
+func NewEngineTeardown(e Exec) *Engine {
+	return &Engine{exec: e}
 }
 
 // Releases implements engine.Teardown.
@@ -51,20 +51,6 @@ func (a *Engine) Releases(ctx, cancel context.Context, comps []engine.ComponentS
 	return items
 }
 
-// Namespaces implements engine.Teardown.
-func (a *Engine) Namespaces(ctx context.Context, names []string, own engine.Ownership,
-	emit func(engine.ResidueItem)) []engine.ResidueItem {
-
-	out := Namespaces(ctx, a.kube, a.disc, a.dyn, names, own,
-		func(o NamespaceOutcome) { emit(namespaceItem(o)) })
-
-	items := make([]engine.ResidueItem, 0, len(out))
-	for _, o := range out {
-		items = append(items, namespaceItem(o))
-	}
-	return items
-}
-
 // releaseItem projects one outcome onto the engine's inventory shape.
 // Removed is derived rather than carried: a release with neither a skip
 // reason nor an error is one the uninstall command ran against and helm
@@ -77,16 +63,6 @@ func releaseItem(o ReleaseOutcome) engine.ResidueItem {
 		Removed:   o.Skip == "" && o.Err == "",
 		Skip:      o.Skip,
 		Err:       o.Err,
-	}
-}
-
-func namespaceItem(o NamespaceOutcome) engine.ResidueItem {
-	return engine.ResidueItem{
-		Kind:    engine.KindNamespace,
-		Name:    o.Name,
-		Removed: o.Deleted,
-		Skip:    o.Skip,
-		Err:     o.Err,
 	}
 }
 

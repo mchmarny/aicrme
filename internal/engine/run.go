@@ -162,6 +162,16 @@ type ResidueItem struct {
 	// answer, not a failure. Most of what a Reset considers is legitimately
 	// not its to remove, and an operator cannot act on a silence.
 	Skip string `json:"skip,omitempty"`
+	// Created records that this run brought the object into existence. Only
+	// namespaces carry it, and it is what separates the two reasons one is
+	// left standing: this run made it and the operator may now want it gone,
+	// or it predates the install and is none of this console's business.
+	//
+	// A flag rather than a parsed Skip string, because it drives what the
+	// console offers the operator to do next -- the cleanup command is shown
+	// only for namespaces in the first group, and deriving that from prose
+	// would break the moment the wording changed.
+	Created bool `json:"created,omitempty"`
 	// Err is why removing it did not succeed.
 	Err string `json:"error,omitempty"`
 }
@@ -222,34 +232,24 @@ type ReleaseRef struct {
 }
 
 // NamespaceRef is one namespace's pre-Apply state.
+//
+// Two UID fields used to live here -- the namespace's UID at snapshot time,
+// and the UID of the namespace the run went on to create -- because deleting
+// a namespace safely means proving it is the same OBJECT the run created and
+// not something recreated at the same name in between. Reset reports
+// namespaces rather than deleting them, so no UID decides anything and both
+// are gone. What is left is what the operator is actually told.
 type NamespaceRef struct {
 	Name string `json:"name"`
-	// UID is the namespace's object UID at snapshot time, empty when it did
-	// not exist. It is what makes "the namespace this run created" a claim
-	// about an OBJECT rather than about a name: a namespace deleted and
-	// recreated between Apply and Reset wears the same name and belongs to
-	// whoever recreated it.
-	UID string `json:"uid,omitempty"`
-	// Existed records whether the namespace was present pre-Apply. A
-	// namespace that existed is never deleted by Reset, whatever is in it.
+	// Existed records whether the namespace was present pre-Apply. It is the
+	// difference between a namespace the operator may now want to remove and
+	// one that predates the install and is none of this console's business.
 	Existed bool `json:"existed,omitempty"`
 	// SnapshotErr is non-empty when this namespace could not be snapshotted
 	// at all. It does not fail Apply (see steps.snapshotOwnership), but it
 	// makes every release in the namespace unprovable, so Reset skips them
 	// and says why -- an unanswered question is not evidence of ownership.
 	SnapshotErr string `json:"snapshotErr,omitempty"`
-	// CreatedUID is the UID of the namespace THIS RUN created, read back
-	// after Apply. It is the only UID that can decide a deletion, which is
-	// why it exists alongside UID rather than reusing it: UID is what was
-	// there BEFORE Apply, and a namespace that was already there is never
-	// deleted, so UID is diagnostic only and never decides anything.
-	//
-	// Empty means "this run did not create a namespace at this name, or
-	// could not confirm that it did" -- a component that failed before its
-	// namespace was created, a chart that ships its own Namespace manifest
-	// and had it removed by helm uninstall, or an API error on the read
-	// back. All three are the same instruction to Reset: do not delete.
-	CreatedUID string `json:"createdUid,omitempty"`
 }
 
 // Ownership is the pre-Apply cluster state Reset reasons from. Its zero

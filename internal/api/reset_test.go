@@ -33,7 +33,7 @@ func (installingStep) Run(_ context.Context, r *engine.Run, _ engine.Emit) error
 		{Name: "gpu-operator", Namespace: "gpu-operator", Index: 1, Total: 1, Status: "installed"},
 	}
 	r.Ownership = engine.Ownership{Namespaces: []engine.NamespaceRef{
-		{Name: "gpu-operator", CreatedUID: "uid-1"},
+		{Name: "gpu-operator"},
 	}}
 	return nil
 }

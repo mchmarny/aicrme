@@ -34,10 +34,14 @@ const (
 // way only, so the interface lives on this side and main.go injects the
 // implementation, exactly as SetProveClient already does for prove.Client.
 //
-// Both methods report each outcome through emit as it happens and also
-// return the full list: a thirteen-component teardown with --wait takes
-// minutes, and an operator watching it needs the rows to land as they
-// resolve rather than all at once at the end.
+// Releases reports each outcome through emit as it happens and also returns
+// the full list: a thirteen-component teardown with --wait takes minutes, and
+// an operator watching it needs the rows to land as they resolve rather than
+// all at once at the end.
+//
+// One method, not two. Namespaces used to be the other half; it is now
+// namespaceResidue, a pure function over the ownership snapshot, because the
+// console reports namespaces rather than deleting them.
 type Teardown interface {
 	// Releases uninstalls each component's release, in reverse install
 	// order, skipping every release the run cannot prove it created.
@@ -48,9 +52,6 @@ type Teardown interface {
 	// interrupted. See Reset's goroutine and internal/teardown for why that
 	// distinction is load-bearing on both sides.
 	Releases(ctx, cancel context.Context, comps []ComponentState, own Ownership, emit func(ResidueItem)) []ResidueItem
-
-	// Namespaces deletes each namespace the run created and left empty.
-	Namespaces(ctx context.Context, names []string, own Ownership, emit func(ResidueItem)) []ResidueItem
 }
 
 // SetTeardown installs the cluster-removal half of Reset. Set once, before
@@ -233,7 +234,13 @@ func (e *Engine) runReset(ctx, cancelCtx context.Context, epoch uint64, runID st
 
 	emit := func(item ResidueItem) { e.publishResidueItem(runID, item) }
 	items := client.Releases(ctx, cancelCtx, run.Components, run.Ownership, emit)
-	items = append(items, client.Namespaces(ctx, namespaceNames(run.Ownership), run.Ownership, emit)...)
+	// Reported, not removed -- and reported even when the release half was
+	// cut short, because a half-finished teardown is exactly when the
+	// operator most needs the inventory.
+	for _, it := range namespaceResidue(run.Ownership) {
+		emit(it)
+		items = append(items, it)
+	}
 
 	// Interrupted counts as incomplete even when every command that ran
 	// succeeded: what was never attempted is still on the cluster, and the
@@ -311,13 +318,35 @@ func (e *Engine) recordResidue(epoch uint64, runID string, items []ResidueItem, 
 	e.current.UpdatedAt = time.Now().UTC()
 }
 
-// namespaceNames is the namespace set a teardown may consider: the ones
-// recorded in the ownership snapshot, which is exactly the set Apply was
-// about to install into. Nothing outside it is ever a candidate.
-func namespaceNames(own Ownership) []string {
-	out := make([]string, 0, len(own.Namespaces))
+// namespaceResidue reports every namespace the ownership snapshot recorded,
+// and removes none of them.
+//
+// A pure function over evidence Apply already persisted -- no API call, no
+// discovery document, no dynamic client. That is the point: deciding whether
+// a namespace was safe to delete required walking every namespaced kind the
+// API server serves, and the answer was almost always "not empty, keeping
+// it". The walk is gone and the honest half of its output is kept, because
+// whoever applied the bundle owns the cleanup of what it applied and this
+// console is only the bash deployer.
+//
+// Best effort about completeness, never about destructiveness: a namespace
+// left standing is one command for the operator, and one deleted out from
+// under something is unrecoverable. So each is reported with what the
+// operator needs to decide -- did this run create it, or did it predate the
+// install -- and the console acts on neither.
+func namespaceResidue(own Ownership) []ResidueItem {
+	out := make([]ResidueItem, 0, len(own.Namespaces))
 	for _, ns := range own.Namespaces {
-		out = append(out, ns.Name)
+		note := "this run created it; remove it when you no longer need it"
+		if ns.Existed {
+			note = "it existed before the install, so it was used rather than created"
+		}
+		out = append(out, ResidueItem{
+			Kind:    KindNamespace,
+			Name:    ns.Name,
+			Skip:    note,
+			Created: !ns.Existed,
+		})
 	}
 	return out
 }

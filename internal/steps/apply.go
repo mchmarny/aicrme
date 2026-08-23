@@ -82,18 +82,6 @@ func (a *apply) Run(ctx context.Context, run *engine.Run, emit engine.Emit) erro
 		DryRun:    a.cfg.DryRun,
 	}, trackComponents(run, emit))
 
-	// Deliberately before the error is returned, and deliberately with
-	// context.WithoutCancel. A failed Apply is when Reset matters MOST --
-	// it is the case that leaves a half-installed cluster -- so the
-	// evidence Reset needs must be gathered on that path too. And a run
-	// canceled mid-install has installed the most namespaces it will ever
-	// have while having recorded the fewest, which is precisely when a
-	// canceled ctx would otherwise skip this read.
-	//
-	// snapshotOwnership above is the pre-Apply half; this is the half that
-	// can only be known afterward.
-	confirmCreatedNamespaces(context.WithoutCancel(ctx), a.cfg.Kube, &run.Ownership)
-
 	return err
 }
 

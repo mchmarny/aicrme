@@ -49,10 +49,12 @@ func TestSnapshotOwnershipRecordsPreexistingReleases(t *testing.T) {
 	}
 }
 
-// Existence AND UID: a namespace deleted and recreated between Apply and
-// Reset is a different object wearing the same name, and deleting it would
-// be deleting someone else's.
-func TestSnapshotOwnershipRecordsNamespaceExistenceAndUID(t *testing.T) {
+// Existence, and only existence. The namespace's UID was recorded here too,
+// back when Reset deleted namespaces and had to prove it was addressing the
+// same OBJECT rather than a name someone else had recreated. Reset reports
+// namespaces now, so the one thing still worth knowing is whether the run
+// created this one or merely used it.
+func TestSnapshotOwnershipRecordsWhetherTheNamespaceExisted(t *testing.T) {
 	h := &fakeHelmLister{byNamespace: map[string][]string{}}
 	kube := fake.NewSimpleClientset(&corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: "gpu-operator", UID: "ns-uid-1"},
@@ -64,8 +66,8 @@ func TestSnapshotOwnershipRecordsNamespaceExistenceAndUID(t *testing.T) {
 	for _, ns := range got.Namespaces {
 		byName[ns.Name] = ns
 	}
-	if ns := byName["gpu-operator"]; !ns.Existed || ns.UID != "ns-uid-1" {
-		t.Errorf("gpu-operator = %#v, want Existed=true UID=ns-uid-1", ns)
+	if ns := byName["gpu-operator"]; !ns.Existed {
+		t.Errorf("gpu-operator = %#v, want Existed=true", ns)
 	}
 	if ns := byName["kai-scheduler"]; ns.Existed {
 		t.Errorf("kai-scheduler = %#v, want Existed=false", ns)
@@ -161,75 +163,6 @@ func TestSnapshotOwnershipIsSortedAndDeduplicated(t *testing.T) {
 	want := []string{"cert-manager", "gpu-operator", "monitoring"}
 	if !reflect.DeepEqual(names, want) {
 		t.Errorf("namespaces = %v, want %v", names, want)
-	}
-}
-
-// The UID that decides a namespace deletion is the one the namespace had
-// when THIS RUN created it, which by definition does not exist until Apply
-// has run. Without this read-back there is no way to tell the namespace
-// Apply created from a different object someone else recreated at the same
-// name in the interim (design section 5).
-func TestConfirmCreatedNamespacesRecordsTheUIDApplyCreated(t *testing.T) {
-	own := engine.Ownership{Namespaces: []engine.NamespaceRef{
-		{Name: "kai-scheduler", Existed: false},
-	}}
-	kube := fake.NewSimpleClientset(&corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{Name: "kai-scheduler", UID: "created-uid-1"},
-	})
-
-	confirmCreatedNamespaces(context.Background(), kube, &own)
-
-	if got := own.Namespaces[0].CreatedUID; got != "created-uid-1" {
-		t.Errorf("CreatedUID = %q, want created-uid-1", got)
-	}
-}
-
-// A namespace that already existed is never deleted, so reading a UID back
-// for it would record evidence for a decision that is never made -- and
-// worse, would make an adopted namespace look like a created one.
-func TestConfirmCreatedNamespacesLeavesPreexistingOnesAlone(t *testing.T) {
-	own := engine.Ownership{Namespaces: []engine.NamespaceRef{
-		{Name: "gpu-operator", Existed: true, UID: "pre-existing-uid"},
-	}}
-	kube := fake.NewSimpleClientset(&corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{Name: "gpu-operator", UID: "pre-existing-uid"},
-	})
-
-	confirmCreatedNamespaces(context.Background(), kube, &own)
-
-	if got := own.Namespaces[0].CreatedUID; got != "" {
-		t.Errorf("CreatedUID = %q, want empty -- this run did not create it", got)
-	}
-}
-
-// Three ways to arrive at no namespace: the component failed before
-// creating it, the chart shipped its own Namespace manifest, or the read
-// back failed. All three mean the same thing to Reset -- do not delete --
-// and all three must leave CreatedUID empty rather than guessing.
-func TestConfirmCreatedNamespacesLeavesTheUIDEmptyWhenItCannotConfirm(t *testing.T) {
-	own := engine.Ownership{Namespaces: []engine.NamespaceRef{
-		{Name: "never-created", Existed: false},
-		{Name: "unsnapshotted", Existed: false, SnapshotErr: "connection refused"},
-	}}
-
-	confirmCreatedNamespaces(context.Background(), fake.NewSimpleClientset(), &own)
-
-	for _, ns := range own.Namespaces {
-		if ns.CreatedUID != "" {
-			t.Errorf("%s: CreatedUID = %q, want empty", ns.Name, ns.CreatedUID)
-		}
-	}
-}
-
-// Nil client outside a cluster must not panic the Apply step at the very
-// moment it has finished installing.
-func TestConfirmCreatedNamespacesToleratesANilClient(t *testing.T) {
-	own := engine.Ownership{Namespaces: []engine.NamespaceRef{{Name: "kai-scheduler"}}}
-
-	confirmCreatedNamespaces(context.Background(), nil, &own)
-
-	if own.Namespaces[0].CreatedUID != "" {
-		t.Error("CreatedUID is set with no client to have read it")
 	}
 }
 

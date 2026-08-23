@@ -78,6 +78,9 @@ export interface ResidueItem {
   removed?: boolean
   skip?: string
   error?: string
+  /** created marks a namespace this run brought into existence, which is the
+   * only kind of leftover the console offers a cleanup command for. */
+  created?: boolean
 }
 
 /** ResidueSummary mirrors Go's engine.ResetSummaryData. */

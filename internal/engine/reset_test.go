@@ -19,16 +19,13 @@ import (
 // asked to remove, which is what the ordering and precondition tests below
 // assert on.
 type fakeTeardown struct {
-	releases   []ResidueItem
-	namespaces []ResidueItem
+	releases []ResidueItem
 	// gotComponents is what Releases was handed, in the order it was handed
 	// them -- the real ordering decision lives in internal/teardown and is
 	// tested there; what matters here is that Reset passes the run's own
 	// component rows through untouched.
 	gotComponents []ComponentState
-	gotNamespaces []string
 	releasesRan   bool
-	namespacesRan bool
 	// onReleases runs inside Releases, standing in for an operator
 	// canceling while an uninstall is in flight.
 	onReleases func()
@@ -51,17 +48,6 @@ func (f *fakeTeardown) Releases(ctx, cancelCtx context.Context, comps []Componen
 		emit(it)
 	}
 	return f.releases
-}
-
-func (f *fakeTeardown) Namespaces(_ context.Context, names []string, _ Ownership,
-	emit func(ResidueItem)) []ResidueItem {
-
-	f.namespacesRan = true
-	f.gotNamespaces = names
-	for _, it := range f.namespaces {
-		emit(it)
-	}
-	return f.namespaces
 }
 
 // unstoppableWorkload is a real prove.Client over a clientset that refuses
@@ -98,9 +84,12 @@ func resettableRun(t *testing.T, e *Engine, state State) *Run {
 			{Name: "cert-manager", Namespace: "cert-manager", Index: 1, Total: 2, Status: "installed"},
 			{Name: "gpu-operator", Namespace: "gpu-operator", Index: 2, Total: 2, Status: "installed"},
 		},
+		// One of each, because the two are reported differently: a namespace
+		// that predates the install is never this console's to touch, and one
+		// the run created is what the operator may now want gone.
 		Ownership: Ownership{Namespaces: []NamespaceRef{
-			{Name: "cert-manager", CreatedUID: "uid-1"},
-			{Name: "gpu-operator", CreatedUID: "uid-2"},
+			{Name: "cert-manager", Existed: true},
+			{Name: "gpu-operator"},
 		}},
 	}
 	e.mu.Lock()
@@ -212,8 +201,52 @@ func TestResetRequiresTheConfirmedWorkloadStop(t *testing.T) {
 	}
 }
 
-// The clean path end to end: the workload is stopped, both halves of the
-// teardown run, the run ends at StateDone, and the persisted record is gone
+// Namespaces are the operator's to remove, not this console's. Reset
+// uninstalls the releases it can prove it created and then REPORTS every
+// namespace the ownership snapshot recorded -- it deletes none of them.
+//
+// Whoever applied the bundle owns the cleanup of what it applied, and this
+// console is the bash deployer. Uninstall is best effort about COMPLETENESS
+// but not about DESTRUCTIVENESS: a namespace left behind is an annoyance the
+// operator clears with one command, while deleting one that turned out to
+// hold something is unrecoverable. So the console names what it left and lets
+// the operator act, which is also why the discovery-driven emptiness walk
+// that used to decide this is gone.
+func TestResetReportsEveryNamespaceAndDeletesNone(t *testing.T) {
+	td := &fakeTeardown{releases: []ResidueItem{removedRelease("gpu-operator", "gpu-operator")}}
+	e := newResetEngine(t, td)
+	run := resettableRun(t, e, StateActive)
+
+	got := resetAndWait(t, e, run.ID)
+
+	if n := got.Residue.Removed(KindNamespace); n != 0 {
+		t.Errorf("Reset removed %d namespaces, want 0 -- namespaces are the operator's to delete", n)
+	}
+	byName := map[string]ResidueItem{}
+	for _, it := range got.Residue.Items {
+		if it.Kind == KindNamespace {
+			byName[it.Name] = it
+		}
+	}
+	if len(byName) != 2 {
+		t.Fatalf("reported %d namespaces, want the 2 the snapshot recorded: %+v", len(byName), got.Residue.Items)
+	}
+	for name, it := range byName {
+		if it.Skip == "" {
+			t.Errorf("namespace %s carries no note -- an orphan the operator is never told about is one they cannot act on", name)
+		}
+	}
+	// The two are not interchangeable: one the run created and the operator
+	// may now want gone, one that predates the install and is none of our
+	// business. The note has to tell them apart or it cannot be acted on.
+	if byName["gpu-operator"].Skip == byName["cert-manager"].Skip {
+		t.Errorf("a namespace this run created reads identically to one that predates it: %q",
+			byName["gpu-operator"].Skip)
+	}
+}
+
+// The clean path end to end: the workload is stopped, the releases are
+// uninstalled, the run ends at StateDone, and the persisted record is gone
 // so the console is free and a restart recovers nothing.
 func TestResetUninstallsInReverseAndDeletesTheRecordWhenClean(t *testing.T) {
 	td := &fakeTeardown{
@@ -221,18 +254,14 @@ func TestResetUninstallsInReverseAndDeletesTheRecordWhenClean(t *testing.T) {
 			removedRelease("gpu-operator", "gpu-operator"),
 			removedRelease("cert-manager", "cert-manager"),
 		},
-		namespaces: []ResidueItem{
-			{Kind: KindNamespace, Name: "gpu-operator", Removed: true},
-			{Kind: KindNamespace, Name: "cert-manager", Removed: true},
-		},
 	}
 	e := newResetEngine(t, td)
 	run := resettableRun(t, e, StateActive)
 
 	got := resetAndWait(t, e, run.ID)
 
-	if !td.releasesRan || !td.namespacesRan {
-		t.Fatalf("releases ran = %v, namespaces ran = %v, want both", td.releasesRan, td.namespacesRan)
+	if !td.releasesRan {
+		t.Fatal("the release teardown never ran")
 	}
 	if got.State != StateDone {
 		t.Errorf("State = %q, want %q", got.State, StateDone)
@@ -240,8 +269,11 @@ func TestResetUninstallsInReverseAndDeletesTheRecordWhenClean(t *testing.T) {
 	if hasIncompleteTeardown(got) {
 		t.Error("the incomplete-teardown guard is set on a clean reset")
 	}
-	if got.Residue.Removed(KindRelease) != 2 || got.Residue.Removed(KindNamespace) != 2 {
-		t.Errorf("Residue = %+v, want 2 releases and 2 namespaces removed", got.Residue)
+	// Releases removed, namespaces only reported -- see
+	// TestResetReportsEveryNamespaceAndDeletesNone for why that asymmetry is
+	// the design rather than an oversight.
+	if got.Residue.Removed(KindRelease) != 2 || got.Residue.Removed(KindNamespace) != 0 {
+		t.Errorf("Residue = %+v, want 2 releases removed and 0 namespaces removed", got.Residue)
 	}
 	// The run's own component rows reach the teardown untouched -- the
 	// reverse ordering itself is internal/teardown's decision and is tested
@@ -249,10 +281,11 @@ func TestResetUninstallsInReverseAndDeletesTheRecordWhenClean(t *testing.T) {
 	if len(td.gotComponents) != 2 {
 		t.Errorf("teardown got %d components, want the run's 2", len(td.gotComponents))
 	}
-	// Only the namespaces the ownership snapshot recorded are ever
-	// candidates.
-	if len(td.gotNamespaces) != 2 {
-		t.Errorf("teardown got namespaces %v, want the 2 from the ownership snapshot", td.gotNamespaces)
+	// Only the namespaces the ownership snapshot recorded are ever reported:
+	// the inventory is bounded by what Apply was about to install into, so a
+	// namespace the console never touched is never named at all.
+	if n := len(got.Residue.Items) - got.Residue.Removed(KindRelease); n != 2 {
+		t.Errorf("reported %d namespaces, want the 2 from the ownership snapshot: %+v", n, got.Residue.Items)
 	}
 	if _, err := e.store.LoadCurrent(context.Background()); err == nil {
 		t.Error("the persisted record survived a clean reset -- a restart would recover an already-torn-down run")

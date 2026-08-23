@@ -327,17 +327,30 @@ already there.
 The answer therefore has to be recorded BEFORE Apply runs — that is the only moment it exists.
 `internal/steps.snapshotOwnership` records, per recipe namespace, the releases already present
 (`helm list --all`, so a release left failed by an earlier attempt still counts as pre-existing)
-and whether the namespace existed with its UID; a second pass after Apply records the UID of
-each namespace the run went on to create, which is the only UID a later deletion may
-legitimately match against. Reset uninstalls only what is absent from that snapshot, and
+and whether the namespace existed. Reset uninstalls only what is absent from that snapshot, and
 anything it cannot account for is skipped and named rather than removed on a guess. The
 snapshot never fails the install: a namespace it cannot read is recorded as unprovable, which
 makes every release in it off limits to Reset — the fail-closed direction.
 
-Emptiness for the namespace half is established by walking the API server's own discovery
-document, not a fixed list of workload kinds. An earlier revision checked six kinds and would
-have deleted a namespace holding Services, Secrets, ConfigMaps, RBAC, CronJobs, PDBs or any
-custom resource.
+**Reset removes releases and reports namespaces. It deletes no namespace, ever** (revised
+2026-08-23). Whoever applies a bundle owns the cleanup of what it applied — that is the whole
+job of a CD tool, and this console is only the bash deployer — so uninstall is a best-effort
+concept and the remainder is the operator's. Naming what is left, with the command to remove
+it, is the answer; more code to chase it is not.
+
+That framing is deliberately asymmetric. Best effort applies to **completeness**, never to
+**destructiveness**: a namespace left standing is one `kubectl delete namespace` for the
+operator, while one deleted out from under something is unrecoverable. The pre-Apply snapshot
+survives because it only ever buys the second property — it never makes a teardown more
+complete, only more careful.
+
+What this replaced: namespace deletion gated on an emptiness check that walked the API server's
+discovery document listing every namespaced kind, plus two UID fields recording the namespace's
+identity before Apply and after, so a deletion could refuse a namespace destroyed and recreated
+at the same name in between. It was correct and it rarely fired — on the real measurement it
+declined 8 of 10 namespaces, because operators leave runtime-created Leases behind that
+`helm uninstall` never removes. Deleting it took the discovery walk, both UID fields, the
+post-Apply confirmation pass, and the discovery and dynamic clients from `main.go` with it.
 
 Still advertised as best-effort, and the boundary is stated rather than implied: CRDs are
 cluster-scoped and shared, `helm uninstall` does not remove them and neither does Reset;

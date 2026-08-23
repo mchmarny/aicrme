@@ -43,8 +43,9 @@ AGENT_NODE_LABEL="aicrme.e2e/agent=true"
 BYSTANDER_RELEASE="${BYSTANDER_RELEASE:-cert-manager}"
 BYSTANDER_NS="${BYSTANDER_NS:-cert-manager}"
 # BYSTANDER_KEPT_NS is a namespace the recipe also uses, seeded with a
-# ConfigMap this console did not create, so the emptiness half of the rule
-# has something to refuse.
+# ConfigMap this console did not create. Reset deletes no namespaces, so this
+# is no longer an emptiness check; the ConfigMap is the inverted input that
+# proves the namespaces really are untouched rather than merely still named.
 BYSTANDER_KEPT_NS="${BYSTANDER_KEPT_NS:-node-feature-discovery}"
 
 # GANG_TIMEOUT is the production default rather than prove.sh's shortened
@@ -367,19 +368,45 @@ helm_releases "${BYSTANDER_NS}" | grep -qx "${BYSTANDER_RELEASE}" \
   || fail "assertion 2's matcher cannot see a release that IS present"
 echo "assertion 2: PASS"
 
-echo "--- assert 3: namespaces this run created are gone; one holding a bystander is kept"
-KEPT="$(kubectl get namespace "${BYSTANDER_KEPT_NS}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
-[[ "${KEPT}" == "${BYSTANDER_KEPT_NS}" ]] \
-  || fail "${BYSTANDER_KEPT_NS} was deleted -- it held a ConfigMap this console did not create"
+echo "--- assert 3: NO namespace is deleted, and every one is reported"
+# Reset deletes no namespaces at all. Whoever applied the bundle owns the
+# cleanup of what it applied, and this console is the bash deployer: a
+# namespace left standing is one command for the operator, one deleted out
+# from under something is unrecoverable. So the assertion is the inverse of
+# what it used to be -- nothing is gone, and everything is named.
+NS_DELETED=0
+while IFS= read -r ns; do
+  [[ -z "${ns}" ]] && continue
+  if ! kubectl get namespace "${ns}" -o jsonpath='{.metadata.name}' >/dev/null 2>&1; then
+    echo "namespace ${ns} was deleted by Reset" >&2
+    NS_DELETED=$((NS_DELETED + 1))
+  fi
+done < <(echo "${RESIDUE}" | jq -r '.items[]? | select(.kind == "namespace") | .name')
+echo "namespaces Reset deleted: ${NS_DELETED} (want 0)"
+[[ "${NS_DELETED}" -eq 0 ]] || fail "Reset deleted ${NS_DELETED} namespaces -- it must only report them"
+
+# The bystander ConfigMap is the inverted-input check: it proves the
+# namespaces are genuinely untouched rather than merely present.
 KEPT_CM="$(kubectl -n "${BYSTANDER_KEPT_NS}" get configmap somebody-elses-config -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
 [[ "${KEPT_CM}" == "somebody-elses-config" ]] || fail "the bystander ConfigMap in ${BYSTANDER_KEPT_NS} is gone"
-# And it is NAMED, not silently spared. A skip nobody can read is a skip the
-# operator cannot act on.
-NAMED="$(echo "${RESIDUE}" | jq --arg ns "${BYSTANDER_KEPT_NS}" \
-  '[.items[]? | select(.kind == "namespace" and .name == $ns and (.skip // "") != "")] | length')"
-echo "namespaces reported as skipped with a stated reason: ${NAMED}"
-[[ "${NAMED}" -ge 1 || "${FINAL_STATE}" == "done" ]] \
-  || fail "${BYSTANDER_KEPT_NS} was kept but not named in the residue"
+
+# Every namespace is named with a reason, and the ones this run CREATED are
+# flagged so the console can offer the cleanup command. A report the operator
+# cannot act on is not a report.
+NS_TOTAL="$(echo "${RESIDUE}" | jq '[.items[]? | select(.kind == "namespace")] | length')"
+NS_NAMED="$(echo "${RESIDUE}" | jq '[.items[]? | select(.kind == "namespace" and (.skip // "") != "")] | length')"
+NS_CREATED="$(echo "${RESIDUE}" | jq '[.items[]? | select(.kind == "namespace" and .created == true)] | length')"
+echo "namespaces reported: ${NS_TOTAL}, each with a reason: ${NS_NAMED}, flagged as created by this run: ${NS_CREATED}"
+[[ "${NS_TOTAL}" -gt 0 ]] || fail "no namespaces were reported at all -- the inventory is empty"
+[[ "${NS_NAMED}" -eq "${NS_TOTAL}" ]] || fail "only ${NS_NAMED} of ${NS_TOTAL} namespaces carry a reason"
+[[ "${NS_CREATED}" -gt 0 ]] || fail "no namespace is flagged created -- the console can offer no cleanup command"
+
+# ...and the one that PREDATES the install must not be flagged, or the
+# console would tell the operator to delete a namespace it deliberately
+# refused to touch.
+PRE="$(echo "${RESIDUE}" | jq --arg ns "${BYSTANDER_KEPT_NS}" \
+  '[.items[]? | select(.kind == "namespace" and .name == $ns and .created == true)] | length')"
+[[ "${PRE}" -eq 0 ]] || fail "${BYSTANDER_KEPT_NS} predates the install but is flagged as created by this run"
 echo "assertion 3: PASS"
 
 echo "--- assert 4: a FAILED reset blocks Start, Retry and Discard, and Reset again succeeds"

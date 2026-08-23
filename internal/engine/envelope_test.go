@@ -491,8 +491,7 @@ func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
 			v.Set(reflect.ValueOf(Ownership{
 				Releases: []ReleaseRef{{Name: "parity-release", Namespace: "parity-release-ns"}},
 				Namespaces: []NamespaceRef{{
-					Name: "parity-ns", UID: "parity-uid", Existed: true,
-					SnapshotErr: "parity-err", CreatedUID: "parity-created-uid",
+					Name: "parity-ns", Existed: true, SnapshotErr: "parity-err",
 				}},
 			}))
 		default:
@@ -607,7 +606,7 @@ func TestEnvelopeRoundTripsOwnership(t *testing.T) {
 	in.Ownership = Ownership{
 		Releases: []ReleaseRef{{Name: "gpu-operator", Namespace: "gpu-operator"}},
 		Namespaces: []NamespaceRef{
-			{Name: "gpu-operator", UID: "ns-uid-1", Existed: true},
+			{Name: "gpu-operator", Existed: true},
 			{Name: "kai-scheduler", Existed: false},
 			{Name: "monitoring", Existed: false, SnapshotErr: "connection refused"},
 		},

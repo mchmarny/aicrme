@@ -154,6 +154,36 @@ describe('the confirm gate', () => {
     // would bury that.
     expect(skipped).not.toContain('gpu-operator')
   })
+
+  // Reset never deletes a namespace, so every one it names is work the
+  // operator now owns. Naming it without saying how to act on it leaves them
+  // to reconstruct the command, which is the difference between a report and
+  // a next step.
+  //
+  // Only for namespaces this run created: offering `kubectl delete namespace`
+  // for one that predates the install would be advising the operator to
+  // destroy something the console went out of its way not to touch.
+  it('gives a cleanup command for namespaces this run created, and not for ones it did not', () => {
+    const run = runState({
+      residue: residue([
+        {
+          kind: 'namespace', name: 'kai-scheduler', created: true,
+          skip: 'this run created it; remove it when you no longer need it',
+        },
+        {
+          kind: 'namespace', name: 'cert-manager',
+          skip: 'it existed before the install, so it was used rather than created',
+        },
+      ]),
+    })
+    render(<ResetGate run={run} components={deriveComponents(installed(), undefined)} busy={false} onReset={vi.fn()} />)
+
+    fireEvent.click(screen.getByTestId('reset'))
+
+    const skipped = screen.getByTestId('reset-skipped').textContent ?? ''
+    expect(skipped).toContain('kubectl delete namespace kai-scheduler')
+    expect(skipped).not.toContain('kubectl delete namespace cert-manager')
+  })
 })
 
 describe('which actions the console offers', () => {
