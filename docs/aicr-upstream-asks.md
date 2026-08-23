@@ -9,9 +9,19 @@ rather than implied.
 
 ---
 
-## 1. `pkg/client/v1.AgentConfig` does not mirror `AKSGPUPoolsPath`
+## 1. `pkg/client/v1.AgentConfig` does not mirror `AKSGPUPoolsPath` — FIXED UPSTREAM in v0.20.0
 
-**Found:** 2026-08-23, scoping the AKS step.
+**Found:** 2026-08-23, scoping the AKS step. **Already fixed on AICR `main` the same day**, before
+this file was ever filed anywhere — `v1.AgentConfig` now carries `AKSGPUPoolsPath` with a doc
+comment naming ADR-015 DD3 and stating the projection is controller-side, so the file never
+enters the cluster.
+
+**Consequence: the reason AKS was deferred no longer holds.** It was deferred because building
+it meant calling `pkg/snapshotter` directly for Discover and taking on permanent upgrade
+exposure. On v0.20.0 the step is expressible entirely inside the facade. Revisit once the bump
+lands; the remaining unknown is validation, which still needs a real AKS cluster.
+
+The original entry is kept below as the record of what was found and why it mattered.
 
 `snapshotter.AgentConfig.AKSGPUPoolsPath` points at an operator-supplied
 `az aks nodepool list -o json` dump and merges the `aks-gpu-pools` subtype into the snapshot.

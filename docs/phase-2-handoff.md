@@ -297,6 +297,51 @@ All three close only on real hardware (Phase 4).
 | `assertMatchesApproved` (`internal/steps/bundle.go`) fails at runtime | The catalog's actual component composition for an already-approved recipe changed between Recommend-time and Bundle-time re-resolve | This is the fail-closed guard working as designed — it exists precisely to catch a bump changing what a stored `recipe.json` resolves to. It should not be silenced; if it fires in production against a real bump, the run correctly refuses to install a component set the user never saw and reviewed. The guard compares all six `ComponentSummary` fields (`Name`, `Kind`, `Version`, `Namespace`, `Chart`, `Source`) per component, plus the recipe's own `Name`/`Version` — not just component name and version, which is what it checked before a final-review fix widened it. The error names every field that differed, not just that drift occurred, so a bump investigation starts from the log line rather than the code. |
 | The e2e's pinned ceiling (`test/e2e/apply-dryrun.sh`'s `EXPECTED_FAILING_COMPONENT="network-operator"`, `EXPECTED_FAILING_INDEX="3"`) fails | Either the recipe's component ordering shifted (a bump moved `network-operator`'s position without changing the underlying CRD-ordering issue) or the underlying nfd/network-operator CRD-ordering limitation was actually resolved upstream | Read the script's own failure message before touching the assertion — it names exactly which of these happened. A position shift with the same underlying error is a benign catalog reshuffle; update the pinned index. A run that now reaches `done` under dry-run is a genuine upstream fix and needs a human to re-verify and rewrite this section of the handoff, not just widen the assertion. |
 
+### v0.20.0 bump rehearsal, run 2026-08-23 (release expected 2026-08-24)
+
+Rehearsed against AICR `main` at `709b17939b5c` (104 commits ahead of v0.19.0) in a throwaway
+worktree: `go get github.com/NVIDIA/aicr@main`, build, full suite. **Nothing broke.**
+
+| Detector | Result |
+|---|---|
+| compile | clean — no API break reaches this codebase |
+| `go test ./...` | passes but for two benign failures (below) |
+| `TestDeployTemplateUnchanged` | **passes** — `deploy.sh.tmpl` is byte-identical on `main`, so the marker parser is safe |
+| `recommend_test.go` `succeeds` matrix | **passes** — the same five `(intent, platform)` pairs resolve |
+| resolved component set | **identical**: 13 recipe components for `training/kubeflow`, 16 for `training/slurm`, same names, versions and namespaces |
+| `api-diff-exceptions.yaml` | `acknowledgements: []` — upstream declares zero intentional API breaks |
+
+The two failures are both expected and neither is AICR's:
+`TestDefaultSnapshotAgentImageTracksLinkedAICRVersion` fires because the image constant still
+says `v0.19.0` — that is the pin detector doing its job, and the bump fixes it.
+`TestStaticServesIndex` fails on `index.html not embedded`, because a fresh worktree has no
+built SPA under `internal/web/dist`.
+
+**One behaviour change to expect in the demo, and it is not caught by any detector.**
+`recipes/overlays/kind.yaml` gains `nvsentinel.labeler.assumeDriverInstalled: true`, fixing
+upstream #2175. On v0.19.0, nvsentinel's metadata-collector and both syslog-health-monitor
+DaemonSets sit at **zero desired pods — silently, with no error and no event**. After the bump
+they schedule for real. Expect new pods in the Apply timeline, a different (probably longer)
+Apply, and a new surface for KWOK-specific failure. Watch the first post-bump `apply-real.sh`
+and `reset.sh` rather than assuming the green unit suite covers it.
+
+`recipes/overlays/h100-kind-training-slurm.yaml` was reworked too (topograph's test provider
+now uses a built-in fixture instead of a mounted ConfigMap model), but that is the
+`training/slurm` path, not the demo's `training/kubeflow`.
+
+**Confirmed still absent from the facade, on `main`: apply, deploy, and uninstall.** There is no
+`Client.Apply` or `Client.Uninstall` — `internal/applier` and `internal/teardown` remain
+necessary, which matches the position that the deployer owns the lifecycle of what it applied.
+
+**What the facade gained that this console can use:** `AKSGPUPoolsPath` on `AgentConfig` (see
+`docs/aicr-upstream-asks.md` — this unblocks AKS), and `VerifyBundle`, `VerifyEvidence`,
+`VerifyCatalog`, `RecipeDigest`, `LoadSnapshot`, `SignCatalog`, `PublishEvidence`, plus a
+`Config` loader. `VerifyBundle` reports a real trust level (`verified` / `attested` /
+`unverified` / `unknown`), which is the first thing this console could truthfully show on the
+confirm gate since the unbacked "signed" claim was removed.
+
+---
+
 **Closed 2026-08-23: `renovate.json`.** `approach.md` Risk 5 asked for "a deliberate bump cadence, and probably a CI job that opens a bump PR when aicr releases." That is now configuration rather than a custom workflow — the boring option, and the one `.settings.yaml`'s pre-existing `# renovate:` annotation was already written for.
 
 Two custom regex managers cover the pins the standard `gomod` manager cannot see: `.settings.yaml`'s `dependencies.aicr`, and `defaultSnapshotAgentImage` in `cmd/aicrme/main.go`. Both are declared with `datasource=go` against `github.com/NVIDIA/aicr` rather than the container registry, deliberately — the module and the agent image must be the same version, and a `docker` datasource would let the tag drift ahead of or behind the module whenever a release publishes its image at a different moment. A `packageRules` entry groups all three into one PR, because `make check-aicr-pin` exists precisely to fail the half-bump that separate PRs would produce.
