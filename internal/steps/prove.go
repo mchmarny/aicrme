@@ -223,9 +223,28 @@ func (p *proveStep) awaitGang(ctx context.Context, runID string, emit engine.Emi
 // operator needs to tell "the cluster is full" apart from "nothing is
 // scheduling at all".
 func (p *proveStep) gangTimeoutErr(runID string, placed int) error {
-	return aicrerrors.New(aicrerrors.ErrCodeTimeout,
-		fmt.Sprintf("gang for run %s did not place within %s (%d/%d members placed)",
-			runID, p.cfg.GangTimeout, placed, gangSize))
+	msg := fmt.Sprintf("gang for run %s did not place within %s (%d/%d members placed)",
+		runID, p.cfg.GangTimeout, placed, gangSize)
+	// Nothing at all placed is the branch worth saying more about. A gang
+	// that placed SOME members is a capacity answer -- the cluster is fuller
+	// than the gang is large -- while zero is the scheduler not acting, and
+	// there is one known cause of that with a two-command remedy: a
+	// kai-scheduler left inconsistent by an earlier teardown. Measured
+	// 2026-08-23, docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md.
+	//
+	// Offered as a possibility, not a diagnosis: this console cannot tell
+	// from here whether the cluster was ever reset. And printed rather than
+	// performed, deliberately -- doing it from Reset would mean the teardown
+	// restarting objects it had just declined to touch on ownership grounds,
+	// and hard-coding one component into a component-agnostic package.
+	if placed == 0 {
+		msg += ". Nothing placed at all. If this cluster has been reset before, kai-scheduler" +
+			" may have survived the teardown in a state where its pod-grouper cannot read back" +
+			" the PodGroup it creates, so the scheduler sees none: try" +
+			" `kubectl delete schedulingshard default` and" +
+			" `kubectl rollout restart deploy -n kai-scheduler`, then retry this run"
+	}
+	return aicrerrors.New(aicrerrors.ErrCodeTimeout, msg)
 }
 
 // cleanup deletes the workload this step just created and failed to place,

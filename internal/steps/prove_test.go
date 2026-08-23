@@ -281,6 +281,34 @@ func TestProveGangTimeoutNamesTheDeadlineAndTheCount(t *testing.T) {
 	}
 }
 
+// Nothing placed at all is a different failure from a gang that placed some
+// members, and there is one known cause for it that an operator can act on
+// in two commands: a kai-scheduler left inconsistent by an earlier teardown,
+// whose pod-grouper cannot read back the PodGroup it just created, so the
+// scheduler sees none at all. Measured 2026-08-23 --
+// docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md.
+//
+// The remedy is deliberately printed rather than performed. Restarting
+// kai-scheduler from Reset would mean the teardown mutating objects it had
+// just declined to touch on ownership grounds, and hard-coding one component
+// into a component-agnostic package. Telling the operator costs nothing and
+// breaks nothing.
+func TestProveGangTimeoutPointsAtTheKnownCauseWhenNothingPlaced(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	run := newRun()
+	run.ID = testRunID
+	err := steps.NewProve(prove.NewClient(cs), steps.ProveConfig{GangTimeout: 100 * time.Millisecond}).
+		Run(context.Background(), run, func(bus.Event) {})
+	if err == nil {
+		t.Fatal("Run() succeeded though the gang never placed")
+	}
+	for _, want := range []string{"kai-scheduler", "rollout restart"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Run() error = %q, want it to name the remedy (%q)", err.Error(), want)
+		}
+	}
+}
+
 // The same claim when the placement READ is what notices the deadline first.
 //
 // A List still in flight when the budget expires fails with the deadline's
