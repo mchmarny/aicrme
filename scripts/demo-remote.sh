@@ -84,8 +84,19 @@ up() {
   report_gpu_nodes
 
   if [[ "${SKIP_PUSH}" != "true" ]]; then
-    echo "==> building ${IMAGE}"
-    make image IMAGE="${IMAGE}"
+    # Build for the CLUSTER's architecture, not the laptop's. A managed
+    # cluster is almost always amd64 and the machine building the image
+    # increasingly is not, and the mismatch surfaces as a CrashLoopBackOff
+    # with "exec format error" -- which says nothing about its own cause.
+    local arch
+    arch="$(kubectl get nodes -o json 2>/dev/null \
+      | jq -r '[.items[].metadata.labels["kubernetes.io/arch"]] | unique | join(",")')"
+    case "${arch}" in
+      amd64|arm64) ;;
+      *) die "cluster reports architecture '${arch}'; set PLATFORM= by hand and re-run with SKIP_PUSH=false" ;;
+    esac
+    echo "==> building ${IMAGE} for linux/${arch} (cluster arch)"
+    make image IMAGE="${IMAGE}" PLATFORM="linux/${arch}"
     echo "==> pushing ${IMAGE}"
     docker push "${IMAGE}" \
       || die "push failed — run 'docker login ghcr.io' first, or set SKIP_PUSH=true if it is already pushed"

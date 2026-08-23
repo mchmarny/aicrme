@@ -143,7 +143,16 @@ IMAGE ?= aicrme:dev
 
 .PHONY: image
 image: ## Builds the container image; GO_VERSION comes from .go-version, never hardcoded
-	docker build --build-arg GO_VERSION=$(GO_VERSION) -t $(IMAGE) .
+	@# PLATFORM is empty by default, which builds for the host and is what Kind
+	@# wants: an arm64 laptop running an arm64 Kind node needs an arm64 image,
+	@# and forcing amd64 there would emulate for no reason. It is set only when
+	@# the target cluster's architecture differs from the host's --
+	@# scripts/demo-remote.sh reads kubernetes.io/arch off the nodes and passes
+	@# it, because a managed cluster is almost always amd64 while the laptop
+	@# building the image increasingly is not, and the failure that mismatch
+	@# produces (CrashLoopBackOff with "exec format error") says nothing about
+	@# its own cause.
+	docker build $(if $(PLATFORM),--platform $(PLATFORM),) --build-arg GO_VERSION=$(GO_VERSION) -t $(IMAGE) .
 
 .PHONY: qualify
 qualify: web lint lint-shell test-chart test-web test-coverage check-aicr-pin ## Full local gate — must match CI exactly
