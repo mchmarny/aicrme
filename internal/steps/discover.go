@@ -146,7 +146,8 @@ func NewDiscover(c aicrclient.Snapshotter, cfg DiscoverConfig) engine.Step {
 // Extras are appended rather than replacing the default so an operator adding
 // their cluster's own GPU taint does not silently drop the common one.
 func agentTolerations(extra []corev1.Toleration) []corev1.Toleration {
-	out := []corev1.Toleration{{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}}
+	out := make([]corev1.Toleration, 0, 1+len(extra))
+	out = append(out, corev1.Toleration{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists})
 	return append(out, extra...)
 }
 
