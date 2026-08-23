@@ -457,6 +457,9 @@ func main() {
 			// e2e test) can pin the agent Job off the tainted, fake-executing
 			// simulated GPU nodes and onto a real one.
 			NodeSelector: parseNodeSelector(os.Getenv("AICRME_SNAPSHOT_NODE_SELECTOR")),
+			// Added to the built-in nvidia.com/gpu toleration, for a cluster
+			// whose GPU pool carries a different taint. See parseTolerations.
+			ExtraTolerations: parseTolerations(os.Getenv("AICRME_SNAPSHOT_TOLERATIONS")),
 			// Unset (nil) on every real deployment, where AICR's own 1000m
 			// CPU default applies. Exists so the KWOK e2e can fit the agent
 			// onto the one real node it is pinned to -- see the Requests
@@ -756,6 +759,57 @@ func parseResourceRequests(s string) corev1.ResourceList {
 		slog.Warn("AICRME_SNAPSHOT_REQUESTS set but produced no usable requests; "+
 			"the snapshot agent falls back to AICR's own defaults", "value", s)
 		return nil
+	}
+	return out
+}
+
+// parseTolerations reads AICRME_SNAPSHOT_TOLERATIONS: a comma-separated list
+// of "key=value:effect" or "key:effect", the same spelling AICR's own
+// --tolerations flag takes.
+//
+// It exists because "the GPU taint" is not one taint. GKE's docs use
+// nvidia.com/gpu=present:NoSchedule and internal/steps tolerates that
+// built-in, but a cluster built by a platform team routinely carries
+// something else -- the first real GKE H100 cluster this console met used
+// dedicated=gpu-workload:NoSchedule. Without a matching toleration the agent
+// cannot land on a GPU node, and since the accelerator comes from an in-pod
+// PCI probe, the snapshot then carries no accelerator and no recipe resolves.
+//
+// An unparseable entry is skipped and named rather than failing startup: the
+// console still runs, Discover still works on any cluster whose GPU nodes are
+// untainted, and a typo here should not be the reason the whole binary
+// refuses to boot.
+func parseTolerations(s string) []corev1.Toleration {
+	if s == "" {
+		return nil
+	}
+	var out []corev1.Toleration
+	for _, spec := range strings.Split(s, ",") {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+		keyValue, effect, hasEffect := strings.Cut(spec, ":")
+		key, value, hasValue := strings.Cut(keyValue, "=")
+		key = strings.TrimSpace(key)
+		if key == "" {
+			slog.Warn("AICRME_SNAPSHOT_TOLERATIONS: skipping entry with no key",
+				"entry", spec, "value", s)
+			continue
+		}
+		tol := corev1.Toleration{Key: key, Operator: corev1.TolerationOpExists}
+		if hasValue && strings.TrimSpace(value) != "" {
+			tol.Operator = corev1.TolerationOpEqual
+			tol.Value = strings.TrimSpace(value)
+		}
+		if hasEffect && strings.TrimSpace(effect) != "" {
+			tol.Effect = corev1.TaintEffect(strings.TrimSpace(effect))
+		}
+		out = append(out, tol)
+	}
+	if len(out) == 0 {
+		slog.Warn("AICRME_SNAPSHOT_TOLERATIONS set but produced no usable toleration; "+
+			"the agent keeps only its built-in nvidia.com/gpu toleration", "value", s)
 	}
 	return out
 }

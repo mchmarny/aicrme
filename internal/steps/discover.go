@@ -80,6 +80,25 @@ type DiscoverConfig struct {
 	// AICRME_SNAPSHOT_NODE_SELECTOR: it is a test-path knob, and shrinking
 	// the request on a real cluster is a way to make Discover worse.
 	Requests corev1.ResourceList
+
+	// ExtraTolerations are added to the agent Job alongside the built-in
+	// nvidia.com/gpu one (see Run). Empty on Kind and KWOK.
+	//
+	// It exists because "the GPU taint" is not one taint. GKE's own docs use
+	// nvidia.com/gpu=present:NoSchedule, but a cluster built by a platform
+	// team routinely carries something else entirely -- the first real GKE
+	// H100 cluster this console met tainted its GPU pool
+	// dedicated=gpu-workload:NoSchedule, which the built-in toleration does
+	// not match. The agent then cannot land on a GPU node, and the
+	// accelerator is derived from an IN-POD PCI probe
+	// (fingerprint's gpu.hardware.model), so the snapshot comes back with no
+	// accelerator and the recipe does not resolve.
+	//
+	// Deliberately additive rather than a replacement, and deliberately not a
+	// blanket Exists: see Run's comment for why a blanket toleration would
+	// let the agent land on a KWOK fake node and report success having
+	// collected nothing.
+	ExtraTolerations []corev1.Toleration
 }
 
 type discover struct {
@@ -111,6 +130,24 @@ func NewDiscover(c aicrclient.Snapshotter, cfg DiscoverConfig) engine.Step {
 		cfg.ServiceAccountName = defaultAgentName
 	}
 	return &discover{client: c, cfg: cfg}
+}
+
+// agentTolerations is the built-in nvidia.com/gpu toleration plus whatever the
+// operator added.
+//
+// Never a blanket {Operator: Exists}, which is what AICR's own CLI defaults to.
+// A blanket toleration also accepts kwok.x-k8s.io/node=fake:NoSchedule, and
+// KWOK's controller reports Running/Succeeded for anything scheduled onto a
+// fake node without executing it -- so the agent would land on a simulated GPU
+// node and Discover would report success having collected nothing.
+// DiscoverConfig.NodeSelector's doc records that trade deliberately; this
+// keeps it. A timeout is bad; a false success is worse.
+//
+// Extras are appended rather than replacing the default so an operator adding
+// their cluster's own GPU taint does not silently drop the common one.
+func agentTolerations(extra []corev1.Toleration) []corev1.Toleration {
+	out := []corev1.Toleration{{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}}
+	return append(out, extra...)
 }
 
 func (d *discover) Phase() engine.Phase { return engine.PhaseDiscover }
@@ -151,10 +188,7 @@ func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) err
 		// Naming the key is what separates the two: simulated GPU nodes carry
 		// BOTH taints, so refusing the kwok one keeps the agent off them
 		// while the nvidia.com/gpu toleration lets it reach a real one.
-		Tolerations: []corev1.Toleration{{
-			Key:      "nvidia.com/gpu",
-			Operator: corev1.TolerationOpExists,
-		}},
+		Tolerations:     agentTolerations(d.cfg.ExtraTolerations),
 		Timeout:         d.cfg.Timeout,
 		Privileged:      d.cfg.Privileged,
 		RequireGPU:      d.cfg.RequireGPU,
