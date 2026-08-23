@@ -114,7 +114,7 @@ check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml
 
 .PHONY: lint-shell
 lint-shell: check-tools ## Lints shell scripts with shellcheck
-	shellcheck -x -P test/e2e -P test/chart -P scripts test/e2e/*.sh test/chart/*.sh scripts/*.sh
+	shellcheck -x -P test/e2e -P test/chart -P test/hardware -P scripts test/e2e/*.sh test/chart/*.sh test/hardware/*.sh scripts/*.sh
 
 .PHONY: test-chart
 test-chart: ## Runs helm lint plus the chart contract assertions (offline, no cluster)
