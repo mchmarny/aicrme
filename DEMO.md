@@ -191,6 +191,20 @@ If a Reset does not finish, the console offers only Reset again: the run record 
 inventory of what is still installed, so Start, Retry and Discard are all refused until the
 cluster's state is known again.
 
+**A second Reset is always accepted, but it cannot always finish.** If an uninstall was
+interrupted part-way — a timeout, a crash, an admission webhook refusing a delete — helm leaves
+that release in `uninstalling`, and it refuses to uninstall a release in that state. Retrying
+achieves nothing, and the console will keep naming it with its error. Clear it by hand:
+
+```sh
+helm list -A --uninstalling            # find the wedged release
+helm uninstall <name> -n <namespace>   # often succeeds once the blocker is gone
+kubectl -n <namespace> delete secret -l name=<name>,owner=helm   # last resort: drop the release record
+```
+
+Measured 2026-08-23. This is the best-effort boundary in its sharpest form: the console reports
+precisely what it could not remove, and removing it is yours.
+
 **To remove the cluster entirely:**
 
 ```sh
