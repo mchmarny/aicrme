@@ -495,41 +495,47 @@ echo "with an incomplete teardown: start=${START_STATUS} retry=${RETRY_STATUS} d
 [[ "${RETRY_STATUS}" == "409" ]] || fail "Retry returned ${RETRY_STATUS} over a half-torn-down cluster, want 409"
 [[ "${DISCARD_STATUS}" == "409" ]] || fail "Discard returned ${DISCARD_STATUS}, want 409 -- it would delete the only residue inventory"
 
+# A teardown the operator cannot act on is useless, so before anything is
+# repaired, assert the failure was NAMED. This is what makes the manual
+# remedy below possible at all.
+STUCK_LIST="$(echo "${BLOCKED_JSON}" \
+  | jq -r '.residue.items[]? | select(.kind == "release" and (.error // "") != "") | [.name, .namespace] | @tsv')"
+STUCK_N="$(printf '%s' "${STUCK_LIST}" | grep -c . || true)"
+echo "releases the blocked teardown named with an error: ${STUCK_N}"
+[[ "${STUCK_N}" -ge 1 ]] \
+  || fail "the teardown is incomplete but names no failing release -- the operator cannot act on it"
+
 # The remedy stays reachable: blocking every operation that could resolve
 # the residue is the operator dead end the guard exists to prevent.
 kubectl delete validatingwebhookconfiguration aicrme-e2e-block-deploy-delete
+
+# Now the operator's own move, run exactly as DEMO.md documents it.
+#
+# An uninstall interrupted mid-flight leaves the helm release in
+# `uninstalling`, and helm refuses to uninstall a release in that state -- so
+# a second Reset cannot clear it however many times it runs. Measured
+# 2026-08-23: blocking Deployment deletion wedged nodewright-operator exactly
+# there. A crash or a timeout mid-uninstall does the same, so this is not an
+# artefact of the webhook.
+#
+# The console's answer is to name it and let the operator clear it, and
+# running those instructions HERE is what proves they actually work. If
+# DEMO.md's remedy ever stops working, this fails.
+while IFS=$'\t' read -r stuck_name stuck_ns; do
+  [[ -z "${stuck_name}" ]] && continue
+  echo "clearing wedged release ${stuck_name} in ${stuck_ns}, per DEMO.md"
+  helm uninstall "${stuck_name}" -n "${stuck_ns}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "${stuck_ns}" delete secret -l "name=${stuck_name},owner=helm" --ignore-not-found >/dev/null 2>&1 || true
+done <<<"${STUCK_LIST}"
+
 AGAIN_STATUS="$(post_status "/api/runs/${FAIL_RUN_ID}/reset" -d '{"confirm":"reset"}')"
 [[ "${AGAIN_STATUS}" == "200" ]] || fail "a second Reset returned ${AGAIN_STATUS}, want 200 -- the remedy must stay reachable"
 AGAIN_STATE="$(await_terminal "${FAIL_RUN_ID}" 180)"
 AGAIN_JSON="$(run_json "${FAIL_RUN_ID}")"
 AGAIN_INCOMPLETE="$(echo "${AGAIN_JSON}" | jq -r '.residue.incomplete // false')"
 echo "second reset settled at state=${AGAIN_STATE} incomplete=${AGAIN_INCOMPLETE}"
-
-# What a second Reset guarantees, and what it does not.
-#
-# It is always ACCEPTED -- asserted above -- so the operator is never at a dead
-# end where every operation is refused. What it cannot always do is FINISH. An
-# uninstall interrupted mid-flight leaves the helm release in `uninstalling`,
-# and helm refuses to uninstall a release in that state, so retrying achieves
-# nothing. Measured 2026-08-23: blocking Deployment deletion left
-# nodewright-operator stuck exactly there, and the second Reset failed on it
-# with exit status 1. A crash or a timeout mid-uninstall produces the same
-# state, so this is not an artefact of the webhook.
-#
-# The assertion is therefore the honest one: whatever is still installed is
-# NAMED with its error, so the operator knows what to clear by hand. Adding
-# recovery code for a wedged helm release is the complexity this project
-# refuses on purpose -- uninstall is best effort, the remainder is the
-# operator's, and a release helm has wedged is squarely the remainder.
-if [[ "${AGAIN_INCOMPLETE}" == "true" ]]; then
-  STUCK="$(echo "${AGAIN_JSON}" \
-    | jq '[.residue.items[]? | select(.kind == "release" and (.error // "") != "")] | length')"
-  echo "second reset could not finish; releases named with an error: ${STUCK}"
-  [[ "${STUCK}" -ge 1 ]] \
-    || fail "the teardown is incomplete but names no failing release -- the operator cannot act on it"
-else
-  echo "second reset cleared the guard"
-fi
+[[ "${AGAIN_INCOMPLETE}" != "true" ]] \
+  || fail "the guard is still set after the documented manual cleanup -- DEMO.md's remedy does not work"
 echo "assertion 4: PASS"
 
 echo "--- assert 5: the console accepts a new run afterward"
