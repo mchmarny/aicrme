@@ -8,7 +8,7 @@ the fix. Entries are removed when they ship, not when they are agreed with.
 
 ---
 
-## 1. The event stream appends, so the newest event is off-screen
+## 1. The event stream appends, so the newest event is off-screen — SHIPPED 2026-08-23
 
 **Observed:** 2026-08-19, Mark, first local `make demo` run, during Apply.
 

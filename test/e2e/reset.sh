@@ -95,7 +95,7 @@ cleanup() {
   [[ -n "${PF_PID}" ]] && kill "${PF_PID}" 2>/dev/null
   rm -f "${JAR}"
   [[ -n "${CHART_DIR}" ]] && rm -rf "${CHART_DIR}"
-  kubectl delete validatingwebhookconfiguration aicrme-e2e-block-ns-delete >/dev/null 2>&1 || true
+  kubectl delete validatingwebhookconfiguration aicrme-e2e-block-deploy-delete >/dev/null 2>&1 || true
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
 trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
@@ -435,19 +435,25 @@ echo "second run: state=${STATE} with ${SECOND_INSTALLED} components installed"
 }
 
 # The webhook goes up HERE, after the install and before the teardown --
-# not before the install, which is where this script first put it. It
-# refuses every namespace DELETE cluster-wide with failurePolicy: Fail, and
-# deploy.sh's own preflight deletes terminating namespaces, so a webhook
-# live during Apply breaks the install rather than the reset. Only a real
-# API server can produce this at all: admission is exactly what a fake
-# clientset does not run.
+# not before the install. It refuses DELETE with failurePolicy: Fail and no
+# reachable backend, so anything live during Apply breaks the install rather
+# than the reset. Only a real API server can produce this at all: admission
+# is exactly what a fake clientset does not run.
+#
+# It blocks DEPLOYMENTS, not namespaces. Blocking namespaces was how this
+# assertion worked until 2026-08-23, when Reset stopped deleting namespaces
+# altogether -- at which point the webhook had nothing to refuse, the
+# teardown came back clean, and this assertion skipped itself while the
+# script still reported PASS. A failing helm uninstall is now the only route
+# to an incomplete teardown, and every release in the recipe owns at least
+# one Deployment.
 kubectl apply -f - <<EOF
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
-  name: aicrme-e2e-block-ns-delete
+  name: aicrme-e2e-block-deploy-delete
 webhooks:
-  - name: block.namespaces.aicrme.e2e
+  - name: block.deployments.aicrme.e2e
     admissionReviewVersions: ["v1"]
     sideEffects: None
     failurePolicy: Fail
@@ -458,11 +464,11 @@ webhooks:
         namespace: ${NS}
         path: /reject
     rules:
-      - apiGroups: [""]
+      - apiGroups: ["apps"]
         apiVersions: ["v1"]
         operations: ["DELETE"]
-        resources: ["namespaces"]
-        scope: Cluster
+        resources: ["deployments"]
+        scope: Namespaced
 EOF
 
 post_status "/api/runs/${FAIL_RUN_ID}/reset" -d '{"confirm":"reset"}' >/dev/null
@@ -472,31 +478,33 @@ INCOMPLETE="$(echo "${BLOCKED_JSON}" | jq -r '.residue.incomplete // false')"
 echo "blocked reset settled at state=${BLOCKED_STATE} incomplete=${INCOMPLETE}"
 
 if [[ "${INCOMPLETE}" != "true" ]]; then
-  # The webhook blocks namespace deletion only. A recipe whose charts all
-  # ship their own Namespace manifests would have nothing left for the
-  # namespace step to delete, so there would be no failure to provoke. Say
-  # so rather than asserting on a condition that never arose.
-  echo "SKIP: this recipe left no console-created namespace for the webhook to block; assertion 4 not exercised" >&2
-else
-  START_STATUS="$(post_status /api/runs)"
-  RETRY_STATUS="$(post_status "/api/runs/${FAIL_RUN_ID}/retry")"
-  DISCARD_STATUS="$(delete_status "/api/runs/${FAIL_RUN_ID}")"
-  echo "with an incomplete teardown: start=${START_STATUS} retry=${RETRY_STATUS} discard=${DISCARD_STATUS}"
-  [[ "${START_STATUS}" == "409" ]] || fail "Start returned ${START_STATUS} over a half-torn-down cluster, want 409"
-  [[ "${RETRY_STATUS}" == "409" ]] || fail "Retry returned ${RETRY_STATUS} over a half-torn-down cluster, want 409"
-  [[ "${DISCARD_STATUS}" == "409" ]] || fail "Discard returned ${DISCARD_STATUS}, want 409 -- it would delete the only residue inventory"
-
-  # The remedy stays reachable: blocking every operation that could resolve
-  # the residue is the operator dead end the guard exists to prevent.
-  kubectl delete validatingwebhookconfiguration aicrme-e2e-block-ns-delete
-  AGAIN_STATUS="$(post_status "/api/runs/${FAIL_RUN_ID}/reset" -d '{"confirm":"reset"}')"
-  [[ "${AGAIN_STATUS}" == "200" ]] || fail "a second Reset returned ${AGAIN_STATUS}, want 200 -- the remedy must stay reachable"
-  AGAIN_STATE="$(await_terminal "${FAIL_RUN_ID}" 180)"
-  AGAIN_INCOMPLETE="$(run_json "${FAIL_RUN_ID}" | jq -r '.residue.incomplete // false')"
-  echo "second reset settled at state=${AGAIN_STATE} incomplete=${AGAIN_INCOMPLETE}"
-  [[ "${AGAIN_INCOMPLETE}" != "true" ]] || fail "the second Reset did not clear the guard"
-  echo "assertion 4: PASS"
+  # A hard failure, not a skip. This branch used to print SKIP and carry on,
+  # which is how the whole assertion quietly stopped running the day Reset
+  # stopped deleting namespaces: the script still printed PASS. If the
+  # webhook did not provoke an incomplete teardown, the thing this assertion
+  # exists to test is untested, and that is a failure of the test.
+  echo "blocked reset record: $(run_json "${FAIL_RUN_ID}" | jq -c '{state,residue}')" >&2
+  fail "the blocked Reset came back complete -- the webhook provoked no uninstall failure, so the guard is untested"
 fi
+
+START_STATUS="$(post_status /api/runs)"
+RETRY_STATUS="$(post_status "/api/runs/${FAIL_RUN_ID}/retry")"
+DISCARD_STATUS="$(delete_status "/api/runs/${FAIL_RUN_ID}")"
+echo "with an incomplete teardown: start=${START_STATUS} retry=${RETRY_STATUS} discard=${DISCARD_STATUS}"
+[[ "${START_STATUS}" == "409" ]] || fail "Start returned ${START_STATUS} over a half-torn-down cluster, want 409"
+[[ "${RETRY_STATUS}" == "409" ]] || fail "Retry returned ${RETRY_STATUS} over a half-torn-down cluster, want 409"
+[[ "${DISCARD_STATUS}" == "409" ]] || fail "Discard returned ${DISCARD_STATUS}, want 409 -- it would delete the only residue inventory"
+
+# The remedy stays reachable: blocking every operation that could resolve
+# the residue is the operator dead end the guard exists to prevent.
+kubectl delete validatingwebhookconfiguration aicrme-e2e-block-deploy-delete
+AGAIN_STATUS="$(post_status "/api/runs/${FAIL_RUN_ID}/reset" -d '{"confirm":"reset"}')"
+[[ "${AGAIN_STATUS}" == "200" ]] || fail "a second Reset returned ${AGAIN_STATUS}, want 200 -- the remedy must stay reachable"
+AGAIN_STATE="$(await_terminal "${FAIL_RUN_ID}" 180)"
+AGAIN_INCOMPLETE="$(run_json "${FAIL_RUN_ID}" | jq -r '.residue.incomplete // false')"
+echo "second reset settled at state=${AGAIN_STATE} incomplete=${AGAIN_INCOMPLETE}"
+[[ "${AGAIN_INCOMPLETE}" != "true" ]] || fail "the second Reset did not clear the guard"
+echo "assertion 4: PASS"
 
 echo "--- assert 5: the console accepts a new run afterward"
 # LAST, deliberately -- numbered 5 because it runs fifth, not because it
