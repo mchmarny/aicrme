@@ -508,8 +508,10 @@ Each phase is independently demoable.
    designed in phase 2, not retrofitted.
 
 5. **Two-repo drift.** Recipe data is embedded in the aicr module, so a console release pins a
-   recipe catalog snapshot. This needs a deliberate bump cadence, and probably a CI job that
-   opens a bump PR when aicr releases.
+   recipe catalog snapshot. **Addressed 2026-08-23 by `renovate.json`**, which groups all three
+   AICR pins — `go.mod`, `.settings.yaml`, and the snapshot agent image constant — into one
+   weekly PR carrying the bump checklist in its body. Still requires the Renovate GitHub App to
+   be installed on the repository; see `docs/phase-2-handoff.md`.
 
 6. **Image size.** The console image carries helm, kubectl, and the built SPA, and it is the
    first thing the cluster pulls. Keep it lean; it is on the critical path of the first

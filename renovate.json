@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "America/Los_Angeles",
+  "schedule": ["before 9am on monday"],
+  "prConcurrentLimit": 3,
+  "dependencyDashboard": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The AICR pin in .settings.yaml, which check-aicr-pin compares go.mod against. The `# renovate:` annotation above the key predates this config -- it was written expecting exactly this manager.",
+      "managerFilePatterns": ["/^\\.settings\\.yaml$/"],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+?)\\s+depName=(?<depName>\\S+?)(?:\\s+depType=\\S+)?\\s*\\n\\s*aicr:\\s*'(?<currentValue>[^']+)'"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "The snapshot agent image tag. Tracked against the Go module rather than the container registry on purpose: these two must be the same version, and a docker datasource would let the tag drift ahead of or behind the module whenever a release publishes an image at a different moment.",
+      "managerFilePatterns": ["/^cmd/aicrme/main\\.go$/"],
+      "matchStrings": [
+        "const defaultSnapshotAgentImage = \"ghcr\\.io/nvidia/aicr:(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "github.com/NVIDIA/aicr",
+      "datasourceTemplate": "go"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "One PR for all three AICR pins. They must move together or `make check-aicr-pin` fails by design -- it exists to catch exactly the half-bump that separate PRs would produce.",
+      "matchDepNames": ["github.com/NVIDIA/aicr"],
+      "groupName": "aicr",
+      "commitMessageTopic": "aicr",
+      "prBodyNotes": [
+        "### Bump checklist",
+        "`docs/phase-2-handoff.md` carries the full table. Four detectors fire on an AICR bump, and one of them must NOT be answered by updating a number:",
+        "- **`make check-aicr-pin`** — the three pins disagree. Should be green here; if not, this PR bumped some but not all.",
+        "- **`internal/steps/recommend_test.go`'s `succeeds` matrix** — which intent/platform pairs resolve on KWOK changed. Re-verify against the new catalog and record reality; a shrinking or growing set is information, not a regression to suppress.",
+        "- **`TestDeployTemplateUnchanged`** — ⚠️ upstream's `deploy.sh.tmpl` changed, and `internal/applier/parse.go` transcribes its output format into seven regexes. **Do not reflexively update the sha256.** Re-read the template's output helpers against the regexes first. Updating the hash to turn CI green would silently empty the Apply timeline in production, and every existing test would still pass.",
+        "- **`test/e2e/apply-dryrun.sh`'s pinned ceiling** — read the script's own failure message before touching the assertion; it names whether this was a benign reordering or a genuine upstream fix.",
+        "Also re-run the e2e on this branch: `check-aicr-pin` and the unit suite do not exercise a real install."
+      ]
+    }
+  ]
+}
