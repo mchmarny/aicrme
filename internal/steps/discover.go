@@ -125,12 +125,42 @@ func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) err
 		JobName:            d.cfg.JobName,
 		ServiceAccountName: d.cfg.ServiceAccountName,
 		NodeSelector:       d.cfg.NodeSelector,
-		Timeout:            d.cfg.Timeout,
-		Privileged:         d.cfg.Privileged,
-		RequireGPU:         d.cfg.RequireGPU,
-		DiscoverNetwork:    d.cfg.DiscoverNetwork,
-		Requests:           d.cfg.Requests,
-		Cleanup:            true,
+		// The GPU taint, and ONLY the GPU taint.
+		//
+		// On every managed cloud the GPUs sit on tainted nodes -- GKE taints
+		// its GPU pools nvidia.com/gpu=present:NoSchedule, EKS and AKS do the
+		// equivalent -- and nothing else in the chain supplies a toleration.
+		// snapshotter.maybeInjectGPUNodeSelector biases the Job ONTO a GPU
+		// node by injecting a nodeSelector and injects no toleration with it;
+		// pkg/client/v1 defaults tolerations for validation only, never for
+		// CollectSnapshot; and the agent assigns config.Tolerations straight
+		// through. With none, the Job sits Pending until Discover's
+		// ten-minute timeout -- as the first thing the demo does, on the one
+		// cluster that matters.
+		//
+		// Deliberately NOT a bare {Operator: Exists}, which is what AICR's
+		// own CLI defaults to and what an earlier draft of this put here. A
+		// blanket toleration also accepts kwok.x-k8s.io/node=fake:NoSchedule,
+		// and KWOK's controller fakes Running/Succeeded for anything
+		// scheduled onto a fake node without executing it -- so the agent
+		// would land on a simulated GPU node and Discover would report
+		// success having collected nothing. The NodeSelector doc above
+		// records that trade deliberately; this keeps it. A timeout is a bad
+		// outcome, a false success is a worse one.
+		//
+		// Naming the key is what separates the two: simulated GPU nodes carry
+		// BOTH taints, so refusing the kwok one keeps the agent off them
+		// while the nvidia.com/gpu toleration lets it reach a real one.
+		Tolerations: []corev1.Toleration{{
+			Key:      "nvidia.com/gpu",
+			Operator: corev1.TolerationOpExists,
+		}},
+		Timeout:         d.cfg.Timeout,
+		Privileged:      d.cfg.Privileged,
+		RequireGPU:      d.cfg.RequireGPU,
+		DiscoverNetwork: d.cfg.DiscoverNetwork,
+		Requests:        d.cfg.Requests,
+		Cleanup:         true,
 	})
 	if err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable, "cluster snapshot failed", err)

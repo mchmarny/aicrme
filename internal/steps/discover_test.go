@@ -131,6 +131,57 @@ func TestDiscoverEmitsGapWarnings(t *testing.T) {
 	}
 }
 
+// The snapshot agent must reach a tainted GPU node -- on GKE, EKS and AKS
+// that is where the GPUs are -- and must NOT reach a simulated one.
+//
+// Nothing else supplies the toleration. snapshotter.maybeInjectGPUNodeSelector
+// biases the Job onto a GPU node by injecting a nodeSelector and injects no
+// toleration with it; pkg/client/v1 defaults tolerations for validation only,
+// never for CollectSnapshot; and the agent assigns config.Tolerations straight
+// through. With none, the Job sits Pending until Discover's ten-minute
+// timeout on the first thing the demo does.
+//
+// The second half of the assertion is the load-bearing one. A bare
+// {Operator: Exists} -- what AICR's CLI defaults to -- would also tolerate
+// kwok.x-k8s.io/node=fake:NoSchedule, and KWOK fakes Running/Succeeded for
+// anything scheduled onto a fake node without running it. Discover would then
+// report success having collected nothing, which is strictly worse than the
+// timeout it replaces. Simulated GPU nodes carry both taints, so refusing the
+// kwok one is what keeps the agent off them.
+func TestDiscoverToleratesTheGPUTaintButNotTheKwokOne(t *testing.T) {
+	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+
+	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	got := fake.LastAgentConfig
+	if got == nil {
+		t.Fatal("CollectSnapshot was called with a nil AgentConfig")
+	}
+	if len(got.Tolerations) == 0 {
+		t.Fatal("Tolerations is empty -- the agent cannot schedule onto a tainted GPU node, " +
+			"which is where the GPUs are on GKE, EKS and AKS")
+	}
+	var gpu, blanket bool
+	for _, tol := range got.Tolerations {
+		if tol.Operator == corev1.TolerationOpExists && tol.Key == "nvidia.com/gpu" {
+			gpu = true
+		}
+		if tol.Operator == corev1.TolerationOpExists && tol.Key == "" {
+			blanket = true
+		}
+	}
+	if !gpu {
+		t.Errorf("Tolerations = %+v, want one for nvidia.com/gpu", got.Tolerations)
+	}
+	if blanket {
+		t.Error("a blanket toleration also accepts kwok.x-k8s.io/node=fake, which lets the agent " +
+			"land on a simulated node where KWOK fakes success without running the collector")
+	}
+}
+
 // TestDiscoverPlumbsAgentConfig proves DiscoverConfig actually reaches the
 // AgentConfig CollectSnapshot is called with — every field non-default so the
 // test cannot pass against an accidentally empty *aicr.AgentConfig{}.
