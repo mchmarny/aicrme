@@ -27,10 +27,24 @@ const filePayloadCeiling = 64 << 20
 const currentFile = "current"
 
 type fileStore struct {
-	// mu serializes the read-modify-write of the current pointer against
-	// concurrent Saves. The rename below is atomic on its own; the pairing of
-	// a run write with a pointer write is not.
-	mu  sync.Mutex
+	// mu makes every method safe to call from separate goroutines with no
+	// lock of the caller's own held. engine.go documents that Store I/O
+	// never runs under e.mu, and Discard's store.Delete in particular runs
+	// fully unlocked -- so it can genuinely race a concurrent LoadCurrent
+	// from another goroutine. Save and Delete take the write lock; Load and
+	// LoadCurrent take the read lock.
+	//
+	// The read lock is not only for the Save/Delete write pairing (the
+	// pointer file and the run file are two separate writes, and the rename
+	// below is only atomic on its own). LoadCurrent is itself a two-step
+	// READ -- the current pointer, then the record it names -- and without a
+	// lock a Delete landing between those two steps is observed as "pointer
+	// present, record gone": a dangling pointer LoadCurrent cannot tell
+	// apart from real corruption, turning a clean concurrent Delete into a
+	// spurious error. memoryStore (store.go) takes its RWMutex on all four
+	// methods for the same reason -- a Store that is not independently
+	// concurrency-safe is not a substitute for it.
+	mu  sync.RWMutex
 	dir string
 }
 
@@ -66,10 +80,17 @@ func writeAtomic(path string, b []byte) error {
 		_ = tmp.Close()
 		return err
 	}
-	// Sync before rename: a rename that reaches the directory entry ahead of
-	// the data leaves a zero-length record after a crash, which decodeRun
-	// reports as corrupt rather than absent -- the one outcome that stops
-	// recovery cold.
+	// Sync before rename: without it, the temp file's data can still be
+	// unflushed when the rename that publishes it lands, so a crash in that
+	// window can leave a torn or zero-length record at path -- which
+	// decodeRun reports as corrupt rather than absent, the one outcome that
+	// stops recovery cold. That is the full scope of what this buys: it
+	// keeps a torn record from ever being observable. It does NOT make the
+	// rename itself crash-durable -- the directory entry Rename creates is
+	// never fsynced, so a crash immediately after a successful Save can
+	// still lose that write on some filesystems. Accepted here: this is a
+	// local, single-operator console, and a lost last write is re-derivable
+	// by re-running, unlike a torn record, which is not.
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err
@@ -100,6 +121,17 @@ func (s *fileStore) Save(_ context.Context, r *Run) error {
 }
 
 func (s *fileStore) Load(_ context.Context, id string) (*Run, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.load(id)
+}
+
+// load is Load's body without the lock, so LoadCurrent can reuse it while
+// already holding the read lock it took for the pointer read. A second RLock
+// from the same goroutine is not safe to add on top of that: sync.RWMutex is
+// not reentrant, and a writer (Save or Delete) queued in between the two
+// RLock calls would deadlock the goroutine against itself.
+func (s *fileStore) load(id string) (*Run, error) {
 	blob, err := os.ReadFile(s.runPath(id))
 	if os.IsNotExist(err) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+id)
@@ -110,14 +142,18 @@ func (s *fileStore) Load(_ context.Context, id string) (*Run, error) {
 	return decodeRun(blob, filePayloadCeiling)
 }
 
-// LoadCurrent reads the pointer and then the record it names.
+// LoadCurrent reads the pointer and then the record it names, under a single
+// read lock -- see mu's doc comment for why the two-step read has to be one
+// critical section rather than two.
 //
 // A missing pointer is ErrCodeNotFound -- nothing to recover. A pointer naming
 // a record that is missing or undecodable is deliberately NOT: recovery must
 // not read "unreadable" as "nothing there", because that is exactly the
 // mistake that lets a new run overwrite a record that was only momentarily
 // unreadable. Same distinction the ConfigMap store drew, for the same reason.
-func (s *fileStore) LoadCurrent(ctx context.Context) (*Run, error) {
+func (s *fileStore) LoadCurrent(_ context.Context) (*Run, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	id, err := os.ReadFile(filepath.Join(s.dir, currentFile))
 	if os.IsNotExist(err) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeNotFound, "no current run")
@@ -128,7 +164,7 @@ func (s *fileStore) LoadCurrent(ctx context.Context) (*Run, error) {
 	if len(id) == 0 {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeNotFound, "no current run")
 	}
-	run, err := s.Load(ctx, string(id))
+	run, err := s.load(string(id))
 	var se *aicrerrors.StructuredError
 	if errors.As(err, &se) && se.Code == aicrerrors.ErrCodeNotFound {
 		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal,
