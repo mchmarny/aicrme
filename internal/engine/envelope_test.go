@@ -260,6 +260,26 @@ func TestDecodeBoundsDecompression(t *testing.T) {
 	}
 }
 
+// TestDerivedDecompressionBoundNeverNarrowsTheConfigMapStoresOriginal pins
+// the invariant fix round 1 found broken: the ×10 this file originally used
+// made cmPayloadCeiling*10 (8,192,000) narrower than the unparameterized
+// code's original 8 << 20 (8,388,608), so decodeRun would have newly
+// rejected a decompressed record between roughly 7.8 and 8 MiB that the old
+// bound accepted. TestDecodeBoundsDecompression's 64 MiB bomb is nowhere
+// near either threshold, so a several-percent narrowing like that is
+// invisible to it -- this asserts the derivation arithmetic directly instead
+// of constructing a payload near the boundary, which would be far more
+// brittle (a single byte of JSON/gzip framing overhead either way changes
+// whether a near-boundary fixture actually exercises the bound).
+func TestDerivedDecompressionBoundNeverNarrowsTheConfigMapStoresOriginal(t *testing.T) {
+	got := cmPayloadCeiling * decompressMultiplier
+	const oldBound = 8 << 20
+	if got < oldBound {
+		t.Errorf("derived decompression bound at cmPayloadCeiling = %d, want >= %d (the ConfigMap store's original 8 MiB) -- "+
+			"parameterizing the ceiling must never cause decodeRun to reject a record the old, unparameterized bound accepted", got, oldBound)
+	}
+}
+
 // bumpVersionForTest rewrites the envelope's version to one the decoder does
 // not know, without hand-authoring a fixture that would drift from the type.
 func bumpVersionForTest(t *testing.T, blob []byte) []byte {

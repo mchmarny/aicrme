@@ -772,9 +772,9 @@ func waitStateSlow(t *testing.T, e *engine.Engine, id string, want engine.State)
 }
 
 // oversizeStep writes an artifact that cannot be compressed under
-// envelope.go's maxPayload, so every checkpoint after it has to deal with a
-// record over the limit. 1MiB of random bytes is past the 800KiB cap on its
-// own and DEFLATE cannot claw any of it back.
+// cmstore.go's cmPayloadCeiling, so every checkpoint after it has to deal
+// with a record over the limit. 1MiB of random bytes is past the 800KiB cap
+// on its own and DEFLATE cannot claw any of it back.
 type oversizeStep struct{ phase engine.Phase }
 
 func (s oversizeStep) Phase() engine.Phase { return s.phase }

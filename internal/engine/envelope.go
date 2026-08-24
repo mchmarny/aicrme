@@ -212,10 +212,10 @@ func encodeRun(r *Run, maxPayload int) ([]byte, error) {
 	}
 	if len(blob) > maxPayload {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-			fmt.Sprintf("run state too large to checkpoint: %d bytes compressed, limit %d", len(blob), maxPayload))
+			fmt.Sprintf("run state too large to checkpoint: %d bytes compressed exceeds the payload ceiling of %d bytes", len(blob), maxPayload))
 	}
 
-	slog.Warn("run checkpoint exceeded the ConfigMap payload limit; artifacts were dropped so the record could still be written. "+
+	slog.Warn("run checkpoint exceeded its payload ceiling; artifacts were dropped so the record could still be written. "+
 		"Durability is degraded: this run is still recoverable as a state machine, but a retry that reads one of the dropped artifacts will fail and the operator will have to discard and start over",
 		"run", r.ID, "dropped", env.Truncated, "droppedBytes", shedBytes,
 		"compressedBytes", len(blob), "limit", maxPayload)
@@ -240,19 +240,34 @@ func largestArtifact(artifacts map[string][]byte) string {
 	return best
 }
 
+// decompressMultiplier scales maxPayload into decodeRun's decompression-bomb
+// guard. It is not sized to reproduce any particular old relationship
+// exactly -- an earlier version of this comment claimed the ×10 it replaced
+// reproduced the ConfigMap store's original 800 KiB to 8 MiB ratio "exactly",
+// and that arithmetic was wrong (819,200 × 10 = 8,192,000, which is narrower
+// than 8 << 20 = 8,388,608, so decodeRun would have newly rejected a
+// decompressed record between roughly 7.8 and 8 MiB that the old,
+// unparameterized bound accepted). The one property that matters is that
+// parameterizing the ceiling must never narrow what decodeRun accepts:
+// cmPayloadCeiling * decompressMultiplier (9,011,200) is deliberately kept
+// wider than the ConfigMap store's original 8 << 20, with headroom rather
+// than a value pinned to the boundary.
+const decompressMultiplier = 11
+
 // decodeRun deserializes a record written by encodeRun. An unrecognized
 // version is refused rather than partially decoded: guessing at a format
 // written by a different image is how a newer record gets silently
 // downgraded.
 //
-// maxPayload is the same ceiling encodeRun was given; decompression is bounded
-// at ten times it, which reproduces the ConfigMap store's original 800 KiB to
-// 8 MiB relationship. That bound guards against a small stored payload
-// inflating without limit, which is a property of this decoder rather than of
-// wherever the bytes were kept.
+// maxPayload is the same ceiling encodeRun was given. Decompression is
+// bounded at maxPayload * decompressMultiplier: a decompression-bomb guard
+// scaled to whatever ceiling the store supplies, rather than a fixed number,
+// and deliberately never narrower than the ConfigMap store's original 8 MiB
+// -- so parameterizing the ceiling rejects nothing decodeRun previously
+// accepted. That bound is a property of this decoder, not of where the bytes
+// were kept.
 func decodeRun(blob []byte, maxPayload int) (*Run, error) {
-	// See the doc comment above for why this is ten times maxPayload.
-	maxDecompressed := maxPayload * 10
+	maxDecompressed := maxPayload * decompressMultiplier
 
 	var env envelope
 	if err := gunzipJSON(blob, &env, maxDecompressed); err != nil {
