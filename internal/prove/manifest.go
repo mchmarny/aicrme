@@ -36,6 +36,20 @@ func Labels(runID string) map[string]string {
 // run always names the same object -- the property a restart depends on.
 func WorkloadName(runID string) string { return "prove-" + runID }
 
+// SpecHashAnnotation carries a hash of the workload as this process would
+// create it. Apply compares it before deciding whether an existing object is
+// the one it wants or a survivor of a differently-configured run.
+//
+// It exists because the workload name is derived from the run ID alone, so a
+// retried Apply for the same run always addresses the same object -- and the
+// rendered spec is no longer a pure function of the run. Client.extraTolerations
+// comes from AICRME_GPU_TOLERATIONS, which is process configuration: two
+// Applies of one run, from two differently-configured processes, legitimately
+// want different Jobs. Without this the second is discarded in silence, which
+// is how a toleration fix deployed mid-demo failed to reach the run it was
+// deployed for (docs/phase-4-status.md).
+const SpecHashAnnotation = "aicrme.dev/spec-hash"
+
 // OwnedKinds enumerates what Prove creates. Stop and reconciliation act on
 // this list, never on "everything in the namespace", so an object someone
 // else put there is not collateral damage.
