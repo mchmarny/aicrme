@@ -1,7 +1,7 @@
 # Local binary — replacing the in-cluster console
 
 **Date:** 2026-08-23
-**Status:** Approved for planning (revision 3)
+**Status:** Approved for planning (revision 4)
 
 **Revision 2** corrected §2 and §5 against two findings from reading AICR's client and this
 repo's own `internal/steps/ownership.go`. Revision 1 claimed §2 made every consumer agree on the
@@ -28,11 +28,23 @@ accepted on description:
 
 Open questions 1 and 2 from revision 1, and the in-session-switching question from revision 2,
 are resolved and folded in.
+
+**Revision 4** absorbs Phase 4's open decision #1 — whether Prove adopts or recreates a workload
+whose spec has changed — which was the only one of that phase's three open decisions the move to
+a local binary does not dissolve. §4 answers it: Apply recreates on spec drift and stays
+idempotent otherwise. Reading the code to write that answer corrected the diagnosis in
+`docs/phase-4-status.md`, which named the wrong mechanism.
+
 **Scope:** The delivery model only. `aicrme` stops being a Helm chart that deploys a console
 into the target cluster and becomes a binary an operator runs on their own machine, which
 serves the same SPA over loopback and drives the cluster through their kubeconfig. The arc —
-Discover, Recommend, Bundle, Apply, Prove, Reset — is unchanged, and no step's behavior is
-redesigned here.
+Discover, Recommend, Bundle, Apply, Prove, Reset — is unchanged.
+
+**One deliberate exception to that scope**, added in revision 4: `prove.Client.Apply` changes
+behavior (§4, *Prove's workload can outlive the spec that produced it*). It is in scope because
+this restructure is what turns that defect from a crash-only edge case into the ordinary
+reconfigure-restart-retry loop, and because §4's recovery table leans on the same mechanism.
+Nothing else in any step moves.
 
 **Not in scope:** release automation (goreleaser, Homebrew tap, install script) lands after the
 code works under `make build`. Upstreaming into AICR as `aicr server` is a later, separately
@@ -458,6 +470,78 @@ record that says "a teardown was in flight and I do not know what survived" is a
 release names get acted on by the next Reset, and acting on them in the wrong cluster is the
 worst outcome this design can produce.
 
+### Prove's workload can outlive the spec that produced it
+
+**This is the one step behavior this design changes**, against §Scope's claim that none are. It
+is in scope because the restructure turns a rare failure into the ordinary one, and because the
+Prove row above depends on the mechanism that carries the bug.
+
+Phase 4 hit it on real hardware. `docs/phase-4-status.md` records it as "Prove **adopted the
+stale Job** from the previous attempt … That is the Phase 3 adoption rule working as designed."
+**That attribution is wrong, and the distinction decides the fix.** `ReconcileWorkloads`'
+adoption rule (`internal/engine/reconcile.go:95`) governs orphans found at startup, never
+deletes anything, and is correct as written. What actually happened is in `prove.Client.Apply`:
+
+```go
+_, err = c.kube.BatchV1().Jobs(Namespace).Create(ctx, &job, metav1.CreateOptions{})
+if err != nil && !apierrors.IsAlreadyExists(err) {   // internal/prove/client.go:122
+```
+
+`WorkloadName(runID)` is `"prove-" + runID` (`manifest.go:37`), so a retried Apply for the same
+run creates the same name, gets `AlreadyExists`, and reports success — leaving whatever is
+already there. On the H100 cluster that was a Job carrying the *pre-fix* tolerations, so the fix
+the operator had just deployed could not reach the run they applied it to.
+
+**Apply's stated premise stopped being true, and its comment still asserts it.** The comment
+justifies the swallow with "Render's output for a given run never changes." That held when the
+manifest was fully baked into the binary. It stopped holding when Phase 4 added
+`c.extraTolerations`, appended after decode (`client.go:120-121`) from `AICRME_GPU_TOLERATIONS`
+— **process configuration, not run state.** Two Applies of the same run ID, from two processes
+configured differently, now legitimately render different Jobs, and the second one is discarded
+without a word.
+
+**The local binary makes this the normal path rather than an edge case.** Two reasons:
+
+- *The window opens more often.* `proveStep.cleanup` (`internal/steps/prove.go:282`) deletes and
+  confirms absence on every Apply and gang-placement failure, so a stale Job survives only when
+  neither cleanup nor Stop ran at all — the process died, or the cluster went away. In-cluster
+  that meant a crash. Locally it means `Ctrl-C`, which §4 has already established is an ordinary
+  way to end a session.
+- *The fix loop runs straight through it.* In-cluster, changing tolerations meant
+  `kubectl set env deploy/aicrme` and a new pod. Locally it is: stop the binary, correct the
+  environment, start it, connect, press Retry. That sequence — reconfigure, restart, retry the
+  same run — is precisely the one that reproduces Phase 4's failure, and the restructure makes
+  it the expected way to recover from a placement problem.
+
+#### Apply recreates on spec drift, and only on spec drift
+
+`prove.Client.Apply` stamps the rendered workload with a hash annotation and compares before
+deciding:
+
+- **No Job present** — create. Unchanged.
+- **Present, hash matches** — success, no write. This is the genuine idempotence the current
+  comment describes, and it is worth keeping: a retried Apply against a healthy running gang
+  must not disturb it.
+- **Present, hash differs or is absent** — `EnsureAbsent` (foreground delete plus `WaitAbsent`,
+  `internal/prove/client.go`), then create. An absent annotation means a Job from a binary that
+  predates this change, which is the exact Phase 4 shape, so it recreates rather than trusting
+  it.
+
+The hash covers the Job as *this process would create it* — `Render`'s output decoded, with
+`extraTolerations` already appended — not the live object read back. Server-side defaulting
+fills a `PodSpec` with dozens of fields the client never set, so comparing against a retrieved
+Job would report drift on every call and turn "recreate on drift" into "always recreate."
+
+Recreation reuses `EnsureAbsent` rather than a bare `Delete` for the reason that method's own
+comment gives: foreground deletion only guarantees the API server has *started* cascading, and a
+new gang placed against pods still dying is a scheduling failure that reads as a placement bug.
+
+**This does not loosen the never-delete rule.** Apply runs only inside `proveStep.Run`, on a run
+this process is executing, against a name derived from that run's own ID. A workload adopted
+from an earlier session lands `StateActive`, where `workloadAdoptedMsg` already tells the
+operator Stop is the only way to end it — Apply is not reachable on that path, and nothing here
+makes it so.
+
 ### The envelope's size ceiling is a ConfigMap artifact
 
 `maxPayload = 800 << 10` exists because "Kubernetes caps a ConfigMap at roughly 1MiB"
@@ -644,6 +728,19 @@ recovered state the pod-restart path used to produce (§4).
     startup while a live one is left alone.
   - Preflight fails closed with `bash` absent from `PATH`, and warns — does not fail — with `jq`
     absent.
+- **Prove's recreate-on-drift (§4)** is testable against the fake clientset the package already
+  uses, and each case is a distinct assertion:
+  - Apply twice with identical configuration issues exactly one `Create` and no `Delete` — the
+    idempotence that must not regress.
+  - Apply, then Apply again from a client built with different `extraTolerations`, deletes and
+    recreates, and the resulting Job carries the *new* tolerations. This is Phase 4's failure
+    written as a test, and it fails against today's code.
+  - A Job with no hash annotation is recreated — the older-binary case.
+  - Recreation waits for absence before creating: a fake whose delete is not immediately
+    visible must not produce a `Create` until `WaitAbsent` returns.
+  - The hash is computed from the rendered-and-mutated Job, not the retrieved one, so a Job
+    read back with server-defaulted `PodSpec` fields still compares equal. Without this, the
+    second bullet passes for the wrong reason and the first one silently breaks.
 - **e2e gets simpler, not harder.** `test/e2e/*.sh` currently install the chart into KWOK and wait
   on a rollout. They become: start the binary on the CI host against the KWOK cluster, drive the
   API. No image build, no `kind load`, no rollout wait. `apply-dryrun.sh`, `apply-real.sh`,
@@ -710,6 +807,22 @@ keys on the `kube-system` UID.
 write to every cluster the operator inspects. §2 moves it to Discover, which is also what the
 `prove.Client.EnsureNamespace` precedent actually does.
 
+**Always recreating Prove's workload (§4).** Simplest to implement and simplest to reason about,
+and wrong: a retried Apply against a healthy placed gang would tear it down and re-queue it, so
+the cost of the fix lands on the case that was already working.
+
+**Updating the existing Job in place instead of recreating.** Not available. A Job's
+placement-defining fields — `completions`, `parallelism`, `selector`, and the whole pod template
+— are immutable once created; `prove.Client.Apply`'s existing comment already says so, which is
+why it never issues an Update today.
+
+**Putting the spec hash in the workload name.** A changed spec would yield a different object and
+need no comparison at all. Rejected because `WorkloadName(runID)`'s determinism is load-bearing
+in six places — `matchesRun` and `adoptable` (`internal/engine/reconcile.go`), and `Delete`,
+`WaitAbsent`, `EnsureAbsent` and Stop (`internal/prove/client.go`) — all of which reconstruct the
+name from a run ID alone. Making the name depend on configuration would give the operator a Stop
+button that deletes nothing, which is the outcome `adoptable`'s own comment exists to prevent.
+
 ---
 
 ## Resolved in revision 2
@@ -737,9 +850,26 @@ write to every cluster the operator inspects. §2 moves it to Discover, which is
    with "let the operator change context before connecting" is not one: that reads as *before*,
    and it is the Connect screen's whole purpose.
 
+## Resolved in revision 4
+
+5. **Prove recreates on spec drift; it does not adopt its own stale workload.** Phase 4's open
+   decision #1, answered in §4. The other two open decisions in `docs/phase-4-status.md` are
+   dissolved rather than answered: #2 (does pinning the console to a GPU-free pool eliminate the
+   churn) stops existing, because a process on the operator's machine is not schedulable and
+   cannot be evicted by the install it is running; and #3 (does the in-cluster premise survive
+   contact with what AICR does to a cluster) is the question this whole design answers in the
+   negative.
+6. **`docs/phase-4-status.md` needs a correction, and it is not cosmetic.** It attributes the
+   stale-Job failure to "the Phase 3 adoption rule," which is `ReconcileWorkloads` — a different
+   code path, one that never deletes and is correct as written. The actual carrier is Apply's
+   `IsAlreadyExists` swallow. Left uncorrected, the next person to read that file would harden
+   the wrong function. The same file's "Branch state" section is also stale: it says
+   `phase-5-reset-shrink` is unmerged, and it merged on 2026-08-23 with ci and e2e green.
+
 ## Open questions
 
-None outstanding. Revision 3 closed the last one above.
+None outstanding. Revision 3 closed the last design question; revision 4 closed the last one
+carried in from Phase 4.
 
 **Settled:** Validate and evidence collection are **the next slice, not this one**. The original
 framing for this work listed "validate the cluster and provide option for evidence collection,"
