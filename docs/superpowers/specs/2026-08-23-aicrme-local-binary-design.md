@@ -448,9 +448,9 @@ comparable effort.
    mid-process. Restarting the binary is cheap. Recommend: no in-session switching, and the
    Connect screen is reachable only at startup — but confirm, since it slightly contradicts
    "let users change kubectl context before connecting" if read as "at any time."
-2. **Validate and evidence collection.** The original framing for this work listed "validate the
-   cluster and provide option for evidence collection" as a step. Validate was previously cut on
-   measured evidence that `ValidateState` false-passes on simulated nodes, and Phase 3 shipped
-   Prove alone. This design does not reintroduce it. If validation is meant to be part of the
-   local-binary arc, that is a separate slice and needs its own decision — it is not a
-   delivery-model question and should not be smuggled into this one.
+**Settled:** Validate and evidence collection are **the next slice, not this one**. The original
+framing for this work listed "validate the cluster and provide option for evidence collection,"
+and Validate was previously cut on measured evidence that `ValidateState` false-passes on
+simulated nodes. It gets its own design, after this lands, including its own decision about
+whether that false-pass still holds on real hardware — one of the six unmeasured Phase 4
+questions. Nothing in this spec changes as a result.
