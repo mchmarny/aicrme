@@ -1,13 +1,33 @@
 # Local binary — replacing the in-cluster console
 
 **Date:** 2026-08-23
-**Status:** Approved for planning (revision 2)
+**Status:** Approved for planning (revision 3)
 
-**Revision 2** corrects §2 and §5 against two findings from reading AICR's client and this
+**Revision 2** corrected §2 and §5 against two findings from reading AICR's client and this
 repo's own `internal/steps/ownership.go`. Revision 1 claimed §2 made every consumer agree on the
 target cluster; it enumerated two of four. It also treated helm version skew as a warning, when
-a known hard incompatibility exists at helm 4 in code this repo already ships. Open questions 1
-and 2 are resolved and folded in.
+a known hard incompatibility exists at helm 4 in code this repo already ships.
+
+**Revision 3** folds in review. Six corrections, each verified against code rather than
+accepted on description:
+
+1. §4's run key (server URL + context name) is not an identity. Both halves are mutable and
+   an endpoint can be re-pointed at a replacement cluster — §2 now establishes a real one.
+2. Nothing in this repo takes a lock of any kind (`grep -rn "flock\|LOCK_EX\|lockfile"
+   internal/` is empty), and the ConfigMap store being deleted carried the *existing*
+   multi-writer guard. §2 adds a connection state machine and a work-directory lock.
+3. A kubeconfig persisted at `<workdir>/kubeconfig` outlives the process, contradicting §2's
+   own claim about credential lifetime.
+4. Preflight checked two of the four executables the deleted image supplied.
+5. **The token in §3 cannot reach `/api/events`.** `internal/api/server.go:160` already
+   records in a comment that EventSource cannot attach custom headers, which is why safe
+   methods are exempt from the same-origin check and why `GET /api/session` exists at all.
+   Revision 2 claimed the SPA was unchanged while removing the only auth mechanism its
+   event stream can carry.
+6. Connect created a namespace, which made a read-only-looking probe mutate the cluster.
+
+Open questions 1 and 2 from revision 1, and the in-session-switching question from revision 2,
+are resolved and folded in.
 **Scope:** The delivery model only. `aicrme` stops being a Helm chart that deploys a console
 into the target cluster and becomes a binary an operator runs on their own machine, which
 serves the same SPA over loopback and drives the cluster through their kubeconfig. The arc —
@@ -43,6 +63,10 @@ A process on the operator's machine has none of these problems. The last one is 
 **The decisive question was durability**, and the answer is that it is not required: this is a
 demo and eval tool, the operator watches the run, and a run that dies with the session is
 re-run rather than resumed. That is what makes the deletions safe rather than merely relocated.
+
+That sentence is about the *process*, not the record — §4 spells out what the next launch does
+with an Apply, a Prove or a Reset that was interrupted, and the answer in all three cases is the
+behavior the engine already has today.
 
 **The prerequisite that looked like a cost is not one.** AICR's `helm` deployer already requires
 `helm` and `kubectl` on the operator's machine, for the same audience. Requiring them here is
@@ -116,17 +140,96 @@ binary that cannot reach a cluster has nothing to offer and should say so plainl
 - `GET /api/contexts` — the context names, the current one, and each one's cluster server URL.
   Reads the kubeconfig only. No cluster contact.
 - `POST /api/connect {context}` — builds the clientset, calls `ServerVersion()` under a bounded
-  context, and returns the server version and node count on success.
+  context, reads the cluster identity below, and returns the server version, node count and
+  identity on success. **It creates nothing.**
 
 Every other API route returns `409 Conflict` until a connection is established. This is a state
 gate, not an auth gate; §3 covers auth.
 
+### Connect is single-assignment, and the work directory is locked
+
+`net/http` serves every request on its own goroutine, so `POST /api/connect` is concurrent with
+itself. Connect mutates process-global state (`KUBECONFIG`, below), builds the clientset the
+observer and every step read, and selects the run directory. Two in-flight connects interleaving
+across those three is a torn connection, not a lost race — the clientset can end up pointing at
+one cluster while `KUBECONFIG` names another, which is precisely the split-brain the rest of
+this section exists to prevent.
+
+**Connection state is single-assignment.** A `sync.Mutex`-guarded state variable moves
+`disconnected → connecting → connected` and never leaves `connected`; a second `POST /api/connect`
+returns `409 Conflict` whether the first is still running or already finished. The
+already-connected case is the same status as the not-yet-connected one for the routes above, and
+it means the same thing: the request does not match the process's state. This is what makes the
+four-consumer pin below a property of the process rather than of one request handler.
+
+**A second aicrme against the same work directory is refused.** Two processes sharing
+`~/.aicrme` write the same run record, and against the same cluster they also drive the same
+install. The in-cluster console never had this problem — one Deployment, one replica, and
+`cmstore`'s `resolveDeploymentOwner` resolved an `ownerReference` so a record written by a
+*different* deployment was detected and degraded rather than overwritten. §6 deletes that file.
+**The guard it carried has to be replaced, not merely dropped**, which revision 2 missed by
+listing `cmstore.go` as a pure subtraction.
+
+The replacement is an `O_CREATE|O_EXCL` lock file at `<workdir>/lock` holding the PID, taken at
+startup and removed on clean shutdown. A stale lock — the file exists, the PID does not — is
+reported with the PID and the path, and cleared by the operator rather than automatically: a
+live second process and a crashed first one look identical from the file alone, and guessing
+wrong is the case this guard exists to prevent.
+
+This is a local-exclusion guard, not a distributed one. Two operators on two laptops installing
+into the same cluster is not something a file lock can see, and this design does not attempt to
+solve it — Apply's idempotence and AICR's own release-level behavior are what stand between that
+case and damage. What is in scope is the single-machine case, which is the one a demo tool
+actually meets.
+
+### Cluster identity is the kube-system UID
+
+Connect reads `kube-system`'s namespace UID and records it with the run. **That UID, not the
+server URL and not the context name, is this cluster's identity.**
+
+Both halves of the obvious key are mutable: a context can be renamed or re-pointed in the
+operator's kubeconfig between two runs, and an endpoint — a load balancer address, a
+`kind-aicrme` local cluster torn down and recreated — can front a completely different cluster at
+the same URL. §4 keys the run directory on identity for recovery, and Reset acts on that record
+by uninstalling releases; a key that two different clusters can collide on is a key that can
+point Reset at the wrong one.
+
+`kube-system` is created by the control plane at bootstrap, is never recreated during a
+cluster's life, and is readable by any principal that can do anything else useful here. Using a
+namespace UID as an identity is already this repo's idiom: `snapshotOwnership` records one per
+namespace for exactly this reason (`internal/steps/ownership.go:101`,
+`internal/engine/run.go:244`).
+
+**Identity is revalidated, not merely recorded.** Before recovering a run (§4) and before Reset
+acts on one, the stored UID is compared against the connected cluster's. A mismatch is refused
+with both UIDs named — it means the record describes a cluster that no longer exists at this
+address, and every release name in it is now a name in somebody else's cluster.
+
 ### The connection is frozen for the process
 
 On successful connect, a **flattened, minified, single-context kubeconfig** is written to
-`<workdir>/kubeconfig` at mode `0600`. The selected context is baked in as that file's
-`current-context`, so the file alone is a complete answer and no consumer needs a separate
-context argument.
+`<workdir>/session-<pid>/kubeconfig`, in a directory created `0700` with the file at `0600`. The
+selected context is baked in as that file's `current-context`, so the file alone is a complete
+answer and no consumer needs a separate context argument.
+
+**The file is per-launch and is deleted on shutdown**, in the same deferred cleanup that releases
+the lock file. Flattening inlines whatever the source context held — a bearer token, a client
+certificate and key, a cached OIDC id_token — so a fixed `<workdir>/kubeconfig` would leave live
+credentials on disk after the process exits, indefinitely. That flatly contradicts the promise
+this section makes further down, under *Exec credential plugins*: that the binary holds the
+operator's credentials **for as long as it runs**. A per-launch path is what makes that sentence
+true. (An exec-based context minifies to a stanza rather than a secret and is the benign case;
+a context holding a bearer token or a client key is not, and the file cannot know which it got.)
+
+Cleanup is best-effort, so startup also sweeps `session-*` directories whose PID is not live —
+the same liveness test the lock file uses, and the same reason: a `SIGKILL` leaves the file
+behind, and the next launch is the only thing that will ever come looking. A sweep that finds a
+live PID leaves it alone; that case is the second-instance refusal above, and deleting another
+process's kubeconfig mid-Apply would break a running install to tidy up.
+
+There is no reconnect path to regenerate for — the connection is single-assignment for the
+process, and switching clusters means restarting the binary, which produces a new PID and a new
+directory.
 
 **Four things in this binary independently decide which cluster they talk to.** Revision 1
 addressed two of them and asserted the property held; it does not. All four must be pinned to
@@ -175,27 +278,48 @@ get-token` and OIDC refresh are preserved as `exec` stanzas, and the child proce
 acts against the cluster with whatever credentials the operator holds, and holds them for as long
 as it runs.
 
-### The namespace must be created
+### The namespace must be created — by Discover, not by Connect
 
 `steps.NewDiscover` passes `Namespace` to AICR's snapshot Job but does not create it
 (`internal/steps/discover.go:160`). In-cluster, `helm --create-namespace` did. Locally nothing
 does, so Discover would fail on a fresh cluster.
 
-Connect ensures the namespace exists, idempotently, following the pattern
-`prove.Client.EnsureNamespace` already establishes (`internal/prove/client.go:87`).
+**Discover creates it, at the start of its own `Run`.** Revision 2 put this in Connect, which
+made a probe that reports a server version and a node count also write to the cluster — an
+operator clicking through contexts to see which one they are pointed at would leave a namespace
+behind on every cluster they looked at, including ones they never installed to.
+
+Point-of-use is also what the cited precedent actually does: `prove.Client.EnsureNamespace`
+(`internal/prove/client.go:87`) creates Prove's namespace when Prove runs, not when the process
+starts. Revision 2 cited it as a pattern for Connect and read it backwards.
+
+**Whether it pre-existed is recorded on the run, and this needs new state.** The existing
+`Ownership.Namespaces[].Existed` field cannot carry it: `recipeNamespaces` builds that set from
+recipe.json's components (`internal/steps/ownership.go:183`), and `DiscoverConfig.Namespace` is
+aicrme's own agent namespace, which is not one of them. So Discover records its own
+create-or-found result, with the namespace's UID, on the run record.
+
+**It is reported, not reclaimed.** AICR's agent deployer already cleans up the Job, the
+ServiceAccount and the RoleBinding it created (`DiscoverConfig.Cleanup` is always true); the
+namespace is what remains. If Discover created it, Reset names it in the residue as an orphan
+with the command to remove it. Adding teardown code to chase it would put aicrme in the business
+of undoing a deployer's work, which is the line this repo has already drawn: the deployer owns
+its own cleanup, and aicrme prints what is left rather than reaching for it.
 
 ---
 
 ## 3. Auth becomes a loopback token
 
-**Deleted:** `internal/api/auth.go` and its two test files, the test-only cookie jar in
-`internal/api/jar_test.go` (which exists to drive the session cookie), the
+**Deleted:** `internal/api/auth.go` and its two test files, the
 `Config.{Username,Password,SessionTTL,LoginRate,TLS}` fields and their validation in
 `api.New` (`internal/api/server.go:54`), the `AICRME_USERNAME`/`AICRME_PASSWORD`/`AICRME_TLS`
-environment surface, and `web/src/components/Login.tsx`.
+environment surface, `POST /api/login`, `POST /api/logout`, and
+`web/src/components/Login.tsx`.
 
-`jar_test.go` also defines `newRecorder()`, used elsewhere in the package's tests; it moves
-rather than dying with the jar.
+**`internal/api/jar_test.go` stays.** Revision 2 deleted it on the reasoning that it exists to
+drive the session cookie and the session cookie was going. The cookie is not going — see below —
+so the jar is still how the package's tests hold one. It also defines `newRecorder()`, used
+elsewhere in the package's tests, which was already a reason it could not simply be dropped.
 
 **Replaced by:**
 
@@ -204,17 +328,55 @@ rather than dying with the jar.
   a credential to put on a network.
 - A 32-byte random token generated per launch, delivered by opening
   `http://127.0.0.1:<port>/?t=<token>`. The SPA reads it from the query string, drops it from the
-  visible URL, holds it in memory, and sends it as a request header. Middleware compares it with
-  `crypto/subtle`.
+  visible URL, and posts it once to `POST /api/session` — which sets it as a `HttpOnly`,
+  `SameSite=Strict`, `Secure`-exempt-on-loopback session cookie scoped to the process. Every
+  later request, including the event stream, authenticates by that cookie. Middleware compares
+  with `crypto/subtle` in both places.
 - The existing same-origin wrapper (`internal/api/server.go:152`) **stays**, and so does
   `csrf_test.go`, which covers it via `Sec-Fetch-Site`. There is no `csrf.go` — that check has
   always lived in `server.go`, and it is exactly the anti-DNS-rebinding guard a loopback server
-  needs. The test changes only where it obtains a client: `loggedInClient` becomes a tokenized
-  one.
+  needs. With the cookie below it is load-bearing rather than defense in depth: it is what stops
+  a cross-origin page from riding the cookie on a mutating request. `loggedInClient` becomes a
+  tokenized one; the assertions do not move.
+- `GET /api/session` **stays** as the 204 liveness probe. Its original job — telling an expired
+  session from a network blip, because `EventSource` surfaces no HTTP status — narrows but does
+  not vanish: the cookie no longer expires, but the process it belongs to can exit, and the SPA
+  still needs to tell "server gone" from "reconnecting." `POST` to the same path establishes the
+  session; `GET` probes it.
+
+### Why a cookie and not a header
+
+A header-borne token was revision 2's design, and it does not work here. Two things break:
+
+**`GET /api/events` cannot carry it.** The SPA's timeline is a native `EventSource`
+(`web/src/useEvents.ts`), and `EventSource` has no API for request headers. This is not a new
+discovery — `internal/api/server.go:160` already documents it, as the reason safe methods are
+exempt from the same-origin check, and `GET /api/session` exists at all
+(`internal/api/server.go:132`) only because "EventSource surfaces no HTTP status on error."
+Revision 2 deleted the cookie, kept the stream, and declared the SPA unchanged. The stream would
+have 401'd on first connect.
+
+**A refresh loses the token.** Held in memory and stripped from the URL, the token does not
+survive `F5` or a restored tab — the operator would be dropped to a dead screen mid-Apply with
+the only copy of the token in a terminal they may have scrolled past. A cookie survives both.
+
+The alternatives were considered and are worse. Putting the token in the `EventSource` URL as a
+query parameter leaks a live credential into browser history, the referrer on any outbound link,
+and this repo's own request logging. Replacing `EventSource` with a `fetch`-plus-`ReadableStream`
+reader would let a header work, but it means hand-rolling the reconnect, `Last-Event-ID` replay,
+and gap-detection logic that `useEvents.ts` already implements and tests
+(`useEvents.lifecycle.test.tsx` covers reconnect, backoff and the `MAX_GAP_RECONNECT_ATTEMPTS`
+cap) — a large rewrite of working, tested code to avoid a cookie.
+
+**The cookie is not what the old auth was.** There is no password, no login form, no 8-hour
+session TTL, no rate limiter, and no `Config.SessionTTL` — the cookie carries the launch token,
+lives as long as the process, and dies with it. `internal/api/auth.go` still goes; what survives
+is one `POST /api/session` handler and one comparison. The same-origin wrapper is what keeps the
+cookie from being usable cross-origin.
 
 **Why this is not simply "no auth":** a server on `127.0.0.1` is reachable by every process on
-the machine and, via DNS rebinding, by any page the operator browses. A header-borne token that
-a cross-origin page cannot read, plus the origin check, is the Jupyter pattern and is the right
+the machine and, via DNS rebinding, by any page the operator browses. A launch token a
+cross-origin page cannot read, plus the origin check, is the Jupyter pattern and is the right
 size for the threat. It is roughly fifty lines against the several hundred being deleted.
 
 **What the README loses:** most of the Security section. `cluster-admin` stops being something
@@ -233,21 +395,32 @@ this way rather than inventing a persistence model.
 
 - Writes are temp-file-plus-`os.Rename` within the same directory, mode `0600`.
 - `internal/engine/cmstore.go` and `cmstore_test.go` are deleted, along with `newRunStore`,
-  `resolveDeploymentOwner`, `deploymentLookupTimeout`, `runStoreSuffix`, and the
-  `AICRME_DEPLOYMENT_NAME` environment variable.
+  `deploymentLookupTimeout`, `runStoreSuffix`, and the `AICRME_DEPLOYMENT_NAME` environment
+  variable. `resolveDeploymentOwner` goes with them, but **what it guarded does not** — see §2's
+  work-directory lock, and the note in §6.
 - The file store runs against the same contract tests as `memoryStore` in `store_test.go`.
 
-### Recovery is keyed by cluster
+### Recovery is keyed by cluster identity
 
-The run directory is `<workdir>/runs/<hash>/`, where `<hash>` derives from the connected
-cluster's server URL and context name.
+The run directory is `<workdir>/runs/<uid>/`, where `<uid>` is §2's `kube-system` UID.
 
-The ConfigMap got this property for free by living inside the cluster it described. A flat local
-file does not: an operator who demos cluster A, then connects to cluster B, would have B's
-console recover A's run and offer a Reset that uninstalls releases in the wrong place. Keying by
-cluster is what prevents that, and it is a new requirement created by this move.
+Revision 2 keyed this on a hash of the server URL and the context name. Neither is stable: a
+context is a label in a file the operator edits, and a server URL is an address that can be
+re-pointed at a rebuilt cluster — `kind delete cluster && kind create cluster` yields the same
+endpoint and a different cluster, which is not a corner case for a demo tool. The UID changes
+when the cluster does, which is exactly the property the key needs.
 
-### `Recover` and `ReconcileWorkloads` stay
+The ConfigMap got this for free by living inside the cluster it described. A flat local file does
+not: an operator who demos cluster A, then connects to cluster B, would have B's console recover
+A's run and offer a Reset that uninstalls releases in the wrong place. Keying by identity is what
+prevents that, and it is a new requirement created by this move.
+
+The UID is also stored *inside* the record, and revalidated before recovery and before Reset per
+§2 — the directory name says which cluster a record was filed under, and the field says which
+cluster it describes. They should never disagree; if they do, the record is refused rather than
+reconciled.
+
+### `Recover` and `ReconcileWorkloads` stay, and now run after connect
 
 The durability question in §Why was "must a run survive the operator disconnecting," and the
 answer was no. That is not the same as "no recovery is useful." The binary can still be
@@ -255,6 +428,35 @@ answer was no. That is not the same as "no recovery is useful." The binary can s
 record so the operator gets a Stop button instead of a cluster only `kubectl` can clean up. That
 workload holds GPUs. Locally this matters more, not less, because there is no pod restart to
 trigger reconciliation on the operator's behalf.
+
+**The ordering is new and has to be stated.** In-cluster, the pod restarting *was* the trigger:
+`Recover` ran during startup, before the API served anything, because the store was reachable
+from the moment the process began. Locally it is not — the store lives under a directory named
+for a cluster the process has not yet chosen. So `Recover` and `ReconcileWorkloads` move
+**into the connect path**, after identity is established and the run directory is resolved, and
+before `POST /api/connect` returns. A connect that recovers a run reports that in its response,
+which is what puts the SPA into the recovered state rather than an empty one.
+
+This makes connect the only place recovery can happen, which is a further reason the connection
+is single-assignment: a reconnect would have to re-run recovery against a different directory
+while the engine still holds the previous run.
+
+**What "re-run rather than resumed" does and does not mean.** §Why's phrase is about the
+*process*: no daemon, no resumable session, and a run whose binary died is not picked up where it
+left off. It is not a claim that the record is discarded, and the three interrupted states keep
+the semantics they already have — all three are existing, tested behavior that this change
+inherits rather than redefines:
+
+| Interrupted at | On the next connect | Where it lives today |
+|---|---|---|
+| Apply | Rewound to `PhaseBundle` and landed `StateFailed`; the operator retries from the bundle. | `recover.go:215`, `TestRecoverRewindsInterruptedRunAtApply` |
+| Prove | Run lands `StateFailed`; the orphaned workload is adopted so Stop is offered. | `reconcile.go:95` |
+| Reset | `StateResetting` lands `StateFailed` with `Residue.Incomplete` set, and Start, Retry and Discard are all withheld until another Reset establishes what is actually there. | `recover.go:260-269`, `TestRecoverTreatsAnInterruptedTeardownAsIncomplete` |
+
+The partial-Reset row is the one that most needs the identity check in §2 in front of it: a
+record that says "a teardown was in flight and I do not know what survived" is a record whose
+release names get acted on by the next Reset, and acting on them in the wrong cluster is the
+worst outcome this design can produce.
 
 ### The envelope's size ceiling is a ConfigMap artifact
 
@@ -282,14 +484,35 @@ entirely is not part of this change.
 and `kube/cache`. Those exist only because `readOnlyRootFilesystem: true` left an `emptyDir` as
 the container's one writable path. Locally, redirecting them would be actively wrong: the
 operator's real `helm` configuration may hold private chart repository credentials and registry
-auth that the install needs. What remains is `tmp`, `runs`, and `bundles`.
+auth that the install needs. What remains is `tmp`, `runs`, and `bundles`, plus the two things
+§2 adds: a `lock` file and a per-launch `session-<pid>/` directory holding the frozen kubeconfig.
+`runs/` gains one level — `runs/<kube-system-uid>/` — per §4.
 
 ### Toolchain preflight
 
-At startup, resolve `helm` and `kubectl` on `PATH` and read their versions.
+At startup, resolve **`bash`, `jq`, `helm` and `kubectl`** on `PATH` and read each version.
 
-**Missing is fatal. Minor skew is a warning. Both resolved versions are recorded in the run
-record and surfaced in the evidence bundle.**
+Revision 2 checked two of the four. The deleted image supplied all of them —
+`apk add --no-cache bash ca-certificates curl jq tar` at `Dockerfile:44` — and the comment
+directly above it names why: "the console shells out to the bundle's `deploy.sh`, which needs
+bash, helm, kubectl, and jq (the webhook preflight degrades without jq)."
+
+- **`bash` is not optional and not `sh`.** `applier.Apply` builds
+  `Argv: []string{"bash", "deploy.sh", ...}` (`internal/applier/applier.go:83`) — an explicit
+  interpreter, not a shebang, so a machine without `bash` on `PATH` fails at `exec` with a
+  message about a missing file rather than a missing shell. Relevant beyond the pedantic case:
+  `deploy.sh` is AICR-generated and this repo does not control whether it stays POSIX-clean.
+- **`jq` degrades rather than fails**, per the Dockerfile's own note, so a missing `jq` is a
+  warning naming what degrades — not a refusal.
+- `curl` and `tar` were build-time only: the Dockerfile fetches helm and kubectl with them and
+  the same `RUN` removes them. Neither is a runtime dependency and neither is preflighted.
+- CA certificates are a host property, not a `PATH` lookup. A machine with no trust store fails
+  at the first HTTPS call with a clear TLS error, and preflighting it would mean guessing at
+  platform-specific paths for a case the error already explains.
+
+**Missing is fatal for `bash`, `helm` and `kubectl`; missing `jq` is a warning. Minor version
+skew is a warning. Every resolved version is recorded in the run record and surfaced in the
+evidence bundle.**
 
 Refusing to start because an operator has helm 3.20 rather than the 3.19.0 the deleted Dockerfile
 pinned would make the tool unusable for the reproducibility it was meant to protect. For a
@@ -329,8 +552,8 @@ guarantee.
 | `charts/aicrme/` (10 files) | The delivery model being replaced. |
 | `test/chart/contract.sh`, `make test-chart` | Pins Go constants against chart probe windows that no longer exist. |
 | `Dockerfile`, `.dockerignore`, `make image` | No image. **But it carried the helm 3.19.0 pin that `helm list --all` depends on — see §5.** Deleting it is not purely subtractive. |
-| `internal/api/auth.go`, `auth_test.go`, `auth_internal_test.go`, `jar_test.go` | §3. `csrf_test.go` is **kept** — it covers the same-origin check, which survives. |
-| `internal/engine/cmstore.go`, `cmstore_test.go` | §4. |
+| `internal/api/auth.go`, `auth_test.go`, `auth_internal_test.go` | §3. `csrf_test.go` and `jar_test.go` are both **kept** — the same-origin check survives, and so does the cookie the jar exists to hold. |
+| `internal/engine/cmstore.go`, `cmstore_test.go` | §4. **But it carried `resolveDeploymentOwner`, the only multi-writer guard this repo has ever had — see below.** Deleting it is not purely subtractive. |
 | `web/src/components/Login.tsx` | §3. |
 | `scripts/demo-remote.sh` | Its whole job is `helm upgrade --install` of the chart onto a remote cluster. Replaced by "point kubectl at the cluster and run the binary." |
 
@@ -345,31 +568,82 @@ chart that no longer exists.
 group, so a `Ctrl-C` delivered to the terminal's foreground group does not reach `helm`
 directly. The existing `Drain` → `CancelAndWait` path remains the only thing that stops a run.
 
+### One deletion carries a guard with it
+
+`cmstore.resolveDeploymentOwner` resolved the console Deployment's `ownerReference` and stamped
+it on the run ConfigMap, so a record written by a *different* deployment was recognized as
+foreign and degraded rather than silently overwritten —
+`TestRecoverDegradesAgainstAForeignOwnedRecord` is that behavior. It is the only multi-writer
+protection in the repo today; `grep -rn "flock\|LOCK_EX\|singleflight\|lockfile" internal/`
+returns nothing.
+
+Deleting `cmstore.go` deletes it, and the local model makes the case it defended *more* likely,
+not less: an operator can start a second `aicrme` from a second terminal in one keystroke,
+whereas starting a second console Deployment took a deliberate `helm install` under a new
+release name. §2's work-directory lock is the replacement, and it must land in the same change
+as this deletion rather than after it.
+
+Note also that the shutdown path acquires two new obligations from §2 — releasing
+`<workdir>/lock` and removing `<workdir>/session-<pid>/` — and both must survive the same
+`Ctrl-C` the drain sequence already handles. Neither can be a bare `defer` in `main()`: the
+signal handler is what runs first.
+
 ---
 
 ## 7. SPA
 
 `App.tsx:21` gates the console on `authed` and renders `<Login>` otherwise. That becomes a
 `<Connect>` screen: list contexts, let the operator pick one, show the resolved server URL, and
-connect. On success it reports server version, node count, and the resolved `helm`/`kubectl`
-versions from §5 — which is also the operator's confirmation that they are about to install into
-the cluster they think they are.
+connect. On success it reports server version, node count, the `kube-system` UID from §2, and the
+resolved `bash`/`jq`/`helm`/`kubectl` versions from §5 — which is also the operator's
+confirmation that they are about to install into the cluster they think they are.
+
+**Bootstrap gains one step before any of that.** On load, `App.tsx` reads `?t=` from the URL,
+`POST`s it to `/api/session`, and strips it from the visible URL with `history.replaceState`. If
+there is no `?t=` — a refresh, a restored tab, a URL the operator retyped — it skips straight to
+probing `GET /api/session`, because the cookie from the original load is still there. That is the
+case revision 2's in-memory token could not serve.
+
+`useEvents.ts` is **unchanged**, and that is the point of §3's cookie: the `EventSource`
+constructor sends cookies to a same-origin URL with no configuration, so the reconnect,
+`Last-Event-ID` replay and gap-detection logic — and
+`useEvents.lifecycle.test.tsx`'s coverage of all three — carry over untouched.
 
 Every other component — `Wizard`, `Discover`, `Recommend`, `Cockpit`, `Prove`, `Reset`,
 `Timeline`, `ComponentConditions` — is unchanged. The arc the product performs is not what this
 design is changing.
 
-The API client gains the token header from §3 and a 409 handler that returns the operator to the
-Connect screen, replacing the existing 401-to-Login path.
+The API client gains a 409 handler that returns the operator to the Connect screen, replacing the
+existing 401-to-Login path. A recovered run in the connect response lands the SPA in the same
+recovered state the pod-restart path used to produce (§4).
 
 ---
 
 ## 8. Testing
 
 - **`FileStore`** runs against the same contract tests `memoryStore` does in `store_test.go`.
-  Additional cases for the atomic-rename path and for cluster-keyed directory isolation.
+  Additional cases for the atomic-rename path and for identity-keyed directory isolation.
 - **`internal/console`** becomes testable for the first time: `Run` against a fake clientset and
-  a temp work dir, asserting the connect gate, the written kubeconfig, and namespace creation.
+  a temp work dir, asserting the connect gate, the written kubeconfig, and that connect creates
+  no namespace.
+- **The corrections in revision 3 each get a test**, because every one of them is a case that
+  looked handled and was not:
+  - Concurrent `POST /api/connect` — the second returns 409, and exactly one clientset and one
+    `KUBECONFIG` value result. Run under `-race`.
+  - A second process against a locked work directory refuses; a lock whose PID is dead reports
+    the stale path rather than clearing it.
+  - Recovery against a changed `kube-system` UID at the same server URL is refused, and Reset
+    against that record is refused, with both UIDs in the message. This is the
+    rebuilt-`kind`-cluster case and is cheap to construct in e2e.
+  - The session cookie reaches `GET /api/events`: an `EventSource`-shaped request carrying only
+    the cookie streams, and one carrying nothing gets 401. `csrf_test.go`'s existing
+    `TestEventsUnaffectedByCSRFMiddleware` is the shape to follow.
+  - A reload with no `?t=` in the URL still authenticates — the regression revision 2's design
+    would have shipped.
+  - `session-<pid>/` is gone after clean shutdown, and a stale one from a dead PID is swept at
+    startup while a live one is left alone.
+  - Preflight fails closed with `bash` absent from `PATH`, and warns — does not fail — with `jq`
+    absent.
 - **e2e gets simpler, not harder.** `test/e2e/*.sh` currently install the chart into KWOK and wait
   on a rollout. They become: start the binary on the CI host against the KWOK cluster, drive the
   API. No image build, no `kind load`, no rollout wait. `apply-dryrun.sh`, `apply-real.sh`,
@@ -423,6 +697,19 @@ a generated script to accept and correctly spell a context flag, and leaves an i
 exposed to an ambient `kubectl config use-context`. §2's written file is strictly safer for
 comparable effort.
 
+**A header-borne token instead of a cookie (revision 2's design).** `EventSource` cannot set
+request headers, so the timeline would not authenticate; keeping it would mean replacing
+`useEvents.ts` with a hand-rolled `fetch`/`ReadableStream` reader and reimplementing its
+reconnect, replay and gap handling. A header token also does not survive a page refresh. See §3.
+
+**Keying the run directory on server URL plus context name (revision 2's design).** Both are
+mutable and neither identifies a cluster; `kind delete && kind create` reuses the endpoint. §4
+keys on the `kube-system` UID.
+
+**Ensuring the Discover namespace at connect (revision 2's design).** Makes a read-shaped probe
+write to every cluster the operator inspects. §2 moves it to Discover, which is also what the
+`prove.Client.EnsureNamespace` precedent actually does.
+
 ---
 
 ## Resolved in revision 2
@@ -440,14 +727,20 @@ comparable effort.
    unconditionally, whether or not the open succeeds and whether or not `--open` was passed, so a
    headless or SSH session is never a dead end.
 
+## Resolved in revision 3
+
+4. **No in-session cluster switching.** Confirmed on review. The Connect screen is reachable only
+   before a connection is established; switching clusters means restarting the binary. This is
+   what makes the rest of revision 3 tractable — the four-consumer pin, the single-assignment
+   connection state, the per-PID kubeconfig directory, and recovery running inside the connect
+   path all depend on the connection being decided exactly once per process. The apparent tension
+   with "let the operator change context before connecting" is not one: that reads as *before*,
+   and it is the Connect screen's whole purpose.
+
 ## Open questions
 
-1. **Does the console allow switching clusters without a restart?** §2 freezes the connection for
-   the process, which is what makes the four-consumer pin in that section tractable. A
-   disconnect-and-reconnect flow would have to re-derive all four, and re-key the run directory
-   mid-process. Restarting the binary is cheap. Recommend: no in-session switching, and the
-   Connect screen is reachable only at startup — but confirm, since it slightly contradicts
-   "let users change kubectl context before connecting" if read as "at any time."
+None outstanding. Revision 3 closed the last one above.
+
 **Settled:** Validate and evidence collection are **the next slice, not this one**. The original
 framing for this work listed "validate the cluster and provide option for evidence collection,"
 and Validate was previously cut on measured evidence that `ValidateState` false-passes on
