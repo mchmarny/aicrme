@@ -18,6 +18,11 @@ import (
 // handles the base64 transport encoding itself.
 const payloadKey = "run"
 
+// cmPayloadCeiling bounds a record stored in a ConfigMap. Kubernetes caps a
+// ConfigMap at roughly 1 MiB; this leaves headroom for the object's own
+// metadata. Deleted with this file in the local-binary restructure.
+const cmPayloadCeiling = 800 << 10
+
 // maxConflictRetries bounds optimistic-concurrency retries. The chart sets
 // strategy: Recreate so overlapping writers should not exist; this is the
 // belt to that braces, and it is bounded because an unbounded retry against a
@@ -126,7 +131,7 @@ func NewConfigMapStore(client kubernetes.Interface, namespace, name string, owne
 // is bounded so a genuinely contended object fails loudly instead of
 // spinning forever.
 func (s *configMapStore) Save(ctx context.Context, r *Run) error {
-	blob, err := encodeRun(r)
+	blob, err := encodeRun(r, cmPayloadCeiling)
 	if err != nil {
 		return err
 	}
@@ -261,7 +266,7 @@ func (s *configMapStore) loadCurrent(ctx context.Context) (*Run, error) {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
 			"run checkpoint is missing its payload key")
 	}
-	r, err := decodeRun(blob)
+	r, err := decodeRun(blob, cmPayloadCeiling)
 	if err != nil {
 		return nil, err
 	}
