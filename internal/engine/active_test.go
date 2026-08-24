@@ -487,9 +487,6 @@ func assertFailedStopLeavesRunActive(t *testing.T, e *Engine, runID string) {
 func TestFailedStopLeavesRunActive(t *testing.T) {
 	const runID = "run-stop-wait-fails"
 	cs := fake.NewSimpleClientset()
-	cs.PrependReactor("get", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("get refused")
-	})
 	e, client := newStopTestEngine(t, runID, cs)
 	ctx := context.Background()
 	if err := client.EnsureNamespace(ctx); err != nil {
@@ -498,6 +495,12 @@ func TestFailedStopLeavesRunActive(t *testing.T) {
 	if err := client.Apply(ctx, runID); err != nil {
 		t.Fatalf("Apply() error = %v", err)
 	}
+	// Installed after Apply, not before: Apply itself now issues a Get to
+	// check for spec drift, and this reactor exists to fail WaitAbsent's poll
+	// during the Stop under test below, not that unrelated setup call.
+	cs.PrependReactor("get", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("get refused")
+	})
 	run := startAndWait(t, e)
 
 	assertFailedStopLeavesRunActive(t, e, run.ID)
