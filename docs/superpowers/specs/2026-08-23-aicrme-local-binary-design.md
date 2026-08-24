@@ -1,7 +1,13 @@
 # Local binary — replacing the in-cluster console
 
 **Date:** 2026-08-23
-**Status:** Approved for planning
+**Status:** Approved for planning (revision 2)
+
+**Revision 2** corrects §2 and §5 against two findings from reading AICR's client and this
+repo's own `internal/steps/ownership.go`. Revision 1 claimed §2 made every consumer agree on the
+target cluster; it enumerated two of four. It also treated helm version skew as a warning, when
+a known hard incompatibility exists at helm 4 in code this repo already ships. Open questions 1
+and 2 are resolved and folded in.
 **Scope:** The delivery model only. `aicrme` stops being a Helm chart that deploys a console
 into the target cluster and becomes a binary an operator runs on their own machine, which
 serves the same SPA over loopback and drives the cluster through their kubeconfig. The arc —
@@ -118,17 +124,43 @@ gate, not an auth gate; §3 covers auth.
 ### The connection is frozen for the process
 
 On successful connect, a **flattened, minified, single-context kubeconfig** is written to
-`<workdir>/kubeconfig` at mode `0600`, and both of these are added to `applier.env()`:
+`<workdir>/kubeconfig` at mode `0600`. The selected context is baked in as that file's
+`current-context`, so the file alone is a complete answer and no consumer needs a separate
+context argument.
 
-```
-KUBECONFIG=<workdir>/kubeconfig
-KUBECONFIG_FLAG=--kubeconfig <workdir>/kubeconfig
-```
+**Four things in this binary independently decide which cluster they talk to.** Revision 1
+addressed two of them and asserted the property held; it does not. All four must be pinned to
+that file:
 
-`KUBECONFIG_FLAG` is the variable `deploy.sh` already consumes (it is exported empty today,
-`internal/applier/applier.go:122`); the exported `KUBECONFIG` covers anything `deploy.sh` invokes
-without threading the flag through. Both, because either alone leaves a gap and neither costs
-anything.
+| Consumer | How it resolves today | What pins it |
+|---|---|---|
+| client-go clientset — observer, prove, teardown | `rest.InClusterConfig()` | The `rest.Config` built from the selected context (§2 above). |
+| `deploy.sh` → `install.sh` → helm/kubectl | ServiceAccount token in-pod | `KUBECONFIG` and `KUBECONFIG_FLAG` in `applier.env()`. |
+| **AICR's client, `CollectSnapshot`** | **its own resolution — `KUBECONFIG`, else `~/.kube/config`, else in-cluster** | **`AgentConfig.Kubeconfig`**, threaded from a new `DiscoverConfig.Kubeconfig`. |
+| **`steps.helmLister`, the pre-Apply ownership snapshot** | **inherits `os.Environ()`; sets no `Env` at all** | **`KUBECONFIG` in the aicrme process itself.** |
+
+The third is the dangerous one. AICR resolves its own kubeconfig path
+(`pkg/k8s/client/client.go`), and `AgentConfig.Kubeconfig` is documented as "the path (or empty
+for in-cluster)" (`pkg/client/v1/aicr.go:1395`, field at `types.go:124`). `DiscoverConfig` does
+not set it today, and empty is exactly right in a pod. Locally, empty means Discover snapshots
+whatever `~/.kube/config` currently points at while Apply installs into the selected context —
+a silent split-brain that produces a recipe for one cluster and installs it into another.
+
+The fourth is why the pin cannot live in `applier.env()` alone: `helmLister.List` builds an
+`applier.Spec` with `Argv` and no `Env` (`internal/steps/ownership.go:149`), inheriting the
+parent's environment. Its result is what `Run.Ownership` is built from, so a lister pointed at
+the wrong cluster makes Reset's ownership record wrong.
+
+**Therefore connect sets `KUBECONFIG` in the aicrme process itself**, once, before any cluster
+work begins — which covers consumers two, three and four by the mechanism each already uses —
+**and additionally sets `AgentConfig.Kubeconfig` explicitly**, because that seam has a real field
+and relying on ambient environment for the one call that decides the recipe is not worth the
+economy. Process-global mutation is ugly; it is also precisely how these libraries expect to be
+told, and the alternative is threading a path through four call chains to reach code that will
+read the environment variable anyway.
+
+`KUBECONFIG_FLAG` is the variable `deploy.sh` already consumes (exported empty today,
+`internal/applier/applier.go:122`).
 
 **Why a written file rather than passing `--context`:** it removes the question of whether every
 tool in the chain supports a context flag and spells it the same way (`helm --kube-context`,
@@ -256,8 +288,8 @@ auth that the install needs. What remains is `tmp`, `runs`, and `bundles`.
 
 At startup, resolve `helm` and `kubectl` on `PATH` and read their versions.
 
-**Missing is fatal. Skew is a warning. Both resolved versions are recorded in the run record and
-surfaced in the evidence bundle.**
+**Missing is fatal. Minor skew is a warning. Both resolved versions are recorded in the run
+record and surfaced in the evidence bundle.**
 
 Refusing to start because an operator has helm 3.20 rather than the 3.19.0 the deleted Dockerfile
 pinned would make the tool unusable for the reproducibility it was meant to protect. For a
@@ -265,6 +297,28 @@ product whose output is evidence, the honest way to serve "correctness must be r
 to *record* the toolchain that produced the result, not to block on it. A run's evidence should
 be able to answer "which helm installed this," and today — where the version is baked into an
 image — nothing ever asks.
+
+### Helm 4 is not skew, and deleting the Dockerfile is what exposes it
+
+`steps.helmLister.List` runs `helm list --all`. Its own comment records that **helm 4 removed
+`--all`**, failing with `Error: unknown flag: --all`, and that this is survivable today only
+because "this binary pins helm 3.19.0 (Dockerfile's ARG)"
+(`internal/steps/ownership.go:134-142`). The same comment notes that `test/e2e/reset.sh` already
+met a host whose helm "was already 4.x."
+
+Deleting the Dockerfile deletes that pin, and hands version selection to an operator who is
+statistically likely to be on helm 4 by now. The failure would land on the pre-Apply ownership
+snapshot — the thing `Run.Ownership` is built from, and therefore the thing Reset trusts to know
+what it created. A generic "version skew" warning does not cover a flag that does not exist.
+
+**`helmLister` must detect the major version and omit `--all` on helm 4**, where the comment
+records it is the default behavior anyway. Until that lands, **preflight fails closed on helm ≥ 4
+with the flag named in the error**, rather than letting a run reach Apply and fail at the one
+step whose output Reset depends on.
+
+This is the single largest piece of real work created by deleting the Dockerfile, and revision 1
+missed it by treating the pin as packaging rather than as a load-bearing compatibility
+guarantee.
 
 ---
 
@@ -274,7 +328,7 @@ image — nothing ever asks.
 |---|---|
 | `charts/aicrme/` (10 files) | The delivery model being replaced. |
 | `test/chart/contract.sh`, `make test-chart` | Pins Go constants against chart probe windows that no longer exist. |
-| `Dockerfile`, `.dockerignore`, `make image` | No image. Confirmed: nothing else needs one. |
+| `Dockerfile`, `.dockerignore`, `make image` | No image. **But it carried the helm 3.19.0 pin that `helm list --all` depends on — see §5.** Deleting it is not purely subtractive. |
 | `internal/api/auth.go`, `auth_test.go`, `auth_internal_test.go`, `jar_test.go` | §3. `csrf_test.go` is **kept** — it covers the same-origin check, which survives. |
 | `internal/engine/cmstore.go`, `cmstore_test.go` | §4. |
 | `web/src/components/Login.tsx` | §3. |
@@ -371,16 +425,32 @@ comparable effort.
 
 ---
 
+## Resolved in revision 2
+
+1. **`~/.aicrme` versus XDG — `~/.aicrme` stands.** AICR establishes no per-user config or state
+   directory to match. Its only home-rooted paths are the standard `~/.kube/config` default
+   (`pkg/k8s/client/client.go`) and `.claude/skills/…` for skill generation; it is otherwise a
+   stateless CLI over files the caller names. There is no convention to diverge from, so this
+   carries no rename risk at upstreaming time.
+2. **`maxPayload` becomes a plain parameter, not a store field.** `encodeRun` has exactly one
+   caller (`cmstore.go:129`) and `decodeRun` one (`cmstore.go:264`); both die with that file, and
+   the file store becomes the sole caller of each. So the ceiling passes as an argument, with no
+   store indirection and no constructor-parameter fallback needed.
+3. **Browser-open failure — always print the URL.** The tokenized URL is written to stdout
+   unconditionally, whether or not the open succeeds and whether or not `--open` was passed, so a
+   headless or SSH session is never a dead end.
+
 ## Open questions
 
-1. **`~/.aicrme` versus XDG.** This design picks `~/.aicrme` for symmetry with how most
-   single-binary cluster tools behave. If AICR's CLI already establishes a config-directory
-   convention, match that instead — worth checking before implementation rather than diverging
-   from the project this may be donated to.
-2. **`maxPayload` as a store field.** §4 asserts the ceiling belongs to the store. If `encodeRun`
-   turns out to be called from a path with no store in hand, it becomes a constructor parameter
-   on the envelope encoder instead. Resolvable during implementation; it does not change the
-   design.
-3. **Browser-open failure.** Headless CI and SSH sessions have no browser. `--no-open` covers it,
-   but the default path should print the tokenized URL unconditionally so a failed open is never
-   a dead end.
+1. **Does the console allow switching clusters without a restart?** §2 freezes the connection for
+   the process, which is what makes the four-consumer pin in that section tractable. A
+   disconnect-and-reconnect flow would have to re-derive all four, and re-key the run directory
+   mid-process. Restarting the binary is cheap. Recommend: no in-session switching, and the
+   Connect screen is reachable only at startup — but confirm, since it slightly contradicts
+   "let users change kubectl context before connecting" if read as "at any time."
+2. **Validate and evidence collection.** The original framing for this work listed "validate the
+   cluster and provide option for evidence collection" as a step. Validate was previously cut on
+   measured evidence that `ValidateState` false-passes on simulated nodes, and Phase 3 shipped
+   Prove alone. This design does not reintroduce it. If validation is meant to be part of the
+   local-binary arc, that is a separate slice and needs its own decision — it is not a
+   delivery-model question and should not be smuggled into this one.
