@@ -1,7 +1,7 @@
 # Local binary — replacing the in-cluster console
 
 **Date:** 2026-08-23
-**Status:** Approved for planning (revision 4)
+**Status:** Approved for planning (revision 5)
 
 **Revision 2** corrected §2 and §5 against two findings from reading AICR's client and this
 repo's own `internal/steps/ownership.go`. Revision 1 claimed §2 made every consumer agree on the
@@ -28,6 +28,15 @@ accepted on description:
 
 Open questions 1 and 2 from revision 1, and the in-session-switching question from revision 2,
 are resolved and folded in.
+
+**Revision 5** was written while decomposing this spec into tasks, which is where a phantom one
+surfaced. §5's "Helm 4 is not skew" — revision 2's "single largest piece of real work created by
+deleting the Dockerfile" — described a defect that commit `e36b015` had already fixed before this
+spec existed. Revision 2 read a comment explaining *why the code avoids `--all`* as a description
+of code that uses it. The section is withdrawn and replaced with what is actually left, which is
+a test obligation rather than a code change. §8's e2e claim is corrected in the same pass: two
+assertions cannot survive the image's deletion, contrary to "keep their assertions and change
+only how the console is started."
 
 **Revision 4** absorbs Phase 4's open decision #1 — whether Prove adopts or recreates a workload
 whose spec has changed — which was the only one of that phase's three open decisions the move to
@@ -605,27 +614,44 @@ to *record* the toolchain that produced the result, not to block on it. A run's 
 be able to answer "which helm installed this," and today — where the version is baked into an
 image — nothing ever asks.
 
-### Helm 4 is not skew, and deleting the Dockerfile is what exposes it
+### Helm 4 — revision 2 was wrong, and it is already handled
 
-`steps.helmLister.List` runs `helm list --all`. Its own comment records that **helm 4 removed
-`--all`**, failing with `Error: unknown flag: --all`, and that this is survivable today only
-because "this binary pins helm 3.19.0 (Dockerfile's ARG)"
-(`internal/steps/ownership.go:134-142`). The same comment notes that `test/e2e/reset.sh` already
-met a host whose helm "was already 4.x."
+**Revision 2 called this "the single largest piece of real work created by deleting the
+Dockerfile." It is zero work.** Revision 5 withdraws the claim.
 
-Deleting the Dockerfile deletes that pin, and hands version selection to an operator who is
-statistically likely to be on helm 4 by now. The failure would land on the pre-Apply ownership
-snapshot — the thing `Run.Ownership` is built from, and therefore the thing Reset trusts to know
-what it created. A generic "version skew" warning does not cover a flag that does not exist.
+Revision 2 asserted that `steps.helmLister.List` runs `helm list --all` and would break under
+helm 4. It does not run `--all`, and has not since commit `e36b015`, *"fix(steps): list helm
+releases in a way both helm majors accept"* — which predates this spec. The current argv is
+explicit status flags (`internal/steps/ownership.go:151-153`):
 
-**`helmLister` must detect the major version and omit `--all` on helm 4**, where the comment
-records it is the default behavior anyway. Until that lands, **preflight fails closed on helm ≥ 4
-with the flag named in the error**, rather than letting a run reach Apply and fail at the one
-step whose output Reset depends on.
+```go
+"helm", "list", "--namespace", namespace,
+"--deployed", "--failed", "--pending", "--superseded", "--uninstalled", "--uninstalling",
+"--short",
+```
 
-This is the single largest piece of real work created by deleting the Dockerfile, and revision 1
-missed it by treating the pin as packaging rather than as a load-bearing compatibility
-guarantee.
+The comment above it does discuss `--all` and helm 4 at length, which is what revision 2 read.
+It is explaining **why the code avoids `--all`**, not describing what the code does. Reading a
+comment as a description of present behavior when it is a rationale for past behavior is the
+error here, and it is worth naming because the same comment is still in the file and will read
+the same way to the next person.
+
+**What remains true:** the Dockerfile's helm 3.19.0 pin does disappear, and version selection
+does move to the operator. What that now costs is bounded and different:
+
+- The two version-sensitive helm surfaces are `helm list`'s status flags above and
+  `helm uninstall --ignore-not-found --wait --timeout` (`internal/teardown/teardown.go:132-139`).
+  Both are believed valid in helm 3 and 4. **That is reasoning, not a tested claim** — no run
+  against a helm 4 host has exercised the teardown path.
+- So preflight **records** the helm version, per the policy above, and does not fail closed on
+  major 4. Blocking on a major that the code was deliberately made compatible with would be
+  the reproducibility-over-usability trade this section already rejects.
+- The one concrete obligation this creates is a test: exercise `helmLister.List` and
+  `uninstallArgv` against a helm 4 binary before the first release. §8 carries it.
+
+`test/e2e/apply-dryrun.sh:134-148` asserts the in-image helm major matches the Dockerfile's
+`HELM_VERSION`. That block has no meaning without an image and is deleted rather than ported —
+see §8, which revision 2 also overstated.
 
 ---
 
@@ -635,7 +661,7 @@ guarantee.
 |---|---|
 | `charts/aicrme/` (10 files) | The delivery model being replaced. |
 | `test/chart/contract.sh`, `make test-chart` | Pins Go constants against chart probe windows that no longer exist. |
-| `Dockerfile`, `.dockerignore`, `make image` | No image. **But it carried the helm 3.19.0 pin that `helm list --all` depends on — see §5.** Deleting it is not purely subtractive. |
+| `Dockerfile`, `.dockerignore`, `make image` | No image. It carried the helm 3.19.0 pin, but nothing in this repo depends on helm 3 any more — §5 withdraws revision 2's claim that it does. What goes with it is `apply-dryrun.sh`'s in-image version assertion (§8). |
 | `internal/api/auth.go`, `auth_test.go`, `auth_internal_test.go` | §3. `csrf_test.go` and `jar_test.go` are both **kept** — the same-origin check survives, and so does the cookie the jar exists to hold. |
 | `internal/engine/cmstore.go`, `cmstore_test.go` | §4. **But it carried `resolveDeploymentOwner`, the only multi-writer guard this repo has ever had — see below.** Deleting it is not purely subtractive. |
 | `web/src/components/Login.tsx` | §3. |
@@ -741,11 +767,27 @@ recovered state the pod-restart path used to produce (§4).
   - The hash is computed from the rendered-and-mutated Job, not the retrieved one, so a Job
     read back with server-defaulted `PodSpec` fields still compares equal. Without this, the
     second bullet passes for the wrong reason and the first one silently breaks.
-- **e2e gets simpler, not harder.** `test/e2e/*.sh` currently install the chart into KWOK and wait
-  on a rollout. They become: start the binary on the CI host against the KWOK cluster, drive the
-  API. No image build, no `kind load`, no rollout wait. `apply-dryrun.sh`, `apply-real.sh`,
-  `discover-recommend.sh`, `prove.sh`, `reset.sh` and `smoke.sh` keep their assertions and change
-  only how the console is started.
+- **e2e gets simpler, but not for free.** `test/e2e/*.sh` currently install the chart into KWOK
+  and wait on a rollout. They become: start the binary on the CI host against the KWOK cluster,
+  drive the API. No image build, no `kind load`, no rollout wait. `apply-dryrun.sh`,
+  `apply-real.sh`, `discover-recommend.sh`, `prove.sh`, `reset.sh` and `smoke.sh` keep their
+  *subject-matter* assertions and change how the console is started — with two exceptions
+  revision 2 missed by claiming they change "only" that:
+  - `apply-dryrun.sh:134-148` asserts the in-image helm major against the Dockerfile's
+    `HELM_VERSION`, reading both through `kubectl exec deploy/aicrme`. There is no image, no
+    Deployment and no Dockerfile to compare against; the block is deleted. The property it
+    protected — knowing which helm produced a result — is served better by §5's recorded
+    versions, which travel in the evidence bundle instead of in a CI log.
+  - Every script reaches the console through `kubectl -n aicrme exec deploy/aicrme` or a
+    `Service`. All of that becomes a local address, and each script needs the launch token from
+    §3 to call the API at all. A shared helper that starts the binary, captures the printed
+    tokenized URL, and exports a curl-usable cookie jar is the one new piece of e2e
+    infrastructure this change requires.
+- **A helm 4 host must be exercised before the first release.** §5 withdraws revision 2's claim
+  that `helm list --all` breaks — the code already avoids it — but `helm list`'s status flags and
+  `helm uninstall --ignore-not-found --wait --timeout` are compatible by reasoning and have never
+  run against helm 4 in this repo. One CI job on a helm 4 host covering `helmLister.List` and a
+  Reset is what converts that into evidence.
 - **`make qualify`** drops `test-chart`; everything else holds, including the 80% coverage floor
   and `check-aicr-pin`.
 - **`make demo` / `demo-down` / `demo-status`** are reworked: the Kind + KWOK cluster setup stays,
@@ -866,10 +908,19 @@ button that deletes nothing, which is the outcome `adoptable`'s own comment exis
    the wrong function. The same file's "Branch state" section is also stale: it says
    `phase-5-reset-shrink` is unmerged, and it merged on 2026-08-23 with ci and e2e green.
 
+## Resolved in revision 5
+
+7. **Helm 4 needs no code change.** `helmLister.List` already uses per-status flags rather than
+   `--all` (`e36b015`). Preflight records the version and does not fail closed on major 4. The
+   residue is a test obligation in §8, not an implementation task.
+8. **Two e2e assertions do not survive the image**, contrary to §8's original wording. The
+   in-image helm-major check is deleted; every script's console access needs a local-address and
+   launch-token helper.
+
 ## Open questions
 
-None outstanding. Revision 3 closed the last design question; revision 4 closed the last one
-carried in from Phase 4.
+None outstanding. Revision 3 closed the last design question, revision 4 the last one carried in
+from Phase 4, and revision 5 removed one that was never real.
 
 **Settled:** Validate and evidence collection are **the next slice, not this one**. The original
 framing for this work listed "validate the cluster and provide option for evidence collection,"
