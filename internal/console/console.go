@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -392,6 +393,19 @@ func Run(ctx context.Context, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Refused before anything else happens, and before a socket is bound: the
+	// console drives a cluster with the operator's own credentials, so an
+	// --addr reachable from off this machine is a mistake worth failing on
+	// rather than warning about.
+	if err := requireLoopback(ctx, opts.Addr); err != nil {
+		return err
+	}
+
+	token, err := newLaunchToken()
+	if err != nil {
+		return err
+	}
+
 	workDir := opts.WorkDir
 	releaseWorkDir, err := prepareWorkDir(workDir)
 	if err != nil {
@@ -534,14 +548,10 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	srv, err := api.New(api.Config{
-		Username:   envOr("AICRME_USERNAME", "admin"),
-		Password:   os.Getenv("AICRME_PASSWORD"),
-		SessionTTL: 8 * time.Hour,
-		LoginRate:  10,
-		TLS:        os.Getenv("AICRME_TLS") == "true",
-		AICR:       client,
-		WorkDir:    workDir,
-		Cluster:    clusterGate{conn},
+		Token:   token,
+		AICR:    client,
+		WorkDir: workDir,
+		Cluster: clusterGate{conn},
 	}, b, eng, static)
 	if err != nil {
 		return fmt.Errorf("server configuration invalid: %w", err)
@@ -562,8 +572,8 @@ func Run(ctx context.Context, opts Options) error {
 	// exists purely so this can log that, per Ruling 4 -- Recover already
 	// performed the only corrective action available (swapping to a fresh
 	// memory store) by the time this returns.
-	if err := eng.Recover(ctx); err != nil {
-		return fmt.Errorf("engine step configuration cannot be recovered against: %w", err)
+	if recoverErr := eng.Recover(ctx); recoverErr != nil {
+		return fmt.Errorf("engine step configuration cannot be recovered against: %w", recoverErr)
 	}
 	if eng.StoreUnreadable() {
 		slog.Warn("persisted run checkpoint was unreadable or failed validation; starting without it")
@@ -583,9 +593,9 @@ func Run(ctx context.Context, opts Options) error {
 	// worth refusing to start over. The call itself is bounded (one List) and
 	// deliberately decides nothing when that List fails -- see its own doc
 	// comment for why a failed list must not be read as "gone".
-	if err := eng.ReconcileWorkloads(ctx, proveClient); err != nil {
+	if reconcileErr := eng.ReconcileWorkloads(ctx, proveClient); reconcileErr != nil {
 		slog.Warn("could not reconcile reference workloads left in the cluster; one may still be running untracked",
-			"error", err)
+			"error", reconcileErr)
 	}
 
 	// Started in a goroutine, not called inline: Start ends by blocking on
@@ -619,24 +629,21 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 
-	httpSrv := &http.Server{
-		Addr:              opts.Addr,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		// No WriteTimeout: SSE streams are long-lived by design.
+	httpSrv, err := startServer(ctx, opts, srv.Handler(), token, cancel)
+	if err != nil {
+		return err
 	}
-
-	go func() {
-		slog.Info("listening", "addr", opts.Addr)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server failed", "error", err)
-			cancel()
-		}
-	}()
 
 	<-ctx.Done()
 	slog.Info("shutting down")
+	shutdown(ctx, srv, httpSrv, eng, &sess)
+	return nil
+}
 
+// shutdown ends the console in the one order that does not damage anything:
+// refuse new work, drain the HTTP surface and the engine concurrently, and
+// only then remove the credentials both were still using.
+func shutdown(ctx context.Context, srv *api.Server, httpSrv *http.Server, eng *engine.Engine, sess *sessionState) {
 	// Drain first: canceling the run lands it in StateFailed, which isLive
 	// does not consider live, so an unguarded POST /api/runs during the wait
 	// below would start a run that shutdown then kills mid-flight.
@@ -685,7 +692,39 @@ func Run(ctx context.Context, opts Options) error {
 	// deploy.sh tree is still being reaped. Removing it any earlier would
 	// break the shutdown this ordering exists to complete cleanly.
 	sess.close()
-	return nil
+}
+
+// startServer binds, serves and announces. It returns the running server so
+// the caller can drain it; onFail is what a serve error triggers, which in
+// Run is the context cancel that ends the whole process.
+//
+// Listen and Serve rather than ListenAndServe, for one reason: --addr
+// defaults to port 0 and the OS picks, so the bound address is the only place
+// the real port exists and the operator cannot be told their URL without it.
+func startServer(ctx context.Context, opts Options, h http.Handler, token string, onFail func()) (*http.Server, error) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", opts.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("listening on %s: %w", opts.Addr, err)
+	}
+
+	httpSrv := &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		// No WriteTimeout: SSE streams are long-lived by design.
+	}
+	go func() {
+		slog.Info("listening", "addr", ln.Addr().String())
+		if serveErr := httpSrv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			slog.Error("server failed", "error", serveErr)
+			onFail()
+		}
+	}()
+
+	// After Serve is running, so a browser this opens finds something
+	// listening rather than a refused connection.
+	announce(ctx, consoleURL(ln.Addr(), token), opts.OpenBrowser)
+	return httpSrv, nil
 }
 
 // connectHook is everything that has to be true before the console answers a

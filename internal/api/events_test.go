@@ -17,21 +17,28 @@ import (
 	"github.com/mchmarny/aicrme/internal/testfs"
 )
 
-func loggedInClient(t *testing.T, h http.Handler) (*httptest.Server, *http.Client) {
+// testToken is the launch token every test server in this package is built
+// with. The real one is 32 random bytes; its value is irrelevant to every
+// test but token_test.go, which checks the comparison itself.
+const testToken = "launch-token-value"
+
+// authedClient starts h and exchanges the launch token for the session cookie
+// every later request carries. It replaces the login helper the password auth
+// needed: the exchange is now the only way to become authenticated.
+func authedClient(t *testing.T, h http.Handler) (*httptest.Server, *http.Client) {
 	t.Helper()
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
 
-	jar := &cookieJar{}
-	client := &http.Client{Jar: jar}
-	resp, err := client.Post(ts.URL+"/api/login", "application/json",
-		strings.NewReader(`{"username":"admin","password":"correct-horse"}`))
+	client := &http.Client{Jar: &cookieJar{}}
+	resp, err := client.Post(ts.URL+"/api/session", "application/json",
+		strings.NewReader(`{"token":"`+testToken+`"}`))
 	if err != nil {
-		t.Fatalf("login error = %v", err)
+		t.Fatalf("POST /api/session error = %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("login status = %d", resp.StatusCode)
+		t.Fatalf("POST /api/session status = %d, want 204", resp.StatusCode)
 	}
 	return ts, client
 }
@@ -39,14 +46,14 @@ func loggedInClient(t *testing.T, h http.Handler) (*httptest.Server, *http.Clien
 func TestEventStreamReplaysFromLastEventID(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	b.Publish(bus.Event{Kind: bus.KindLog, Message: "one"})
 	b.Publish(bus.Event{Kind: bus.KindLog, Message: "two"})
@@ -97,14 +104,14 @@ func TestEventStreamReplaysFromLastEventID(t *testing.T) {
 func TestEventsHandlerEmitsEpochControlEventFirst(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	b.Publish(bus.Event{Kind: bus.KindLog, Message: "data event"})
 

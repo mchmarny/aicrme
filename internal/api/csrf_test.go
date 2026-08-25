@@ -9,7 +9,7 @@ import (
 
 func TestSameOriginRequestSucceeds(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs", strings.NewReader("{}"))
 	if err != nil {
@@ -30,7 +30,7 @@ func TestSameOriginRequestSucceeds(t *testing.T) {
 
 func TestSecFetchSiteCrossSiteRejected(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs", strings.NewReader("{}"))
 	if err != nil {
@@ -58,7 +58,7 @@ func TestSecFetchSiteCrossSiteRejected(t *testing.T) {
 // matching neither case and allowing it through unchecked.
 func TestSecFetchSiteSameSiteRejected(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs", strings.NewReader("{}"))
 	if err != nil {
@@ -79,7 +79,7 @@ func TestSecFetchSiteSameSiteRejected(t *testing.T) {
 
 func TestCrossOriginCreateRunRejected(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs", strings.NewReader("{}"))
 	if err != nil {
@@ -105,7 +105,7 @@ func TestCrossOriginCreateRunRejected(t *testing.T) {
 // the rejection happens.
 func TestCrossOriginDecideRejected(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs/does-not-exist/decide",
 		strings.NewReader(`{"intent":"training"}`))
@@ -135,7 +135,7 @@ func TestCrossOriginDecideRejected(t *testing.T) {
 // mutating handler with neither anti-CSRF header present.
 func TestFormContentTypeWithoutOriginHeadersRejected(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs/does-not-exist/decide",
 		strings.NewReader(`{"intent":"training"}=`+"\r\n"))
@@ -160,7 +160,7 @@ func TestFormContentTypeWithoutOriginHeadersRejected(t *testing.T) {
 // unconditionally, with no header simulation needed.
 func TestEventsUnaffectedByCSRFMiddleware(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	resp, err := client.Get(ts.URL + "/api/events")
 	if err != nil {
@@ -191,7 +191,7 @@ func TestSecurityHeadersIncludeCSP(t *testing.T) {
 
 func TestAPIResponsesAreNotCached(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	resp, err := client.Get(ts.URL + "/api/runs/does-not-exist")
 	if err != nil {

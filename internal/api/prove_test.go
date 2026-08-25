@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -49,14 +48,14 @@ func newStopTestServer(t *testing.T, cs *fake.Clientset) (*httptest.Server, *htt
 	e.SetProveClient(client)
 
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, httpClient := loggedInClient(t, srv.Handler())
+	ts, httpClient := authedClient(t, srv.Handler())
 	return ts, httpClient, client
 }
 
@@ -113,14 +112,14 @@ func TestStopEndsTheRunOverHTTP(t *testing.T) {
 func TestStopOnNonActiveRunConflicts(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), failingStep{}), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
@@ -145,7 +144,7 @@ func TestStopOnNonActiveRunConflicts(t *testing.T) {
 }
 
 func TestStopOnUnknownRunNotFound(t *testing.T) {
-	ts, client := loggedInClient(t, newTestServer(t))
+	ts, client := authedClient(t, newTestServer(t))
 
 	resp, err := client.Post(ts.URL+"/api/runs/does-not-exist/stop", "application/json", nil)
 	if err != nil {
@@ -173,7 +172,7 @@ func TestStopRequiresCSRFAndAuth(t *testing.T) {
 
 	t.Run("requires same-origin", func(t *testing.T) {
 		h := newTestServer(t)
-		ts, client := loggedInClient(t, h)
+		ts, client := authedClient(t, h)
 
 		req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/runs/does-not-exist/stop", nil)
 		if err != nil {

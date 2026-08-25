@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
@@ -46,9 +45,9 @@ func TestSPAMissingAssetIs404EndToEnd(t *testing.T) {
 func newDrainableTestServer(t *testing.T) *api.Server {
 	t.Helper()
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, bus.New(64), engine.New(bus.New(64), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -79,7 +78,7 @@ func TestDrainRejectsMutations(t *testing.T) {
 // rejected once draining begins.
 func TestDrainKeepsSafeMethodsServing(t *testing.T) {
 	srv := newDrainableTestServer(t)
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 	srv.Drain()
 
 	healthzResp, err := client.Get(ts.URL + "/healthz")
@@ -112,9 +111,9 @@ func TestDrainedEngineRejectsRunCreation(t *testing.T) {
 	b := bus.New(64)
 	eng := engine.New(b, engine.NewMemoryStore())
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, eng, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
@@ -123,7 +122,7 @@ func TestDrainedEngineRejectsRunCreation(t *testing.T) {
 		t.Fatalf("CancelAndWait() error = %v", cancelErr)
 	}
 
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatalf("POST /api/runs error = %v", err)
@@ -139,7 +138,7 @@ func TestDrainedEngineRejectsRunCreation(t *testing.T) {
 // must still accept a normal same-origin POST /api/runs.
 func TestNotDrainingByDefault(t *testing.T) {
 	h := newTestServer(t)
-	ts, client := loggedInClient(t, h)
+	ts, client := authedClient(t, h)
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {

@@ -12,7 +12,6 @@ import (
 	"path"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/aicrclient"
@@ -27,13 +26,10 @@ var errNotConnected = aicrerrors.New(aicrerrors.ErrCodeConflict, "connect to a c
 
 // Config is the server's runtime configuration.
 type Config struct {
-	Username   string
-	Password   string
-	SessionTTL time.Duration
-	// LoginRate is the burst and per-minute ceiling on login attempts.
-	LoginRate int
-	// TLS marks the session cookie Secure.
-	TLS bool
+	// Token is the launch token this console prints in its URL and exchanges
+	// once for a session cookie. See internal/api/token.go for why the
+	// exchange exists rather than a header.
+	Token string
 	// AICR backs GET /api/options: it asks the live recipe catalog which
 	// intents and platforms actually have an overlay for this cluster,
 	// rather than the console offering a static list that can dead-end.
@@ -66,7 +62,7 @@ type Cluster interface {
 
 // Server wires the HTTP routes.
 type Server struct {
-	auth     *authenticator
+	launch   *launchToken
 	bus      *bus.Bus
 	engine   *engine.Engine
 	static   fs.FS
@@ -79,17 +75,8 @@ type Server struct {
 
 // New validates cfg and returns a Server.
 func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error) {
-	if cfg.Password == "" {
-		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "password must not be empty")
-	}
-	if cfg.Username == "" {
-		cfg.Username = "admin"
-	}
-	if cfg.SessionTTL <= 0 {
-		cfg.SessionTTL = 8 * time.Hour
-	}
-	if cfg.LoginRate <= 0 {
-		cfg.LoginRate = 10
+	if cfg.Token == "" {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "launch token must not be empty")
 	}
 	if cfg.AICR == nil {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "aicr client must not be nil")
@@ -105,7 +92,7 @@ func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "cluster must not be nil")
 	}
 	return &Server{
-		auth: newAuthenticator(cfg), bus: b, engine: e, static: static, aicr: cfg.AICR, workDir: cfg.WorkDir,
+		launch: newLaunchToken(cfg.Token), bus: b, engine: e, static: static, aicr: cfg.AICR, workDir: cfg.WorkDir,
 		cluster: cfg.Cluster,
 	}, nil
 }
@@ -203,8 +190,9 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("POST /api/login", s.auth.login)
-	mux.HandleFunc("POST /api/logout", s.auth.logout)
+	// Outside requireToken, because it is the exchange that produces what
+	// requireToken checks for.
+	mux.HandleFunc("POST /api/session", s.launch.exchange)
 
 	// gated carries every route that needs a cluster; protected carries the
 	// three that do not and delegates the rest to it through the connect gate.
@@ -226,16 +214,18 @@ func (s *Server) Handler() http.Handler {
 	protected := http.NewServeMux()
 	protected.HandleFunc("GET /api/contexts", s.handleContexts)
 	protected.HandleFunc("POST /api/connect", s.handleConnect)
-	// GET /api/session exists so the SPA can tell an expired session from a
+	// GET /api/session exists so the SPA can tell a dead console from a
 	// network blip: EventSource surfaces no HTTP status on error, so without
-	// this probe the console had no way to learn its 8-hour session expired
-	// and stuck on "reconnecting..." forever. The auth middleware wrapping
-	// protected already supplies the 401; a live session just needs a 204.
+	// this probe the console had no way to learn its session was no longer
+	// recognized and stuck on "reconnecting..." forever. The cookie does not
+	// expire any more, but the process that minted it can exit -- and the one
+	// that replaces it will not know the old session. requireToken supplies
+	// the 401; a live session just needs a 204.
 	protected.HandleFunc("GET /api/session", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	protected.Handle("/api/", s.requireConnected(gated))
-	mux.Handle("/api/", s.auth.require(protected))
+	mux.Handle("/api/", s.requireToken(protected))
 
 	// Unrestricted method, not "GET /": http.ServeMux (Go 1.22+) treats "GET /"
 	// and "/api/" as conflicting patterns — neither is a strict subset of the

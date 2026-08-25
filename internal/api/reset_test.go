@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -81,14 +80,14 @@ func newResetTestServer(t *testing.T) (*httptest.Server, *http.Client, *counting
 	e.SetTeardown(td)
 
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, httpClient := loggedInClient(t, srv.Handler())
+	ts, httpClient := authedClient(t, srv.Handler())
 	return ts, httpClient, td
 }
 
@@ -184,14 +183,14 @@ func TestResetSurfacesTheEnginesConflict(t *testing.T) {
 	e.SetTeardown(&countingTeardown{})
 
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
@@ -246,14 +245,14 @@ func TestResetOnARunThatInstalledNothingConflicts(t *testing.T) {
 	e.SetTeardown(&countingTeardown{})
 
 	srv, err := api.New(api.Config{
-		Cluster:  connectedCluster(),
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
