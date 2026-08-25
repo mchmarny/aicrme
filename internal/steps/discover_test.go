@@ -321,3 +321,29 @@ func TestDiscoverDefaultsAgentName(t *testing.T) {
 		t.Error("ServiceAccountName is empty — CollectSnapshot would reach the API server as metadata.name: \"\"")
 	}
 }
+
+// AgentConfig.Kubeconfig is documented as "the path (or empty for
+// in-cluster)", and empty was exactly right in a pod. Locally, empty means
+// AICR resolves KUBECONFIG and then ~/.kube/config itself -- so Discover
+// would snapshot whatever the operator's ambient config points at while Apply
+// installs into the context they selected. That is a recipe generated for one
+// cluster and installed into another, with nothing in the timeline saying so.
+func TestDiscoverPinsTheAgentConfigKubeconfig(t *testing.T) {
+	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace:  "aicrme",
+		Image:      "ghcr.io/nvidia/aicr:v0.20.0",
+		Kubeconfig: "/tmp/session-42/kubeconfig",
+	})
+
+	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if fake.LastAgentConfig == nil {
+		t.Fatal("CollectSnapshot was never called")
+	}
+	if got := fake.LastAgentConfig.Kubeconfig; got != "/tmp/session-42/kubeconfig" {
+		t.Errorf("AgentConfig.Kubeconfig = %q -- empty means AICR resolves ~/.kube/config itself, "+
+			"so Discover would snapshot one cluster while Apply installs into another", got)
+	}
+}

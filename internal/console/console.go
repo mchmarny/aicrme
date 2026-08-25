@@ -451,6 +451,9 @@ func Run(ctx context.Context, opts Options) error {
 	// establishes identity without yet rewiring them.
 	var kube kubernetes.Interface
 
+	// Knowable now, written at connect. See sessionKubeconfigPath.
+	sessionKubeconfig := sessionKubeconfigPath(workDir)
+
 	namespace := envOr("AICRME_NAMESPACE", "aicrme")
 	runStore := newRunStore(ctx, kube, namespace, envOr("AICRME_DEPLOYMENT_NAME", "aicrme"))
 	// One instance, shared between the Prove step below and eng.SetProveClient
@@ -478,6 +481,10 @@ func Run(ctx context.Context, opts Options) error {
 			// console's aicr dependency (go.mod / .settings.yaml
 			// dependencies.aicr) rather than derived at runtime.
 			Image: envOr("AICRME_SNAPSHOT_IMAGE", defaultSnapshotAgentImage),
+			// Set explicitly even though KUBECONFIG below would cover it:
+			// this seam has a real field, and the one call that decides the
+			// recipe should not depend on ambient environment.
+			Kubeconfig: sessionKubeconfig,
 			// Unset (nil) on every real deployment: aicr.Client.CollectSnapshot
 			// then auto-targets a real GPU node itself (see the NodeSelector
 			// doc on steps.DiscoverConfig). AICRME_SNAPSHOT_NODE_SELECTOR
@@ -501,7 +508,8 @@ func Run(ctx context.Context, opts Options) error {
 			WorkDir: workDir,
 		}),
 		steps.NewApply(applier.New(applier.BashExec{}), steps.ApplyConfig{
-			Retries: defaultApplyRetries,
+			Retries:    defaultApplyRetries,
+			Kubeconfig: sessionKubeconfig,
 			// Not exposed in values.yaml, deliberately -- same treatment as
 			// AICRME_SNAPSHOT_NODE_SELECTOR. It exists so the CI end-to-end
 			// test can exercise the real deploy.sh and the real helm binary
@@ -758,6 +766,28 @@ func connectHook(workDir, kubeconfig string, eng *engine.Engine, sess *sessionSt
 			return fmt.Errorf("freezing context %q for this session: %w", info.Context, err)
 		}
 		sess.set(cleanup)
+
+		// KUBECONFIG in this process covers three of the four consumers by the
+		// mechanism each already uses: deploy.sh inherits it through
+		// applier.env, AICR's client reads it during resolution, and
+		// steps.helmLister -- which builds an applier.Spec with no Env at all
+		// (internal/steps/ownership.go) -- inherits it from os.Environ. Its
+		// result is what Run.Ownership is built from, so a lister pointed at
+		// the wrong cluster makes Reset's ownership record wrong.
+		//
+		// Process-global mutation is ugly. It is also precisely how these
+		// libraries expect to be told, and the alternative is threading a path
+		// through four call chains to reach code that will read the
+		// environment variable anyway.
+		//
+		// Set here rather than at startup, and that timing is load-bearing:
+		// listContexts resolves the operator's own kubeconfig through the same
+		// variable, so pinning it before a context is chosen would leave the
+		// Connect screen listing the contexts of a file that does not exist
+		// yet.
+		if err := os.Setenv("KUBECONFIG", path); err != nil {
+			return fmt.Errorf("pinning KUBECONFIG for this process: %w", err)
+		}
 
 		eng.SetClusterUID(info.UID)
 		slog.Info("connected", "context", info.Context, "server", info.Server,

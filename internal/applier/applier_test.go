@@ -176,3 +176,45 @@ func TestApplyFlushesAnUnterminatedFinalLine(t *testing.T) {
 		t.Fatalf("published %d events, want 1", len(*events))
 	}
 }
+
+// The four cluster consumers each resolve a cluster their own way, and this
+// is the one deploy.sh reads. KUBECONFIG covers the tools that read the
+// environment; KUBECONFIG_FLAG covers the script's own explicit pass-through
+// to helm and kubectl. A run pinned in only one of the two would be pinned
+// for some of its components.
+func TestApplierEnvCarriesTheSessionKubeconfig(t *testing.T) {
+	a := New(BashExec{})
+	env := a.env(Options{Kubeconfig: "/tmp/session-42/kubeconfig"})
+
+	var sawPath, sawFlag bool
+	for _, kv := range env {
+		if kv == "KUBECONFIG=/tmp/session-42/kubeconfig" {
+			sawPath = true
+		}
+		if kv == "KUBECONFIG_FLAG=--kubeconfig /tmp/session-42/kubeconfig" {
+			sawFlag = true
+		}
+	}
+	if !sawPath {
+		t.Error("KUBECONFIG is not exported to deploy.sh")
+	}
+	if !sawFlag {
+		t.Error("KUBECONFIG_FLAG is not set -- deploy.sh consumes it and would fall back to ambient config")
+	}
+}
+
+// An unset Kubeconfig must not produce `--kubeconfig ` with nothing after it:
+// deploy.sh interpolates the flag verbatim, so a dangling flag would consume
+// whatever argument follows it.
+func TestApplierEnvLeavesTheFlagEmptyWithNoKubeconfig(t *testing.T) {
+	a := New(BashExec{})
+	for _, kv := range a.env(Options{}) {
+		if kv == "KUBECONFIG_FLAG=" {
+			return
+		}
+		if strings.HasPrefix(kv, "KUBECONFIG_FLAG=") {
+			t.Fatalf("KUBECONFIG_FLAG = %q, want empty when no kubeconfig is pinned", kv)
+		}
+	}
+	t.Error("KUBECONFIG_FLAG is absent entirely; deploy.sh expects it to be set")
+}

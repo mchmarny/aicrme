@@ -152,3 +152,26 @@ func TestSweepClearsCredentialsLeftByAKilledLaunch(t *testing.T) {
 		t.Error("a killed launch's flattened kubeconfig survived the next start's sweep")
 	}
 }
+
+// The steps are configured with this path at construction, before any context
+// is chosen, so it must be the same path writeSessionKubeconfig later writes
+// to. If those two ever diverge, Discover and Apply would each read a file
+// that is never written and silently fall back to the operator's ambient
+// kubeconfig -- the exact failure the pin exists to prevent.
+func TestTheConfiguredSessionPathIsTheOneWritten(t *testing.T) {
+	work := t.TempDir()
+	predicted := sessionKubeconfigPath(work)
+
+	written, cleanup, err := writeSessionKubeconfig(work, writeKubeconfig(t), "alpha")
+	if err != nil {
+		t.Fatalf("writeSessionKubeconfig() error = %v", err)
+	}
+	defer cleanup()
+
+	if written != predicted {
+		t.Fatalf("wrote %s, but the steps were configured with %s", written, predicted)
+	}
+	if _, err := os.Stat(predicted); err != nil {
+		t.Errorf("nothing exists at the path the steps will read: %v", err)
+	}
+}

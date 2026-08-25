@@ -19,6 +19,15 @@ import (
 type DiscoverConfig struct {
 	Namespace string
 	Image     string
+	// Kubeconfig is set explicitly rather than left to AICR's own resolution.
+	// AgentConfig.Kubeconfig is documented as "the path (or empty for
+	// in-cluster)", and empty was exactly right in a pod. Locally, empty means
+	// AICR reads KUBECONFIG, else ~/.kube/config -- so Discover would snapshot
+	// whatever the operator's ambient config points at while Apply installs
+	// into the context they selected. That is a recipe generated for one
+	// cluster and installed into another, with nothing in the timeline saying
+	// so.
+	Kubeconfig string
 	// JobName and ServiceAccountName name the transient Job and the
 	// ServiceAccount/Role/RoleBinding trio AICR's agent deployer creates for
 	// it (see NewDiscover for why they cannot be left blank). Both are
@@ -158,6 +167,7 @@ func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) err
 	emit(bus.Event{Kind: bus.KindLog, Message: "deploying cluster snapshot agent"})
 
 	snap, err := d.client.CollectSnapshot(ctx, &aicr.AgentConfig{
+		Kubeconfig:         d.cfg.Kubeconfig,
 		Namespace:          d.cfg.Namespace,
 		Image:              d.cfg.Image,
 		JobName:            d.cfg.JobName,

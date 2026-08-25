@@ -75,7 +75,7 @@ func writeSessionKubeconfig(workDir, kubeconfig, contextName string) (string, fu
 	// Written by hand rather than through clientcmd.WriteToFile so the mode is
 	// stated here: this file holds inlined credentials, and 0600 is the
 	// property the test asserts.
-	path := filepath.Join(dir, "kubeconfig")
+	path := sessionKubeconfigPath(workDir)
 	if err = os.WriteFile(path, raw, 0o600); err != nil {
 		cleanup()
 		return "", nil, fmt.Errorf("writing the session kubeconfig %s: %w", path, err)
@@ -112,6 +112,16 @@ func (s *sessionState) close() {
 
 func sessionDir(workDir string, pid int) string {
 	return filepath.Join(workDir, sessionDirPrefix+strconv.Itoa(pid))
+}
+
+// sessionKubeconfigPath is where this launch's frozen kubeconfig will be
+// written. It depends only on the work directory and this process's PID, so
+// it is knowable at startup even though the file itself does not exist until
+// a context is chosen -- which is what lets the steps be configured with it
+// at construction rather than growing a lazy accessor. Nothing reads the file
+// before connect: the connect gate refuses every route that could.
+func sessionKubeconfigPath(workDir string) string {
+	return filepath.Join(sessionDir(workDir, os.Getpid()), "kubeconfig")
 }
 
 func removeSession(dir string) {

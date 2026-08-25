@@ -30,6 +30,12 @@ type Options struct {
 	// anything. Used by the CI end-to-end test, which exercises the real
 	// script and the real helm binary on a cluster with no GPUs.
 	DryRun bool
+	// Kubeconfig is the frozen per-launch kubeconfig every tool deploy.sh
+	// invokes must read. Empty means "whatever the environment resolves",
+	// which was right inside a pod with a ServiceAccount and is wrong on a
+	// machine where the operator can run `kubectl config use-context`
+	// mid-Apply.
+	Kubeconfig string
 }
 
 // Applier runs one bundle's deploy.sh.
@@ -116,10 +122,20 @@ func (a *Applier) env(opts Options) []string {
 	if opts.DryRun {
 		dryRun = "--dry-run"
 	}
+	// KUBECONFIG covers the tools that read the environment; KUBECONFIG_FLAG
+	// covers deploy.sh's own explicit pass-through to helm and kubectl. Both,
+	// because the script uses the flag where it has one and inherits the
+	// variable everywhere else, and a run pinned in only one of the two would
+	// be pinned for some of its components.
+	kubeconfigFlag := ""
+	if opts.Kubeconfig != "" {
+		kubeconfigFlag = "--kubeconfig " + opts.Kubeconfig
+	}
 	return []string{
 		"NO_COLOR=1",
 		"DRY_RUN_FLAG=" + dryRun,
-		"KUBECONFIG_FLAG=",
+		"KUBECONFIG=" + opts.Kubeconfig,
+		"KUBECONFIG_FLAG=" + kubeconfigFlag,
 		"HELM_DEBUG_FLAG=",
 	}
 }
