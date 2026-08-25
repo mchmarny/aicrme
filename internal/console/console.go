@@ -406,6 +406,15 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	// Before the work directory, the cluster, or the socket: a machine
+	// missing bash, helm or kubectl cannot complete a run, and finding that
+	// out at Apply -- twenty minutes in, with releases already installed --
+	// is the failure this exists to move to second zero.
+	toolchain, err := preflight(ctx)
+	if err != nil {
+		return err
+	}
+
 	workDir := opts.WorkDir
 	releaseWorkDir, err := prepareWorkDir(workDir)
 	if err != nil {
@@ -433,6 +442,7 @@ func Run(ctx context.Context, opts Options) error {
 	// binary cannot usefully be in, because a console that cannot reach a
 	// cluster has nothing to offer.
 	conn := newConnector(opts.Kubeconfig, liveProber{})
+	conn.toolchain = toolchain
 
 	// Still nil at wiring time, and the connect gate in internal/api is what
 	// keeps that from being reachable: no route that needs a cluster answers
@@ -529,6 +539,7 @@ func Run(ctx context.Context, opts Options) error {
 	// it at ~80 call sites), and Stop is the only caller that needs a
 	// cluster client at all.
 	eng.SetProveClient(proveClient)
+	eng.SetToolchain(toolchain)
 
 	var sess sessionState
 	conn.onConnected = connectHook(workDir, opts.Kubeconfig, eng, &sess)

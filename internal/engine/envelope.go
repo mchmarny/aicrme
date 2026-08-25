@@ -100,6 +100,11 @@ type envelope struct {
 	// Absent means "written before this field existed", which is not a
 	// mismatch -- see Run.ClusterUID.
 	ClusterUID string `json:"clusterUid,omitempty"`
+	// Toolchain is the same optional-on-both-sides addition. It must survive
+	// the round trip because the evidence bundle is built from the record, and
+	// a recovered run that lost its toolchain would produce evidence that
+	// cannot say what produced it.
+	Toolchain map[string]string `json:"toolchain,omitempty"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -185,6 +190,7 @@ func encodeRun(r *Run, maxPayload int) ([]byte, error) {
 		Ownership:          r.Ownership,
 		Residue:            r.Residue,
 		ClusterUID:         r.ClusterUID,
+		Toolchain:          r.Toolchain,
 		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -303,6 +309,7 @@ func decodeRun(blob []byte, maxPayload int) (*Run, error) {
 		Ownership:          env.Ownership,
 		Residue:            env.Residue,
 		ClusterUID:         env.ClusterUID,
+		Toolchain:          env.Toolchain,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

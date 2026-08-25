@@ -347,3 +347,23 @@ func TestConnectFailsWhenTheHookFails(t *testing.T) {
 }
 
 var errHookFailed = errors.New("recovery failed")
+
+// The Connect screen is where the operator confirms what this console is
+// about to do and with what, so the versions preflight resolved have to reach
+// it. They describe this machine rather than the cluster, which is why they
+// are known before any connection exists.
+func TestConnectReportsTheResolvedToolchain(t *testing.T) {
+	c := newTestConnector(t, fakeProber{})
+	c.toolchain = Toolchain{"helm": "v3.19.0", "kubectl": "v1.34.2", "bash": "GNU bash, version 5.2.37(1)-release"}
+
+	info, err := c.Connect(context.Background(), "alpha")
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if info.Toolchain["helm"] != "v3.19.0" {
+		t.Errorf("Toolchain[helm] = %q, want the resolved version", info.Toolchain["helm"])
+	}
+	if len(info.Toolchain) != 3 {
+		t.Errorf("Toolchain has %d entries, want every tool preflight resolved", len(info.Toolchain))
+	}
+}

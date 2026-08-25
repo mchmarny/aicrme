@@ -37,6 +37,12 @@ type ClusterInfo struct {
 	Version   string `json:"version"`
 	NodeCount int    `json:"nodeCount"`
 	UID       string `json:"uid"`
+	// Toolchain is what preflight resolved at startup, carried here because
+	// the Connect screen is where the operator confirms what this console is
+	// about to do and with what. Spec §7 asks the screen to report the
+	// resolved versions; §5 asks the run to record them. Preflight runs once,
+	// before connect, so one map answers both.
+	Toolchain Toolchain `json:"toolchain,omitempty"`
 }
 
 // ContextInfo is one row of the Connect screen's list.
@@ -144,6 +150,10 @@ type connector struct {
 	state      connState
 	kubeconfig string
 	prober     prober
+	// toolchain is reported on the connect response. It is resolved before
+	// any connection exists -- it describes this machine, not the cluster --
+	// so it is set once at construction rather than discovered in dial.
+	toolchain Toolchain
 	// newKube builds the clientset from the selected context's rest.Config.
 	// A field rather than a direct call so a test can hand dial a fake
 	// clientset and exercise the identity read for real, instead of stubbing
@@ -270,6 +280,7 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 		Version:   version,
 		NodeCount: nodes,
 		UID:       string(ns.UID),
+		Toolchain: c.toolchain,
 	}, restCfg, kube, nil
 }
 

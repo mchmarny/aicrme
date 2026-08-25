@@ -121,9 +121,18 @@ type Run struct {
 	// Empty is not a mismatch. Every record the ConfigMap store ever wrote
 	// has no UID, and one written inside the cluster it described could not
 	// have been about anywhere else.
-	ClusterUID string    `json:"clusterUid,omitempty"`
-	StartedAt  time.Time `json:"startedAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	ClusterUID string `json:"clusterUid,omitempty"`
+	// Toolchain is the version of every executable this run shelled out to --
+	// bash, helm, kubectl, and jq when present -- resolved once at startup.
+	//
+	// It is on the record rather than only in the log because the evidence
+	// bundle is the artifact anyone asks "which helm installed this" of, and
+	// a version that lives only in a terminal scrollback cannot answer it. The
+	// image used to make this question unnecessary by construction; a binary
+	// on an operator's laptop makes it unanswerable unless it is recorded.
+	Toolchain map[string]string `json:"toolchain,omitempty"`
+	StartedAt time.Time         `json:"startedAt"`
+	UpdatedAt time.Time         `json:"updatedAt"`
 	// Truncated names artifacts the store dropped to fit its size limit (see
 	// encodeRun). It is read-mostly state about the RECORD, not the run: the
 	// engine never sets it, decodeRun populates it on load, and encodeRun

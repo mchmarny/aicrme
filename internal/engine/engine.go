@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sync"
 	"time"
 
@@ -168,6 +169,11 @@ type Engine struct {
 	// else; a comparison against empty is not a mismatch, on either side.
 	clusterUID string
 
+	// toolchain is what preflight resolved for this process: the version of
+	// every executable a run shells out to. Set once, before serving, the
+	// same shape as clusterUID.
+	toolchain map[string]string
+
 	mu      sync.Mutex
 	current *Run
 	resume  chan struct{}
@@ -272,6 +278,15 @@ func (e *Engine) SetClusterUID(uid string) {
 	e.mu.Unlock()
 }
 
+// SetToolchain records the executables this process resolved at startup, so
+// every run it starts carries them into its evidence. Same "assigned once,
+// before concurrent readers exist" shape as SetClusterUID.
+func (e *Engine) SetToolchain(tc map[string]string) {
+	e.mu.Lock()
+	e.toolchain = maps.Clone(tc)
+	e.mu.Unlock()
+}
+
 // ClusterUID returns the connected cluster's identity, or empty if none was
 // set.
 func (e *Engine) ClusterUID() string {
@@ -360,6 +375,10 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		// -- while it lacked one -- from a record written before the field
 		// existed, and those are deliberately accepted by any cluster.
 		ClusterUID: e.clusterUID,
+		// Copied, not shared: a run record is cloned and persisted
+		// independently, and a map shared across every run would let one
+		// record's mutation reach another's.
+		Toolchain: maps.Clone(e.toolchain),
 	}
 	// Name the phase here rather than leaving it to the first step's own
 	// runStep/awaitDecisions call. Without this, the very first Save below

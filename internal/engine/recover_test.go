@@ -1108,3 +1108,43 @@ func TestStartStampsTheConnectedClusterOnTheRun(t *testing.T) {
 		t.Errorf("ClusterUID = %q, want %q -- a run with no identity is recoverable by any cluster", run.ClusterUID, uid)
 	}
 }
+
+// The evidence bundle is built from the record, so the toolchain has to be on
+// the record rather than only in the log. A run that lost it would produce
+// evidence that cannot say which helm installed anything.
+func TestStartStampsTheResolvedToolchainOnTheRun(t *testing.T) {
+	store := newRecoverStore()
+	e := fourStepEngine(store)
+	e.SetToolchain(map[string]string{"helm": "v3.19.0", "kubectl": "v1.34.2"})
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if run.Toolchain["helm"] != "v3.19.0" {
+		t.Errorf("Toolchain[helm] = %q, want the version preflight resolved", run.Toolchain["helm"])
+	}
+}
+
+// The engine hands each run its own copy: a map shared across runs would let
+// one record's mutation reach another's, and these records are persisted
+// independently.
+func TestEachRunGetsItsOwnToolchainMap(t *testing.T) {
+	e := fourStepEngine(newRecoverStore())
+	source := map[string]string{"helm": "v3.19.0"}
+	e.SetToolchain(source)
+	source["helm"] = "mutated-after-the-fact"
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if run.Toolchain["helm"] != "v3.19.0" {
+		t.Errorf("Toolchain[helm] = %q; the engine kept a reference to the caller's map", run.Toolchain["helm"])
+	}
+	run.Toolchain["helm"] = "mutated-by-a-holder"
+	second, err := e.Start(context.Background())
+	if err == nil && second.Toolchain["helm"] != "v3.19.0" {
+		t.Errorf("a second run saw %q; the runs share one map", second.Toolchain["helm"])
+	}
+}
