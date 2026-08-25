@@ -20,4 +20,4 @@ test_tools:
 
 dependencies:
   # renovate: datasource=go depName=github.com/NVIDIA/aicr depType=dependencies
-  aicr: 'v0.19.0'
+  aicr: 'v0.20.0'

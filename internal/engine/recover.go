@@ -222,7 +222,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 	r, err := e.loadCurrentWithRetry(ctx)
 	if err != nil {
-		// aicr@v0.19.0's errors package exposes no Code(err) helper -- New,
+		// aicr@v0.20.0's errors package exposes no Code(err) helper -- New,
 		// Wrap, IsTransient and friends only -- so the code is reached
 		// through errors.As, matching how the rest of this repo inspects it.
 		var se *aicrerrors.StructuredError
