@@ -10,6 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mchmarny/aicrme/internal/aicrclient"
+	"github.com/mchmarny/aicrme/internal/bus"
+	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/prove"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -310,7 +314,7 @@ func TestConnectRunsTheHookBeforeReportingConnected(t *testing.T) {
 
 	var sawUID string
 	var stateDuringHook connState
-	c.onConnected = func(_ context.Context, info ClusterInfo) error {
+	c.onConnected = func(_ context.Context, info *ClusterInfo, _ kubernetes.Interface) error {
 		sawUID = info.UID
 		stateDuringHook = c.State()
 		return nil
@@ -331,7 +335,7 @@ func TestConnectRunsTheHookBeforeReportingConnected(t *testing.T) {
 // something a cluster-touching request would have relied on.
 func TestConnectFailsWhenTheHookFails(t *testing.T) {
 	c := newTestConnector(t, fakeProber{})
-	c.onConnected = func(context.Context, ClusterInfo) error {
+	c.onConnected = func(context.Context, *ClusterInfo, kubernetes.Interface) error {
 		return errHookFailed
 	}
 
@@ -347,6 +351,150 @@ func TestConnectFailsWhenTheHookFails(t *testing.T) {
 }
 
 var errHookFailed = errors.New("recovery failed")
+
+// connectTo runs the REAL connect hook against a fake cluster whose
+// kube-system UID is uid, so everything the hook installs -- the per-cluster
+// store, the steps, the two cluster clients, and the recovery that runs
+// against them -- is exercised rather than stubbed.
+func connectTo(t *testing.T, workDir, uid string) (ClusterInfo, *engine.Engine, error) {
+	t.Helper()
+	// connectHook pins KUBECONFIG for the process. t.Setenv restores whatever
+	// the developer's environment had when the test ends.
+	t.Setenv("KUBECONFIG", "")
+
+	kubeconfig := writeKubeconfig(t)
+	kube := fake.NewClientset(kubeSystem(uid))
+	c := newConnector(kubeconfig, fakeProber{})
+	c.newKube = func(*rest.Config) (kubernetes.Interface, error) { return kube, nil }
+
+	eng := engine.New(bus.New(16), engine.NewMemoryStore())
+	obsStop := make(chan struct{})
+	t.Cleanup(func() { close(obsStop) })
+	var sess sessionState
+	t.Cleanup(sess.close)
+
+	c.onConnected = connectHook(clusterWiring{
+		workDir:    workDir,
+		kubeconfig: kubeconfig,
+		namespace:  "aicrme",
+		aicr:       &aicrclient.Fake{},
+		bus:        bus.New(16),
+		engine:     eng,
+		session:    &sess,
+		obsStop:    obsStop,
+	})
+
+	info, err := c.Connect(context.Background(), "alpha")
+	return info, eng, err
+}
+
+func seedRun(t *testing.T, workDir, uid, runID string) {
+	t.Helper()
+	store, err := engine.NewFileStore(runDir(workDir, uid))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.Save(context.Background(), &engine.Run{
+		ID: runID, State: engine.StateFailed, Phase: engine.PhaseApply, ClusterUID: uid,
+		StartedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+}
+
+// In-cluster the pod restart was the recovery trigger, and locally nothing
+// else can be: the store lives under a directory named for a cluster the
+// process has not chosen until this call.
+func TestConnectRecoversTheRunForThatCluster(t *testing.T) {
+	work := t.TempDir()
+	const runID = "abcdef0123456789"
+	seedRun(t, work, testClusterUID, runID)
+
+	info, eng, err := connectTo(t, work, testClusterUID)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if info.RecoveredRun == nil {
+		t.Fatal("connect did not recover the run for this cluster -- the SPA would land empty over a record that still describes releases on it")
+	}
+	if info.RecoveredRun.ID != runID {
+		t.Errorf("recovered run ID = %q, want %q", info.RecoveredRun.ID, runID)
+	}
+	if got := eng.Current(); got == nil || got.ID != runID {
+		t.Errorf("the engine is not holding the recovered run: %+v", got)
+	}
+}
+
+// Recovery is keyed by cluster identity because a flat local file does not get
+// that property the way a ConfigMap living inside the cluster it described
+// did. Recovering the wrong cluster's run offers a Reset that uninstalls
+// releases somewhere else entirely.
+func TestConnectDoesNotRecoverAnotherClustersRun(t *testing.T) {
+	work := t.TempDir()
+	seedRun(t, work, "aaaaaaaa-1111-1111-1111-111111111111", "abcdef0123456789")
+
+	info, _, err := connectTo(t, work, "bbbbbbbb-2222-2222-2222-222222222222")
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if info.RecoveredRun != nil {
+		t.Errorf("connecting to one cluster recovered another's run (%s) -- Reset would uninstall releases in the wrong place",
+			info.RecoveredRun.ID)
+	}
+}
+
+// A cluster with nothing filed under it connects clean. The absence has to be
+// reported as absence rather than as an error: a first connect to a fresh
+// cluster is the ordinary case.
+func TestConnectToAClusterWithNoRecordRecoversNothing(t *testing.T) {
+	info, eng, err := connectTo(t, t.TempDir(), testClusterUID)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if info.RecoveredRun != nil {
+		t.Errorf("recovered %+v from a cluster with no record", info.RecoveredRun)
+	}
+	if eng.Current() != nil {
+		t.Error("the engine holds a run nothing filed")
+	}
+}
+
+// The record is written where the next connect to the SAME cluster will look
+// for it -- which is the whole of what keying by identity buys.
+func TestConnectStoresRunsUnderTheClusterDirectory(t *testing.T) {
+	work := t.TempDir()
+	if _, _, err := connectTo(t, work, testClusterUID); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if _, err := os.Stat(runDir(work, testClusterUID)); err != nil {
+		t.Fatalf("the per-cluster run directory was not created: %v", err)
+	}
+}
+
+// The steps hold the clientset dial built, so they cannot be constructed until
+// a cluster is chosen. This asserts the pipeline connect installs is the whole
+// pipeline, in order -- an engine given four steps completes a run having
+// silently skipped one.
+func TestConnectBuildsEveryStepInOrder(t *testing.T) {
+	w := clusterWiring{workDir: t.TempDir(), namespace: "aicrme", aicr: &aicrclient.Fake{}}
+
+	kube := fake.NewClientset()
+	got := w.steps(kube, "/tmp/session-1/kubeconfig", prove.NewClient(kube))
+
+	want := []engine.Phase{
+		engine.PhaseDiscover, engine.PhaseRecommend, engine.PhaseBundle,
+		engine.PhaseApply, engine.PhaseProve,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("built %d steps, want %d", len(got), len(want))
+	}
+	for i, phase := range want {
+		if got[i].Phase() != phase {
+			t.Errorf("step %d is %q, want %q", i, got[i].Phase(), phase)
+		}
+	}
+}
 
 // The Connect screen is where the operator confirms what this console is
 // about to do and with what, so the versions preflight resolved have to reach

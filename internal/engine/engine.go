@@ -267,6 +267,35 @@ func (e *Engine) SetProveClient(c *prove.Client) {
 	e.mu.Unlock()
 }
 
+// SetStore installs the run store the connect path selected, replacing the
+// placeholder New was given. Same "assigned once, under the lock, before
+// concurrent readers exist" shape as SetProveClient.
+//
+// It exists because the store's directory is named for a cluster this process
+// has not chosen at construction time, and the engine has to exist before then
+// -- internal/api takes it at New, and the server that serves the Connect
+// screen is the same one that serves every run route. Every route that could
+// reach the store is behind api's connect gate, and this lands while the
+// connection is still stateConnecting, so no request can observe the
+// placeholder.
+//
+// Per Ruling 4 this and Recover's unreadable-record swap are the only two
+// places Engine.store is ever reassigned.
+func (e *Engine) SetStore(st Store) {
+	e.mu.Lock()
+	e.store = st
+	e.mu.Unlock()
+}
+
+// SetSteps installs the pipeline the connect path built. Same shape and same
+// timing as SetStore, and for the same reason: three of the five steps hold a
+// clientset that does not exist until a cluster is chosen.
+func (e *Engine) SetSteps(steps ...Step) {
+	e.mu.Lock()
+	e.steps = steps
+	e.mu.Unlock()
+}
+
 // SetClusterUID records which cluster this engine is connected to, so Recover
 // and Reset can refuse a record that describes a different one. Same
 // "assigned once, under the lock, before concurrent readers exist" shape as

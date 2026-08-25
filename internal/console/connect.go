@@ -9,6 +9,7 @@ import (
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/mchmarny/aicrme/internal/engine"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -43,6 +44,16 @@ type ClusterInfo struct {
 	// resolved versions; §5 asks the run to record them. Preflight runs once,
 	// before connect, so one map answers both.
 	Toolchain Toolchain `json:"toolchain,omitempty"`
+	// RecoveredRun is the run this cluster's store was holding, if any.
+	//
+	// It travels in the connect response because connect is now the only
+	// moment recovery can happen: the store lives under a directory named for
+	// a cluster this process had not chosen until this call. In-cluster the
+	// pod restart was the trigger and the SPA simply found a run waiting on
+	// its first GET; locally there is no restart, so the response has to say
+	// so or the SPA lands in an empty state over a record that still describes
+	// releases on the cluster.
+	RecoveredRun *engine.Run `json:"recoveredRun,omitempty"`
 }
 
 // ContextInfo is one row of the Connect screen's list.
@@ -160,12 +171,15 @@ type connector struct {
 	// out the one call the run directory is keyed on.
 	newKube func(*rest.Config) (kubernetes.Interface, error)
 	// onConnected is everything that has to be true before the console
-	// answers a single cluster-touching request: today the engine learning
-	// which cluster it is connected to, and later the per-cluster store and
-	// the recovery that runs against it. It runs while the connection is
-	// still stateConnecting, so a failure leaves the connector reusable and
-	// the gate shut rather than open over half-built wiring.
-	onConnected func(context.Context, ClusterInfo) error
+	// answers a single cluster-touching request: the frozen kubeconfig, the
+	// per-cluster store, the steps and the two cluster clients the engine
+	// runs on, and the recovery that runs against them. It runs while the
+	// connection is still stateConnecting, so a failure leaves the connector
+	// reusable and the gate shut rather than open over half-built wiring.
+	//
+	// It takes *ClusterInfo rather than a copy because recovery is part of
+	// what it does and the recovered run is reported in the same response.
+	onConnected func(context.Context, *ClusterInfo, kubernetes.Interface) error
 
 	// Written once, under mu, at the connected transition.
 	info ClusterInfo
@@ -216,7 +230,7 @@ func (c *connector) Connect(ctx context.Context, contextName string) (ClusterInf
 
 	info, restCfg, kube, err := c.dial(ctx, contextName)
 	if err == nil && c.onConnected != nil {
-		err = c.onConnected(ctx, info)
+		err = c.onConnected(ctx, &info, kube)
 	}
 	if err != nil {
 		// Back to disconnected, not stuck in connecting: a wrong context or a

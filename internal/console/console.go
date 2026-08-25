@@ -19,7 +19,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/mchmarny/aicrme/internal/aicrclient"
@@ -282,85 +281,6 @@ func newObserverScopeFn(eng attributionReader, nsScope func() observer.RunScope)
 	}
 }
 
-// runStoreSuffix distinguishes the run store's ConfigMap from the chart's
-// own {{ include "aicrme.fullname" . }} ConfigMap (AICRME_TLS /
-// AICRME_NAMESPACE -- charts/aicrme/templates/configmap.yaml), following the
-// naming convention charts/aicrme/templates/secret.yaml already uses for the
-// auth Secret ("<fullname>-auth"). It must be a distinct, runtime-created
-// object: a templated one would revert to the chart's rendered content on
-// every helm upgrade, wiping state an in-flight Apply is actively
-// checkpointing (docs/superpowers/specs/2026-08-17-aicrme-phase-2b-ii-design.md,
-// "It must not be the chart's ConfigMap, and must not be templated at all").
-const runStoreSuffix = "-run"
-
-// deploymentLookupTimeout bounds the one-time Deployment Get newRunStore
-// issues to resolve the run ConfigMap's ownerReference. Everything the
-// resulting store does afterward is self-bounded by cmStoreCallTimeout
-// (internal/engine/cmstore.go), but this call happens before that store
-// exists, so it has to bound itself: a wedged API server here must degrade
-// to the in-memory store, not hang startup indefinitely the way 2b-i's
-// unbounded WaitForCacheSync did.
-const deploymentLookupTimeout = 10 * time.Second
-
-// resolveDeploymentOwner returns an ownerReference to the named Deployment,
-// so the run ConfigMap survives every pod and ReplicaSet churn along a
-// rollout but is garbage-collected the moment the release itself is
-// uninstalled. The chart sets AICRME_DEPLOYMENT_NAME to the exact
-// {{ include "aicrme.fullname" . }} value it names the Deployment object
-// with (charts/aicrme/templates/deployment.yaml), so one Get resolves the
-// object this pod actually belongs to. Deliberately not a walk of the pod's
-// own ownerReferences chain (Pod -> ReplicaSet -> Deployment): that would
-// cost a second API call for the ReplicaSet -- itself transient and reaped
-// on every rollout, exactly the object this reference must never target --
-// for no benefit over asking for the Deployment directly.
-func resolveDeploymentOwner(ctx context.Context, kube kubernetes.Interface, namespace, name string) (metav1.OwnerReference, error) {
-	dep, err := kube.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return metav1.OwnerReference{}, err
-	}
-	return metav1.OwnerReference{
-		APIVersion: "apps/v1",
-		Kind:       "Deployment",
-		Name:       dep.Name,
-		UID:        dep.UID,
-	}, nil
-}
-
-// newRunStore resolves the ConfigMap-backed run store, or falls back to an
-// in-memory one. kube is nil outside a cluster (rest.InClusterConfig fails
-// on a developer laptop) -- `make build && ./bin/aicrme` outside a cluster
-// stays a supported development path, so this is expected and logs at Warn
-// (the kube client construction above already explains why kube is nil for
-// the telemetry side; this is the persistence-specific consequence, not a
-// second diagnosis of the same cause).
-//
-// A resolution error with a live client is a different animal and logs at
-// Error, not Warn: it means a pod holding cluster-admin cannot look up its
-// own Deployment (RBAC, a control-plane blip, an unusual install order that
-// starts the pod before the Deployment object is visible to its own API
-// server), and /healthz reports identically healthy either way -- this log
-// line is the only signal an operator gets that the durability this whole
-// phase exists to provide has silently gone missing.
-//
-// Per Ruling 4, this is the only place that ever chooses the store;
-// Engine.store is set once in New and, on the unreadable-record path,
-// reassigned only by Recover itself.
-func newRunStore(ctx context.Context, kube kubernetes.Interface, namespace, deploymentName string) engine.Store {
-	if kube == nil {
-		slog.Warn("no cluster client; run state will not survive a pod restart")
-		return engine.NewMemoryStore()
-	}
-	lookupCtx, cancel := context.WithTimeout(ctx, deploymentLookupTimeout)
-	defer cancel()
-	owner, err := resolveDeploymentOwner(lookupCtx, kube, namespace, deploymentName)
-	if err != nil {
-		slog.Error("resolving the console Deployment for the run store's owner reference failed despite a live cluster client; run state will not survive a pod restart",
-			"deployment", deploymentName, "namespace", namespace, "error", err)
-		return engine.NewMemoryStore()
-	}
-	return engine.NewConfigMapStore(kube, namespace, deploymentName+runStoreSuffix, owner)
-}
-
 // Options configures Run.
 type Options struct {
 	Addr        string // listen address; must resolve to loopback
@@ -444,133 +364,16 @@ func Run(ctx context.Context, opts Options) error {
 	conn := newConnector(opts.Kubeconfig, liveProber{})
 	conn.toolchain = toolchain
 
-	// Still nil at wiring time, and the connect gate in internal/api is what
-	// keeps that from being reachable: no route that needs a cluster answers
-	// until a connection exists. The four consumers below are re-derived from
-	// the connection in the tasks that follow -- until then, connecting
-	// establishes identity without yet rewiring them.
-	var kube kubernetes.Interface
-
-	// Knowable now, written at connect. See sessionKubeconfigPath.
-	sessionKubeconfig := sessionKubeconfigPath(workDir)
-
-	namespace := envOr("AICRME_NAMESPACE", "aicrme")
-	runStore := newRunStore(ctx, kube, namespace, envOr("AICRME_DEPLOYMENT_NAME", "aicrme"))
-	// One instance, shared between the Prove step below and eng.SetProveClient
-	// further down -- see that call's comment for why a second construction
-	// site is worth avoiding even though both would be equivalent today.
-	// The same taints the snapshot agent needs. Both have to land on THIS
-	// cluster's GPU nodes, and a cluster whose GPU pool carries a
-	// non-standard taint breaks both in the same way -- so one knob, read
-	// once, handed to both rather than two that can disagree.
-	gpuTolerations := parseTolerations(os.Getenv("AICRME_GPU_TOLERATIONS"))
-	proveClient := prove.NewClient(kube, gpuTolerations...)
-
-	eng := engine.New(b, runStore,
-		steps.NewDiscover(client, steps.DiscoverConfig{
-			Namespace: namespace,
-			// aicr.Client.CollectSnapshot forwards Image verbatim to the Job
-			// spec's container -- unlike the `aicr` CLI, the Go client applies
-			// no fallback of its own (verified against pkg/client/v1 and
-			// pkg/k8s/agent/job.go in the pinned module). An empty string here
-			// reaches the API server as `image: ""`, which container
-			// validation rejects outright, so Discover would fail before the
-			// Job is even scheduled. defaultSnapshotAgentImage reproduces the
-			// same ghcr.io/nvidia/aicr:<version> mapping the CLI's own
-			// defaultAgentImage() uses (pkg/cli/root.go), pinned to this
-			// console's aicr dependency (go.mod / .settings.yaml
-			// dependencies.aicr) rather than derived at runtime.
-			Image: envOr("AICRME_SNAPSHOT_IMAGE", defaultSnapshotAgentImage),
-			// Set explicitly even though KUBECONFIG below would cover it:
-			// this seam has a real field, and the one call that decides the
-			// recipe should not depend on ambient environment.
-			Kubeconfig: sessionKubeconfig,
-			// Used for exactly one thing -- creating the namespace the agent
-			// Job runs in, which in-cluster `helm --create-namespace` did and
-			// locally nothing does. Nil until Task 12 re-derives the four
-			// cluster consumers from the connection, the same nil ApplyConfig.Kube
-			// below already carries.
-			Kube: kube,
-			// Unset (nil) on every real deployment: aicr.Client.CollectSnapshot
-			// then auto-targets a real GPU node itself (see the NodeSelector
-			// doc on steps.DiscoverConfig). AICRME_SNAPSHOT_NODE_SELECTOR
-			// exists only so a KWOK-simulated cluster (this console's own
-			// e2e test) can pin the agent Job off the tainted, fake-executing
-			// simulated GPU nodes and onto a real one.
-			NodeSelector: parseNodeSelector(os.Getenv("AICRME_SNAPSHOT_NODE_SELECTOR")),
-			// Added to the built-in nvidia.com/gpu toleration, for a cluster
-			// whose GPU pool carries a different taint. See parseTolerations.
-			ExtraTolerations: gpuTolerations,
-			// Unset (nil) on every real deployment, where AICR's own 1000m
-			// CPU default applies. Exists so the KWOK e2e can fit the agent
-			// onto the one real node it is pinned to -- see the Requests
-			// field's doc on steps.DiscoverConfig.
-			Requests:   parseResourceRequests(os.Getenv("AICRME_SNAPSHOT_REQUESTS")),
-			Privileged: true,
-			Timeout:    10 * time.Minute,
-		}),
-		steps.NewRecommend(client),
-		steps.NewBundle(client, steps.BundleConfig{
-			WorkDir: workDir,
-		}),
-		steps.NewApply(applier.New(applier.BashExec{}), steps.ApplyConfig{
-			Retries:    defaultApplyRetries,
-			Kubeconfig: sessionKubeconfig,
-			// Not exposed in values.yaml, deliberately -- same treatment as
-			// AICRME_SNAPSHOT_NODE_SELECTOR. It exists so the CI end-to-end
-			// test can exercise the real deploy.sh and the real helm binary
-			// against a cluster with no GPUs without installing anything.
-			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
-			// The pre-Apply ownership snapshot's two seams. helm runs
-			// through the same BashExec deploy.sh does, so there is one
-			// place in this binary that spawns a subprocess. kube is nil
-			// outside a pod, the same nil the Warn above covers -- the
-			// snapshot records that as a per-namespace failure, which
-			// leaves a later Reset removing nothing rather than guessing.
-			Helm: steps.NewHelmLister(applier.BashExec{}),
-			Kube: kube,
-		}),
-		// The final step: a run that reaches here and returns without error
-		// ends at StateActive rather than StateDone (engine.ActiveStep), with
-		// the reference workload deliberately left running. proveClient
-		// wraps the same in-cluster kube client the observer uses for
-		// telemetry, nil outside a pod -- see the Warn above for why that no
-		// longer risks the process.
-		steps.NewProve(proveClient, steps.ProveConfig{
-			// The design doc's own open question, now answered against a real
-			// cluster rather than guessed -- see defaultProveGangTimeout.
-			GangTimeout: proveGangTimeout(),
-		}),
-	)
-	// Stop (Task 7) is the only way a run leaves StateActive, and it needs
-	// the same client the Prove step above just used to create the
-	// workload -- one instance, shared, rather than a second one wrapping
-	// the same kube: both are stateless beyond that one field, but a second
-	// construction site is a second place for the two to silently diverge
-	// if either ever grows real state. Set after New, not threaded through
-	// it: engine.New's signature is shared by every test in this binary's
-	// dependency tree (internal/engine and internal/api together construct
-	// it at ~80 call sites), and Stop is the only caller that needs a
-	// cluster client at all.
-	eng.SetProveClient(proveClient)
-	eng.SetToolchain(toolchain)
-
-	var sess sessionState
-	conn.onConnected = connectHook(workDir, opts.Kubeconfig, eng, &sess)
-
-	// Reset's cluster-removal half, wired the same way and for the same
-	// reason: engine.New's signature is shared by ~80 construction sites
-	// across internal/engine and internal/api, and Reset is the only caller
-	// that needs any of this. Nil kube leaves the teardown unset, and
-	// engine.Reset refuses with 503 rather than dereferencing it -- the same
-	// nil this file's Warn above already covers.
+	// The engine exists before any cluster does, because internal/api takes it
+	// at New and the server that serves the Connect screen is the same one
+	// that serves every run route. Its store, its steps, and the two cluster
+	// clients they run on are all installed by connectHook.
 	//
-	// Only the process seam now. The discovery and dynamic clients went with
-	// namespace deletion: the console reports namespaces rather than deleting
-	// them, and reporting one needs no cluster access at all.
-	if kube != nil {
-		eng.SetTeardown(teardown.NewEngineTeardown(teardown.BashExec{}))
-	}
+	// The memory store here is a placeholder no request can observe: every
+	// route that could reach it is behind api's connect gate, and connectHook
+	// replaces it while the connection is still stateConnecting.
+	eng := engine.New(b, engine.NewMemoryStore())
+	eng.SetToolchain(toolchain)
 
 	srv, err := api.New(api.Config{
 		Token:   token,
@@ -582,77 +385,29 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("server configuration invalid: %w", err)
 	}
 
-	// Recovery must complete before httpSrv.ListenAndServe below: a window
-	// in which the console answers requests while a recovered run is not yet
-	// installed is a window in which the SPA's automatic POST /api/runs on
-	// load wins the race and silently replaces it. This does not reintroduce
-	// 2b-i's startup-hang class -- every ConfigMap call Recover makes is
-	// bounded by cmStoreCallTimeout (internal/engine/cmstore.go) and its own
-	// load retry is bounded and ctx-aware (internal/engine/recover.go) -- so
-	// this call always returns. ErrStepConfig is the one error it returns:
-	// a step slice recovery cannot make sense of, which is a programming
-	// error in this binary's own wiring above, not a runtime condition, so
-	// it is fatal rather than degraded. Everything else Recover handles
-	// internally and falls through to a degraded start; StoreUnreadable()
-	// exists purely so this can log that, per Ruling 4 -- Recover already
-	// performed the only corrective action available (swapping to a fresh
-	// memory store) by the time this returns.
-	if recoverErr := eng.Recover(ctx); recoverErr != nil {
-		return fmt.Errorf("engine step configuration cannot be recovered against: %w", recoverErr)
-	}
-	if eng.StoreUnreadable() {
-		slog.Warn("persisted run checkpoint was unreadable or failed validation; starting without it")
-	}
-
-	// Immediately after Recover and, like it, before ListenAndServe below:
-	// the record Recover just installed (or failed to find) is only half the
-	// state -- the workload it describes outlives this process independently,
-	// and the store can lose the record while the workload keeps holding
-	// GPUs. Reconciling settles the two against each other and, in the case
-	// that matters most, adopts a workload with no surviving record so the
-	// operator gets a Stop button back rather than a cluster only kubectl can
-	// clean up.
-	//
-	// Never fatal: an unreachable API server here costs the console its
-	// bearings on a leftover workload, which is worth a loud warning and not
-	// worth refusing to start over. The call itself is bounded (one List) and
-	// deliberately decides nothing when that List fails -- see its own doc
-	// comment for why a failed list must not be read as "gone".
-	if reconcileErr := eng.ReconcileWorkloads(ctx, proveClient); reconcileErr != nil {
-		slog.Warn("could not reconcile reference workloads left in the cluster; one may still be running untracked",
-			"error", reconcileErr)
-	}
-
-	// Started in a goroutine, not called inline: Start ends by blocking on
-	// the informer factory's WaitForCacheSync, which carries no deadline of
-	// its own -- it returns only once every watched type has synced or
-	// obsStop closes, and obsStop closes only when Run returns (the defer
-	// above). A synchronous call here would mean an unreachable, partitioned,
-	// or merely slow API server blocks httpSrv.ListenAndServe() from ever
-	// running -- and the chart's probes are already counting against that.
-	// The startupProbe governs until it first succeeds (initialDelaySeconds:
-	// 5, periodSeconds: 5, failureThreshold: 11 --
-	// charts/aicrme/templates/deployment.yaml), which kills the pod at 55s;
-	// once startup has succeeded the livenessProbe takes over and kills on
-	// its third consecutive failure, at 25s. Either way the result of
-	// blocking here is a permanent CrashLoopBackOff of the whole console,
-	// caused by the one subsystem that is supposed to be optional. (A pod
-	// dies on the failureThreshold-th CONSECUTIVE failure, so the last probe
-	// that can still save it fires at initialDelaySeconds + periodSeconds x
-	// (failureThreshold - 1) -- one period earlier than the arithmetic an
-	// earlier version of this comment used, which named a fourth liveness
-	// probe that never runs.) Handlers are registered
-	// before the informer factory starts, so events flow whether or not this
-	// goroutine's Start call has returned yet; its return value is consumed
-	// only for this warning.
+	// Closed by this defer rather than at connect: the observer is started by
+	// connectHook and must keep running until Run itself returns, which is
+	// after shutdown below has drained the HTTP surface that reads its
+	// telemetry.
 	obsStop := make(chan struct{})
 	defer close(obsStop)
-	obs := observer.New(kube, b, newObserverScopeFn(eng, newRunScopeFn(eng)))
-	go func() {
-		if startErr := obs.Start(obsStop); startErr != nil {
-			slog.Warn("observer failed to start; continuing without cluster telemetry", "error", startErr)
-		}
-	}()
+
+	var sess sessionState
+	conn.onConnected = connectHook(clusterWiring{
+		workDir:    workDir,
+		kubeconfig: opts.Kubeconfig,
+		namespace:  envOr("AICRME_NAMESPACE", "aicrme"),
+		// One knob, read once, handed to both the snapshot agent and the Prove
+		// workload rather than two that can disagree. Both have to land on
+		// THIS cluster's GPU nodes, and a cluster whose GPU pool carries a
+		// non-standard taint breaks both in the same way.
+		gpuTolerations: parseTolerations(os.Getenv("AICRME_GPU_TOLERATIONS")),
+		aicr:           client,
+		bus:            b,
+		engine:         eng,
+		session:        &sess,
+		obsStop:        obsStop,
+	})
 
 	httpSrv, err := startServer(ctx, opts, srv.Handler(), token, cancel)
 	if err != nil {
@@ -752,26 +507,42 @@ func startServer(ctx context.Context, opts Options, h http.Handler, token string
 	return httpSrv, nil
 }
 
+// clusterWiring is everything the connect path needs to build the half of this
+// console that cannot exist until a cluster has been chosen. A struct rather
+// than nine parameters, and named rather than a closure over Run's locals, so
+// the boundary between "known at startup" and "known at connect" is one thing
+// a reader can see.
+type clusterWiring struct {
+	workDir        string
+	kubeconfig     string
+	namespace      string
+	gpuTolerations []corev1.Toleration
+	aicr           aicrclient.API
+	bus            *bus.Bus
+	engine         *engine.Engine
+	session        *sessionState
+	obsStop        <-chan struct{}
+}
+
 // connectHook is everything that has to be true before the console answers a
 // single cluster-touching request. It runs inside Connect, while the state is
 // still connecting, so anything that fails here leaves the gate shut rather
 // than open over half-built wiring.
 //
-// Two things today. The session kubeconfig can only be written once a context
-// is chosen, and freezing it here is what makes the rest of the process immune
-// to `kubectl config use-context` running mid-Apply. And the engine learns
-// which cluster it is talking to, which is what lets Recover and Reset refuse
-// a record describing a different one -- a console that never made that call
-// would accept any record it found.
-//
-// Task 12 adds the per-cluster store and the recovery that runs against it.
-func connectHook(workDir, kubeconfig string, eng *engine.Engine, sess *sessionState) func(context.Context, ClusterInfo) error {
-	return func(_ context.Context, info ClusterInfo) error {
-		path, cleanup, err := writeSessionKubeconfig(workDir, kubeconfig, info.Context)
+// In-cluster all of this happened at startup, because a pod inherited its
+// cluster from its ServiceAccount and had one from its first instruction. A
+// local binary does not: the store lives under a directory named for a cluster
+// nobody has picked, the steps hold a clientset that does not exist, and there
+// is no pod restart to trigger recovery on the operator's behalf. So the whole
+// cluster-dependent half of the wiring moves here, in one place, behind one
+// gate.
+func connectHook(w clusterWiring) func(context.Context, *ClusterInfo, kubernetes.Interface) error {
+	return func(ctx context.Context, info *ClusterInfo, kube kubernetes.Interface) error {
+		path, cleanup, err := writeSessionKubeconfig(w.workDir, w.kubeconfig, info.Context)
 		if err != nil {
 			return fmt.Errorf("freezing context %q for this session: %w", info.Context, err)
 		}
-		sess.set(cleanup)
+		w.session.set(cleanup)
 
 		// KUBECONFIG in this process covers three of the four consumers by the
 		// mechanism each already uses: deploy.sh inherits it through
@@ -791,16 +562,185 @@ func connectHook(workDir, kubeconfig string, eng *engine.Engine, sess *sessionSt
 		// variable, so pinning it before a context is chosen would leave the
 		// Connect screen listing the contexts of a file that does not exist
 		// yet.
-		if err := os.Setenv("KUBECONFIG", path); err != nil {
+		if err = os.Setenv("KUBECONFIG", path); err != nil {
 			return fmt.Errorf("pinning KUBECONFIG for this process: %w", err)
 		}
 
-		eng.SetClusterUID(info.UID)
+		store, err := engine.NewFileStore(runDir(w.workDir, info.UID))
+		if err != nil {
+			return fmt.Errorf("opening the run store for cluster %s: %w", info.UID, err)
+		}
+
+		// One prove.Client instance, built here and handed to both the Prove
+		// step and Stop. Both are stateless beyond the clientset and the
+		// tolerations they hold, but a second construction site is a second
+		// place for the two to diverge if either ever grows real state.
+		prover := prove.NewClient(kube, w.gpuTolerations...)
+
+		w.engine.SetStore(store)
+		w.engine.SetSteps(w.steps(kube, path, prover)...)
+		w.engine.SetProveClient(prover)
+		w.engine.SetTeardown(teardown.NewEngineTeardown(teardown.BashExec{}))
+		// Before Recover, not after: the identity check is what lets recovery
+		// refuse a record describing a different cluster, and a record loaded
+		// before the engine knows which cluster it is on is one nothing can
+		// refuse.
+		w.engine.SetClusterUID(info.UID)
+
+		if err := w.recover(ctx, prover); err != nil {
+			return err
+		}
+		info.RecoveredRun = w.engine.Current()
+
+		w.startObserver(kube)
+
 		slog.Info("connected", "context", info.Context, "server", info.Server,
 			"version", info.Version, "nodes", info.NodeCount, "cluster", info.UID,
-			"runDir", runDir(workDir, info.UID), "kubeconfig", path)
+			"runDir", runDir(w.workDir, info.UID), "kubeconfig", path,
+			"recovered", info.RecoveredRun != nil)
 		return nil
 	}
+}
+
+// steps builds the pipeline against the connected cluster. kube is the
+// clientset dial just built, sessionKubeconfig is the frozen file every
+// subprocess in the chain reads, and prover is the same instance Stop holds.
+func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string, prover *prove.Client) []engine.Step {
+	return []engine.Step{
+		steps.NewDiscover(w.aicr, steps.DiscoverConfig{
+			Namespace: w.namespace,
+			// aicr.Client.CollectSnapshot forwards Image verbatim to the Job
+			// spec's container -- unlike the `aicr` CLI, the Go client applies
+			// no fallback of its own (verified against pkg/client/v1 and
+			// pkg/k8s/agent/job.go in the pinned module). An empty string here
+			// reaches the API server as `image: ""`, which container
+			// validation rejects outright, so Discover would fail before the
+			// Job is even scheduled. defaultSnapshotAgentImage reproduces the
+			// same ghcr.io/nvidia/aicr:<version> mapping the CLI's own
+			// defaultAgentImage() uses (pkg/cli/root.go), pinned to this
+			// console's aicr dependency (go.mod / .settings.yaml
+			// dependencies.aicr) rather than derived at runtime.
+			Image: envOr("AICRME_SNAPSHOT_IMAGE", defaultSnapshotAgentImage),
+			// Set explicitly even though KUBECONFIG would cover it: this seam
+			// has a real field, and the one call that decides the recipe
+			// should not depend on ambient environment.
+			Kubeconfig: sessionKubeconfig,
+			// Used for exactly one thing -- creating the namespace the agent
+			// Job runs in, which in-cluster `helm --create-namespace` did and
+			// locally nothing does.
+			Kube: kube,
+			// Unset (nil) on every real deployment: aicr.Client.CollectSnapshot
+			// then auto-targets a real GPU node itself (see the NodeSelector
+			// doc on steps.DiscoverConfig). AICRME_SNAPSHOT_NODE_SELECTOR
+			// exists only so a KWOK-simulated cluster (this console's own
+			// e2e test) can pin the agent Job off the tainted, fake-executing
+			// simulated GPU nodes and onto a real one.
+			NodeSelector: parseNodeSelector(os.Getenv("AICRME_SNAPSHOT_NODE_SELECTOR")),
+			// Added to the built-in nvidia.com/gpu toleration, for a cluster
+			// whose GPU pool carries a different taint. See parseTolerations.
+			ExtraTolerations: w.gpuTolerations,
+			// Unset (nil) on every real deployment, where AICR's own 1000m
+			// CPU default applies. Exists so the KWOK e2e can fit the agent
+			// onto the one real node it is pinned to -- see the Requests
+			// field's doc on steps.DiscoverConfig.
+			Requests:   parseResourceRequests(os.Getenv("AICRME_SNAPSHOT_REQUESTS")),
+			Privileged: true,
+			Timeout:    10 * time.Minute,
+		}),
+		steps.NewRecommend(w.aicr),
+		steps.NewBundle(w.aicr, steps.BundleConfig{
+			WorkDir: w.workDir,
+		}),
+		steps.NewApply(applier.New(applier.BashExec{}), steps.ApplyConfig{
+			Retries:    defaultApplyRetries,
+			Kubeconfig: sessionKubeconfig,
+			// Not exposed as a flag, deliberately -- same treatment as
+			// AICRME_SNAPSHOT_NODE_SELECTOR. It exists so the CI end-to-end
+			// test can exercise the real deploy.sh and the real helm binary
+			// against a cluster with no GPUs without installing anything.
+			DryRun: os.Getenv("AICRME_APPLY_DRY_RUN") == "true",
+			// The pre-Apply ownership snapshot's two seams. helm runs through
+			// the same BashExec deploy.sh does, so there is one place in this
+			// binary that spawns a subprocess.
+			Helm: steps.NewHelmLister(applier.BashExec{}),
+			Kube: kube,
+		}),
+		// The final step: a run that reaches here and returns without error
+		// ends at StateActive rather than StateDone (engine.ActiveStep), with
+		// the reference workload deliberately left running.
+		steps.NewProve(prover, steps.ProveConfig{
+			// The design doc's own open question, now answered against a real
+			// cluster rather than guessed -- see defaultProveGangTimeout.
+			GangTimeout: proveGangTimeout(),
+		}),
+	}
+}
+
+// recover settles this cluster's persisted state against what is actually
+// running on it, before POST /api/connect returns.
+//
+// In-cluster the pod restarting WAS the trigger: Recover ran during startup,
+// before the API served anything, because the store was reachable from the
+// moment the process began. Locally it is not -- the store lives under a
+// directory named for a cluster this process had not chosen. So recovery runs
+// after identity is established and before the gate opens.
+//
+// This is a further reason the connection is single-assignment: a reconnect
+// would have to re-run recovery against a different directory while the engine
+// still holds the previous run.
+func (w clusterWiring) recover(ctx context.Context, prover *prove.Client) error {
+	// ErrStepConfig is the one error Recover returns: a step slice recovery
+	// cannot make sense of, which is a programming error in the wiring above
+	// rather than a runtime condition, so it fails the connect. Everything
+	// else Recover handles internally and falls through to a degraded start;
+	// StoreUnreadable() exists purely so this can log that, per Ruling 4 --
+	// Recover already performed the only corrective action available (swapping
+	// to a fresh memory store) by the time it returns.
+	if err := w.engine.Recover(ctx); err != nil {
+		return fmt.Errorf("engine step configuration cannot be recovered against: %w", err)
+	}
+	if w.engine.StoreUnreadable() {
+		slog.Warn("persisted run checkpoint was unreadable or failed validation; starting without it")
+	}
+
+	// Immediately after Recover: the record it just installed (or failed to
+	// find) is only half the state -- the workload it describes outlives this
+	// process independently, and the store can lose the record while the
+	// workload keeps holding GPUs. Reconciling settles the two against each
+	// other and, in the case that matters most, adopts a workload with no
+	// surviving record so the operator gets a Stop button back rather than a
+	// cluster only kubectl can clean up.
+	//
+	// Never fatal: an unreachable API server here costs the console its
+	// bearings on a leftover workload, which is worth a loud warning and not
+	// worth refusing to connect over. The call itself is bounded (one List)
+	// and deliberately decides nothing when that List fails -- see its own doc
+	// comment for why a failed list must not be read as "gone".
+	if err := w.engine.ReconcileWorkloads(ctx, prover); err != nil {
+		slog.Warn("could not reconcile reference workloads left in the cluster; one may still be running untracked",
+			"error", err)
+	}
+	return nil
+}
+
+// startObserver begins cluster telemetry.
+//
+// In a goroutine, not called inline: Start ends by blocking on the informer
+// factory's WaitForCacheSync, which carries no deadline of its own -- it
+// returns only once every watched type has synced or obsStop closes. A
+// synchronous call here would mean an unreachable, partitioned, or merely slow
+// API server holds POST /api/connect open indefinitely, and the operator sees
+// a Connect button that never resolves against a cluster the console can
+// otherwise talk to. Handlers are registered before the informer factory
+// starts, so events flow whether or not this goroutine's Start call has
+// returned yet; its return value is consumed only for the warning.
+func (w clusterWiring) startObserver(kube kubernetes.Interface) {
+	obs := observer.New(kube, w.bus, newObserverScopeFn(w.engine, newRunScopeFn(w.engine)))
+	go func() {
+		if err := obs.Start(w.obsStop); err != nil {
+			slog.Warn("observer failed to start; continuing without cluster telemetry", "error", err)
+		}
+	}()
 }
 
 func envOr(key, fallback string) string {
