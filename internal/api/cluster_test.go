@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,13 @@ func (c *fakeCluster) Connect(_ context.Context, contextName string) (any, error
 }
 
 func (c *fakeCluster) Connected() bool { return c.connected }
+
+func (c *fakeCluster) Info() (any, bool) {
+	if !c.connected {
+		return nil, false
+	}
+	return map[string]string{"context": c.connectedTo}, true
+}
 
 // connectedCluster is the state every test that exercises a cluster-touching
 // route needs: a console that has already connected.
@@ -136,6 +144,42 @@ func TestConnectRoutesAnswerBeforeAnyConnection(t *testing.T) {
 	// And the gate opens behind it.
 	if rec := do(t, h, jar, http.MethodGet, "/api/options", ""); rec.Code == http.StatusConflict {
 		t.Error("GET /api/options still conflicts after a successful connect")
+	}
+}
+
+// GET /api/cluster is the reload's answer. The connection is
+// single-assignment, so a restored tab that went back to the Connect screen
+// would ask again, get a 409, and strand the operator on a screen refusing to
+// connect them to the cluster they are already on.
+func TestClusterReportsTheEstablishedConnection(t *testing.T) {
+	cluster := connectedCluster()
+	cluster.connectedTo = "kind-kind"
+	h := serverWithCluster(t, cluster)
+	jar := sessionJar(t, h)
+
+	rec := do(t, h, jar, http.MethodGet, "/api/cluster", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/cluster = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decoding the response: %v", err)
+	}
+	if got["context"] != "kind-kind" {
+		t.Errorf("context = %q, want the connected one", got["context"])
+	}
+}
+
+// Ungated and 409 when there is nothing to report: "is there a connection" is
+// the question this route exists to answer, so it cannot be gated on the
+// answer being yes.
+func TestClusterConflictsBeforeAnyConnection(t *testing.T) {
+	h := serverWithCluster(t, &fakeCluster{connected: false})
+	jar := sessionJar(t, h)
+
+	rec := do(t, h, jar, http.MethodGet, "/api/cluster", "")
+	if rec.Code != http.StatusConflict {
+		t.Errorf("GET /api/cluster = %d before connecting, want %d", rec.Code, http.StatusConflict)
 	}
 }
 

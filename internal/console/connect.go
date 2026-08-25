@@ -245,6 +245,12 @@ func (c *connector) Connect(ctx context.Context, contextName string) (ClusterInf
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.info, c.rest, c.kube = info, restCfg, kube
+	// The recovered run is reported to the caller of THIS connect and kept out
+	// of the stored connection: it is a fact about one instant, and the run it
+	// describes moves on. A later reader -- the reload path behind GET
+	// /api/cluster -- gets the live run from the run routes instead of a
+	// snapshot that was true once.
+	c.info.RecoveredRun = nil
 	c.state = stateConnected
 	return info, nil
 }
@@ -321,4 +327,12 @@ func (g clusterGate) Connect(ctx context.Context, contextName string) (any, erro
 func (g clusterGate) Connected() bool {
 	_, _, ok := g.c.Cluster()
 	return ok
+}
+
+func (g clusterGate) Info() (any, bool) {
+	_, info, ok := g.c.Cluster()
+	if !ok {
+		return nil, false
+	}
+	return info, true
 }

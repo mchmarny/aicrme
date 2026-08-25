@@ -58,6 +58,8 @@ type Cluster interface {
 	Connect(ctx context.Context, contextName string) (any, error)
 	// Connected reports whether a connection has been established.
 	Connected() bool
+	// Info returns the established connection, or false if there is none.
+	Info() (any, bool)
 }
 
 // Server wires the HTTP routes.
@@ -182,6 +184,26 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
+// handleCluster reports the connection this process already has.
+//
+// It exists for the reload. A tab restored after a connect carries a live
+// session cookie and no memory of which cluster this console is on, and the
+// connection is single-assignment -- so POST /api/connect would answer 409 and
+// leave the operator stuck on a Connect screen refusing to connect them to the
+// cluster they are already connected to. This is how the SPA learns to skip it.
+//
+// Ungated, and 409 when there is no connection: this is one of the routes that
+// has to answer before a cluster exists, because "is there one" is the
+// question it is for.
+func (s *Server) handleCluster(w http.ResponseWriter, _ *http.Request) {
+	info, ok := s.cluster.Info()
+	if !ok {
+		writeErr(w, errNotConnected)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
 // Handler returns the fully routed http.Handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -214,6 +236,7 @@ func (s *Server) Handler() http.Handler {
 	protected := http.NewServeMux()
 	protected.HandleFunc("GET /api/contexts", s.handleContexts)
 	protected.HandleFunc("POST /api/connect", s.handleConnect)
+	protected.HandleFunc("GET /api/cluster", s.handleCluster)
 	// GET /api/session exists so the SPA can tell a dead console from a
 	// network blip: EventSource surfaces no HTTP status on error, so without
 	// this probe the console had no way to learn its session was no longer

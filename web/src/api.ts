@@ -13,13 +13,102 @@ export class ApiError extends Error {
   }
 }
 
-export async function login(username: string, password: string): Promise<void> {
-  const res = await fetch('/api/login', {
+/**
+ * establishSession exchanges the launch token for a session cookie.
+ *
+ * Called once on load with the ?t= value, which App then strips from the
+ * visible URL. Everything afterwards -- including the EventSource timeline,
+ * which cannot attach request headers -- authenticates by the cookie this
+ * sets. See internal/api/token.go.
+ */
+export async function establishSession(token: string): Promise<void> {
+  const res = await fetch('/api/session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ token }),
   })
-  if (!res.ok) throw new Error(res.status === 429 ? 'Too many attempts' : 'Invalid credentials')
+  if (!res.ok) throw new ApiError(res.status, 'This launch token was not accepted')
+}
+
+/**
+ * probeSession reports whether the cookie from a previous load is still good.
+ *
+ * This is the reload path: a restored tab has no ?t= in its URL, and the
+ * cookie is the only thing that can authenticate it. It also still does its
+ * original job of telling "server gone" from "reconnecting", because
+ * EventSource surfaces no HTTP status on error.
+ */
+export async function probeSession(): Promise<boolean> {
+  const res = await fetch('/api/session')
+  return res.status === 204
+}
+
+/** ContextInfo mirrors Go's console.ContextInfo (internal/console/connect.go). */
+export interface ContextInfo {
+  name: string
+  server: string
+  current: boolean
+}
+
+/**
+ * fetchContexts lists what the operator can connect to. The server reads the
+ * kubeconfig and contacts no cluster, so this returns promptly even when most
+ * of the listed contexts are unreachable from wherever the operator is
+ * sitting.
+ */
+export async function fetchContexts(): Promise<ContextInfo[]> {
+  const res = await fetch('/api/contexts')
+  if (!res.ok) throw new ApiError(res.status, 'Failed to read your kubeconfig')
+  return res.json()
+}
+
+/** ClusterInfo mirrors Go's console.ClusterInfo (internal/console/connect.go). */
+export interface ClusterInfo {
+  context: string
+  server: string
+  version: string
+  nodeCount: number
+  uid: string
+  toolchain?: Record<string, string>
+  /**
+   * recoveredRun is the run this cluster's store was holding, recovered
+   * during the connect that produced this response. In-cluster the pod
+   * restart triggered recovery and the console simply found a run waiting;
+   * locally there is no restart, so it arrives here or not at all.
+   */
+  recoveredRun?: Run
+}
+
+/**
+ * connect establishes this process's one cluster connection. A second call
+ * conflicts: switching clusters means restarting the binary, because the run
+ * directory, the frozen kubeconfig and every cluster client are all keyed on
+ * the first answer.
+ */
+/**
+ * currentCluster reports the connection this console already has, or null.
+ *
+ * This is the reload path's other half. A restored tab has the session cookie
+ * and no memory of which cluster it was on, and the connection is
+ * single-assignment -- so asking to connect again answers 409 and strands the
+ * operator on a screen that will not let them past. Asking first is what
+ * skips it.
+ */
+export async function currentCluster(): Promise<ClusterInfo | null> {
+  const res = await fetch('/api/cluster')
+  if (res.status === 409) return null
+  if (!res.ok) throw new ApiError(res.status, 'Failed to read this console’s cluster connection')
+  return res.json()
+}
+
+export async function connect(contextName: string): Promise<ClusterInfo> {
+  const res = await fetch('/api/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ context: contextName }),
+  })
+  if (!res.ok) throw new ApiError(res.status, 'Failed to connect to that cluster')
+  return res.json()
 }
 
 /** Run mirrors Go's engine.Run field-for-field (internal/engine/run.go). Artifacts is Go json:"-" and never appears here. */
