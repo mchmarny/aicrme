@@ -122,10 +122,12 @@ hand. It refuted a shipped assumption within two minutes.
 
 - `main` is green. The `apt-get` CI hang was fixed on 2026-08-20 by deleting the `apt` step
   entirely and giving `qualify` a 30-minute timeout.
-- **Local toolchain drift to watch:** `golangci-lint` v2.12.2 (the `.settings.yaml` pin) cannot
+- ~~**Local toolchain drift to watch:** `golangci-lint` v2.12.2 (the `.settings.yaml` pin) cannot
   typecheck a Go 1.27 stdlib, and Homebrew has moved local Go past `.go-version`'s 1.26.5. Run
   the gate as `GOTOOLCHAIN=go1.26.5 make qualify` until the pins move together, or lint fails on
-  `math/rand/v2` with nothing to do with this repo.
+  `math/rand/v2` with nothing to do with this repo.~~ **Closed 2026-08-25:** the pins moved
+  together — `.go-version` 1.27.0, `golangci-lint` v2.13.1 — because AICR v0.20.0 requires
+  Go 1.27. `make qualify` needs no `GOTOOLCHAIN` prefix again.
 - UX feedback from the first human demo run is in `docs/ux-feedback.md`, including one
   correctness bug (a stale, already-converged warning pinned to a healthy row on the success
   screen). Unassigned to any phase.
