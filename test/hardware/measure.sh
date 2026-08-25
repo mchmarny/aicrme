@@ -135,7 +135,7 @@ if [[ -z "${EVENTS}" || "${EVENTS}" == "0" ]]; then
   missing "the events endpoint returned nothing — check the path before concluding the bus is quiet"
 else
   echo "  events published for this run: ${EVENTS}"
-  echo "  replayCapacity (cmd/aicrme/main.go): 20000"
+  echo "  replayCapacity (internal/console/console.go): 20000"
   [[ "${EVENTS}" -gt 20000 ]] && echo "  ⇒ OVER the ring. A late-joining tab cannot replay the whole run."
 fi
 

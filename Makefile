@@ -47,7 +47,7 @@ test-coverage: test ## Runs tests and enforces the coverage floor
 # second copy of the AICR version literal that go.mod and .settings.yaml also
 # carry, and neither Go's module graph nor yq can see it — check-aicr-pin
 # below greps it so all three stay equal or the build fails.
-AICR_IMAGE_SRC := cmd/aicrme/main.go
+AICR_IMAGE_SRC := internal/console/console.go
 
 .PHONY: check-aicr-pin
 check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.com/NVIDIA/aicr to the version in .settings.yaml

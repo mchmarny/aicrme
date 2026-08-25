@@ -238,11 +238,11 @@ fi
 
 # The two halves of the budget live in different languages and neither
 # toolchain can see the other, exactly like the AICR image pin `make
-# check-aicr-pin` greps for. main.go's constants are the process's own wait;
+# check-aicr-pin` greps for. console.go's constants are the process's own wait;
 # the chart's grace period is the wall clock Kubernetes allows before SIGKILL.
 # Raising one without the other is silent until a real Apply is interrupted,
 # so read both and compare.
-SHUTDOWN_SRC="cmd/aicrme/main.go"
+SHUTDOWN_SRC="internal/console/console.go"
 
 # go_const_seconds FILE NAME — reads `const NAME = <n> * time.Second` from a Go
 # source file as whole seconds, or nothing if it is not declared that way.
@@ -373,13 +373,13 @@ probe_initial=$(probe_num "${probe}" initialDelaySeconds 0)
 probe_period=$(probe_num "${probe}" periodSeconds 10)
 probe_threshold=$(probe_num "${probe}" failureThreshold 3)
 
-lookup_budget=$(go_const_seconds cmd/aicrme/main.go deploymentLookupTimeout)
+lookup_budget=$(go_const_seconds internal/console/console.go deploymentLookupTimeout)
 cm_call_budget=$(go_const_seconds internal/engine/cmstore.go cmStoreCallTimeout)
 max_load_attempts=$(go_const_int internal/engine/recover.go maxLoadAttempts)
 
 if [[ -z "${lookup_budget}" || -z "${cm_call_budget}" || -z "${max_load_attempts}" ]]; then
   fail "startup constants readable" \
-    "could not read deploymentLookupTimeout (cmd/aicrme/main.go), cmStoreCallTimeout (internal/engine/cmstore.go), and maxLoadAttempts (internal/engine/recover.go)"
+    "could not read deploymentLookupTimeout (internal/console/console.go), cmStoreCallTimeout (internal/engine/cmstore.go), and maxLoadAttempts (internal/engine/recover.go)"
 elif [[ -z "${probe_initial}" || -z "${probe_period}" || -z "${probe_threshold}" ]]; then
   fail "${probe} readable" "could not read initialDelaySeconds/periodSeconds/failureThreshold for the container's ${probe}"
 else

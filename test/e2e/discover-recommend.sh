@@ -35,7 +35,7 @@
 #
 # Getting a live run this far surfaced three gaps in aicrme's own Discover
 # wiring that would break Discover on ANY cluster, real or simulated, not
-# just KWOK -- fixed alongside this script (see cmd/aicrme/main.go and
+# just KWOK -- fixed alongside this script (see internal/console/console.go and
 # internal/steps/discover.go): the snapshot agent's Image, JobName, and
 # ServiceAccountName were never defaulted, so aicr.Client.CollectSnapshot
 # (the Go entry point this console calls, unlike its CLI) forwarded them to

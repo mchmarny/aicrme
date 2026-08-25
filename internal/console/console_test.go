@@ -1,4 +1,4 @@
-package main
+package console
 
 import (
 	"bytes"
@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime/debug"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,34 +32,74 @@ import (
 
 const aicrModulePath = "github.com/NVIDIA/aicr"
 
-// linkedAICRVersion returns the github.com/NVIDIA/aicr version this test
-// binary was actually compiled against, read from the module graph the
-// toolchain stamps into every binary it links. This is the same version
-// go.mod records and `make check-aicr-pin` compares against .settings.yaml,
-// but taken from the build itself rather than from a file that could have
-// drifted from what was compiled.
+// requiredAICRVersion returns the github.com/NVIDIA/aicr version this module
+// builds against, read from go.mod's require directive.
 //
-// Only Deps is used, never info.Main.Version: for a plain `go build` with no
-// VCS stamping the main module reads "(devel)", so deriving the console's own
-// release tag at runtime is not reliable. Dependency versions carry no such
-// caveat -- the module graph resolves them exactly.
-func linkedAICRVersion(t *testing.T) string {
+// In cmd/aicrme this read the module graph the linker stamps into the binary
+// (debug.ReadBuildInfo), which is better evidence -- it is what was actually
+// compiled rather than what a file claims. That mechanism does not survive the
+// move into a library package: `go test` stamps the dependency list only into
+// the test binary of a package main, and a library package's test binary
+// reports info.Deps empty, so the check failed outright rather than silently
+// passing. go.mod is the next-best source and the one `make check-aicr-pin`
+// already compares .settings.yaml against, which makes the image tag, go.mod
+// and .settings.yaml a single chain rather than three independent pins.
+//
+// A replace directive would decouple the require line from what is compiled,
+// so one is treated as a failure rather than followed.
+func requiredAICRVersion(t *testing.T) string {
 	t.Helper()
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		t.Fatal("debug.ReadBuildInfo() unavailable; cannot verify the snapshot agent image against the linked AICR module")
+
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatalf("reading go.mod: %v", err)
 	}
-	for _, dep := range info.Deps {
-		if dep.Path != aicrModulePath {
+
+	version := ""
+	for line := range strings.Lines(string(raw)) {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
 			continue
 		}
-		if dep.Replace != nil {
-			return dep.Replace.Version
+		if fields[0] == "require" || fields[0] == "replace" {
+			fields = fields[1:]
 		}
-		return dep.Version
+		if len(fields) < 2 || fields[0] != aicrModulePath {
+			continue
+		}
+		if slices.Contains(fields, "=>") {
+			t.Fatalf("go.mod replaces %s; the snapshot agent image cannot be verified against the require line", aicrModulePath)
+		}
+		version = fields[1]
 	}
-	t.Fatalf("%s is not among this binary's module dependencies; the snapshot agent image pin cannot be verified", aicrModulePath)
-	return ""
+	if version == "" {
+		t.Fatalf("%s is not required by go.mod; the snapshot agent image pin cannot be verified", aicrModulePath)
+	}
+	return version
+}
+
+// moduleRoot walks up from the package directory -- `go test` runs a test in
+// it -- to the directory holding go.mod.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("resolving the working directory: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("no go.mod above %s", dir)
+		}
+		dir = parent
+	}
 }
 
 func splitImage(t *testing.T, image string) (repo, tag string) {
@@ -71,20 +111,20 @@ func splitImage(t *testing.T, image string) (repo, tag string) {
 	return repo, tag
 }
 
-// TestDefaultSnapshotAgentImageTracksLinkedAICRVersion is the guard that makes
+// TestDefaultSnapshotAgentImageTracksRequiredAICRVersion is the guard that makes
 // the image default load-bearing. Discover forwards it verbatim to the agent
 // Job's container spec -- aicr.Client.CollectSnapshot, unlike the `aicr` CLI,
 // applies no default of its own -- so deleting the constant or letting its tag
 // drift from the compiled-in AICR client breaks Discover on every cluster.
 // Before this test, both failure modes left the suite green.
-func TestDefaultSnapshotAgentImageTracksLinkedAICRVersion(t *testing.T) {
+func TestDefaultSnapshotAgentImageTracksRequiredAICRVersion(t *testing.T) {
 	repo, tag := splitImage(t, defaultSnapshotAgentImage)
 
 	if want := "ghcr.io/nvidia/aicr"; repo != want {
 		t.Errorf("defaultSnapshotAgentImage repo = %q, want %q (the CLI's own defaultAgentImage mapping)", repo, want)
 	}
-	if want := linkedAICRVersion(t); tag != want {
-		t.Errorf("defaultSnapshotAgentImage tag = %q, want %q (the linked %s version; see .settings.yaml dependencies.aicr and `make check-aicr-pin`)",
+	if want := requiredAICRVersion(t); tag != want {
+		t.Errorf("defaultSnapshotAgentImage tag = %q, want %q (go.mod's required %s version; see .settings.yaml dependencies.aicr and `make check-aicr-pin`)",
 			tag, want, aicrModulePath)
 	}
 }
