@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes/fake"
-
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
@@ -665,18 +663,23 @@ func waitForPersistedState(t *testing.T, store engine.Store, id string, want eng
 // TestUnconfirmedCleanupSurvivesRestart is fix round 2's N1 regression:
 // envelope.go is a hand-maintained projection -- its own doc comment says
 // it deliberately does not reuse Run's json tags -- and Run.CleanupUnconfirmed
-// went a full fix round without a producer there, so a pod restart silently
+// went a full fix round without a producer there, so a restart silently
 // dropped Ruling 12's guard while the OLD Run.Err text it replaced would
 // have survived just fine. This is why NewMemoryStore cannot be used here:
 // its Save/Load clone the Run struct directly in-process and never touch
 // encodeRun/decodeRun at all, so it would report this field surviving
-// correctly whether or not envelope.go actually carries it. The real
-// ConfigMap-backed store, and a genuinely SECOND *engine.Engine instance
-// over the same persisted record, is what simulates the pod restart spec
-// §9's own recovered-StateActive flow describes.
+// correctly whether or not envelope.go actually carries it. A real
+// envelope-backed store, and a genuinely SECOND *engine.Engine instance over
+// the same persisted record, is what simulates the restart.
+//
+// The file store, since the ConfigMap store this originally used is gone.
+// Same envelope, same property, and now it is also the store production runs
+// on rather than one only this test would exercise.
 func TestUnconfirmedCleanupSurvivesRestart(t *testing.T) {
-	client := fake.NewSimpleClientset()
-	store := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+	store, err := engine.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
 
 	proveStep := newFakeStep(engine.PhaseProve)
 	proveStep.err = fmt.Errorf("run failed: %w", engine.ErrUnconfirmedCleanup)
@@ -698,9 +701,8 @@ func TestUnconfirmedCleanupSurvivesRestart(t *testing.T) {
 		t.Fatal("fixture check: Discard() succeeded before restart, want the unconfirmed-cleanup guard blocking")
 	}
 
-	// A genuinely second engine instance over the same underlying
-	// ConfigMap, not a second call on `before` -- the shape an actual pod
-	// restart produces.
+	// A genuinely second engine instance over the same underlying record,
+	// not a second call on `before` -- the shape an actual restart produces.
 	after := engine.New(bus.New(64), store, newFakeStep(engine.PhaseBundle), newFakeStep(engine.PhaseProve))
 	if recoverErr := after.Recover(context.Background()); recoverErr != nil {
 		t.Fatalf("Recover() error = %v", recoverErr)

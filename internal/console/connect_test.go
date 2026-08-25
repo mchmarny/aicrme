@@ -309,6 +309,49 @@ func TestRunDirectoryDiffersForADifferentUIDAtTheSameServer(t *testing.T) {
 // cluster-touching request lands -- the engine's identity today, the
 // per-cluster store and recovery later. A connect that returned with the hook
 // unfinished would open the gate over half-built wiring.
+// --context says which context the Connect screen arrives preselected on. It
+// deliberately does not connect: which cluster is the one irreversible
+// decision this console makes, and a flag that made it unattended would make
+// it without anyone looking.
+func TestPreferredContextIsMarkedCurrent(t *testing.T) {
+	c := newTestConnector(t, fakeProber{})
+	c.preferred = "beta"
+
+	got, err := c.Contexts()
+	if err != nil {
+		t.Fatalf("Contexts() error = %v", err)
+	}
+	for _, ctx := range got {
+		if ctx.Current != (ctx.Name == "beta") {
+			t.Errorf("context %q current = %v, want it marked only for --context beta", ctx.Name, ctx.Current)
+		}
+	}
+	if c.State() == stateConnected {
+		t.Error("listing contexts connected to one")
+	}
+}
+
+// A typo in a preselection is not a reason to refuse to start: the screen
+// still lists the real contexts and the operator picks from them.
+func TestAnUnknownPreferredContextLeavesTheKubeconfigsChoice(t *testing.T) {
+	c := newTestConnector(t, fakeProber{})
+	c.preferred = "does-not-exist"
+
+	got, err := c.Contexts()
+	if err != nil {
+		t.Fatalf("Contexts() error = %v", err)
+	}
+	var current string
+	for _, ctx := range got {
+		if ctx.Current {
+			current = ctx.Name
+		}
+	}
+	if current != "alpha" {
+		t.Errorf("current context = %q, want the kubeconfig's own (alpha)", current)
+	}
+}
+
 func TestConnectRunsTheHookBeforeReportingConnected(t *testing.T) {
 	c := newTestConnector(t, fakeProber{})
 

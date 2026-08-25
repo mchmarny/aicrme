@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -165,6 +166,10 @@ type connector struct {
 	// any connection exists -- it describes this machine, not the cluster --
 	// so it is set once at construction rather than discovered in dial.
 	toolchain Toolchain
+	// preferred is --context: the one the Connect screen arrives preselected
+	// on. Empty leaves the kubeconfig's own current-context marked. See
+	// Contexts for why this preselects rather than connects.
+	preferred string
 	// newKube builds the clientset from the selected context's rest.Config.
 	// A field rather than a direct call so a test can hand dial a fake
 	// clientset and exercise the identity read for real, instead of stubbing
@@ -210,9 +215,38 @@ func (c *connector) Cluster() (kubernetes.Interface, ClusterInfo, bool) {
 	return c.kube, c.info, c.state == stateConnected
 }
 
-// Contexts lists the contexts the operator can choose between.
+// Contexts lists the contexts the operator can choose between, with --context
+// (if given) marked current in place of the kubeconfig's own choice.
+//
+// Marked, not selected: --context says which one the Connect screen should
+// arrive preselected on, and the operator still confirms it. A flag that
+// connected on their behalf would make the one irreversible decision this
+// console has -- which cluster -- without anyone looking at it.
+//
+// A name that is not in the kubeconfig leaves the list exactly as it was. It
+// is reported at the point it becomes actionable: the screen shows the real
+// contexts and the operator picks, rather than the binary refusing to start
+// over a typo in a preselection.
 func (c *connector) Contexts() ([]ContextInfo, error) {
-	return listContexts(c.kubeconfig)
+	out, err := listContexts(c.kubeconfig)
+	if err != nil || c.preferred == "" {
+		return out, err
+	}
+	var found bool
+	for i := range out {
+		if out[i].Name == c.preferred {
+			found = true
+		}
+	}
+	if !found {
+		slog.Warn("the requested context is not in this kubeconfig; leaving the kubeconfig's own current-context selected",
+			"context", c.preferred)
+		return out, nil
+	}
+	for i := range out {
+		out[i].Current = out[i].Name == c.preferred
+	}
+	return out, nil
 }
 
 func (c *connector) Connect(ctx context.Context, contextName string) (ClusterInfo, error) {

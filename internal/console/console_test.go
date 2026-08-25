@@ -298,14 +298,30 @@ func TestProveGangTimeout(t *testing.T) {
 	}
 }
 
-func TestEnsureWorkDirsCreatesEveryCacheDir(t *testing.T) {
+func TestEnsureWorkDirsCreatesEverySubdirectory(t *testing.T) {
 	root := t.TempDir()
 	if err := ensureWorkDirs(root); err != nil {
 		t.Fatalf("ensureWorkDirs() error = %v", err)
 	}
-	for _, sub := range []string{"tmp", "home", "helm/cache", "helm/config", "helm/data", "kube/cache", "runs"} {
+	for _, sub := range workSubdirs {
 		if _, err := os.Stat(filepath.Join(root, sub)); err != nil {
 			t.Errorf("missing %s: %v", sub, err)
+		}
+	}
+}
+
+// The helm and kube cache redirections were deleted with the image, not
+// forgotten: locally, pointing HELM_* at a scratch directory would hide the
+// operator's real chart repository credentials and registry auth from an
+// install that needs them.
+func TestEnsureWorkDirsDoesNotRedirectTheOperatorsToolCaches(t *testing.T) {
+	root := t.TempDir()
+	if err := ensureWorkDirs(root); err != nil {
+		t.Fatalf("ensureWorkDirs() error = %v", err)
+	}
+	for _, sub := range []string{"home", "helm", "kube"} {
+		if _, err := os.Stat(filepath.Join(root, sub)); err == nil {
+			t.Errorf("%s was created -- the console must use the operator's own tool configuration", sub)
 		}
 	}
 }

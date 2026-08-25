@@ -41,9 +41,6 @@ jobs:
             | tar -xJ --strip-components=1 -C /usr/local/bin "shellcheck-${want}/shellcheck"
           shellcheck --version | grep -E '^version:'
       - uses: mikefarah/yq@v4.53.3
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.19.0
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.13.1
@@ -52,7 +49,6 @@ jobs:
       # names the gate that broke rather than the whole target.
       - run: make web
       - run: make lint-shell
-      - run: make test-chart
       - run: make test-web
       - run: make test-coverage
       - run: make check-aicr-pin

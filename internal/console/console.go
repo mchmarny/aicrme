@@ -69,27 +69,32 @@ const defaultProveGangTimeout = 3 * time.Minute
 // WaitDelay doc comment: "starts when either the associated Context is done
 // or a call to Wait observes that the child process has exited, whichever
 // occurs first"). 15s was the right estimate but zero slack; 30s gives real
-// headroom and still fits inside the chart's terminationGracePeriodSeconds of
-// 45 alongside the concurrent HTTP drain -- test/chart/contract.sh pins
-// runShutdownTimeout against killGrace + terminalSaveTimeout, and both
-// against the grace period, so they cannot drift apart silently.
+// headroom.
+//
+// It used to be justified against the chart's terminationGracePeriodSeconds,
+// with test/chart/contract.sh pinning the three constants so they could not
+// drift apart. Both are gone with the chart. The arithmetic is unchanged and
+// still correct; what changed is the deadline it has to fit inside. There is
+// none now -- an operator's Ctrl-C waits as long as this says, and the reason
+// to keep it bounded is that a wedged helm should surface as a slow exit
+// rather than a console that never returns their terminal.
 const runShutdownTimeout = 30 * time.Second
 
 // httpShutdownTimeout bounds the HTTP drain. Runs concurrently with the
-// above, so the pod's total shutdown budget is the larger of the two, not
-// their sum -- which is what lets both fit inside
-// terminationGracePeriodSeconds.
+// above, so total shutdown is the larger of the two rather than their sum.
 const httpShutdownTimeout = 10 * time.Second
 
-// workSubdirs are the directories the console and deploy.sh need writable.
-// With readOnlyRootFilesystem: true, the emptyDir at AICRME_WORK_DIR is the
-// only writable path in the container, so every tool that wants scratch
-// space is pointed at a subdirectory of it by the chart's env block --
-// bash's mktemp -d at TMPDIR, helm's three XDG-style caches, kubectl's
-// discovery cache, and $HOME for anything that ignores all of the above.
-// They are created here rather than by the chart because an emptyDir is
-// mounted empty on every pod start.
-var workSubdirs = []string{"tmp", "home", "helm/cache", "helm/config", "helm/data", "kube/cache", "runs"}
+// workSubdirs are the directories the console and deploy.sh need writable:
+// scratch for bash's mktemp -d, and the per-cluster run records.
+//
+// The helm and kube cache redirections that used to be here are gone
+// deliberately, not by oversight. They existed because readOnlyRootFilesystem:
+// true left an emptyDir as the container's one writable path. Locally,
+// redirecting them would be actively WRONG: the operator's real helm
+// configuration may hold private chart repository credentials and registry
+// auth that the install needs, and pointing HELM_* at a scratch directory
+// would hide it.
+var workSubdirs = []string{"tmp", "runs", "bundles"}
 
 // prepareWorkDir makes workDir usable and makes this process its sole owner:
 // the subdirectories every tool writes into, a sweep of the session
@@ -363,6 +368,7 @@ func Run(ctx context.Context, opts Options) error {
 	// cluster has nothing to offer.
 	conn := newConnector(opts.Kubeconfig, liveProber{})
 	conn.toolchain = toolchain
+	conn.preferred = opts.Context
 
 	// The engine exists before any cluster does, because internal/api takes it
 	// at New and the server that serves the Connect screen is the same one
@@ -431,14 +437,17 @@ func shutdown(ctx context.Context, srv *api.Server, httpSrv *http.Server, eng *e
 
 	// HTTP drain and engine cleanup run concurrently. The invariant is "do
 	// not return before the deploy.sh process tree is reaped" -- not "do not
-	// begin HTTP shutdown first". aicrme is PID 1 under the image's
-	// ENTRYPOINT with no init, so returning from main tears down the whole
-	// PID namespace and SIGKILLs helm mid-release. Helm handles SIGTERM
-	// itself and marks the release failed; killed outright it leaves the
-	// release stranded in pending-install, which blocks the next
-	// `helm upgrade --install` until someone runs `helm rollback` by hand.
-	// deploy.sh's own INT/TERM trap is not what needs the time -- it is an
-	// `rm -rf` of the helm temp workdir and returns immediately.
+	// begin HTTP shutdown first".
+	//
+	// Reaping is what needs the time. Helm handles SIGTERM itself and marks the
+	// release failed; killed outright it leaves the release stranded in
+	// pending-install, which blocks the next `helm upgrade --install` until
+	// someone runs `helm rollback` by hand. applier/exec.go's Setpgid puts
+	// deploy.sh in its own process group, so a Ctrl-C delivered to the
+	// terminal's foreground group does not reach helm directly -- this shutdown
+	// is what ends it, on its own terms. deploy.sh's own INT/TERM trap is not
+	// what needs the time: it is an `rm -rf` of the helm temp workdir and
+	// returns immediately.
 	var wg sync.WaitGroup
 	wg.Add(2)
 

@@ -85,7 +85,7 @@ demo-down: ## Deletes the local demo cluster
 	./scripts/demo.sh down
 
 .PHONY: demo-status
-demo-status: ## Shows whether the local demo is running, and its URL and password
+demo-status: ## Shows whether the local demo is running, and the console's URL
 	./scripts/demo.sh status
 
 .PHONY: check-tools
@@ -96,11 +96,12 @@ check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml
 	@# file, which is what happened on 2026-08-19 when an unpinned shellcheck
 	@# flagged SC2015 in CI and not locally.
 	@#
-	@# Deliberately covers lint tools only. helm and kubectl are pinned in the
-	@# Dockerfile because they ship INSIDE the console image and deploy.sh runs
-	@# against them -- those pins are the product's contract, and matching them
-	@# to a developer's machine is the mistake that produced the dry-run ceiling
-	@# confusion (docs/phase-2-handoff.md).
+	@# Deliberately covers lint tools only. helm and kubectl are no longer
+	@# pinned anywhere: the image that used to ship them is gone, and the
+	@# binary now uses whatever the operator has. internal/console/preflight.go
+	@# resolves and records those versions per run so the evidence bundle can
+	@# say which helm installed a cluster -- which is the property the pins
+	@# used to provide, moved from build time to run time.
 	@want=$$(sed -n 's/^  shellcheck: *.\(v[0-9.]*\).*/\1/p' .settings.yaml); \
 	have=v$$(shellcheck --version 2>/dev/null | awk '/^version:/{print $$2}'); \
 	if [ -n "$$have" ] && [ "$$want" != "$$have" ]; then \
@@ -114,11 +115,7 @@ check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml
 
 .PHONY: lint-shell
 lint-shell: check-tools ## Lints shell scripts with shellcheck
-	shellcheck -x -P test/e2e -P test/chart -P test/hardware -P scripts test/e2e/*.sh test/chart/*.sh test/hardware/*.sh scripts/*.sh
-
-.PHONY: test-chart
-test-chart: ## Runs helm lint plus the chart contract assertions (offline, no cluster)
-	./test/chart/contract.sh
+	shellcheck -x -P test/e2e -P test/hardware -P scripts test/e2e/*.sh test/hardware/*.sh scripts/*.sh
 
 .PHONY: test-e2e-apply
 test-e2e-apply: ## Runs the Discover-to-Apply dry-run e2e on Kind+KWOK (needs Docker)
@@ -139,23 +136,8 @@ web: ## Builds the SPA into web/dist and syncs it into internal/web/dist for go:
 build: web ## Builds the aicrme binary with the SPA embedded
 	go build -ldflags "$(LDFLAGS)" -o bin/aicrme ./cmd/aicrme
 
-IMAGE ?= aicrme:dev
-
-.PHONY: image
-image: ## Builds the container image; GO_VERSION comes from .go-version, never hardcoded
-	@# PLATFORM is empty by default, which builds for the host and is what Kind
-	@# wants: an arm64 laptop running an arm64 Kind node needs an arm64 image,
-	@# and forcing amd64 there would emulate for no reason. It is set only when
-	@# the target cluster's architecture differs from the host's --
-	@# scripts/demo-remote.sh reads kubernetes.io/arch off the nodes and passes
-	@# it, because a managed cluster is almost always amd64 while the laptop
-	@# building the image increasingly is not, and the failure that mismatch
-	@# produces (CrashLoopBackOff with "exec format error") says nothing about
-	@# its own cause.
-	docker build $(if $(PLATFORM),--platform $(PLATFORM),) --build-arg GO_VERSION=$(GO_VERSION) -t $(IMAGE) .
-
 .PHONY: qualify
-qualify: web lint lint-shell test-chart test-web test-coverage check-aicr-pin ## Full local gate — must match CI exactly
+qualify: web lint lint-shell test-web test-coverage check-aicr-pin ## Full local gate — must match CI exactly
 # web comes first: internal/web/dist holds only .gitkeep on a clean
 # checkout, and go test ./internal/web/... (part of test-coverage) needs the
 # real embedded index.html, not just a directory that satisfies go:embed.

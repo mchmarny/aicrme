@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+// testPayloadCeiling is the ConfigMap store's old 800 KiB ceiling, kept here
+// after that store was deleted because the envelope's shedding behavior needs
+// a ceiling a test-sized record can actually reach. filePayloadCeiling is 64
+// MiB precisely so shedding is unreachable in normal use, which makes it
+// useless for testing the thing shedding does.
+const testPayloadCeiling = 800 << 10
+
 func testRun() *Run {
 	return &Run{
 		ID:         "abc123",
@@ -29,11 +36,11 @@ func testRun() *Run {
 
 func TestEncodeDecodeRoundTripsArtifacts(t *testing.T) {
 	in := testRun()
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -58,11 +65,11 @@ func TestEncodeDecodeRoundTripsArtifacts(t *testing.T) {
 func TestEncodeDropsBundlePath(t *testing.T) {
 	in := testRun()
 	in.Artifacts["bundle.path"] = []byte("/var/lib/aicrme/runs/abc123/bundle")
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -80,7 +87,7 @@ func TestEncodeCompresses(t *testing.T) {
 	// Highly compressible, like a real snapshot.yaml.
 	in.Artifacts["snapshot.yaml"] = bytes.Repeat([]byte("nodes:\n  - name: gpu-0\n"), 4000)
 	raw := len(in.Artifacts["snapshot.yaml"])
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
@@ -115,15 +122,15 @@ func TestEncodeShedsOversizedArtifactsRatherThanFailing(t *testing.T) {
 	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
 	in.Artifacts["recipe.json"] = []byte(`{"components":[{"name":"gpu-operator"}]}`)
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v, want the oversized artifact shed rather than the write failed", err)
 	}
-	if len(blob) > cmPayloadCeiling {
-		t.Errorf("encoded size %d exceeds cmPayloadCeiling %d -- shedding must actually bring the record under the cap", len(blob), cmPayloadCeiling)
+	if len(blob) > testPayloadCeiling {
+		t.Errorf("encoded size %d exceeds testPayloadCeiling %d -- shedding must actually bring the record under the cap", len(blob), testPayloadCeiling)
 	}
 
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -158,12 +165,12 @@ func TestEncodeNamesTheArtifactsItShed(t *testing.T) {
 	in := testRun()
 	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
 	var env envelope
-	if err := gunzipJSON(blob, &env, cmPayloadCeiling*10); err != nil {
+	if err := gunzipJSON(blob, &env, testPayloadCeiling*10); err != nil {
 		t.Fatalf("gunzipJSON() error = %v", err)
 	}
 	if len(env.Truncated) != 1 || env.Truncated[0] != "snapshot.yaml" {
@@ -174,12 +181,12 @@ func TestEncodeNamesTheArtifactsItShed(t *testing.T) {
 // A record that fits keeps Truncated empty: the marker must mean something,
 // not be set on every write.
 func TestEncodeLeavesTruncatedEmptyWhenTheRecordFits(t *testing.T) {
-	blob, err := encodeRun(testRun(), cmPayloadCeiling)
+	blob, err := encodeRun(testRun(), testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
 	var env envelope
-	if err := gunzipJSON(blob, &env, cmPayloadCeiling*10); err != nil {
+	if err := gunzipJSON(blob, &env, testPayloadCeiling*10); err != nil {
 		t.Fatalf("gunzipJSON() error = %v", err)
 	}
 	if len(env.Truncated) != 0 {
@@ -200,11 +207,11 @@ func TestEncodeShedsDeterministically(t *testing.T) {
 		in.Artifacts["aaa.bin"] = big
 		in.Artifacts["zzz.bin"] = append([]byte(nil), big...)
 
-		blob, err := encodeRun(in, cmPayloadCeiling)
+		blob, err := encodeRun(in, testPayloadCeiling)
 		if err != nil {
 			t.Fatalf("encodeRun() error = %v", err)
 		}
-		out, err := decodeRun(blob, cmPayloadCeiling)
+		out, err := decodeRun(blob, testPayloadCeiling)
 		if err != nil {
 			t.Fatalf("decodeRun() error = %v", err)
 		}
@@ -233,7 +240,7 @@ func TestEncodeRejectsOversizedPayload(t *testing.T) {
 	big := incompressibleBytes(t, 2<<20)
 	in.Decisions = map[string]string{"intent": base64.RawStdEncoding.EncodeToString(big)}
 
-	if _, err := encodeRun(in, cmPayloadCeiling); err == nil {
+	if _, err := encodeRun(in, testPayloadCeiling); err == nil {
 		t.Fatal("encodeRun() error = nil, want ErrTooLarge")
 	} else if !strings.Contains(err.Error(), "too large") {
 		t.Errorf("error = %v, want a too-large error", err)
@@ -241,12 +248,12 @@ func TestEncodeRejectsOversizedPayload(t *testing.T) {
 }
 
 func TestDecodeRejectsUnknownVersion(t *testing.T) {
-	blob, err := encodeRun(testRun(), cmPayloadCeiling)
+	blob, err := encodeRun(testRun(), testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
 	bumped := bumpVersionForTest(t, blob)
-	if _, err := decodeRun(bumped, cmPayloadCeiling); err == nil {
+	if _, err := decodeRun(bumped, testPayloadCeiling); err == nil {
 		t.Fatal("decodeRun() error = nil, want an unsupported-version error")
 	}
 }
@@ -255,14 +262,14 @@ func TestDecodeBoundsDecompression(t *testing.T) {
 	// A gzip bomb: small stored, enormous expanded. The pod is capped at
 	// 512Mi, so an unbounded reader here is an OOM kill rather than an error.
 	bomb := gzipBombForTest(t, 64<<20)
-	if _, err := decodeRun(bomb, cmPayloadCeiling); err == nil {
+	if _, err := decodeRun(bomb, testPayloadCeiling); err == nil {
 		t.Fatal("decodeRun() error = nil, want a decode error from the size bound")
 	}
 }
 
 // TestDerivedDecompressionBoundNeverNarrowsTheConfigMapStoresOriginal pins
 // the invariant fix round 1 found broken: the ×10 this file originally used
-// made cmPayloadCeiling*10 (8,192,000) narrower than the unparameterized
+// made testPayloadCeiling*10 (8,192,000) narrower than the unparameterized
 // code's original 8 << 20 (8,388,608), so decodeRun would have newly
 // rejected a decompressed record between roughly 7.8 and 8 MiB that the old
 // bound accepted. TestDecodeBoundsDecompression's 64 MiB bomb is nowhere
@@ -272,10 +279,10 @@ func TestDecodeBoundsDecompression(t *testing.T) {
 // brittle (a single byte of JSON/gzip framing overhead either way changes
 // whether a near-boundary fixture actually exercises the bound).
 func TestDerivedDecompressionBoundNeverNarrowsTheConfigMapStoresOriginal(t *testing.T) {
-	got := cmPayloadCeiling * decompressMultiplier
+	got := testPayloadCeiling * decompressMultiplier
 	const oldBound = 8 << 20
 	if got < oldBound {
-		t.Errorf("derived decompression bound at cmPayloadCeiling = %d, want >= %d (the ConfigMap store's original 8 MiB) -- "+
+		t.Errorf("derived decompression bound at testPayloadCeiling = %d, want >= %d (the ConfigMap store's original 8 MiB) -- "+
 			"parameterizing the ceiling must never cause decodeRun to reject a record the old, unparameterized bound accepted", got, oldBound)
 	}
 }
@@ -285,7 +292,7 @@ func TestDerivedDecompressionBoundNeverNarrowsTheConfigMapStoresOriginal(t *test
 func bumpVersionForTest(t *testing.T, blob []byte) []byte {
 	t.Helper()
 	var env envelope
-	if err := gunzipJSON(blob, &env, cmPayloadCeiling*10); err != nil {
+	if err := gunzipJSON(blob, &env, testPayloadCeiling*10); err != nil {
 		t.Fatalf("gunzipJSON() error = %v", err)
 	}
 	env.Version = envelopeVersion + 99
@@ -319,11 +326,11 @@ func TestTruncatedSurvivesTheRoundTrip(t *testing.T) {
 	in := testRun()
 	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -338,11 +345,11 @@ func TestTruncatedSurvivesTheRoundTrip(t *testing.T) {
 // A record that fits leaves Run.Truncated empty, so the flag means something
 // rather than being set on every load.
 func TestTruncatedEmptyOnAnIntactRecord(t *testing.T) {
-	blob, err := encodeRun(testRun(), cmPayloadCeiling)
+	blob, err := encodeRun(testRun(), testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -360,21 +367,21 @@ func TestTruncatedIsCarriedForwardOnRewrite(t *testing.T) {
 	in := testRun()
 	in.Artifacts["snapshot.yaml"] = incompressibleBytes(t, 1<<20)
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	recovered, err := decodeRun(blob, cmPayloadCeiling)
+	recovered, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
 
 	// The record this process would write next, from the run it recovered.
-	rewritten, err := encodeRun(recovered, cmPayloadCeiling)
+	rewritten, err := encodeRun(recovered, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun(recovered) error = %v", err)
 	}
-	out, err := decodeRun(rewritten, cmPayloadCeiling)
+	out, err := decodeRun(rewritten, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun(rewritten) error = %v", err)
 	}
@@ -393,11 +400,11 @@ func TestCleanupUnconfirmedSurvivesTheRoundTrip(t *testing.T) {
 	in.State = StateFailed
 	in.CleanupUnconfirmed = true
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -409,11 +416,11 @@ func TestCleanupUnconfirmedSurvivesTheRoundTrip(t *testing.T) {
 // A run that never had an unconfirmed cleanup must decode as false, not pick
 // up junk from an unset field.
 func TestCleanupUnconfirmedFalseOnAnOrdinaryRecord(t *testing.T) {
-	blob, err := encodeRun(testRun(), cmPayloadCeiling)
+	blob, err := encodeRun(testRun(), testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -441,7 +448,7 @@ func TestDecodeRunAcceptsARecordWithoutCleanupUnconfirmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gzipJSON() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v, want a pre-CleanupUnconfirmed record to still decode", err)
 	}
@@ -575,11 +582,11 @@ func TestEnvelopeRoundTripsEveryRunField(t *testing.T) {
 		setDistinctFieldValue(t, rv.Field(i), f.Name)
 	}
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -672,11 +679,11 @@ func TestEnvelopeRoundTripsOwnership(t *testing.T) {
 		},
 	}
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -728,11 +735,11 @@ func TestEnvelopeRoundTripsEveryComponentStateField(t *testing.T) {
 		Components: []ComponentState{cs},
 	}
 
-	blob, err := encodeRun(in, cmPayloadCeiling)
+	blob, err := encodeRun(in, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}

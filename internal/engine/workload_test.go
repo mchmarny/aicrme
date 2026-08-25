@@ -11,7 +11,7 @@ import (
 // encode as a setup failure, not the behavior under test.
 func mustEncodeRun(t *testing.T, r Run) []byte {
 	t.Helper()
-	blob, err := encodeRun(&r, cmPayloadCeiling)
+	blob, err := encodeRun(&r, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("encodeRun() error = %v", err)
 	}
@@ -25,7 +25,7 @@ func mustEncodeRun(t *testing.T, r Run) []byte {
 func TestWorkloadSurvivesTheRecordRoundTrip(t *testing.T) {
 	in := Run{ID: "run-abc", State: StateActive,
 		Workload: Workload{Namespace: "aicrme-prove", Kind: "Job", Name: "prove-run-abc"}}
-	out, err := decodeRun(mustEncodeRun(t, in), cmPayloadCeiling)
+	out, err := decodeRun(mustEncodeRun(t, in), testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -39,7 +39,7 @@ func TestWorkloadSurvivesTheRecordRoundTrip(t *testing.T) {
 // field.
 func TestWorkloadEmptyOnARunThatNeverWentActive(t *testing.T) {
 	in := Run{ID: "run-idle", State: StateDone}
-	out, err := decodeRun(mustEncodeRun(t, in), cmPayloadCeiling)
+	out, err := decodeRun(mustEncodeRun(t, in), testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v", err)
 	}
@@ -86,7 +86,7 @@ func TestDecodeRunAcceptsARecordWithoutWorkload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gzipJSON() error = %v", err)
 	}
-	out, err := decodeRun(blob, cmPayloadCeiling)
+	out, err := decodeRun(blob, testPayloadCeiling)
 	if err != nil {
 		t.Fatalf("decodeRun() error = %v, want a pre-Workload record to still decode", err)
 	}
