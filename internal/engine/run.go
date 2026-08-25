@@ -168,6 +168,37 @@ type Run struct {
 	//
 	// omitzero, not omitempty: see Workload's comment.
 	Residue Residue `json:"residue,omitzero"`
+	// AgentNamespace is the namespace AICR's snapshot agent ran in, and
+	// whether Discover created it.
+	//
+	// It needs its own field because Ownership.Namespaces cannot carry it:
+	// that set is built from recipe.json's components (steps.recipeNamespaces)
+	// and the agent namespace is not one of them -- it exists before a recipe
+	// does. Recorded at all because Reset's whole vocabulary is "did this run
+	// create this", and a namespace nothing recorded is one the operator is
+	// never told about.
+	//
+	// omitzero, not omitempty: see Workload's comment.
+	AgentNamespace AgentNamespace `json:"agentNamespace,omitzero"`
+}
+
+// AgentNamespace is the namespace AICR's snapshot agent ran in.
+//
+// Its zero value means Discover never ran, which is the state of every run
+// that failed earlier and of every record written before this field existed.
+type AgentNamespace struct {
+	Name string `json:"name,omitempty"`
+	// UID is the namespace object's UID as Discover found or created it.
+	// Recorded for the same reason every other identity in this package is:
+	// a name is a label anyone can recreate, and the operator reading the
+	// residue should be able to tell the object they were told about from a
+	// later one wearing its name.
+	UID string `json:"uid,omitempty"`
+	// Created records that Discover brought the namespace into existence.
+	// The one thing Reset needs to know: a namespace this run made is one
+	// the operator may now want gone, and one that predates the install is
+	// none of this console's business.
+	Created bool `json:"created,omitempty"`
 }
 
 // ResidueItem is what happened to one thing a Reset considered. Exactly one

@@ -105,6 +105,16 @@ type envelope struct {
 	// a recovered run that lost its toolchain would produce evidence that
 	// cannot say what produced it.
 	Toolchain map[string]string `json:"toolchain,omitempty"`
+	// AgentNamespace is the same optional-on-both-sides addition, and it must
+	// survive the round trip for the reason Residue must: it is evidence about
+	// what is still on the cluster, and Reset reports it. A recovered run that
+	// lost it would leave the namespace Discover created standing with nothing
+	// telling the operator it is theirs to remove. Absent means "written
+	// before this field existed", which decodes to the zero value -- "Discover
+	// never ran" -- and that is a correct decode, not a degraded one.
+	//
+	// omitzero, not omitempty: see Run.AgentNamespace's comment.
+	AgentNamespace AgentNamespace `json:"agentNamespace,omitzero"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -191,6 +201,7 @@ func encodeRun(r *Run, maxPayload int) ([]byte, error) {
 		Residue:            r.Residue,
 		ClusterUID:         r.ClusterUID,
 		Toolchain:          r.Toolchain,
+		AgentNamespace:     r.AgentNamespace,
 		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -310,6 +321,7 @@ func decodeRun(blob []byte, maxPayload int) (*Run, error) {
 		Residue:            env.Residue,
 		ClusterUID:         env.ClusterUID,
 		Toolchain:          env.Toolchain,
+		AgentNamespace:     env.AgentNamespace,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

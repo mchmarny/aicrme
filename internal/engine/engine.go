@@ -890,6 +890,14 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 			// leave the one run that most needs a teardown with nothing it
 			// can prove it owns.
 			e.current.Ownership = scratch.Ownership
+			// AgentNamespace merges on the failure path for the strongest
+			// version of that same reason: Discover creates the namespace
+			// BEFORE it deploys the agent, so the most likely failure -- the
+			// snapshot timing out -- is one that has already left a namespace
+			// on the cluster. Dropping the record here would leave the operator
+			// with a namespace nothing told them about, created by a run that
+			// never got far enough to install anything.
+			e.current.AgentNamespace = scratch.AgentNamespace
 			switch {
 			case errors.Is(err, ErrUnconfirmedCleanup):
 				logUnconfirmed = !e.current.CleanupUnconfirmed
@@ -965,6 +973,9 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// Merged on BOTH paths, unlike Workload. See the failure-path merge
 	// above for why.
 	e.current.Ownership = scratch.Ownership
+	// AgentNamespace, merged on both paths for the reason stated on the
+	// failure-path merge above.
+	e.current.AgentNamespace = scratch.AgentNamespace
 	// Advance the cursor before this checkpoint is taken, not after: the
 	// save below must carry the advanced StepIndex, and it must complete
 	// before the next step begins (it does, trivially -- this call is

@@ -17,7 +17,13 @@ import (
 	"github.com/mchmarny/aicrme/internal/steps"
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	kubefake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func newRun() *engine.Run {
@@ -54,7 +60,9 @@ func loadSnapshot(t *testing.T) *aicr.Snapshot {
 func TestDiscoverStoresRawSnapshot(t *testing.T) {
 	snap := loadSnapshot(t)
 	fake := &aicrclient.Fake{Snapshot: snap}
-	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme", Timeout: time.Minute})
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace: "aicrme", Timeout: time.Minute, Kube: kubefake.NewSimpleClientset(),
+	})
 
 	run := newRun()
 	var events []bus.Event
@@ -75,7 +83,9 @@ func TestDiscoverStoresRawSnapshot(t *testing.T) {
 
 func TestDiscoverStoresCapabilityReport(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
-	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace: "aicrme", Kube: kubefake.NewSimpleClientset(),
+	})
 
 	run := newRun()
 	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
@@ -100,7 +110,9 @@ func TestDiscoverStoresCapabilityReport(t *testing.T) {
 
 func TestDiscoverEmitsGapWarnings(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
-	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace: "aicrme", Kube: kubefake.NewSimpleClientset(),
+	})
 
 	var events []bus.Event
 	if err := step.Run(context.Background(), newRun(), func(e bus.Event) { events = append(events, e) }); err != nil {
@@ -150,7 +162,9 @@ func TestDiscoverEmitsGapWarnings(t *testing.T) {
 // kwok one is what keeps the agent off them.
 func TestDiscoverToleratesTheGPUTaintButNotTheKwokOne(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
-	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace: "aicrme", Kube: kubefake.NewSimpleClientset(),
+	})
 
 	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -207,6 +221,7 @@ func TestDiscoverPlumbsAgentConfig(t *testing.T) {
 		RequireGPU:         true,
 		DiscoverNetwork:    true,
 		Requests:           corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+		Kube:               kubefake.NewSimpleClientset(),
 	}
 	step := steps.NewDiscover(fake, cfg)
 
@@ -259,7 +274,9 @@ func TestDiscoverPlumbsAgentConfig(t *testing.T) {
 func TestDiscoverPropagatesFailure(t *testing.T) {
 	boom := errors.New("agent job timed out")
 	fake := &aicrclient.Fake{SnapshotErr: boom}
-	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace: "aicrme", Kube: kubefake.NewSimpleClientset(),
+	})
 
 	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err == nil {
 		t.Fatal("Run() returned nil on a collection failure")
@@ -280,7 +297,9 @@ func TestDiscoverDefaultsTimeout(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
 	// Timeout left zero: NewDiscover must default it rather than deploy the
 	// agent Job with no wait bound at all.
-	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace: "aicrme", Kube: kubefake.NewSimpleClientset(),
+	})
 
 	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -305,7 +324,9 @@ func TestDiscoverDefaultsTimeout(t *testing.T) {
 func TestDiscoverDefaultsAgentName(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
 	// JobName and ServiceAccountName left zero-valued.
-	step := steps.NewDiscover(fake, steps.DiscoverConfig{Namespace: "aicrme"})
+	step := steps.NewDiscover(fake, steps.DiscoverConfig{
+		Namespace: "aicrme", Kube: kubefake.NewSimpleClientset(),
+	})
 
 	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -334,6 +355,7 @@ func TestDiscoverPinsTheAgentConfigKubeconfig(t *testing.T) {
 		Namespace:  "aicrme",
 		Image:      "ghcr.io/nvidia/aicr:v0.20.0",
 		Kubeconfig: "/tmp/session-42/kubeconfig",
+		Kube:       kubefake.NewSimpleClientset(),
 	})
 
 	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err != nil {
@@ -345,5 +367,85 @@ func TestDiscoverPinsTheAgentConfigKubeconfig(t *testing.T) {
 	if got := fake.LastAgentConfig.Kubeconfig; got != "/tmp/session-42/kubeconfig" {
 		t.Errorf("AgentConfig.Kubeconfig = %q -- empty means AICR resolves ~/.kube/config itself, "+
 			"so Discover would snapshot one cluster while Apply installs into another", got)
+	}
+}
+
+// CollectSnapshot passes Namespace to the agent Job and does not create it.
+// In-cluster, `helm --create-namespace` did; locally nothing does, so Discover
+// fails on a fresh cluster before the agent is ever scheduled.
+func TestDiscoverCreatesItsNamespaceAndRecordsThat(t *testing.T) {
+	kube := kubefake.NewSimpleClientset()
+	step := steps.NewDiscover(&aicrclient.Fake{Snapshot: loadSnapshot(t)}, steps.DiscoverConfig{
+		Namespace: "aicrme",
+		Kube:      kube,
+	})
+
+	run := newRun()
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if _, err := kube.CoreV1().Namespaces().Get(context.Background(), "aicrme", metav1.GetOptions{}); err != nil {
+		t.Fatalf("the namespace was not created: %v", err)
+	}
+	if !run.AgentNamespace.Created {
+		t.Error("Created is false for a namespace this run made -- Reset cannot tell it from one that pre-existed")
+	}
+	if run.AgentNamespace.Name != "aicrme" {
+		t.Errorf("AgentNamespace.Name = %q, want %q", run.AgentNamespace.Name, "aicrme")
+	}
+}
+
+func TestDiscoverRecordsAPreExistingNamespaceAsNotCreated(t *testing.T) {
+	kube := kubefake.NewSimpleClientset(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "aicrme", UID: "existing-uid"},
+	})
+	step := steps.NewDiscover(&aicrclient.Fake{Snapshot: loadSnapshot(t)}, steps.DiscoverConfig{
+		Namespace: "aicrme",
+		Kube:      kube,
+	})
+
+	run := newRun()
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if run.AgentNamespace.Created {
+		t.Error("a pre-existing namespace was recorded as created by this run")
+	}
+	if run.AgentNamespace.UID != "existing-uid" {
+		t.Errorf("UID = %q, want the pre-existing namespace's", run.AgentNamespace.UID)
+	}
+}
+
+// A namespace that cannot be created stops Discover before the agent Job is
+// submitted. The alternative is a ten-minute wait for a Job that was rejected
+// the moment it reached the API server, reported as a snapshot timeout.
+func TestDiscoverFailsWhenTheNamespaceCannotBeCreated(t *testing.T) {
+	kube := kubefake.NewSimpleClientset()
+	kube.PrependReactor("create", "namespaces",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(
+				schema.GroupResource{Resource: "namespaces"}, "aicrme", errors.New("no"))
+		})
+	aicrFake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
+	step := steps.NewDiscover(aicrFake, steps.DiscoverConfig{Namespace: "aicrme", Kube: kube})
+
+	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err == nil {
+		t.Fatal("Run() returned nil when the agent namespace could not be created")
+	}
+	if aicrFake.SnapshotCalls != 0 {
+		t.Error("the snapshot agent was deployed into a namespace that does not exist")
+	}
+}
+
+// Kube is nil only if this binary's own wiring failed to hand Discover the
+// connected cluster's client. Reported as such rather than dereferenced: a
+// panic in a step goroutine takes the console down with it.
+func TestDiscoverWithoutAClusterClientFails(t *testing.T) {
+	step := steps.NewDiscover(&aicrclient.Fake{Snapshot: loadSnapshot(t)},
+		steps.DiscoverConfig{Namespace: "aicrme"})
+
+	if err := step.Run(context.Background(), newRun(), func(bus.Event) {}); err == nil {
+		t.Fatal("Run() returned nil with no cluster client")
 	}
 }

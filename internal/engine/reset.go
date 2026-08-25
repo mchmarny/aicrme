@@ -249,7 +249,7 @@ func (e *Engine) runReset(ctx, cancelCtx context.Context, epoch uint64, runID st
 	// Reported, not removed -- and reported even when the release half was
 	// cut short, because a half-finished teardown is exactly when the
 	// operator most needs the inventory.
-	for _, it := range namespaceResidue(run.Ownership) {
+	for _, it := range namespaceResidue(run.Ownership, run.AgentNamespace) {
 		emit(it)
 		items = append(items, it)
 	}
@@ -346,8 +346,23 @@ func (e *Engine) recordResidue(epoch uint64, runID string, items []ResidueItem, 
 // under something is unrecoverable. So each is reported with what the
 // operator needs to decide -- did this run create it, or did it predate the
 // install -- and the console acts on neither.
-func namespaceResidue(own Ownership) []ResidueItem {
-	out := make([]ResidueItem, 0, len(own.Namespaces))
+//
+// agent is the namespace AICR's snapshot agent ran in, and it has to be passed
+// separately because own.Namespaces cannot carry it: steps.recipeNamespaces
+// builds that set from recipe.json's components, and the agent namespace is
+// not one of them -- it exists before a recipe does. Reported only when this
+// run created it. One that predates the install is not residue; it is somebody
+// else's namespace a Job briefly ran in, and listing it would send an operator
+// to delete something this console never touched.
+//
+// Reported, never removed, and not because removing it would be hard. AICR's
+// deployer already cleans up the Job, ServiceAccount and RoleBinding it
+// created (DiscoverConfig.Cleanup is always true), so the namespace is all
+// that remains; adding teardown code to chase it would put this console in the
+// business of undoing a deployer's work, which is the line this repo has
+// drawn. The deployer owns its cleanup, and aicrme prints what is left.
+func namespaceResidue(own Ownership, agent AgentNamespace) []ResidueItem {
+	out := make([]ResidueItem, 0, len(own.Namespaces)+1)
 	for _, ns := range own.Namespaces {
 		note := "this run created it; remove it when you no longer need it"
 		if ns.Existed {
@@ -360,7 +375,29 @@ func namespaceResidue(own Ownership) []ResidueItem {
 			Created: !ns.Existed,
 		})
 	}
+	// Appended last and only if the ownership snapshot did not already name
+	// it. Nothing stops an operator pointing AICRME_NAMESPACE at a namespace
+	// the recipe also installs into, and two residue rows for one namespace
+	// would double it in the summary counts the operator reads to tell a clean
+	// teardown from a partial one.
+	if agent.Created && agent.Name != "" && !namesNamespace(out, agent.Name) {
+		out = append(out, ResidueItem{
+			Kind:    KindNamespace,
+			Name:    agent.Name,
+			Skip:    "this run created it for the snapshot agent; remove it when you no longer need it",
+			Created: true,
+		})
+	}
 	return out
+}
+
+func namesNamespace(items []ResidueItem, name string) bool {
+	for _, it := range items {
+		if it.Kind == KindNamespace && it.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // resetSummary is the counts-not-verdict line the design requires (section

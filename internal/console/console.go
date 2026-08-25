@@ -485,6 +485,12 @@ func Run(ctx context.Context, opts Options) error {
 			// this seam has a real field, and the one call that decides the
 			// recipe should not depend on ambient environment.
 			Kubeconfig: sessionKubeconfig,
+			// Used for exactly one thing -- creating the namespace the agent
+			// Job runs in, which in-cluster `helm --create-namespace` did and
+			// locally nothing does. Nil until Task 12 re-derives the four
+			// cluster consumers from the connection, the same nil ApplyConfig.Kube
+			// below already carries.
+			Kube: kube,
 			// Unset (nil) on every real deployment: aicr.Client.CollectSnapshot
 			// then auto-targets a real GPU node itself (see the NodeSelector
 			// doc on steps.DiscoverConfig). AICRME_SNAPSHOT_NODE_SELECTOR

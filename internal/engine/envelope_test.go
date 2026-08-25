@@ -503,6 +503,13 @@ func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
 					Removed: true, Skip: "parity-skip", Err: "parity-err",
 				}},
 			}))
+		case AgentNamespace:
+			// Every field distinct from its zero value: an envelope that
+			// carried the name but dropped Created would otherwise round-trip
+			// a DeepEqual-identical value on a run that never created one.
+			v.Set(reflect.ValueOf(AgentNamespace{
+				Name: "parity-agent-ns", UID: "parity-uid", Created: true,
+			}))
 		case Ownership:
 			// Both slices non-empty, and every NamespaceRef field distinct
 			// from its zero value -- an envelope that carried Ownership but

@@ -245,6 +245,55 @@ func TestResetReportsEveryNamespaceAndDeletesNone(t *testing.T) {
 	}
 }
 
+// The namespace AICR's snapshot agent ran in is residue too, and it is the one
+// namespace the ownership snapshot cannot describe: recipeNamespaces builds
+// that set from recipe.json's components and the agent namespace is not one of
+// them. A run that reached Discover and stopped there installed nothing, so
+// this is the ONLY thing it left behind -- and before this it was reported
+// nowhere.
+func TestNamespaceResidueReportsTheAgentNamespaceThisRunCreated(t *testing.T) {
+	items := namespaceResidue(Ownership{}, AgentNamespace{
+		Name: "aicrme", UID: "u-1", Created: true,
+	})
+
+	if len(items) != 1 {
+		t.Fatalf("reported %d namespaces, want the agent namespace: %+v", len(items), items)
+	}
+	if items[0].Name != "aicrme" || items[0].Kind != KindNamespace {
+		t.Errorf("item = %+v, want the aicrme namespace", items[0])
+	}
+	if !items[0].Created {
+		t.Error("Created is false -- the console shows the cleanup command only for namespaces it made")
+	}
+	if items[0].Removed {
+		t.Error("the agent namespace was removed; namespaces are reported, never reclaimed")
+	}
+}
+
+// A namespace that predates the install is not residue. It is somebody else's
+// namespace that a Job briefly ran in, and reporting it would send an operator
+// to delete something this console never created.
+func TestNamespaceResidueOmitsAnAgentNamespaceThisRunDidNotCreate(t *testing.T) {
+	items := namespaceResidue(Ownership{}, AgentNamespace{Name: "kube-system", UID: "u-1"})
+
+	if len(items) != 0 {
+		t.Errorf("reported %+v for a namespace this run did not create", items)
+	}
+}
+
+// Nothing stops an operator pointing AICRME_NAMESPACE at a namespace the
+// recipe also installs into. Two rows for one namespace would double it in the
+// counts resetSummary reports, which is the number an operator reads to tell a
+// clean teardown from a partial one.
+func TestNamespaceResidueDoesNotReportOneNamespaceTwice(t *testing.T) {
+	own := Ownership{Namespaces: []NamespaceRef{{Name: "aicrme"}}}
+	items := namespaceResidue(own, AgentNamespace{Name: "aicrme", UID: "u-1", Created: true})
+
+	if len(items) != 1 {
+		t.Fatalf("reported %d rows for one namespace: %+v", len(items), items)
+	}
+}
+
 // The clean path end to end: the workload is stopped, the releases are
 // uninstalled, the run ends at StateDone, and the persisted record is gone
 // so the console is free and a restart recovers nothing.
