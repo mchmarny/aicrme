@@ -91,6 +91,23 @@ const httpShutdownTimeout = 10 * time.Second
 // mounted empty on every pod start.
 var workSubdirs = []string{"tmp", "home", "helm/cache", "helm/config", "helm/data", "kube/cache", "runs"}
 
+// prepareWorkDir makes workDir usable and makes this process its sole owner:
+// the subdirectories every tool writes into, a sweep of the session
+// directories left by launches that are gone, and the lock that keeps a
+// second console out.
+//
+// The sweep runs before the lock is taken rather than after. A launch killed
+// with SIGKILL leaves behind both its session directory and its lock file, and
+// this ordering is what clears the flattened credentials in the first even
+// though the lock refuses and Run returns on the next line.
+func prepareWorkDir(workDir string) (func(), error) {
+	if err := ensureWorkDirs(workDir); err != nil {
+		return nil, fmt.Errorf("work directory %s unusable: %w", workDir, err)
+	}
+	sweepStaleSessions(workDir)
+	return acquireLock(workDir)
+}
+
 func ensureWorkDirs(root string) error {
 	for _, sub := range workSubdirs {
 		if err := os.MkdirAll(filepath.Join(root, sub), 0o700); err != nil {
@@ -376,9 +393,11 @@ func Run(ctx context.Context, opts Options) error {
 	defer cancel()
 
 	workDir := opts.WorkDir
-	if err := ensureWorkDirs(workDir); err != nil {
-		return fmt.Errorf("work directory %s unusable: %w", workDir, err)
+	releaseWorkDir, err := prepareWorkDir(workDir)
+	if err != nil {
+		return err
 	}
+	defer releaseWorkDir()
 
 	static, err := web.Static()
 	if err != nil {
@@ -497,18 +516,8 @@ func Run(ctx context.Context, opts Options) error {
 	// cluster client at all.
 	eng.SetProveClient(proveClient)
 
-	// The engine learns which cluster it is talking to at connect, because
-	// that is the first moment anything knows. Everything the identity gates
-	// -- refusing a record from another cluster in Recover and, more
-	// importantly, in Reset -- hangs off this one call, and a console that
-	// never made it would accept any record it found.
-	conn.onConnected = func(_ context.Context, info ClusterInfo) error {
-		eng.SetClusterUID(info.UID)
-		slog.Info("connected", "context", info.Context, "server", info.Server,
-			"version", info.Version, "nodes", info.NodeCount, "cluster", info.UID,
-			"runDir", runDir(workDir, info.UID))
-		return nil
-	}
+	var sess sessionState
+	conn.onConnected = connectHook(workDir, opts.Kubeconfig, eng, &sess)
 
 	// Reset's cluster-removal half, wired the same way and for the same
 	// reason: engine.New's signature is shared by ~80 construction sites
@@ -669,7 +678,43 @@ func Run(ctx context.Context, opts Options) error {
 	}()
 
 	wg.Wait()
+
+	// Last, and deliberately after the wait above rather than as a defer
+	// registered at connect: this directory holds the flattened kubeconfig
+	// helm and kubectl read, and the wait is exactly the window in which the
+	// deploy.sh tree is still being reaped. Removing it any earlier would
+	// break the shutdown this ordering exists to complete cleanly.
+	sess.close()
 	return nil
+}
+
+// connectHook is everything that has to be true before the console answers a
+// single cluster-touching request. It runs inside Connect, while the state is
+// still connecting, so anything that fails here leaves the gate shut rather
+// than open over half-built wiring.
+//
+// Two things today. The session kubeconfig can only be written once a context
+// is chosen, and freezing it here is what makes the rest of the process immune
+// to `kubectl config use-context` running mid-Apply. And the engine learns
+// which cluster it is talking to, which is what lets Recover and Reset refuse
+// a record describing a different one -- a console that never made that call
+// would accept any record it found.
+//
+// Task 12 adds the per-cluster store and the recovery that runs against it.
+func connectHook(workDir, kubeconfig string, eng *engine.Engine, sess *sessionState) func(context.Context, ClusterInfo) error {
+	return func(_ context.Context, info ClusterInfo) error {
+		path, cleanup, err := writeSessionKubeconfig(workDir, kubeconfig, info.Context)
+		if err != nil {
+			return fmt.Errorf("freezing context %q for this session: %w", info.Context, err)
+		}
+		sess.set(cleanup)
+
+		eng.SetClusterUID(info.UID)
+		slog.Info("connected", "context", info.Context, "server", info.Server,
+			"version", info.Version, "nodes", info.NodeCount, "cluster", info.UID,
+			"runDir", runDir(workDir, info.UID), "kubeconfig", path)
+		return nil
+	}
 }
 
 func envOr(key, fallback string) string {
