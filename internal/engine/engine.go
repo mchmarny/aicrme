@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -100,6 +101,17 @@ func hasUnconfirmedCleanup(r *Run) bool {
 var ErrDraining = aicrerrors.New(aicrerrors.ErrCodeUnavailable,
 	"engine is shutting down; not accepting new runs")
 
+// ErrClusterMismatch means a persisted record describes a different cluster
+// than the one this console is connected to. Not recoverable and not
+// reconcilable: every release name in that record is now a name in somebody
+// else's cluster.
+//
+// In-cluster this could not happen -- the store lived inside the cluster it
+// described. A file on the operator's laptop has no such property, which is
+// why the record carries its cluster's identity and both Recover and Reset
+// revalidate it.
+var ErrClusterMismatch = errors.New("run record belongs to a different cluster")
+
 // Emit publishes a console event. The engine stamps RunID and Phase, so steps
 // only supply Kind, Level, Message, Component, and Data.
 type Emit func(bus.Event)
@@ -148,6 +160,13 @@ type Engine struct {
 	// Declared as an interface here because internal/teardown imports THIS
 	// package -- see the Teardown interface in reset.go.
 	teardown Teardown
+
+	// clusterUID is the kube-system UID of the connected cluster. Empty
+	// until SetClusterUID, and empty forever for a caller that never
+	// connects one -- which is what every test in this package is. It is
+	// read by Recover and Reset to refuse a record that describes somewhere
+	// else; a comparison against empty is not a mismatch, on either side.
+	clusterUID string
 
 	mu      sync.Mutex
 	current *Run
@@ -242,6 +261,39 @@ func (e *Engine) SetProveClient(c *prove.Client) {
 	e.mu.Unlock()
 }
 
+// SetClusterUID records which cluster this engine is connected to, so Recover
+// and Reset can refuse a record that describes a different one. Same
+// "assigned once, under the lock, before concurrent readers exist" shape as
+// SetProveClient -- the console calls it in the connect path, before recovery
+// runs against the store that connect selected.
+func (e *Engine) SetClusterUID(uid string) {
+	e.mu.Lock()
+	e.clusterUID = uid
+	e.mu.Unlock()
+}
+
+// ClusterUID returns the connected cluster's identity, or empty if none was
+// set.
+func (e *Engine) ClusterUID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.clusterUID
+}
+
+// checkClusterMatch refuses a record that describes a different cluster than
+// the one this console is connected to. Both sides empty-tolerant: a record
+// written by the ConfigMap store carries no UID and could not have been about
+// anywhere but the cluster it lived in, and an engine with no UID has no
+// grounds to reject anything.
+func (e *Engine) checkClusterMatch(r *Run, action string) error {
+	uid := e.ClusterUID()
+	if uid == "" || r == nil || r.ClusterUID == "" || r.ClusterUID == uid {
+		return nil
+	}
+	return fmt.Errorf("%w: %s refused -- the persisted run describes cluster %s but this console is connected to %s",
+		ErrClusterMismatch, action, r.ClusterUID, uid)
+}
+
 // Start creates a run and executes it in the background. It returns as soon as
 // the run is registered; callers observe progress over the bus.
 func (e *Engine) Start(ctx context.Context) (*Run, error) {
@@ -302,6 +354,12 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 		Artifacts: map[string][]byte{},
 		StartedAt: now,
 		UpdatedAt: now,
+		// Stamped at creation, under the same lock that reads it, so the
+		// record says which cluster it describes from its very first Save.
+		// A record that only acquired the UID later would be indistinguishable
+		// -- while it lacked one -- from a record written before the field
+		// existed, and those are deliberately accepted by any cluster.
+		ClusterUID: e.clusterUID,
 	}
 	// Name the phase here rather than leaving it to the first step's own
 	// runStep/awaitDecisions call. Without this, the very first Save below

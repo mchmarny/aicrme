@@ -508,3 +508,46 @@ func TestResetDoesNotCancelTheCommandContext(t *testing.T) {
 		t.Errorf("the command context was canceled too (%v) -- helm would be SIGTERMed mid-uninstall", td.cmdCtxErr)
 	}
 }
+
+// The guard that matters most. Reset acts on release names, and a release
+// name only means something in the cluster it was installed into --
+// uninstalling "gpu-operator" against the wrong one removes a stranger's
+// working install and reports success.
+func TestResetRefusesARecordFromADifferentCluster(t *testing.T) {
+	const (
+		recordUID    = "11111111-2222-3333-4444-555555555555"
+		connectedUID = "99999999-8888-7777-6666-555555555555"
+	)
+	td := &fakeTeardown{}
+	e := newResetEngine(t, td)
+	run := resettableRun(t, e, StateDone)
+	e.mu.Lock()
+	e.current.ClusterUID = recordUID
+	e.mu.Unlock()
+	e.SetClusterUID(connectedUID)
+
+	err := e.Reset(context.Background(), run.ID)
+	if !errors.Is(err, ErrClusterMismatch) {
+		t.Fatalf("Reset() error = %v, want ErrClusterMismatch", err)
+	}
+	if !strings.Contains(err.Error(), recordUID) || !strings.Contains(err.Error(), connectedUID) {
+		t.Errorf("the error names neither UID: %v", err)
+	}
+	if td.releasesRan {
+		t.Error("the teardown ran against the wrong cluster")
+	}
+}
+
+func TestResetProceedsForTheConnectedCluster(t *testing.T) {
+	const uid = "11111111-2222-3333-4444-555555555555"
+	e := newResetEngine(t, &fakeTeardown{})
+	run := resettableRun(t, e, StateDone)
+	e.mu.Lock()
+	e.current.ClusterUID = uid
+	e.mu.Unlock()
+	e.SetClusterUID(uid)
+
+	if got := resetAndWait(t, e, run.ID); got != nil && got.State == StateFailed {
+		t.Errorf("Reset() left the run failed for its own cluster: %s", got.Err)
+	}
+}

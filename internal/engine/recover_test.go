@@ -1025,3 +1025,86 @@ func TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState(t *testing.T) {
 		}
 	}
 }
+
+// TestRecoverRefusesARecordFromADifferentCluster is the guard the local
+// binary needs and the in-cluster deployment never did: the store lived
+// inside the cluster it described, so a record could not be about anywhere
+// else. A file on the operator's laptop can be.
+func TestRecoverRefusesARecordFromADifferentCluster(t *testing.T) {
+	const (
+		recordUID    = "11111111-2222-3333-4444-555555555555"
+		connectedUID = "99999999-8888-7777-6666-555555555555"
+	)
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 3)
+	run.ClusterUID = recordUID
+	store.loadCurrent = run
+
+	e := fourStepEngine(store)
+	e.SetClusterUID(connectedUID)
+
+	err := e.Recover(context.Background())
+	if !errors.Is(err, engine.ErrClusterMismatch) {
+		t.Fatalf("Recover() error = %v, want ErrClusterMismatch", err)
+	}
+	if !strings.Contains(err.Error(), recordUID) || !strings.Contains(err.Error(), connectedUID) {
+		t.Errorf("the error names neither UID: %v", err)
+	}
+	if e.Current() != nil {
+		t.Error("a record from another cluster was installed anyway")
+	}
+}
+
+// A record with no UID is not a mismatch: it predates the field, and every
+// record the ConfigMap store ever wrote is one of those.
+func TestRecoverAcceptsARecordWithNoClusterUID(t *testing.T) {
+	store := newRecoverStore()
+	store.loadCurrent = baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 3)
+
+	e := fourStepEngine(store)
+	e.SetClusterUID("11111111-2222-3333-4444-555555555555")
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v, want a record written before the field existed to recover", err)
+	}
+	if e.Current() == nil {
+		t.Error("Current() = nil, want the recovered run installed")
+	}
+}
+
+func TestRecoverAcceptsARecordFromTheConnectedCluster(t *testing.T) {
+	const uid = "11111111-2222-3333-4444-555555555555"
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 3)
+	run.ClusterUID = uid
+	store.loadCurrent = run
+
+	e := fourStepEngine(store)
+	e.SetClusterUID(uid)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if e.Current() == nil {
+		t.Fatal("Current() = nil, want the recovered run installed")
+	}
+}
+
+// A run has to acquire the cluster's identity when it is created, not when it
+// is next saved: a record that lacked a UID for any window is, for that
+// window, indistinguishable from one written before the field existed -- and
+// those are accepted by any cluster.
+func TestStartStampsTheConnectedClusterOnTheRun(t *testing.T) {
+	const uid = "11111111-2222-3333-4444-555555555555"
+	store := newRecoverStore()
+	e := fourStepEngine(store)
+	e.SetClusterUID(uid)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if run.ClusterUID != uid {
+		t.Errorf("ClusterUID = %q, want %q -- a run with no identity is recoverable by any cluster", run.ClusterUID, uid)
+	}
+}

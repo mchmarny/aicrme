@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -143,6 +144,18 @@ type connector struct {
 	state      connState
 	kubeconfig string
 	prober     prober
+	// newKube builds the clientset from the selected context's rest.Config.
+	// A field rather than a direct call so a test can hand dial a fake
+	// clientset and exercise the identity read for real, instead of stubbing
+	// out the one call the run directory is keyed on.
+	newKube func(*rest.Config) (kubernetes.Interface, error)
+	// onConnected is everything that has to be true before the console
+	// answers a single cluster-touching request: today the engine learning
+	// which cluster it is connected to, and later the per-cluster store and
+	// the recovery that runs against it. It runs while the connection is
+	// still stateConnecting, so a failure leaves the connector reusable and
+	// the gate shut rather than open over half-built wiring.
+	onConnected func(context.Context, ClusterInfo) error
 
 	// Written once, under mu, at the connected transition.
 	info ClusterInfo
@@ -151,7 +164,11 @@ type connector struct {
 }
 
 func newConnector(kubeconfig string, p prober) *connector {
-	return &connector{kubeconfig: kubeconfig, prober: p}
+	return &connector{
+		kubeconfig: kubeconfig,
+		prober:     p,
+		newKube:    func(cfg *rest.Config) (kubernetes.Interface, error) { return kubernetes.NewForConfig(cfg) },
+	}
 }
 
 func (c *connector) State() connState {
@@ -188,6 +205,9 @@ func (c *connector) Connect(ctx context.Context, contextName string) (ClusterInf
 	c.mu.Unlock()
 
 	info, restCfg, kube, err := c.dial(ctx, contextName)
+	if err == nil && c.onConnected != nil {
+		err = c.onConnected(ctx, info)
+	}
 	if err != nil {
 		// Back to disconnected, not stuck in connecting: a wrong context or a
 		// sleeping VPN is the ordinary case, and the operator has to be able
@@ -213,7 +233,7 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 	if err != nil {
 		return ClusterInfo{}, nil, nil, fmt.Errorf("building a client for context %q: %w", contextName, err)
 	}
-	kube, err := kubernetes.NewForConfig(restCfg)
+	kube, err := c.newKube(restCfg)
 	if err != nil {
 		return ClusterInfo{}, nil, nil, fmt.Errorf("building a clientset for context %q: %w", contextName, err)
 	}
@@ -225,12 +245,41 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 		return ClusterInfo{}, nil, nil, fmt.Errorf("reaching context %q at %s: %w", contextName, restCfg.Host, err)
 	}
 
+	// The kube-system UID is this cluster's identity, and it is what keys the
+	// run directory. Neither the server URL nor the context name will do: a
+	// context is a label in a file the operator edits, and an address can
+	// front a rebuilt cluster -- `kind delete && kind create` reuses the
+	// endpoint. The UID changes when the cluster does, which is the property
+	// the key needs.
+	//
+	// kube-system is created by the control plane at bootstrap, is never
+	// recreated during a cluster's life, and is readable by any principal
+	// that can do anything else useful here.
+	//
+	// A failure here fails the connect rather than degrading to an empty UID:
+	// every cluster whose identity could not be read would otherwise share
+	// one run directory, which is the collision the UID exists to prevent.
+	ns, err := kube.CoreV1().Namespaces().Get(probeCtx, "kube-system", metav1.GetOptions{})
+	if err != nil {
+		return ClusterInfo{}, nil, nil, fmt.Errorf("reading this cluster's identity from kube-system: %w", err)
+	}
+
 	return ClusterInfo{
 		Context:   contextName,
 		Server:    restCfg.Host,
 		Version:   version,
 		NodeCount: nodes,
+		UID:       string(ns.UID),
 	}, restCfg, kube, nil
+}
+
+// runDir is the per-cluster run directory. The ConfigMap store got this
+// property free by living inside the cluster it described; a flat local file
+// does not. An operator who demos cluster A then connects to cluster B would
+// otherwise have B's console recover A's run and offer a Reset that
+// uninstalls releases in the wrong place.
+func runDir(workDir, clusterUID string) string {
+	return filepath.Join(workDir, "runs", clusterUID)
 }
 
 // clusterGate adapts the connector to the seam internal/api gates its routes

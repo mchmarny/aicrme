@@ -971,6 +971,8 @@ var runFieldsNotMergedFromSteps = map[string]string{
 	"CleanupUnconfirmed": "decided from the step's returned error via errors.Is (Ruling 12), not read off the scratch copy -- " +
 		"see runStep's failure branch for why the distinction is load-bearing",
 	"Residue": "written by engine.Reset directly on e.current; no step produces it",
+	"ClusterUID": "the connected cluster's identity, stamped by the engine when the run is created -- a step that could rewrite it " +
+		"could re-file the run under a cluster it never touched, which is exactly what the field exists to prevent",
 }
 
 // mergeParityStep sets every exported field of the Run it is handed to a

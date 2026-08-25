@@ -497,6 +497,19 @@ func Run(ctx context.Context, opts Options) error {
 	// cluster client at all.
 	eng.SetProveClient(proveClient)
 
+	// The engine learns which cluster it is talking to at connect, because
+	// that is the first moment anything knows. Everything the identity gates
+	// -- refusing a record from another cluster in Recover and, more
+	// importantly, in Reset -- hangs off this one call, and a console that
+	// never made it would accept any record it found.
+	conn.onConnected = func(_ context.Context, info ClusterInfo) error {
+		eng.SetClusterUID(info.UID)
+		slog.Info("connected", "context", info.Context, "server", info.Server,
+			"version", info.Version, "nodes", info.NodeCount, "cluster", info.UID,
+			"runDir", runDir(workDir, info.UID))
+		return nil
+	}
+
 	// Reset's cluster-removal half, wired the same way and for the same
 	// reason: engine.New's signature is shared by ~80 construction sites
 	// across internal/engine and internal/api, and Reset is the only caller

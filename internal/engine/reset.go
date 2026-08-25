@@ -105,6 +105,18 @@ func (e *Engine) Reset(ctx context.Context, runID string) error {
 		e.mu.Unlock()
 		return aicrerrors.New(aicrerrors.ErrCodeNotFound, "run not found: "+runID)
 	}
+	// The guard that matters most. Reset acts on release names, and a release
+	// name is only meaningful in the cluster it was installed into --
+	// uninstalling "gpu-operator" against the wrong one removes a stranger's
+	// working install and reports success. Checked inline rather than through
+	// checkClusterMatch's own ClusterUID() call because e.mu is already held
+	// here and that method takes it.
+	if e.clusterUID != "" && e.current.ClusterUID != "" && e.current.ClusterUID != e.clusterUID {
+		recordUID, connectedUID := e.current.ClusterUID, e.clusterUID
+		e.mu.Unlock()
+		return fmt.Errorf("%w: reset refused -- the persisted run describes cluster %s but this console is connected to %s",
+			ErrClusterMismatch, recordUID, connectedUID)
+	}
 	// isLive now includes StateResetting, so this also refuses a second
 	// Reset while the first is still running.
 	if isLive(e.current.State) {

@@ -244,6 +244,19 @@ func (e *Engine) Recover(ctx context.Context) error {
 		return nil
 	}
 
+	// Returned rather than degraded-past, unlike every other rejection here.
+	// The others mean "this record cannot be trusted", and starting cold is
+	// the recovery. This one means the caller pointed recovery at the wrong
+	// cluster's records, which is a wiring error in the connect path, not a
+	// runtime condition -- and continuing would quietly file this cluster's
+	// run alongside another's. The store is deliberately NOT marked
+	// unreadable: the record is perfectly readable and perfectly valid, it
+	// just is not ours, and nothing here should make it harder for the
+	// console that owns it to read it later.
+	if err := e.checkClusterMatch(r, "recover"); err != nil {
+		return err
+	}
+
 	// Pending names the decisions a now-nonexistent awaitDecisions goroutine
 	// was blocked on. No such goroutine survives a restart in any state, so
 	// this clear is unconditional. It used to sit inside the branch below,

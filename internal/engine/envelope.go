@@ -93,6 +93,13 @@ type envelope struct {
 	//
 	// omitzero, not omitempty: see Run.Residue's comment.
 	Residue Residue `json:"residue,omitzero"`
+	// ClusterUID is the same optional-on-both-sides addition, and it must
+	// survive the round trip for the same reason Residue must: it is what
+	// Recover and Reset revalidate against the connected cluster, and a
+	// record that lost it on save would be accepted by any cluster at all.
+	// Absent means "written before this field existed", which is not a
+	// mismatch -- see Run.ClusterUID.
+	ClusterUID string `json:"clusterUid,omitempty"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -177,6 +184,7 @@ func encodeRun(r *Run, maxPayload int) ([]byte, error) {
 		CleanupUnconfirmed: r.CleanupUnconfirmed,
 		Ownership:          r.Ownership,
 		Residue:            r.Residue,
+		ClusterUID:         r.ClusterUID,
 		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -294,6 +302,7 @@ func decodeRun(blob []byte, maxPayload int) (*Run, error) {
 		CleanupUnconfirmed: env.CleanupUnconfirmed,
 		Ownership:          env.Ownership,
 		Residue:            env.Residue,
+		ClusterUID:         env.ClusterUID,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

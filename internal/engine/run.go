@@ -109,9 +109,21 @@ type Run struct {
 	// (fix round 3's Ruling 20) now checks every exported Run field is
 	// either carried by envelope or named in its exclusion list, so that
 	// class of gap fails a test instead of shipping again.
-	CleanupUnconfirmed bool      `json:"cleanupUnconfirmed,omitempty"`
-	StartedAt          time.Time `json:"startedAt"`
-	UpdatedAt          time.Time `json:"updatedAt"`
+	CleanupUnconfirmed bool `json:"cleanupUnconfirmed,omitempty"`
+	// ClusterUID is the kube-system UID of the cluster this run describes.
+	//
+	// Stored in the record as well as in the directory name it lives under:
+	// the directory says which cluster the record was FILED under, the field
+	// says which cluster it DESCRIBES. They should never disagree, and a
+	// record that does is refused rather than reconciled -- see
+	// ErrClusterMismatch.
+	//
+	// Empty is not a mismatch. Every record the ConfigMap store ever wrote
+	// has no UID, and one written inside the cluster it described could not
+	// have been about anywhere else.
+	ClusterUID string    `json:"clusterUid,omitempty"`
+	StartedAt  time.Time `json:"startedAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 	// Truncated names artifacts the store dropped to fit its size limit (see
 	// encodeRun). It is read-mostly state about the RECORD, not the run: the
 	// engine never sets it, decodeRun populates it on load, and encodeRun
