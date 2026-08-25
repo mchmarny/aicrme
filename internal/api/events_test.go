@@ -39,6 +39,7 @@ func loggedInClient(t *testing.T, h http.Handler) (*httptest.Server, *http.Clien
 func TestEventStreamReplaysFromLastEventID(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
@@ -96,6 +97,7 @@ func TestEventStreamReplaysFromLastEventID(t *testing.T) {
 func TestEventsHandlerEmitsEpochControlEventFirst(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())

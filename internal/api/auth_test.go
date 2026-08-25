@@ -17,6 +17,7 @@ import (
 func newTestServer(t *testing.T) http.Handler {
 	t.Helper()
 	srv, err := api.New(api.Config{
+		Cluster:    connectedCluster(),
 		Username:   "admin",
 		Password:   "correct-horse",
 		SessionTTL: time.Hour,
@@ -85,6 +86,7 @@ func TestProtectedRoutesRequireSession(t *testing.T) {
 
 func TestLoginRateLimited(t *testing.T) {
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "pw", SessionTTL: time.Hour, LoginRate: 2, AICR: &aicrclient.Fake{},
 		WorkDir: t.TempDir(),
 	}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())

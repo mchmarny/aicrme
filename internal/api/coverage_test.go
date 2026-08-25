@@ -49,6 +49,7 @@ func TestLogoutClearsSession(t *testing.T) {
 
 func TestSessionExpiresAndIsUnauthorized(t *testing.T) {
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: 10 * time.Millisecond, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
@@ -70,7 +71,8 @@ func TestSessionExpiresAndIsUnauthorized(t *testing.T) {
 }
 
 func TestConfigDefaultsApply(t *testing.T) {
-	srv, err := api.New(api.Config{Password: "pw", AICR: &aicrclient.Fake{}, WorkDir: t.TempDir()}, bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
+	srv, err := api.New(api.Config{Password: "pw", AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(), Cluster: connectedCluster()},
+		bus.New(8), engine.New(bus.New(8), engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
@@ -87,6 +89,7 @@ func TestConfigDefaultsApply(t *testing.T) {
 func TestEventStreamSinceQueryParamFallback(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())

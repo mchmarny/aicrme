@@ -41,6 +41,7 @@ func newBundleTestServer(t *testing.T, workDir string, step engine.Step) (*httpt
 	t.Helper()
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: workDir,
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())

@@ -46,6 +46,7 @@ func TestSPAMissingAssetIs404EndToEnd(t *testing.T) {
 func newDrainableTestServer(t *testing.T) *api.Server {
 	t.Helper()
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, bus.New(64), engine.New(bus.New(64), engine.NewMemoryStore()), testfs.Static())
@@ -111,6 +112,7 @@ func TestDrainedEngineRejectsRunCreation(t *testing.T) {
 	b := bus.New(64)
 	eng := engine.New(b, engine.NewMemoryStore())
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, eng, testfs.Static())

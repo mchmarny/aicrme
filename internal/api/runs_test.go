@@ -22,6 +22,7 @@ import (
 func TestCreateAndGetRun(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
@@ -60,6 +61,7 @@ func TestCreateAndGetRun(t *testing.T) {
 func TestGetUnknownRunIs404(t *testing.T) {
 	b := bus.New(8)
 	srv, _ := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
@@ -89,6 +91,7 @@ func (failingStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
 func TestRetryReturnsTheRun(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), failingStep{}), testfs.Static())
@@ -245,6 +248,7 @@ func TestCreateRunReturns409WhenRecoveryPending(t *testing.T) {
 	e := seedRecoveredRun(t, b, store)
 
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
@@ -280,6 +284,7 @@ func TestDiscardRunDeletesAndAllowsRestart(t *testing.T) {
 	e := seedRecoveredRun(t, b, store)
 
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
@@ -427,6 +432,7 @@ func TestRequestCancellationReachesTheStore(t *testing.T) {
 	store := &blockingLoadStore{entered: make(chan struct{}), release: make(chan struct{})}
 	e := engine.New(b, store)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
@@ -649,6 +655,7 @@ func TestCreateRunCheckpointSurvivesRequestCancellation(t *testing.T) {
 	store.Arm() // Start's own checkpoint is the very first Save this store sees.
 	e := engine.New(b, store, failingStep{})
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
@@ -696,6 +703,7 @@ func TestRetryCheckpointSurvivesRequestCancellation(t *testing.T) {
 	store := newProbeStore()
 	e := engine.New(b, store, failingStep{})
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
@@ -767,6 +775,7 @@ func TestRetryExecutionSurvivesRequestCancellation(t *testing.T) {
 	step := &retryProbeStep{entered: make(chan struct{}), release: make(chan struct{})}
 	e := engine.New(b, engine.NewMemoryStore(), step)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())

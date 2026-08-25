@@ -53,6 +53,7 @@ func TestOptionsEndpointFiltersThroughTheCatalog(t *testing.T) {
 	}
 	b := bus.New(8)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
@@ -150,6 +151,7 @@ func TestOptionsUsesCurrentRunSnapshotWhenAvailable(t *testing.T) {
 	b := bus.New(8)
 	step := rawSnapshotStep{raw: []byte("apiVersion: aicr.nvidia.com/v1\nkind: Snapshot\n")}
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
@@ -182,6 +184,7 @@ func TestOptionsProvisionalClearsOnceASnapshotYieldsARealService(t *testing.T) {
 	b := bus.New(8)
 	step := rawSnapshotStep{raw: raw}
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
@@ -212,6 +215,7 @@ func TestOptionsDegradesToProvisionalOnCorruptSnapshot(t *testing.T) {
 	b := bus.New(8)
 	step := rawSnapshotStep{raw: []byte("- this\n- is\n- a list, not a Snapshot\n")}
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: fake, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())

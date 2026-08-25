@@ -49,6 +49,7 @@ func newStopTestServer(t *testing.T, cs *fake.Clientset) (*httptest.Server, *htt
 	e.SetProveClient(client)
 
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
@@ -112,6 +113,7 @@ func TestStopEndsTheRunOverHTTP(t *testing.T) {
 func TestStopOnNonActiveRunConflicts(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
+		Cluster:  connectedCluster(),
 		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
 		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), failingStep{}), testfs.Static())

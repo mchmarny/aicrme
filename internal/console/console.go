@@ -20,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
@@ -394,47 +393,23 @@ func Run(ctx context.Context, opts Options) error {
 
 	b := bus.New(replayCapacity)
 
-	// A failure here must not stop the console: the entire Discover-to-Apply
-	// arc works without cluster telemetry, and `make build && ./bin/aicrme`
-	// outside a cluster is a supported development path. Same degrade-with-a-
-	// warning posture as parseNodeSelector. No defer is registered by this
-	// block, so its position relative to the fatal checks above and below it
-	// does not matter the way it would for one that did. This warns about
-	// telemetry only -- newRunStore below logs its own, more specific
-	// warning about persistence for the same nil kube, so this does not
-	// repeat that half of the consequence.
+	// The one connection this process will have, chosen through the Connect
+	// screen rather than inherited from a pod's ServiceAccount.
+	// rest.InClusterConfig and its three "kube is nil outside a pod"
+	// degradation paths are gone with it: every one described a state a local
+	// binary cannot usefully be in, because a console that cannot reach a
+	// cluster has nothing to offer.
+	conn := newConnector(opts.Kubeconfig, liveProber{})
+
+	// Still nil at wiring time, and the connect gate in internal/api is what
+	// keeps that from being reachable: no route that needs a cluster answers
+	// until a connection exists. The four consumers below are re-derived from
+	// the connection in the tasks that follow -- until then, connecting
+	// establishes identity without yet rewiring them.
 	var kube kubernetes.Interface
-	// rest.InClusterConfig does no network I/O -- env vars and two file
-	// reads -- so inside a pod kube is essentially always non-nil here; it
-	// is Start below, not this block, that first talks to the API server.
-	//
-	// One client now. A dynamic client used to be built alongside it, for
-	// Reset alone: establishing that a namespace was empty meant listing
-	// every namespaced kind discovery reports, which a typed client cannot
-	// do. That check is gone -- the console reports namespaces instead of
-	// deleting them -- and with it the awkward branch that had to fail kube
-	// as well whenever the dynamic client failed, so a Reset could never
-	// find itself half-equipped.
-	if cfg, cfgErr := rest.InClusterConfig(); cfgErr != nil {
-		slog.Warn("no in-cluster config; live cluster telemetry disabled", "error", cfgErr)
-	} else if c, clientErr := kubernetes.NewForConfig(cfg); clientErr != nil {
-		slog.Warn("kubernetes client init failed; live cluster telemetry disabled", "error", clientErr)
-	} else {
-		kube = c
-	}
 
 	namespace := envOr("AICRME_NAMESPACE", "aicrme")
 	runStore := newRunStore(ctx, kube, namespace, envOr("AICRME_DEPLOYMENT_NAME", "aicrme"))
-
-	// Same nil kube as the telemetry warning above and newRunStore's own --
-	// the third and most consequential-sounding of the three, since a run
-	// that reaches Prove without it fails outright rather than merely
-	// degrading. Prove itself already guards against a nil client (Client.Ready,
-	// checked first in proveStep.Run) and fails just that one run rather than
-	// the process, so this is visibility for the operator, not the guard.
-	if kube == nil {
-		slog.Warn("no cluster client; any run that reaches Prove will fail until aicrme runs in-cluster")
-	}
 	// One instance, shared between the Prove step below and eng.SetProveClient
 	// further down -- see that call's comment for why a second construction
 	// site is worth avoiding even though both would be equivalent today.
@@ -544,6 +519,7 @@ func Run(ctx context.Context, opts Options) error {
 		TLS:        os.Getenv("AICRME_TLS") == "true",
 		AICR:       client,
 		WorkDir:    workDir,
+		Cluster:    clusterGate{conn},
 	}, b, eng, static)
 	if err != nil {
 		return fmt.Errorf("server configuration invalid: %w", err)
