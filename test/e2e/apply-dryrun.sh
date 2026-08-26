@@ -2,27 +2,28 @@
 # Drives the full Discover -> Recommend -> Apply arc against a live Kind
 # cluster through the real HTTP API, with Apply running deploy.sh
 # --dry-run: create the cluster, install the KWOK controller and AICR's
-# simulated H100 nodes, build and load the PRODUCTION console image,
-# install the chart, log in, create a run, answer intent=training/
-# platform=kubeflow, download the generated bundle at the confirm gate,
-# click through it, and assert components install (dry-run) in the SSE
-# stream. This is Phase 2a's exit gate: the first time the whole arc runs
-# against a live cluster inside the production container image.
+# simulated H100 nodes, start the console against it, connect, create a run,
+# answer intent=training/platform=kubeflow, download the generated bundle at
+# the confirm gate, click through it, and assert components install (dry-run)
+# in the SSE stream.
 #
-# CRITICAL -- why this drives the console over HTTP against the image
-# e2e_build_and_load_image builds and loads into Kind, and must NEVER be
-# "optimised" into invoking deploy.sh (or the aicrme binary) on the host:
-# an earlier Phase 2a probe (docs/phase-2-handoff.md, "The Task 1 probe,
-# folded in from the deleted findings file") ran `deploy.sh --dry-run`
-# successfully, but on the HOST, with helm v4.2.4 and kubectl v1.36.3. The
-# production image pins helm 3.19.0 and kubectl 1.34.1 (Dockerfile ARG
-# HELM_VERSION / ARG KUBECTL_VERSION), and the generated install.sh
-# BRANCHES on helm's major version -- helm>=4 gets `--force-conflicts` and
-# server-side apply, helm 3 gets neither. Different command line, different
-# apply semantics. The host probe's green result therefore proves nothing
-# about what this console actually ships; only a run through the real
-# image, on the real helm 3 binary, does. See the in-image helm-major
-# assertion below, which exists so this can never silently drift again.
+# WHAT THIS DRIVES, AND WHAT IT NO LONGER PINS
+# It used to build and load the production container image and assert the
+# in-image helm major against the Dockerfile's HELM_VERSION, because the image
+# pinned helm 3 while a developer laptop had helm 4 -- and the generated
+# install.sh BRANCHES on helm's major version (helm>=4 gets --force-conflicts
+# and server-side apply, helm 3 gets neither). A host probe's green result
+# therefore proved nothing about what the console shipped.
+#
+# There is no image, no Dockerfile and no pin any more: the binary uses
+# whatever helm the operator has, which is the point of the delivery model.
+# The property that assertion protected did not disappear, it moved --
+# internal/console/preflight.go resolves bash/jq/helm/kubectl before anything
+# touches a cluster and records the versions on the run, so the evidence
+# bundle answers "which helm installed this" for a real install rather than a
+# CI log answering it for a build. What this script pins instead is the
+# behavior of whatever helm is actually present, which is now the honest
+# question.
 #
 # Why simulated GPU nodes, the KWOK setup, and training/kubeflow: see
 # discover-recommend.sh's header -- this script shares that cluster setup
@@ -33,32 +34,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "${SCRIPT_DIR}/lib.sh"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 CLUSTER="${CLUSTER:-aicrme-e2e-apply}"
 NS="${NS:-aicrme}"
-IMAGE="${IMAGE:-aicrme:e2e-apply}"
-PORT="${PORT:-18082}"
-ADDR="localhost:${PORT}"
-
-JAR="$(mktemp -t aicrme-apply-jar.XXXXXX)"
 TARBALL="$(mktemp -t aicrme-apply-bundle.XXXXXX.tar.gz)"
-PF_PID=""
 ec=0
 
 # dump_recent_events prints the last 80 SSE events for a failed run --
 # more than discover-recommend.sh's 50, since Apply alone emits one event
 # per component per attempt across up to 14 components.
 dump_recent_events() {
+  [[ -n "${CONSOLE_URL:-}" ]] || return 0
   echo "--- last 80 SSE events ---" >&2
   set +e
-  curl -fsS -b "${JAR}" --max-time 5 "http://${ADDR}/api/events?since=0" 2>/dev/null \
+  e2e_api GET '/api/events?since=0' --max-time 5 2>/dev/null \
     | sed -n 's/^data: //p' | tail -n 80 >&2
   set -e
 }
 
 # fail_run prints the run's error, then exits 1. The SSE dump itself happens
-# once, in cleanup, while the port-forward is still alive -- see cleanup's
+# once, in cleanup, while the console is still running -- see cleanup's
 # ordering below.
 fail_run() {
   local run_json="$1"
@@ -69,17 +64,15 @@ fail_run() {
 
 cleanup() {
   local exit_code="$1"
-  # Diagnostics run BEFORE killing the port-forward, and exactly once here:
-  # dump_recent_events curls the console through PF_PID, so dumping after
-  # the kill would come back empty.
+  # Diagnostics run BEFORE the console is stopped, and exactly once here:
+  # dump_recent_events curls the console, so dumping after it exits would
+  # come back empty.
   if [[ "${exit_code}" -ne 0 ]]; then
     e2e_diagnose "${NS}"
     dump_recent_events
   fi
-  if [[ -n "${PF_PID}" ]]; then
-    kill "${PF_PID}" 2>/dev/null || true
-  fi
-  rm -f "${JAR}" "${TARBALL}"
+  e2e_console_cleanup
+  rm -f "${TARBALL}"
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
 # Exit status is captured before cleanup runs anything else, and re-asserted
@@ -96,14 +89,6 @@ e2e_install_kwok
 echo "--- apply simulated H100 nodes (2 system + 4x p5.48xlarge)"
 e2e_apply_kwok_nodes
 
-echo "--- build and load PRODUCTION console image (this is the whole point -- see header)"
-e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
-
-echo "--- install chart"
-e2e_install_chart "${NS}" "${IMAGE}"
-
-# Both overrides land in one `kubectl set env` / one rollout, not two: two
-# separate calls would roll the Deployment twice and double the wait.
 # AICRME_SNAPSHOT_NODE_SELECTOR: see discover-recommend.sh's header for why
 # the snapshot agent must be pinned off the tainted simulated GPU nodes.
 # AICRME_SNAPSHOT_REQUESTS: see discover-recommend.sh's header for why the
@@ -113,51 +98,25 @@ e2e_install_chart "${NS}" "${IMAGE}"
 # which every generated install.sh interpolates into its `helm upgrade
 # --install` invocation. Nothing is installed; every chart is still
 # fetched and rendered through the real helm binary.
-echo "--- pin the snapshot agent off the simulated GPU nodes and enable Apply's dry-run"
-kubectl -n "${NS}" set env deploy/aicrme \
-  'AICRME_SNAPSHOT_NODE_SELECTOR=node-role.kubernetes.io/control-plane=' \
-  'AICRME_SNAPSHOT_REQUESTS=cpu=200m' \
-  'AICRME_APPLY_DRY_RUN=true'
-kubectl -n "${NS}" rollout status deploy/aicrme --timeout=120s
+echo "--- start the console with Apply's dry-run on"
+export AICRME_SNAPSHOT_NODE_SELECTOR='node-role.kubernetes.io/control-plane='
+export AICRME_SNAPSHOT_REQUESTS='cpu=200m'
+export AICRME_APPLY_DRY_RUN='true'
+e2e_start_console
+e2e_connect
 
-# The whole reason this script exists rather than just trusting the host
-# probe: assert the shipped image's helm major actually matches what the
-# Dockerfile pins, so a base-image bump that silently changes helm's major
-# version surfaces here, in CI, rather than in a customer's install.
-echo "--- assert in-image helm major matches the Dockerfile pin"
-DOCKERFILE_HELM_VERSION="$(sed -n 's/^ARG HELM_VERSION=\(.*\)$/\1/p' "${REPO_ROOT}/Dockerfile")"
-[[ -n "${DOCKERFILE_HELM_VERSION}" ]] || {
-  echo "could not read ARG HELM_VERSION from Dockerfile" >&2
-  exit 1
-}
-DOCKERFILE_HELM_MAJOR="${DOCKERFILE_HELM_VERSION%%.*}"
-IMAGE_HELM_VERSION="$(kubectl -n "${NS}" exec deploy/aicrme -- helm version --template '{{.Version}}')"
-# IMAGE_KUBECTL_VERSION is captured and logged for the record (it is
-# version-sensitive context for anyone reading a CI log later) but, unlike
-# helm, is not asserted against the Dockerfile's KUBECTL_VERSION pin --
-# only the helm major is required, since that is the one install.sh
-# branches its apply semantics on.
-IMAGE_KUBECTL_VERSION="$(kubectl -n "${NS}" exec deploy/aicrme -- kubectl version --client=true -o json | jq -r '.clientVersion.gitVersion')"
-IMAGE_HELM_MAJOR="$(echo "${IMAGE_HELM_VERSION}" | sed -nE 's/^v?([0-9]+)\..*/\1/p')"
-echo "Dockerfile pins helm ${DOCKERFILE_HELM_VERSION} (major ${DOCKERFILE_HELM_MAJOR}); in-image helm reports ${IMAGE_HELM_VERSION}; in-image kubectl reports ${IMAGE_KUBECTL_VERSION} (informational only, not asserted)"
-[[ -n "${IMAGE_HELM_MAJOR}" ]] || {
-  echo "could not parse a major version out of in-image helm's own version string: ${IMAGE_HELM_VERSION}" >&2
-  exit 1
-}
-[[ "${IMAGE_HELM_MAJOR}" == "${DOCKERFILE_HELM_MAJOR}" ]] || {
-  echo "in-image helm major (${IMAGE_HELM_MAJOR}, from ${IMAGE_HELM_VERSION}) does not match the Dockerfile pin (${DOCKERFILE_HELM_MAJOR}, from HELM_VERSION=${DOCKERFILE_HELM_VERSION}) -- the built image and the Dockerfile have drifted" >&2
-  exit 1
-}
-
-kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &
-PF_PID=$!
-sleep 3
-
-echo "--- login"
-e2e_login "${ADDR}" "${JAR}" "${NS}"
+# Logged, not asserted against a pin: there is no Dockerfile to compare with,
+# and this is the version the run itself will record and ship in its evidence
+# bundle. It is here so a CI log still says which helm produced the outcome
+# the pinned dry-run ceiling below describes -- that ceiling IS helm-major
+# sensitive (helm 3 fails on the missing NodeFeatureRule CRD, helm 4.2.4 was
+# observed tolerating it), so a reader diagnosing a drift needs this line.
+HELM_VERSION="$(helm version --template '{{.Version}}')"
+KUBECTL_VERSION="$(kubectl version --client=true -o json | jq -r '.clientVersion.gitVersion')"
+echo "toolchain driving this run: helm ${HELM_VERSION}, kubectl ${KUBECTL_VERSION}"
 
 echo "--- POST /api/runs"
-RUN_JSON="$(curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs" -H 'Content-Type: application/json')"
+RUN_JSON="$(e2e_api POST /api/runs -H 'Content-Type: application/json')"
 RUN_ID="$(echo "${RUN_JSON}" | jq -r '.id')"
 [[ -n "${RUN_ID}" && "${RUN_ID}" != "null" ]] || {
   echo "no run id in response: ${RUN_JSON}" >&2
@@ -170,7 +129,7 @@ echo "run id: ${RUN_ID}"
 echo "--- poll until awaiting_decision (Discover complete)"
 STATE=""
 for _ in $(seq 1 90); do
-  RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
+  RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 5
@@ -188,14 +147,14 @@ PENDING="$(echo "${RUN_JSON}" | jq -cS '.pending')"
 }
 
 echo "--- POST /api/runs/${RUN_ID}/decide {intent:training, platform:kubeflow}"
-curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
+e2e_api POST "/api/runs/${RUN_ID}/decide" \
   -H 'Content-Type: application/json' \
   -d '{"intent":"training","platform":"kubeflow"}' >/dev/null
 
 echo "--- poll until the run parks a second time (Recommend + Bundle complete, Apply's confirm gate)"
 STATE=""
 for _ in $(seq 1 60); do
-  RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
+  RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 3
@@ -221,7 +180,7 @@ echo "confirm gate fired: pending == [\"apply\"]"
 echo "--- GET /api/runs/${RUN_ID}/bundle"
 # -w writes the response's Content-Type to stdout after the body is
 # streamed to -o, so this is one request, not a HEAD-then-GET pair.
-CONTENT_TYPE="$(curl -fsS -b "${JAR}" -o "${TARBALL}" -w '%{content_type}' "http://${ADDR}/api/runs/${RUN_ID}/bundle")"
+CONTENT_TYPE="$(e2e_api GET "/api/runs/${RUN_ID}/bundle" -o "${TARBALL}" -w '%{content_type}')"
 [[ -s "${TARBALL}" ]] || {
   echo "bundle download was empty" >&2
   exit 1
@@ -250,7 +209,7 @@ grep -qx 'deploy.sh' <<<"${BUNDLE_ENTRIES}" || {
 echo "bundle downloaded: $(wc -c <"${TARBALL}" | tr -d ' ') bytes, contains deploy.sh"
 
 echo "--- POST /api/runs/${RUN_ID}/decide {apply:yes}"
-curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
+e2e_api POST "/api/runs/${RUN_ID}/decide" \
   -H 'Content-Type: application/json' \
   -d '{"apply":"yes"}' >/dev/null
 
@@ -275,7 +234,7 @@ curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
 echo "--- poll until done or failed (Apply)"
 STATE=""
 for _ in $(seq 1 240); do
-  RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
+  RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "done" || "${STATE}" == "failed" ]] && break
   sleep 10
@@ -297,7 +256,7 @@ echo "--- extracting the SSE stream (component statuses, the failing component, 
 # replayed from the start (since=0) and would return the same content
 # again anyway.
 set +e
-EVENTS="$(curl -fsS -b "${JAR}" --max-time 10 "http://${ADDR}/api/events?since=0" 2>/dev/null \
+EVENTS="$(e2e_api GET '/api/events?since=0' --max-time 10 2>/dev/null \
   | sed -n 's/^data: //p' \
   | jq -R -c 'fromjson? // empty')"
 set -e
@@ -383,4 +342,4 @@ grep -q 'no matches for kind "NodeFeatureRule"' <<<"${ERROR_TAIL}" || {
   fail_run "${RUN_JSON}"
 }
 
-echo "PASS: apply-dryrun e2e green (run ${RUN_ID}, helm ${IMAGE_HELM_VERSION} in-image; confirm gate fired, bundle downloaded, >=1 component installed, and the known dry-run ceiling confirmed: fails at ${EXPECTED_FAILING_COMPONENT} (${EXPECTED_FAILING_INDEX}/14) on the nfd CRD-ordering limitation, exactly as pinned)"
+echo "PASS: apply-dryrun e2e green (run ${RUN_ID}, helm ${HELM_VERSION}; confirm gate fired, bundle downloaded, >=1 component installed, and the known dry-run ceiling confirmed: fails at ${EXPECTED_FAILING_COMPONENT} (${EXPECTED_FAILING_INDEX}/14) on the nfd CRD-ordering limitation, exactly as pinned)"

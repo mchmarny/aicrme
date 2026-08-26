@@ -34,28 +34,27 @@ Takes about 5 minutes the first time. It will:
 
 1. Create a Kind cluster — control-plane + 3 workers.
 2. Install KWOK and apply AICR's **simulated H100 nodes** (2 system + 4 × `p5.48xlarge`).
-3. Build the production console image and load it into the cluster.
-4. Install the chart.
-5. Pin the AICR snapshot agent to a labelled worker and turn the real (non-dry-run) install on.
-6. Port-forward and print the URL, username, and generated password.
+3. Label a worker for the AICR snapshot agent.
+4. Build the console binary.
+5. Run it in the foreground, with the real (non-dry-run) install on. It opens your browser at a
+   tokenized loopback URL and prints the same URL.
 
 **Why the simulated GPU nodes are not optional:** with no GPU nodes there is no derivable
 accelerator, so every intent/platform pair fails AICR's coverage post-condition and Recommend
 cannot resolve *anything*. A plain Kind or KWOK cluster will not demo this product.
 
-When it finishes you get:
-
-```
-  URL       http://localhost:8080
-  username  admin
-  password  <generated>
-```
-
-Re-running `make demo` against an existing cluster reuses it and upgrades the console in place.
+The console runs in your terminal. **Ctrl-C stops it; the cluster stays up** until
+`make demo-down`. Re-running `make demo` against an existing cluster reuses it.
 
 ## Drive it
 
-Open the URL and log in. The arc is five screens:
+Open the URL. There is no password: the `?t=` token in the URL is exchanged once for a session
+cookie that dies with the process.
+
+The first screen is **Connect** — it lists your kubeconfig's contexts and arrives preselected on
+`kind-aicrme-demo`. Connecting reports the cluster's server version, node count and UID, and the
+`bash`/`jq`/`helm`/`kubectl` this machine resolved, so you can confirm what you are about to
+install into and with what. Then the arc is five screens:
 
 **1. Discover.** The console runs AICR's snapshot agent as a Job on the cluster, reads node
 topology, and reports **capability gaps** — what the cluster cannot do yet — rather than an
@@ -129,37 +128,26 @@ deletes the workload and waits until its pods are actually gone before closing t
 
 ## Running on a real cluster
 
-`make demo` owns its cluster — it runs `kind create cluster`, loads the image into the nodes,
-and installs with `pullPolicy: Never` so nothing is ever pulled. None of that works on GKE, EKS
-or AKS. Use `scripts/demo-remote.sh`, which creates nothing and pulls the image like any real
-deployment:
+There is nothing special to do. The binary runs on your machine and drives whatever context you
+pick, so a real cluster is just a different row on the Connect screen:
 
 ```sh
-docker login ghcr.io                       # once
-kubectl config use-context <your-cluster>  # this script installs into the CURRENT context
-scripts/demo-remote.sh up                  # build, push, install, then print the URL
-scripts/demo-remote.sh down                # uninstalls the console; the CLUSTER SURVIVES
+make build
+./bin/aicrme --context <your-context>
 ```
 
-It refuses a `kind-*` context outright, tags the image with the current commit so a running pod
-traces back to a commit, and prints every GPU node with its taints before installing anything.
-
-**The image must be pullable.** Either make the ghcr.io package public, or create a pull secret
-and name it — the chart takes it, and never handles the credential itself:
-
-```sh
-kubectl -n aicrme create secret docker-registry ghcr \
-  --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>
-PULL_SECRET=ghcr scripts/demo-remote.sh up
-```
+Nothing is installed into the cluster to make the console work — no Deployment, no
+ClusterRoleBinding, no image to push or pull. It acts with your kubeconfig's credentials, and
+holds them only while it runs. `make demo`'s Kind + KWOK setup exists because a *simulated*
+cluster needs building; a real one you already have.
 
 **One thing to watch on a managed cluster.** The snapshot agent Job tolerates `nvidia.com/gpu`
 and nothing else, which covers GKE's `nvidia.com/gpu=present:NoSchedule` and the EKS/AKS
 equivalents. A GPU pool carrying some *other* taint will strand it, and Discover then sits
-Pending for its full ten-minute timeout. `demo-remote.sh up` prints the taints first and warns
-when it sees one it does not recognise. The toleration is deliberately narrow rather than a
-blanket `Exists`: a blanket one also accepts KWOK's fake-node taint, and KWOK reports success
-for pods it never runs, which would make Discover lie.
+Pending for its full ten-minute timeout. Set `AICRME_GPU_TOLERATIONS` to that taint —
+`key=value:Effect`, comma-separated — and it reaches the node. The built-in toleration is
+deliberately narrow rather than a blanket `Exists`: a blanket one also accepts KWOK's fake-node
+taint, and KWOK reports success for pods it never runs, which would make Discover lie.
 
 ## Check on it / tear it down
 
@@ -242,8 +230,8 @@ precisely what it could not remove, and removing it is yours.
 **To remove the cluster entirely:**
 
 ```sh
-make demo-status   # is it running, what is the URL and password
-make demo-down     # delete the cluster and stop the port-forward
+make demo-status   # is the cluster up, and is a console running against it
+make demo-down     # delete the cluster and its demo work directory
 ```
 
 ## When it goes wrong
@@ -258,8 +246,16 @@ the scheduling budget, not just memory — Kind reports each node's allocatable 
 *host's* core count. Cutting the cluster to one worker took a real install from ~5 minutes to
 over 40 without completing. Give Docker more memory rather than fewer nodes.
 
-**`make demo` says the cluster already exists.** It reuses and upgrades in place. Run
-`make demo-down` first if you want a clean start.
+**`make demo` says the cluster already exists.** It reuses it. Run `make demo-down` first if
+you want a clean start.
+
+**The console refuses to start: "work directory is locked".** One console per work directory,
+and a previous one is still running (or was SIGKILLed and left its lock). Stop the other one, or
+point this one somewhere else with `--work-dir`.
+
+**The console refuses to start: a missing executable.** It resolves `bash`, `helm` and `kubectl`
+before touching a cluster, deliberately — finding that out at Apply, twenty minutes in with
+releases already installed, is the failure this check exists to move to second zero.
 
 ## What this demo cannot show you
 

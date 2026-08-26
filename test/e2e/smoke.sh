@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Installs the chart on a Kind cluster and asserts the console serves a login
-# page and rejects unauthenticated API access.
+# Starts the console against a Kind cluster and asserts it serves the SPA,
+# refuses unauthenticated API access, and gates every run route until a
+# cluster has been chosen.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,20 +10,14 @@ source "${SCRIPT_DIR}/lib.sh"
 
 CLUSTER="${CLUSTER:-aicrme-e2e}"
 NS="${NS:-aicrme}"
-IMAGE="${IMAGE:-aicrme:e2e}"
-JAR="$(mktemp -t aicrme-smoke-jar.XXXXXX)"
-PF_PID=""
 ec=0
 
 cleanup() {
   local exit_code="$1"
-  if [[ -n "${PF_PID}" ]]; then
-    kill "${PF_PID}" 2>/dev/null || true
-  fi
   if [[ "${exit_code}" -ne 0 ]]; then
     e2e_diagnose "${NS}"
   fi
-  rm -f "${JAR}"
+  e2e_console_cleanup
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
 # Exit status is captured before cleanup runs anything else, and re-asserted
@@ -32,30 +27,45 @@ cleanup() {
 trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
 
 kind create cluster --name "${CLUSTER}" --wait 120s
-e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
-e2e_install_chart "${NS}" "${IMAGE}"
-
-kubectl -n "${NS}" port-forward svc/aicrme 18080:8080 >/dev/null 2>&1 &
-PF_PID=$!
-sleep 3
+e2e_start_console
 
 # Body captured before matching, not piped into `grep -q`: under pipefail,
 # grep exiting early on a match closes the pipe and curl fails with EPIPE
 # (exit 23), turning a passing assertion into a failing script. Small bodies
 # fit the pipe buffer and hide it; a larger SPA would not.
 echo "--- GET / serves the SPA"
-SPA_BODY="$(curl -fsS http://localhost:18080/)"
+SPA_BODY="$(curl -fsS "${CONSOLE_URL}/")"
 grep -q "aicrme" <<<"${SPA_BODY}"
 
 echo "--- GET /healthz is public"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/healthz)" == "200" ]]
+[[ "$(curl -s -o /dev/null -w '%{http_code}' "${CONSOLE_URL}/healthz")" == "200" ]]
 
+# No cookie at all, deliberately: the launch token is the only way in, and a
+# request that never exchanged one must not reach any API route.
 echo "--- GET /api/events is 401 without a session"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/api/events)" == "401" ]]
+[[ "$(curl -s -o /dev/null -w '%{http_code}' "${CONSOLE_URL}/api/events")" == "401" ]]
 
-echo "--- login then POST /api/runs succeeds"
-e2e_login "localhost:18080" "${JAR}" "${NS}"
-RUN_BODY="$(curl -fsS -b "${JAR}" -X POST http://localhost:18080/api/runs)"
+# The connect gate, with a live session: authenticated is not the same as
+# connected, and a run route that answered here would be acting on no cluster
+# in particular.
+echo "--- POST /api/runs is 409 before a cluster is chosen"
+[[ "$(e2e_api_status POST /api/runs)" == "409" ]]
+
+echo "--- GET /api/contexts answers before any connection"
+CONTEXTS_BODY="$(e2e_api GET /api/contexts)"
+grep -q "kind-${CLUSTER}" <<<"${CONTEXTS_BODY}"
+
+e2e_connect
+
+echo "--- POST /api/runs succeeds once connected"
+RUN_BODY="$(e2e_api POST /api/runs)"
 grep -q '"id"' <<<"${RUN_BODY}"
+
+# The reload path: a restored tab has the cookie and no memory of the cluster,
+# and the connection is single-assignment, so this is what stops it being sent
+# back to a Connect screen that would refuse it.
+echo "--- GET /api/cluster reports the established connection"
+CLUSTER_BODY="$(e2e_api GET /api/cluster)"
+grep -q "kind-${CLUSTER}" <<<"${CLUSTER_BODY}"
 
 echo "PASS: smoke test green"

@@ -14,7 +14,7 @@ permissions:
 
 # One run per ref at a time: a newer push cancels an in-flight run rather
 # than queuing behind it. Each job below stands up its own Kind cluster and
-# builds an image, so a stale, superseded run left alive just burns runner
+# installs a whole recipe, so a stale, superseded run left alive just burns runner
 # minutes for a result nobody will read.
 concurrency:
   group: e2e-${{ github.ref }}
@@ -31,8 +31,19 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.go.outputs.version }}
+      # The console embeds the SPA, so `make build` -- which every script now
+      # runs -- needs npm. Pinned and cached exactly as ci.yaml pins it, so a
+      # build that passes the gate and one that runs here cannot use two
+      # different Node majors.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       # install_only: smoke.sh creates and tears down its own Kind cluster;
       # this step only needs to put kind, kubectl, and helm on the runner.
+      # helm matters beyond kind here: the console shells out to whatever helm
+      # is on PATH, and refuses to start without one.
       - uses: helm/kind-action@v1
         with:
           install_only: true
@@ -48,10 +59,19 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.go.outputs.version }}
+      # The console embeds the SPA, so `make build` -- which every script now
+      # runs -- needs npm. Pinned and cached exactly as ci.yaml pins it, so a
+      # build that passes the gate and one that runs here cannot use two
+      # different Node majors.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       # install_only: discover-recommend.sh creates and tears down its own
       # Kind cluster (plus the KWOK controller and simulated GPU nodes
       # inside it); this step only needs to put kind, kubectl, and helm on
-      # the runner.
+      # the runner, and the console shells out to the last two.
       - uses: helm/kind-action@v1
         with:
           install_only: true
@@ -60,7 +80,7 @@ jobs:
   apply-dryrun:
     runs-on: ubuntu-latest
     # apply-dryrun.sh's own polling budget (Discover 7.5m + Recommend/Bundle
-    # 3m + Apply 40m = 50.5m) plus 10-15m of cluster/image/chart setup can
+    # 3m + Apply 40m = 50.5m) plus 10-15m of cluster and console setup can
     # total roughly an hour in the worst case the script's loops permit, even
     # though the dry-run ceiling means today's real run finishes in minutes.
     # 45m was silently narrower than that budget; 75m gives it room without
@@ -74,10 +94,20 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.go.outputs.version }}
+      # The console embeds the SPA, so `make build` -- which every script now
+      # runs -- needs npm. Pinned and cached exactly as ci.yaml pins it, so a
+      # build that passes the gate and one that runs here cannot use two
+      # different Node majors.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       # install_only: apply-dryrun.sh creates and tears down its own Kind
       # cluster (plus the KWOK controller and simulated GPU nodes inside
-      # it) and builds+loads the production console image itself; this
-      # step only needs to put kind, kubectl, and helm on the runner.
+      # it) and builds and runs the console itself; this step only needs to
+      # put kind, kubectl, and helm on the runner, and the console shells out
+      # to the last two.
       - uses: helm/kind-action@v1
         with:
           install_only: true
@@ -110,10 +140,20 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.go.outputs.version }}
+      # The console embeds the SPA, so `make build` -- which every script now
+      # runs -- needs npm. Pinned and cached exactly as ci.yaml pins it, so a
+      # build that passes the gate and one that runs here cannot use two
+      # different Node majors.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       # install_only: apply-real.sh creates and tears down its own multi-node
       # Kind cluster (plus the KWOK controller and simulated GPU nodes inside
-      # it) and builds+loads the production console image itself; this step
-      # only needs to put kind, kubectl, and helm on the runner.
+      # it) and builds and runs the console itself; this step only needs to
+      # put kind, kubectl, and helm on the runner, and the console shells out
+      # to the last two.
       - uses: helm/kind-action@v1
         with:
           install_only: true
@@ -160,6 +200,15 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.go.outputs.version }}
+      # The console embeds the SPA, so `make build` -- which every script now
+      # runs -- needs npm. Pinned and cached exactly as ci.yaml pins it, so a
+      # build that passes the gate and one that runs here cannot use two
+      # different Node majors.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - uses: helm/kind-action@v1
         with:
           install_only: true
@@ -190,6 +239,15 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.go.outputs.version }}
+      # The console embeds the SPA, so `make build` -- which every script now
+      # runs -- needs npm. Pinned and cached exactly as ci.yaml pins it, so a
+      # build that passes the gate and one that runs here cannot use two
+      # different Node majors.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - uses: helm/kind-action@v1
         with:
           install_only: true
