@@ -297,13 +297,20 @@ func usableGPUs(p probe) int {
 // unreadable it drops the article-plus-adjective clause entirely rather than
 // filling it with a placeholder, since this is the first sentence a user
 // reads.
-func headline(p probe) string {
+// headline takes the resolved GPU total rather than reading the probe itself.
+//
+// It used to call totalGPUs(p) directly, which is one node's PCI probe, so on
+// a two-node H100 cluster it announced "a gke cluster with 8 GPUs" for sixteen.
+// Passing the resolved number in means headline and punchline cannot disagree:
+// when only punchline was corrected, the screen carried "with 8 GPUs" directly
+// above "16 of 16 GPUs are usable", which reads as a broken tool.
+func headline(p probe, totalGPUs int) string {
 	clusterPhrase := "This cluster"
 	if provider := providerName(p); provider != "" {
 		clusterPhrase = "This is a " + provider + " cluster"
 	}
-	if gpus := totalGPUs(p); gpus > 0 {
-		return fmt.Sprintf("%s with %d GPUs.", clusterPhrase, gpus)
+	if totalGPUs > 0 {
+		return fmt.Sprintf("%s with %d GPUs.", clusterPhrase, totalGPUs)
 	}
 	return fmt.Sprintf("%s with %d node(s) and no GPU hardware detected.", clusterPhrase, nodeCount(p))
 }

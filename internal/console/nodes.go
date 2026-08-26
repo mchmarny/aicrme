@@ -98,6 +98,22 @@ type NodeComposition struct {
 	GPUNodes int         `json:"gpuNodes"`
 	Groups   []NodeGroup `json:"groups,omitempty"`
 	More     int         `json:"more,omitempty"`
+	// TotalGPUs and UsableGPUs are cluster-wide, summed across every node.
+	//
+	// They exist because the snapshot cannot answer this. gap.Analyze derives
+	// its headline from the GPU hardware subtype, which is an in-pod PCI probe
+	// describing the single node the agent landed on -- AICR's own log warns
+	// that "the GPU collector samples a single node". On a two-node H100
+	// cluster that reported "8 of 8" for sixteen GPUs.
+	//
+	// Total is capacity and Usable is allocatable, because they answer
+	// different questions: what the hardware has, versus what a workload could
+	// schedule onto right now. Both are zero on a cluster whose device plugin
+	// has not come up, since nvidia.com/gpu is published by that plugin -- and
+	// zero is the signal gap.Analyze needs to fall back to the probe rather
+	// than report a confident nothing.
+	TotalGPUs  int64 `json:"totalGPUs,omitempty"`
+	UsableGPUs int64 `json:"usableGPUs,omitempty"`
 	// Remedy is the AICRME_GPU_TOLERATIONS value that would clear every
 	// blocked group, in the exact spelling parseTolerations reads back.
 	Remedy string `json:"remedy,omitempty"`
@@ -118,6 +134,8 @@ func groupNodes(nodes []corev1.Node, tolerations []corev1.Toleration) NodeCompos
 		g := describe(&nodes[i], tolerations)
 		if g.GPUsPerNode > 0 {
 			comp.GPUNodes++
+			comp.TotalGPUs += gpuQuantity(nodes[i].Status.Capacity)
+			comp.UsableGPUs += gpuQuantity(nodes[i].Status.Allocatable)
 		}
 		if g.Blocked {
 			for _, t := range untoleratedTaints(&nodes[i], tolerations) {
@@ -208,10 +226,15 @@ func tolerated(t corev1.Taint, tolerations []corev1.Toleration) bool {
 
 // gpuCapacity reads the node's advertised GPU count, preferring allocatable.
 func gpuCapacity(n *corev1.Node) int64 {
-	if q, ok := n.Status.Allocatable[gpuResource]; ok {
-		return q.Value()
+	if v := gpuQuantity(n.Status.Allocatable); v > 0 {
+		return v
 	}
-	if q, ok := n.Status.Capacity[gpuResource]; ok {
+	return gpuQuantity(n.Status.Capacity)
+}
+
+// gpuQuantity reads nvidia.com/gpu out of one resource list.
+func gpuQuantity(rl corev1.ResourceList) int64 {
+	if q, ok := rl[gpuResource]; ok {
 		return q.Value()
 	}
 	return 0

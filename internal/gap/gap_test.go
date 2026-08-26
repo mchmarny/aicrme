@@ -28,7 +28,7 @@ func loadFixture(t *testing.T, name string) *aicr.Snapshot {
 }
 
 func TestAnalyzeKWOK(t *testing.T) {
-	report := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"))
+	report := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"), gap.ClusterGPUs{})
 
 	if report.Headline == "" {
 		t.Error("Analyze produced no headline — Discover opens with a capability statement")
@@ -45,7 +45,7 @@ func TestAnalyzeKWOK(t *testing.T) {
 }
 
 func TestAnalyzeNilSnapshotIsSafe(t *testing.T) {
-	report := gap.Analyze(nil)
+	report := gap.Analyze(nil, gap.ClusterGPUs{})
 	if report.Headline == "" {
 		t.Error("Analyze(nil) must still produce a renderable report")
 	}
@@ -60,7 +60,7 @@ func TestAnalyzeNilSnapshotIsSafe(t *testing.T) {
 // snapshotter.Snapshot with a nil Measurements slice — Analyze must not panic
 // ranging over it.
 func TestAnalyzeBareSnapshotIsSafe(t *testing.T) {
-	report := gap.Analyze(&aicr.Snapshot{})
+	report := gap.Analyze(&aicr.Snapshot{}, gap.ClusterGPUs{})
 	if report.Headline == "" {
 		t.Error("Analyze(&aicr.Snapshot{}) must still produce a renderable report")
 	}
@@ -70,7 +70,7 @@ func TestAnalyzeBareSnapshotIsSafe(t *testing.T) {
 }
 
 func TestEveryGapNamesItsClosingComponent(t *testing.T) {
-	report := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"))
+	report := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"), gap.ClusterGPUs{})
 	if len(report.Gaps) == 0 {
 		t.Fatal("no gaps fired against the KWOK fixture — expected gpu-driver to fire")
 	}
@@ -89,7 +89,7 @@ func TestEveryGapNamesItsClosingComponent(t *testing.T) {
 // has no row — see the package comment on rules in internal/gap/rules.go for
 // why it stays deferred to a real EKS fixture.
 func TestGapRulesFireAgainstFixture(t *testing.T) {
-	report := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"))
+	report := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"), gap.ClusterGPUs{})
 
 	fired := map[string]bool{}
 	for _, g := range report.Gaps {
@@ -184,7 +184,7 @@ func TestDegradedK8sCollectorEmitsNoGuessedGaps(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			report := gap.Analyze(k8sSnapshot(tc.subtypes...))
+			report := gap.Analyze(k8sSnapshot(tc.subtypes...), gap.ClusterGPUs{})
 			got := map[string]bool{}
 			for _, g := range report.Gaps {
 				got[g.ID] = true
@@ -210,7 +210,7 @@ func TestHeadlineWithoutProviderIsGrammatical(t *testing.T) {
 	report := gap.Analyze(k8sSnapshot(measurement.Subtype{
 		Name: "server",
 		Data: map[string]measurement.Reading{measurement.KeyVersion: measurement.Str("1.30.0")},
-	}))
+	}), gap.ClusterGPUs{})
 	if report.Headline == "" {
 		t.Fatal("Headline is empty when provider is unreadable")
 	}
@@ -276,7 +276,7 @@ func TestUsableGPUs(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			report := gap.Analyze(gpuSnapshot(tc.data))
+			report := gap.Analyze(gpuSnapshot(tc.data), gap.ClusterGPUs{})
 			if report.TotalGPUs != tc.wantTotal {
 				t.Errorf("TotalGPUs = %d, want %d", report.TotalGPUs, tc.wantTotal)
 			}
@@ -292,7 +292,7 @@ func TestPunchlineWithGPUs(t *testing.T) {
 		measurement.KeyGPUCount:        measurement.Int64(64),
 		measurement.KeyGPUPresent:      measurement.Bool(true),
 		measurement.KeyGPUDriverLoaded: measurement.Bool(true),
-	}))
+	}), gap.ClusterGPUs{})
 	const want = "64 of 64 GPUs are usable by a workload today."
 	if report.Punchline != want {
 		t.Errorf("Punchline = %q, want %q", report.Punchline, want)
@@ -346,7 +346,7 @@ func fullyCapableSnapshot() *aicr.Snapshot {
 // TestPunchlineWithGPUs alone (a bare GPU-only synthetic snapshot) does not
 // cover.
 func TestAnalyzeFullyCapableClusterHasNoGaps(t *testing.T) {
-	report := gap.Analyze(fullyCapableSnapshot())
+	report := gap.Analyze(fullyCapableSnapshot(), gap.ClusterGPUs{})
 
 	if report.Gaps != nil {
 		t.Errorf("Gaps = %v, want nil -- a fully capable cluster has nothing left to close", report.Gaps)
@@ -360,11 +360,115 @@ func TestAnalyzeFullyCapableClusterHasNoGaps(t *testing.T) {
 // A fully capable cluster and a cluster that was never measured both yield
 // zero gaps. The console must not congratulate the user for the second.
 func TestAnalyzeMarksWhetherASnapshotWasActuallyMeasured(t *testing.T) {
-	if got := gap.Analyze(nil); got.Analyzed {
+	if got := gap.Analyze(nil, gap.ClusterGPUs{}); got.Analyzed {
 		t.Error("Analyzed = true for a nil snapshot, want false")
 	}
-	report := gap.Analyze(loadFixture(t, "snapshot-kwok-h100.yaml"))
+	report := gap.Analyze(loadFixture(t, "snapshot-kwok-h100.yaml"), gap.ClusterGPUs{})
 	if !report.Analyzed {
 		t.Error("Analyzed = false for a real snapshot, want true")
+	}
+}
+
+// probedGPUsPerNode is what one a3-megagpu-8g reports to an in-pod PCI probe,
+// and the number the real cluster's console mistook for the whole cluster.
+const probedGPUsPerNode = 8
+
+// gpuHardware is the reading set a single-node PCI probe produces. Fixed at
+// one node's worth deliberately: every test here is about what happens to that
+// number afterwards, not about the number itself.
+func gpuHardware() map[string]measurement.Reading {
+	return map[string]measurement.Reading{
+		measurement.KeyGPUCount:        measurement.Int64(probedGPUsPerNode),
+		measurement.KeyGPUPresent:      measurement.Bool(true),
+		measurement.KeyGPUDriverLoaded: measurement.Bool(true),
+	}
+}
+
+// TestAnalyzePrefersTheNodeListOverTheSingleNodeProbe is the headline fix.
+//
+// The GPU measurement is an in-pod PCI probe of whichever node the agent
+// landed on. On the real two-node H100 cluster it read 8, and the console
+// announced "8 of 8 GPUs are usable" about a cluster holding 16. When the
+// caller has walked the node list, that is simply better evidence.
+func TestAnalyzePrefersTheNodeListOverTheSingleNodeProbe(t *testing.T) {
+	report := gap.Analyze(gpuSnapshot(gpuHardware()),
+		gap.ClusterGPUs{Nodes: 2, Total: 16, Usable: 16})
+
+	if report.TotalGPUs != 16 || report.UsableGPUs != 16 {
+		t.Errorf("got %d of %d, want 16 of 16 -- the node list outranks one node's probe",
+			report.UsableGPUs, report.TotalGPUs)
+	}
+	if report.InferredGPUs {
+		t.Error("InferredGPUs = true, but these numbers were counted rather than inferred")
+	}
+	if want := "16 of 16 GPUs are usable by a workload today."; report.Punchline != want {
+		t.Errorf("Punchline = %q, want %q", report.Punchline, want)
+	}
+}
+
+// TestAnalyzeCorrectsBothNumbersTogether is the trap this fix must not fall
+// into.
+//
+// Correcting only the denominator -- total from the node list, usable still
+// from the probe -- turns "8 of 8" into "8 of 16" and claims half the
+// cluster's GPUs are unusable. That is a worse lie than the undercount it
+// replaces, because it invents a fault that does not exist.
+func TestAnalyzeCorrectsBothNumbersTogether(t *testing.T) {
+	report := gap.Analyze(gpuSnapshot(gpuHardware()),
+		gap.ClusterGPUs{Nodes: 2, Total: 16, Usable: 16})
+
+	if report.UsableGPUs < report.TotalGPUs {
+		t.Errorf("got %d of %d -- usable fell behind total, which reports a fault the cluster does not have",
+			report.UsableGPUs, report.TotalGPUs)
+	}
+}
+
+// TestAnalyzeInfersFromNodeCountBeforeTheDevicePlugin covers the cluster this
+// console exists to onboard: GPU hardware present, no device plugin yet, so
+// nvidia.com/gpu is advertised by nobody and the node list can only say how
+// many GPU-shaped nodes there are. Multiplying the probe by that count is a
+// guess, and the report says so rather than passing it off as counted.
+func TestAnalyzeInfersFromNodeCountBeforeTheDevicePlugin(t *testing.T) {
+	report := gap.Analyze(gpuSnapshot(gpuHardware()), gap.ClusterGPUs{Nodes: 2})
+
+	if report.TotalGPUs != 16 || report.UsableGPUs != 16 {
+		t.Errorf("got %d of %d, want 16 of 16 inferred from 8 x 2 nodes",
+			report.UsableGPUs, report.TotalGPUs)
+	}
+	if !report.InferredGPUs {
+		t.Error("InferredGPUs = false, but 8 x 2 is an assumption that every GPU node is identical")
+	}
+}
+
+// TestAnalyzeFallsBackToTheProbeWhenNothingIsKnown keeps the old behavior for
+// callers with no node list, which is what the zero ClusterGPUs means.
+func TestAnalyzeFallsBackToTheProbeWhenNothingIsKnown(t *testing.T) {
+	report := gap.Analyze(gpuSnapshot(gpuHardware()), gap.ClusterGPUs{})
+
+	if report.TotalGPUs != 8 || report.UsableGPUs != 8 {
+		t.Errorf("got %d of %d, want 8 of 8 from the probe alone", report.UsableGPUs, report.TotalGPUs)
+	}
+	if report.InferredGPUs {
+		t.Error("InferredGPUs = true, but a single-node probe on one node is a measurement")
+	}
+}
+
+// TestAnalyzeHeadlineUsesTheResolvedGPUCount closes the half of the fix that
+// the first pass missed.
+//
+// punchline and headline are separate strings reading the same probe, and
+// correcting only punchline produced a screen that said "This is a gke cluster
+// with 8 GPUs" directly above "16 of 16 GPUs are usable by a workload today" --
+// two sentences contradicting each other, which is worse than one wrong one.
+// Caught on real hardware, not by this suite.
+func TestAnalyzeHeadlineUsesTheResolvedGPUCount(t *testing.T) {
+	report := gap.Analyze(gpuSnapshot(gpuHardware()),
+		gap.ClusterGPUs{Nodes: 2, Total: 16, Usable: 16})
+
+	if strings.Contains(report.Headline, "8 GPUs") {
+		t.Errorf("Headline = %q, still quotes one node's probe", report.Headline)
+	}
+	if !strings.Contains(report.Headline, "16 GPUs") {
+		t.Errorf("Headline = %q, want it to quote the cluster-wide 16", report.Headline)
 	}
 }

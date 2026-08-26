@@ -706,7 +706,7 @@ export function Wizard({ events, onDiscarded, onStopped }: {
       </div>
 
       <aside className={`${cockpit ? 'w-80' : 'w-96'} shrink-0 border-l border-slate-800 pl-8`}>
-        <Timeline events={events} />
+        <Timeline events={events} runId={run.runId} />
       </aside>
     </div>
   )

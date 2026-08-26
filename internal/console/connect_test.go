@@ -13,6 +13,7 @@ import (
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/gap"
 	"github.com/mchmarny/aicrme/internal/prove"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -525,7 +526,7 @@ func TestConnectBuildsEveryStepInOrder(t *testing.T) {
 	w := clusterWiring{workDir: t.TempDir(), namespace: "aicrme", aicr: &aicrclient.Fake{}}
 
 	kube := fake.NewClientset()
-	got := w.steps(kube, "/tmp/session-1/kubeconfig", prove.NewClient(kube))
+	got := w.steps(kube, "/tmp/session-1/kubeconfig", prove.NewClient(kube), gap.ClusterGPUs{})
 
 	want := []engine.Phase{
 		engine.PhaseDiscover, engine.PhaseRecommend, engine.PhaseBundle,

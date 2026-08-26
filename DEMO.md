@@ -195,16 +195,28 @@ second cycle therefore runs a scheduler from the first against controllers from 
 pod-grouper cannot read back the PodGroup it just created, the scheduler sees zero PodGroups,
 and the gang waits forever.
 
-**The workaround, measured to place the gang within ten seconds:**
+**On KWOK, this workaround placed the gang within ten seconds:**
 
 ```sh
 kubectl delete schedulingshard default              # the next reconcile rebuilds it
 kubectl rollout restart deploy -n kai-scheduler     # no controller keeps a pre-reset cache
 ```
 
-Then Retry the run. This is a restart, not a deletion of anything cluster-scoped — no CRD is
-removed. Rebuilding the cluster (`make demo-down && make demo`) also works and is the safer
-choice if you are about to demo in front of someone.
+> **It does not work on real hardware. Measured 2026-08-26, GKE, 2× a3-megagpu-8g.** The second
+> cycle installed 16/16 and Prove failed `0/2 members placed`. Both commands were run, all six
+> kai-scheduler deployments rolled out cleanly, and the retried run failed **identically** — a
+> fresh PodGroup UUID and the same pod-grouper loop (`already exists`, then `the object has been
+> modified; please apply your changes to the latest version`).
+>
+> **The mechanism above is also not what happens there.** Every kai-scheduler pod was `Running`,
+> `kai-scheduler-default` included, and the `scheduling.run.ai` CRDs had been created fresh
+> minutes earlier. Nor was it leftover reservations: both GPU nodes reported all 8 GPUs
+> allocatable, nothing held a GPU, and `kai-resource-reservation` was empty. Same symptom,
+> different cause — and the real one is not yet understood.
+
+**Rebuilding the cluster is the only path known to work on real hardware.** On KWOK
+`make demo-down && make demo` does it; on a real cluster it means a new cluster. Either way it is
+the safer choice if you are about to demo in front of someone.
 
 Full measurements, including the arm that ruled out "it just needed more time", are in
 `docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md`.

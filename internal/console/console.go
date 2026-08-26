@@ -26,6 +26,7 @@ import (
 	"github.com/mchmarny/aicrme/internal/applier"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/gap"
 	"github.com/mchmarny/aicrme/internal/observer"
 	"github.com/mchmarny/aicrme/internal/prove"
 	"github.com/mchmarny/aicrme/internal/steps"
@@ -551,6 +552,17 @@ type clusterWiring struct {
 // is no pod restart to trigger recovery on the operator's behalf. So the whole
 // cluster-dependent half of the wiring moves here, in one place, behind one
 // gate.
+// clusterGPUs lifts the connect-time node counts into the shape gap.Analyze
+// reads. Connect-time is the right vintage: the headline describes the cluster
+// before this run installs anything, which is when Connect measured it.
+func clusterGPUs(info *ClusterInfo) gap.ClusterGPUs {
+	return gap.ClusterGPUs{
+		Nodes:  info.Nodes.GPUNodes,
+		Total:  info.Nodes.TotalGPUs,
+		Usable: info.Nodes.UsableGPUs,
+	}
+}
+
 func connectHook(w clusterWiring) func(context.Context, *ClusterInfo, kubernetes.Interface) error {
 	return func(ctx context.Context, info *ClusterInfo, kube kubernetes.Interface) error {
 		path, cleanup, err := writeSessionKubeconfig(w.workDir, w.kubeconfig, info.Context)
@@ -593,7 +605,7 @@ func connectHook(w clusterWiring) func(context.Context, *ClusterInfo, kubernetes
 		prover := prove.NewClient(kube, w.gpuTolerations...)
 
 		w.engine.SetStore(store)
-		w.engine.SetSteps(w.steps(kube, path, prover)...)
+		w.engine.SetSteps(w.steps(kube, path, prover, clusterGPUs(info))...)
 		w.engine.SetProveClient(prover)
 		w.engine.SetTeardown(teardown.NewEngineTeardown(teardown.BashExec{}))
 		// Before Recover, not after: the identity check is what lets recovery
@@ -620,7 +632,7 @@ func connectHook(w clusterWiring) func(context.Context, *ClusterInfo, kubernetes
 // steps builds the pipeline against the connected cluster. kube is the
 // clientset dial just built, sessionKubeconfig is the frozen file every
 // subprocess in the chain reads, and prover is the same instance Stop holds.
-func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string, prover *prove.Client) []engine.Step {
+func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string, prover *prove.Client, gpus gap.ClusterGPUs) []engine.Step {
 	return []engine.Step{
 		steps.NewDiscover(w.aicr, steps.DiscoverConfig{
 			Namespace: w.namespace,
@@ -661,6 +673,12 @@ func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string
 			Requests:   parseResourceRequests(os.Getenv("AICRME_SNAPSHOT_REQUESTS")),
 			Privileged: true,
 			Timeout:    10 * time.Minute,
+			// What the node list said at connect, which is the only
+			// cluster-wide GPU evidence there is: the snapshot's GPU count is
+			// an in-pod PCI probe of one node. Connect-time is the right
+			// vintage -- the headline describes the cluster BEFORE this run
+			// installs anything, which is the same moment Connect measured.
+			ClusterGPUs: gpus,
 		}),
 		steps.NewRecommend(w.aicr),
 		steps.NewBundle(w.aicr, steps.BundleConfig{

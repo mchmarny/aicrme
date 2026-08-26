@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { Timeline } from './Timeline'
 import type { AicrEvent } from '../useEvents'
@@ -52,5 +52,96 @@ describe('Timeline', () => {
     const input = [...events]
     render(<Timeline events={input} />)
     expect(input.map(e => e.id)).toEqual([1, 2])
+  })
+})
+
+const ev = (o: Partial<AicrEvent> & { id: number }): AicrEvent => ({
+  at: '2026-08-13T00:00:00Z', kind: 'log', level: 'info', message: `event ${o.id}`, ...o,
+})
+
+describe('Timeline run scoping', () => {
+  // A failed run from an hour ago rendered flush against the run you just
+  // started, in identical styling, with no boundary between them. On the real
+  // GKE cluster that put a wall of red timeout text from a dead run directly
+  // beneath the live run's progress, which reads as though the thing happening
+  // now is on fire.
+  it('shows only the current run when it knows which one that is', () => {
+    render(<Timeline runId="now" events={[
+      ev({ id: 1, runId: 'before', level: 'error', message: 'the previous run timed out' }),
+      ev({ id: 2, runId: 'before', message: 'previous run detail' }),
+      ev({ id: 3, runId: 'now', message: 'deploying cluster snapshot agent' }),
+    ]} />)
+
+    expect(screen.getByText('deploying cluster snapshot agent')).toBeDefined()
+    expect(screen.queryByText('the previous run timed out')).toBeNull()
+  })
+
+  // Collapsed, never dropped: the earlier run is still the evidence for what
+  // the cluster looks like now, and a timeline that silently discards it is
+  // lying by omission.
+  it('says how much earlier history it is holding back, and can reveal it', () => {
+    render(<Timeline runId="now" events={[
+      ev({ id: 1, runId: 'before', level: 'error', message: 'the previous run timed out' }),
+      ev({ id: 2, runId: 'before', message: 'previous run detail' }),
+      ev({ id: 3, runId: 'now', message: 'deploying cluster snapshot agent' }),
+    ]} />)
+
+    fireEvent.click(screen.getByText(/2 events from earlier runs/))
+    expect(screen.getByText('the previous run timed out')).toBeDefined()
+  })
+})
+
+describe('Timeline noise', () => {
+  // 289 of 397 events on a real run were cluster-kind pod chatter -- 73% --
+  // and the DNSConfigForming lines repeat per pod while saying nothing about
+  // the install. The component and phase events that describe progress were
+  // outnumbered three to one.
+  it('hides routine cluster chatter by default', () => {
+    render(<Timeline events={[
+      ev({ id: 1, kind: 'cluster', message: 'monitoring/prometheus-node-exporter: DNSConfigForming resolved' }),
+      ev({ id: 2, kind: 'component', message: 'cert-manager installed' }),
+    ]} />)
+
+    expect(screen.getByText('cert-manager installed')).toBeDefined()
+    expect(screen.queryByText(/DNSConfigForming/)).toBeNull()
+  })
+
+  // The filter is on kind AND level together. A cluster event that is warning
+  // or worse is the pod that would not schedule -- exactly the thing worth
+  // reading -- so it survives the filter that removes its routine siblings.
+  it('never hides a cluster event that is a warning or an error', () => {
+    render(<Timeline events={[
+      ev({ id: 1, kind: 'cluster', level: 'warn', message: 'FailedScheduling: untolerated taint' }),
+    ]} />)
+
+    expect(screen.getByText('FailedScheduling: untolerated taint')).toBeDefined()
+  })
+
+  it('can show the whole stream on request', () => {
+    render(<Timeline events={[
+      ev({ id: 1, kind: 'cluster', message: 'DNSConfigForming resolved' }),
+      ev({ id: 2, kind: 'component', message: 'cert-manager installed' }),
+    ]} />)
+
+    fireEvent.click(screen.getByText(/cluster activity/i))
+    expect(screen.getByText(/DNSConfigForming/)).toBeDefined()
+  })
+})
+
+describe('Timeline remedies', () => {
+  // The kai-scheduler timeout embeds two shell commands inside a wrapped red
+  // paragraph. An operator cannot tell where the prose stops and the command
+  // starts, let alone select one cleanly.
+  it('renders embedded commands as code rather than prose', () => {
+    render(<Timeline events={[
+      ev({
+        id: 1, kind: 'error', level: 'error',
+        message: 'try `kubectl delete schedulingshard default` and `kubectl rollout restart deploy -n kai-scheduler`, then retry',
+      }),
+    ]} />)
+
+    const cmd = screen.getByText('kubectl delete schedulingshard default')
+    expect(cmd.tagName).toBe('CODE')
+    expect(screen.getByText('kubectl rollout restart deploy -n kai-scheduler').tagName).toBe('CODE')
   })
 })

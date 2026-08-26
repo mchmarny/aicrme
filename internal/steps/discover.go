@@ -119,6 +119,13 @@ type DiscoverConfig struct {
 	// let the agent land on a KWOK fake node and report success having
 	// collected nothing.
 	ExtraTolerations []corev1.Toleration
+
+	// ClusterGPUs is what the caller learned by walking the node list. The
+	// snapshot cannot supply it: its GPU count is an in-pod PCI probe of the
+	// single node the agent landed on, so on a two-node H100 cluster the
+	// console announced "8 of 8 GPUs are usable" about sixteen. The zero value
+	// keeps gap.Analyze's pre-existing single-node behavior.
+	ClusterGPUs gap.ClusterGPUs
 }
 
 type discover struct {
@@ -293,7 +300,7 @@ func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) err
 	// round trip drops them silently.
 	r.Artifacts["snapshot.yaml"] = snap.Raw
 
-	report := gap.Analyze(snap)
+	report := gap.Analyze(snap, d.cfg.ClusterGPUs)
 	encoded, err := json.Marshal(report)
 	if err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "encoding capability report failed", err)

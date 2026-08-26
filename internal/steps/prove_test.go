@@ -282,17 +282,21 @@ func TestProveGangTimeoutNamesTheDeadlineAndTheCount(t *testing.T) {
 }
 
 // Nothing placed at all is a different failure from a gang that placed some
-// members, and there is one known cause for it that an operator can act on
-// in two commands: a kai-scheduler left inconsistent by an earlier teardown,
-// whose pod-grouper cannot read back the PodGroup it just created, so the
-// scheduler sees none at all. Measured 2026-08-23 --
-// docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md.
+// members, and there is one known cause: a kai-scheduler left inconsistent by
+// an earlier teardown, whose pod-grouper cannot read back the PodGroup it just
+// created, so the scheduler sees none at all.
 //
-// The remedy is deliberately printed rather than performed. Restarting
-// kai-scheduler from Reset would mean the teardown mutating objects it had
-// just declined to touch on ownership grounds, and hard-coding one component
-// into a component-agnostic package. Telling the operator costs nothing and
-// breaks nothing.
+// The two-command remedy this message used to prescribe -- delete the
+// SchedulingShard, restart the kai-scheduler deployments -- was measured NOT to
+// work on 2026-08-26, on real GKE H100 hardware: all six deployments rolled out
+// cleanly, the run was retried, and it failed identically with a fresh PodGroup
+// UUID and the same pod-grouper loop. The earlier 2026-08-23 KWOK measurement
+// that justified it did not survive contact with a real cluster.
+//
+// So the message names the cause and says what does NOT clear it. Sending an
+// operator through two commands that will not help, at the end of a
+// three-minute wait, is worse than saying plainly that a fresh cluster is the
+// only path known to work.
 func TestProveGangTimeoutPointsAtTheKnownCauseWhenNothingPlaced(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	run := newRun()
@@ -302,9 +306,17 @@ func TestProveGangTimeoutPointsAtTheKnownCauseWhenNothingPlaced(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run() succeeded though the gang never placed")
 	}
-	for _, want := range []string{"kai-scheduler", "rollout restart"} {
+	for _, want := range []string{"kai-scheduler", "pod-grouper", "has not been reset"} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Run() error = %q, want it to name the remedy (%q)", err.Error(), want)
+			t.Errorf("Run() error = %q, want it to name the cause and the path that works (%q)", err.Error(), want)
+		}
+	}
+	// The disproven commands must not come back. This assertion is the only
+	// thing standing between a future edit and re-shipping advice that was
+	// measured not to work.
+	for _, gone := range []string{"rollout restart", "delete schedulingshard"} {
+		if strings.Contains(err.Error(), gone) {
+			t.Errorf("Run() error = %q, still prescribes %q, which was measured not to clear the failure", err.Error(), gone)
 		}
 	}
 }

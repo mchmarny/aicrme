@@ -34,7 +34,7 @@ export default function App() {
         url.searchParams.delete(launchTokenParam)
         window.history.replaceState({}, '', url.pathname + url.search + url.hash)
       } else if (!(await probeSession())) {
-        throw new Error('This console session has expired. Restart aicrme and open the URL it prints.')
+        throw new Error('This console session has expired. Re-open the tokenized URL aicrme printed at startup — the one ending in ?t=…')
       }
       // A reload after connecting lands here with a cluster already chosen.
       // Skipping Connect is not a convenience: the connection is
@@ -76,7 +76,7 @@ export default function App() {
         <Console
           onUnauthorized={() => {
             setStage('authenticating')
-            setAuthError('This console session has expired. Restart aicrme and open the URL it prints.')
+            setAuthError('This console session has expired. Re-open the tokenized URL aicrme printed at startup — the one ending in ?t=…')
           }}
         />
       )}

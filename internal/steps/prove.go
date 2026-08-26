@@ -228,21 +228,29 @@ func (p *proveStep) gangTimeoutErr(runID string, placed int) error {
 	// Nothing at all placed is the branch worth saying more about. A gang
 	// that placed SOME members is a capacity answer -- the cluster is fuller
 	// than the gang is large -- while zero is the scheduler not acting, and
-	// there is one known cause of that with a two-command remedy: a
-	// kai-scheduler left inconsistent by an earlier teardown. Measured
-	// 2026-08-23, docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md.
+	// there is one known cause of that: a kai-scheduler left inconsistent by
+	// an earlier teardown.
 	//
-	// Offered as a possibility, not a diagnosis: this console cannot tell
-	// from here whether the cluster was ever reset. And printed rather than
-	// performed, deliberately -- doing it from Reset would mean the teardown
-	// restarting objects it had just declined to touch on ownership grounds,
-	// and hard-coding one component into a component-agnostic package.
+	// This used to prescribe two commands -- delete the SchedulingShard,
+	// restart the kai-scheduler deployments -- on the strength of a KWOK
+	// measurement from 2026-08-23. That remedy was tested on real GKE H100
+	// hardware on 2026-08-26 and DOES NOT WORK: all six kai-scheduler
+	// deployments rolled out cleanly, the run was retried, and it failed
+	// identically, with a fresh PodGroup UUID and the same pod-grouper loop
+	// (`already exists`, then `the object has been modified`).
+	//
+	// So the advice is withdrawn rather than reworded. Naming what does not
+	// work is worth the words: without it the next operator spends the same
+	// three minutes discovering it again, at the end of an install.
+	//
+	// Offered as a possibility, not a diagnosis -- this console cannot tell
+	// from here whether the cluster was ever reset.
 	if placed == 0 {
-		msg += ". Nothing placed at all. If this cluster has been reset before, kai-scheduler" +
-			" may have survived the teardown in a state where its pod-grouper cannot read back" +
-			" the PodGroup it creates, so the scheduler sees none: try" +
-			" `kubectl delete schedulingshard default` and" +
-			" `kubectl rollout restart deploy -n kai-scheduler`, then retry this run"
+		msg += ". Nothing placed at all. If this cluster has been reset before, this is a known" +
+			" kai-scheduler failure: its pod-grouper cannot read back the PodGroup it creates," +
+			" so the scheduler sees none. Deleting the SchedulingShard and restarting" +
+			" kai-scheduler was measured not to clear it, on real hardware. A cluster that" +
+			" has not been reset is the only path known to work today"
 	}
 	return aicrerrors.New(aicrerrors.ErrCodeTimeout, msg)
 }

@@ -28,10 +28,62 @@ const gpusPerTestNode = 8
 func gpuNode(name, instanceType, accelerator string, taints ...corev1.Taint) corev1.Node {
 	n := cpuNode(name, instanceType, taints...)
 	n.Labels["cloud.google.com/gke-accelerator"] = accelerator
+	n.Status.Capacity = corev1.ResourceList{
+		"nvidia.com/gpu": *resource.NewQuantity(gpusPerTestNode, resource.DecimalSI),
+	}
 	n.Status.Allocatable = corev1.ResourceList{
 		"nvidia.com/gpu": *resource.NewQuantity(gpusPerTestNode, resource.DecimalSI),
 	}
 	return n
+}
+
+// TestGroupNodesCountsGPUsClusterWide is the fix for the headline sentence.
+//
+// gap.Analyze derives "N of M GPUs are usable" from the snapshot's GPU
+// hardware subtype, which is an IN-POD PCI probe: it describes the one node
+// the agent landed on. On the real two-node H100 cluster this reported
+// "8 of 8" for a cluster holding 16, and AICR warns in its own log that the
+// GPU collector samples a single node. The node list is the only place a
+// cluster-wide figure exists, and Connect already walks it.
+//
+// Total comes from capacity and usable from allocatable, because those are
+// different questions: capacity is what the hardware has, allocatable is what
+// a workload could schedule onto right now.
+func TestGroupNodesCountsGPUsClusterWide(t *testing.T) {
+	a := gpuNode("gpu-a", "a3-megagpu-8g", "nvidia-h100-mega-80gb")
+	b := gpuNode("gpu-b", "a3-megagpu-8g", "nvidia-h100-mega-80gb")
+	// One GPU on b is present but not schedulable -- a drained device, or a
+	// device plugin that has not finished advertising all of them.
+	b.Status.Allocatable["nvidia.com/gpu"] = *resource.NewQuantity(7, resource.DecimalSI)
+
+	got := groupNodes([]corev1.Node{a, b, cpuNode("cpu-a", "e2-standard-4")}, steps.AgentTolerations(nil))
+
+	if got.TotalGPUs != 16 {
+		t.Errorf("TotalGPUs = %d, want 16 -- capacity summed across every GPU node, not one node's probe", got.TotalGPUs)
+	}
+	if got.UsableGPUs != 15 {
+		t.Errorf("UsableGPUs = %d, want 15 -- allocatable summed, which is what a workload can actually take", got.UsableGPUs)
+	}
+}
+
+// TestGroupNodesReportsNoGPUsBeforeTheDevicePlugin is the fallback's trigger.
+//
+// nvidia.com/gpu capacity is published by the device plugin, so a cluster that
+// has not installed one yet advertises nothing at all -- which is exactly the
+// cluster this console exists to onboard. The counts must come back zero
+// rather than guessing, so gap.Analyze knows to fall back to the probe.
+func TestGroupNodesReportsNoGPUsBeforeTheDevicePlugin(t *testing.T) {
+	bare := cpuNode("gpu-a", "a3-megagpu-8g")
+	bare.Labels["cloud.google.com/gke-accelerator"] = "nvidia-h100-mega-80gb"
+
+	got := groupNodes([]corev1.Node{bare}, steps.AgentTolerations(nil))
+
+	if got.TotalGPUs != 0 || got.UsableGPUs != 0 {
+		t.Errorf("TotalGPUs/UsableGPUs = %d/%d, want 0/0 -- nothing advertises GPUs yet", got.TotalGPUs, got.UsableGPUs)
+	}
+	if got.GPUNodes != 0 {
+		t.Errorf("GPUNodes = %d, want 0 -- capacity is the signal, and there is none", got.GPUNodes)
+	}
 }
 
 func cpuNode(name, instanceType string, taints ...corev1.Taint) corev1.Node {
