@@ -152,8 +152,14 @@ func NewDiscover(c aicrclient.Snapshotter, cfg DiscoverConfig) engine.Step {
 	return &discover{client: c, cfg: cfg}
 }
 
-// agentTolerations is the built-in nvidia.com/gpu toleration plus whatever the
+// AgentTolerations is the built-in nvidia.com/gpu toleration plus whatever the
 // operator added.
+//
+// Exported because the Connect screen reports whether the GPU nodes it found
+// are reachable, and that verdict is only honest if it is computed against the
+// tolerations the agent Job will really carry. A second copy in the console
+// package would be a copy that can drift, and a UI that says "reachable" about
+// a Job that then sits Pending is worse than no UI at all.
 //
 // Never a blanket {Operator: Exists}, which is what AICR's own CLI defaults to.
 // A blanket toleration also accepts kwok.x-k8s.io/node=fake:NoSchedule, and
@@ -165,7 +171,7 @@ func NewDiscover(c aicrclient.Snapshotter, cfg DiscoverConfig) engine.Step {
 //
 // Extras are appended rather than replacing the default so an operator adding
 // their cluster's own GPU taint does not silently drop the common one.
-func agentTolerations(extra []corev1.Toleration) []corev1.Toleration {
+func AgentTolerations(extra []corev1.Toleration) []corev1.Toleration {
 	out := make([]corev1.Toleration, 0, 1+len(extra))
 	out = append(out, corev1.Toleration{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists})
 	return append(out, extra...)
@@ -270,7 +276,7 @@ func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) err
 		// Naming the key is what separates the two: simulated GPU nodes carry
 		// BOTH taints, so refusing the kwok one keeps the agent off them
 		// while the nvidia.com/gpu toleration lets it reach a real one.
-		Tolerations:     agentTolerations(d.cfg.ExtraTolerations),
+		Tolerations:     AgentTolerations(d.cfg.ExtraTolerations),
 		Timeout:         d.cfg.Timeout,
 		Privileged:      d.cfg.Privileged,
 		RequireGPU:      d.cfg.RequireGPU,

@@ -11,6 +11,8 @@ import (
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/engine"
+	"github.com/mchmarny/aicrme/internal/steps"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -38,7 +40,16 @@ type ClusterInfo struct {
 	Server    string `json:"server"`
 	Version   string `json:"version"`
 	NodeCount int    `json:"nodeCount"`
-	UID       string `json:"uid"`
+	// Nodes is what the cluster is made of, folded into shapes, plus a verdict
+	// on whether the snapshot agent can reach the GPU ones.
+	//
+	// Here rather than on a later screen because the answer is only actionable
+	// here: the tolerations are read from the process environment at startup
+	// and Connect is single-assignment, so a GPU pool the agent cannot reach is
+	// fixed by quitting and relaunching. That is cheap before anything is
+	// installed and expensive after.
+	Nodes NodeComposition `json:"nodes"`
+	UID   string          `json:"uid"`
 	// Toolchain is what preflight resolved at startup, carried here because
 	// the Connect screen is where the operator confirms what this console is
 	// about to do and with what. Spec §7 asks the screen to report the
@@ -121,24 +132,54 @@ func listContexts(kubeconfig string) ([]ContextInfo, error) {
 	return out, nil
 }
 
-// prober is the one cluster round-trip Connect makes, narrowed so tests can
-// supply it without a fake clientset for a call that only reads two scalars.
+// nodePageSize bounds each page of the node List.
+//
+// One unbounded List of a large cluster is a single very large response --
+// Node objects are fat, status.images alone runs to tens of kilobytes each --
+// and it is the shape most likely to time out or be refused outright. Paging
+// costs an extra round trip on clusters big enough to need one and nothing at
+// all on clusters that are not.
+const nodePageSize = 500
+
+// prober is the one cluster round-trip Connect makes.
+//
+// It returns the nodes rather than a verdict about them: this is the I/O seam,
+// and which taints matter is policy that belongs with the tolerations the run
+// will actually use. Keeping the split means the fold and the verdict are
+// testable without a cluster at all.
 type prober interface {
-	probe(ctx context.Context, kube kubernetes.Interface) (version string, nodes int, err error)
+	probe(ctx context.Context, kube kubernetes.Interface) (version string, nodes []corev1.Node, err error)
 }
 
 type liveProber struct{}
 
-func (liveProber) probe(ctx context.Context, kube kubernetes.Interface) (string, int, error) {
+func (liveProber) probe(ctx context.Context, kube kubernetes.Interface) (string, []corev1.Node, error) {
 	v, err := kube.Discovery().ServerVersion()
 	if err != nil {
-		return "", 0, fmt.Errorf("asking the cluster for its version: %w", err)
+		return "", nil, fmt.Errorf("asking the cluster for its version: %w", err)
 	}
-	nodes, err := kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return "", 0, fmt.Errorf("listing nodes: %w", err)
+
+	var out []corev1.Node
+	// ResourceVersion "0" is served from the apiserver's watch cache rather
+	// than etcd. This is a display read taken once at connect; a slightly stale
+	// node list is not a correctness problem, and the cheaper path is the right
+	// default for the screen an operator sees before anything is installed.
+	opts := metav1.ListOptions{Limit: nodePageSize, ResourceVersion: "0"}
+	for {
+		page, err := kube.CoreV1().Nodes().List(ctx, opts)
+		if err != nil {
+			return "", nil, fmt.Errorf("listing nodes: %w", err)
+		}
+		out = append(out, page.Items...)
+		if page.Continue == "" {
+			break
+		}
+		// A continue token is only valid against the exact snapshot it came
+		// from, so the resourceVersion hint has to be dropped on later pages.
+		opts.Continue = page.Continue
+		opts.ResourceVersion = ""
 	}
-	return v.GitVersion, len(nodes.Items), nil
+	return v.GitVersion, out, nil
 }
 
 // connector owns the one connection this process will ever have.
@@ -170,6 +211,11 @@ type connector struct {
 	// on. Empty leaves the kubeconfig's own current-context marked. See
 	// Contexts for why this preselects rather than connects.
 	preferred string
+	// gpuTolerations is AICRME_GPU_TOLERATIONS, the same value handed to the
+	// snapshot agent and the Prove workload. It is here so the connect response
+	// can report whether the GPU nodes it found are reachable BY THE RUN THAT
+	// WILL ACTUALLY HAPPEN, rather than by some default the run does not use.
+	gpuTolerations []corev1.Toleration
 	// newKube builds the clientset from the selected context's rest.Config.
 	// A field rather than a direct call so a test can hand dial a fake
 	// clientset and exercise the identity read for real, instead of stubbing
@@ -328,11 +374,19 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 		return ClusterInfo{}, nil, nil, fmt.Errorf("reading this cluster's identity from kube-system: %w", err)
 	}
 
+	// Computed against steps.AgentTolerations rather than against
+	// c.gpuTolerations alone, because what decides whether the agent Job can
+	// land is the whole set it will carry -- the built-in nvidia.com/gpu
+	// toleration included. Reporting a pool unreachable that the built-in
+	// already covers would warn on the ordinary cluster.
+	composition := groupNodes(nodes, steps.AgentTolerations(c.gpuTolerations))
+
 	return ClusterInfo{
 		Context:   contextName,
 		Server:    restCfg.Host,
 		Version:   version,
-		NodeCount: nodes,
+		NodeCount: len(nodes),
+		Nodes:     composition,
 		UID:       string(ns.UID),
 		Toolchain: c.toolchain,
 	}, restCfg, kube, nil

@@ -61,15 +61,17 @@ type fakeProber struct {
 	err     error
 }
 
-func (p fakeProber) probe(context.Context, kubernetes.Interface) (string, int, error) {
+func (p fakeProber) probe(context.Context, kubernetes.Interface) (string, []corev1.Node, error) {
 	if p.err != nil {
-		return "", 0, p.err
+		return "", nil, p.err
 	}
 	version := p.version
 	if version == "" {
 		version = "v1.34.0"
 	}
-	return version, p.nodes, nil
+	// Shapeless nodes: these tests assert on the state machine, and the count
+	// is all they ever read. Composition has its own tests in nodes_test.go.
+	return version, make([]corev1.Node, p.nodes), nil
 }
 
 const testClusterUID = "11111111-2222-3333-4444-555555555555"

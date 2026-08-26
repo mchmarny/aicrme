@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { connect, fetchContexts, type ClusterInfo, type ContextInfo } from '../api'
+import { connect, fetchContexts, type ClusterInfo, type ContextInfo, type NodeComposition, type NodeGroup } from '../api'
 
 /**
  * Connect is the screen that stands where the password prompt used to.
@@ -117,9 +117,9 @@ function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => vo
         <Row label="context" value={info.context} />
         <Row label="server" value={info.server} />
         <Row label="version" value={info.version} />
-        <Row label="nodes" value={`${info.nodeCount} nodes`} />
         <Row label="cluster" value={info.uid} />
       </dl>
+      <Composition nodes={info.nodes} />
       {tools.length > 0 && (
         <dl className="space-y-1 text-sm">
           {tools.map(([name, version]) => <Row key={name} label={name} value={version} />)}
@@ -134,6 +134,84 @@ function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => vo
         Continue
       </button>
     </div>
+  )
+}
+
+/**
+ * Composition shows what the cluster is made of, and whether the snapshot
+ * agent can reach the GPU part of it.
+ *
+ * The inventory is always visible; the warning appears only when something is
+ * genuinely unreachable. That asymmetry is the point. The first real cluster
+ * this console met tainted its GPU pool `dedicated=gpu-workload:NoSchedule`,
+ * which the built-in toleration does not match, and the only symptom was
+ * Discover sitting Pending for ten minutes before returning a snapshot with no
+ * accelerator in it. Nothing named the taint. Here it is named before anything
+ * is installed, which is also the only time the fix is cheap: the tolerations
+ * are read from the environment at startup, so the remedy is to quit and
+ * relaunch.
+ */
+function Composition({ nodes }: { nodes: NodeComposition }) {
+  const groups = nodes.groups ?? []
+  return (
+    <div className="space-y-2">
+      <div className="flex gap-3 text-sm">
+        <span className="w-20 shrink-0 text-slate-500">nodes</span>
+        <span className="text-slate-200">
+          {`${nodes.total} total · ${nodes.gpuNodes} with GPUs`}
+        </span>
+      </div>
+
+      {groups.length > 0 && (
+        <ul className="divide-y divide-slate-800 rounded border border-slate-700 bg-slate-900">
+          {groups.map((g, i) => <GroupRow key={i} group={g} />)}
+        </ul>
+      )}
+
+      {nodes.more ? (
+        <p className="text-slate-500 text-xs">{`and ${nodes.more} more shapes`}</p>
+      ) : null}
+
+      {nodes.remedy && (
+        <div className="rounded border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs">
+          <p className="text-amber-400">
+            Quit and relaunch to reach them:
+          </p>
+          <code className="mt-1 block break-all text-amber-200">
+            {`AICRME_GPU_TOLERATIONS=${nodes.remedy}`}
+          </code>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function GroupRow({ group }: { group: NodeGroup }) {
+  const hasGPUs = (group.gpusPerNode ?? 0) > 0
+  return (
+    <li className="px-3 py-2 text-xs">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className={hasGPUs ? 'text-slate-100' : 'text-slate-400'}>
+          {`${group.count} × ${group.instanceType || 'unlabelled'}`}
+        </span>
+        <span className="shrink-0 text-slate-500">
+          {hasGPUs ? `${group.gpusPerNode} GPU each` : 'no GPUs'}
+        </span>
+      </div>
+
+      {group.accelerator && <p className="text-slate-500">{group.accelerator}</p>}
+
+      {/* Simulated is stated rather than warned about: a KWOK fake node is
+          unreachable on purpose, and treating it as a fault would put a
+          warning on every demo run. */}
+      {group.simulated && <p className="text-slate-500">simulated (KWOK)</p>}
+
+      {group.blocked && (
+        <p className="mt-1 text-amber-400">
+          {group.taints?.join(', ')} — not tolerated, the agent cannot land here
+        </p>
+      )}
+    </li>
   )
 }
 

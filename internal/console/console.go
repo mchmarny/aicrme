@@ -366,9 +366,15 @@ func Run(ctx context.Context, opts Options) error {
 	// degradation paths are gone with it: every one described a state a local
 	// binary cannot usefully be in, because a console that cannot reach a
 	// cluster has nothing to offer.
+	// One knob, read once. The snapshot agent, the Prove workload and the
+	// Connect screen's reachability verdict are all downstream of it, and a
+	// verdict computed from a second read is a verdict about a different run.
+	gpuTolerations := parseTolerations(os.Getenv("AICRME_GPU_TOLERATIONS"))
+
 	conn := newConnector(opts.Kubeconfig, liveProber{})
 	conn.toolchain = toolchain
 	conn.preferred = opts.Context
+	conn.gpuTolerations = gpuTolerations
 
 	// The engine exists before any cluster does, because internal/api takes it
 	// at New and the server that serves the Connect screen is the same one
@@ -403,11 +409,11 @@ func Run(ctx context.Context, opts Options) error {
 		workDir:    workDir,
 		kubeconfig: opts.Kubeconfig,
 		namespace:  envOr("AICRME_NAMESPACE", "aicrme"),
-		// One knob, read once, handed to both the snapshot agent and the Prove
-		// workload rather than two that can disagree. Both have to land on
-		// THIS cluster's GPU nodes, and a cluster whose GPU pool carries a
-		// non-standard taint breaks both in the same way.
-		gpuTolerations: parseTolerations(os.Getenv("AICRME_GPU_TOLERATIONS")),
+		// Handed to both the snapshot agent and the Prove workload rather than
+		// two knobs that can disagree. Both have to land on THIS cluster's GPU
+		// nodes, and a cluster whose GPU pool carries a non-standard taint
+		// breaks both in the same way. Read once, above.
+		gpuTolerations: gpuTolerations,
 		aicr:           client,
 		bus:            b,
 		engine:         eng,

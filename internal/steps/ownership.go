@@ -133,13 +133,14 @@ func NewHelmLister(e applier.Exec) HelmLister { return &helmLister{exec: e} }
 // Spelled as the explicit status filters rather than `--all`, which is
 // shorter and means the same thing -- under helm 3. Helm 4 REMOVED --all
 // from `list` (it lists every status by default) and rejects it outright:
-// `Error: unknown flag: --all`. This binary pins helm 3.19.0 (Dockerfile's
-// HELM_VERSION), so --all works today, and the failure mode if that pin
-// ever moves is quiet and bad -- every namespace records a SnapshotErr,
+// `Error: unknown flag: --all`. There is no pin to fall back on -- helm is
+// whatever the operator has on PATH, resolved and recorded by preflight --
+// and helm 4 is already the common case. The failure mode if this used
+// --all would be quiet and bad: every namespace records a SnapshotErr,
 // every release becomes unprovable, and Reset removes nothing while
 // reporting itself clean. The status flags below exist in both majors and
-// mean all-of-them in both, so the snapshot survives the bump. Found by
-// test/e2e/reset.sh, whose own helm on the host was already 4.x.
+// mean all-of-them in both. Found by test/e2e/reset.sh, whose own helm on
+// the host was already 4.x.
 //
 // No Dir is set: helm reads its cache, config and data paths from the
 // HELM_* and XDG variables the deployment already sets (see workSubdirs in

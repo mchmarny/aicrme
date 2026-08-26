@@ -62,12 +62,41 @@ export async function fetchContexts(): Promise<ContextInfo[]> {
   return res.json()
 }
 
+/**
+ * NodeGroup mirrors Go's console.NodeGroup: a fold of every node sharing a
+ * shape and a scheduling constraint. The server folds, deliberately — a
+ * cluster can have hundreds of nodes and this screen must not grow with it.
+ */
+export interface NodeGroup {
+  count: number
+  instanceType?: string
+  accelerator?: string
+  gpusPerNode?: number
+  taints?: string[]
+  /** blocked: has GPUs, and carries a taint the snapshot agent cannot tolerate. */
+  blocked?: boolean
+  /** simulated: a KWOK fake node, unreachable by design rather than by mistake. */
+  simulated?: boolean
+}
+
+/** NodeComposition mirrors Go's console.NodeComposition. */
+export interface NodeComposition {
+  total: number
+  gpuNodes: number
+  groups?: NodeGroup[]
+  /** more: shapes beyond the display cap, counted rather than dropped. */
+  more?: number
+  /** remedy: the AICRME_GPU_TOLERATIONS value that would clear every block. */
+  remedy?: string
+}
+
 /** ClusterInfo mirrors Go's console.ClusterInfo (internal/console/connect.go). */
 export interface ClusterInfo {
   context: string
   server: string
   version: string
   nodeCount: number
+  nodes: NodeComposition
   uid: string
   toolchain?: Record<string, string>
   /**
