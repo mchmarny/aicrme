@@ -16,6 +16,9 @@ import (
 type ApplyConfig struct {
 	Retries int
 	DryRun  bool
+	// Kubeconfig is the frozen session kubeconfig every tool deploy.sh runs
+	// must read -- see applier.Options.Kubeconfig.
+	Kubeconfig string
 	// Helm and Kube are the two seams the pre-Apply ownership snapshot
 	// reads (see snapshotOwnership). Both are nil outside a cluster, and
 	// both being nil is handled rather than guarded against: the snapshot
@@ -77,9 +80,10 @@ func (a *apply) Run(ctx context.Context, run *engine.Run, emit engine.Emit) erro
 	emit(bus.Event{Kind: bus.KindLog, Message: "applying the bundle"})
 
 	err := a.applier.Apply(ctx, applier.Options{
-		BundleDir: dir,
-		Retries:   a.cfg.Retries,
-		DryRun:    a.cfg.DryRun,
+		BundleDir:  dir,
+		Retries:    a.cfg.Retries,
+		DryRun:     a.cfg.DryRun,
+		Kubeconfig: a.cfg.Kubeconfig,
 	}, trackComponents(run, emit))
 
 	return err

@@ -2,6 +2,9 @@ package prove
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -65,6 +68,11 @@ type OwnedWorkload struct {
 // path), so a poll never eats a meaningful fraction of the caller's budget.
 const waitAbsentPollInterval = 20 * time.Millisecond
 
+// waitAbsentTimeout bounds the wait when Apply replaces a drifted workload.
+// Generous relative to a Job delete with no running pods, and short enough
+// that a wedged finalizer surfaces as a failed Prove rather than a hang.
+const waitAbsentTimeout = 2 * time.Minute
+
 // runIDLabelKey is the one label key this file reads back off a discovered
 // object, and must agree with the key Labels (manifest.go) sets under the
 // same name. Unlike the ownership pair (managed-by, component) -- which
@@ -97,21 +105,68 @@ func (c *Client) EnsureNamespace(ctx context.Context) error {
 	return nil
 }
 
-// Apply renders and creates the workload for runID. It is idempotent for the
-// same run: WorkloadName is deterministic and Render's output for a given
-// run never changes, so a retried Apply finds its own object already there
-// and treats that as success rather than erroring on AlreadyExists -- it
-// never issues an Update, because a Job's placement-defining fields
-// (completions, parallelism, selector) are immutable once created, and a
-// repeat Apply for the same run has nothing to change them to.
+// Apply renders and creates the workload for runID.
+//
+// Idempotent for an unchanged spec: a matching hash annotation means the
+// object in the cluster is the one this call wants, so it returns without
+// writing. That matters -- a retried Apply against a gang that has already
+// placed must not disturb it.
+//
+// A differing or absent hash means the opposite: the object was created by a
+// differently-configured process, or by a binary predating SpecHashAnnotation.
+// Neither is the workload this call is being asked for, so it is removed and
+// recreated. Update is not an option: a Job's placement-defining fields
+// (completions, parallelism, selector, and the whole pod template) are
+// immutable once created.
 func (c *Client) Apply(ctx context.Context, runID string) error {
+	job, hash, err := c.render(runID)
+	if err != nil {
+		return err
+	}
+
+	existing, getErr := c.kube.BatchV1().Jobs(Namespace).Get(ctx, WorkloadName(runID), metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(getErr):
+		// Nothing there. Fall through to the create below.
+	case getErr != nil:
+		return fmt.Errorf("prove: checking for an existing workload for run %s: %w", runID, getErr)
+	case existing.Annotations[SpecHashAnnotation] == hash:
+		return nil
+	default:
+		// EnsureAbsent rather than Delete: foreground deletion only
+		// guarantees the API server has STARTED cascading, and a new gang
+		// placed against pods that are still dying fails to schedule in a
+		// way that reads as a placement bug rather than a teardown race.
+		if err := c.EnsureAbsent(ctx, runID, waitAbsentTimeout); err != nil {
+			return fmt.Errorf("prove: replacing the workload for run %s: %w", runID, err)
+		}
+	}
+
+	if _, err := c.kube.BatchV1().Jobs(Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
+		// A racing creator, or a Create the API server accepted while the
+		// client saw a failure. Either way something with this name now
+		// exists and this call did not put it there, so it is not treated as
+		// success the way the old unconditional swallow did.
+		return fmt.Errorf("prove: applying workload for run %s: %w", runID, err)
+	}
+	return nil
+}
+
+// render decodes the workload manifest, applies this Client's configuration,
+// and returns the Job alongside a hash of it.
+//
+// The hash covers the object as THIS process would create it -- not one read
+// back from the API server. Server-side defaulting fills a PodSpec with dozens
+// of fields no client ever set, so hashing a retrieved Job would report drift
+// on every call and turn "recreate on drift" into "always recreate".
+func (c *Client) render(runID string) (*batchv1.Job, string, error) {
 	out, err := Render(runID, Namespace)
 	if err != nil {
-		return fmt.Errorf("prove: rendering workload for run %s: %w", runID, err)
+		return nil, "", fmt.Errorf("prove: rendering workload for run %s: %w", runID, err)
 	}
 	var job batchv1.Job
 	if decodeErr := yaml.Unmarshal(out, &job); decodeErr != nil {
-		return fmt.Errorf("prove: decoding rendered workload for run %s: %w", runID, decodeErr)
+		return nil, "", fmt.Errorf("prove: decoding rendered workload for run %s: %w", runID, decodeErr)
 	}
 	// Appended after decode rather than templated into workload.yaml: the
 	// manifest is rendered by string replacement, and a YAML list spliced in
@@ -119,11 +174,19 @@ func (c *Client) Apply(ctx context.Context, runID string) error {
 	// something the typed object expresses directly.
 	job.Spec.Template.Spec.Tolerations = append(
 		job.Spec.Template.Spec.Tolerations, c.extraTolerations...)
-	_, err = c.kube.BatchV1().Jobs(Namespace).Create(ctx, &job, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("prove: applying workload for run %s: %w", runID, err)
+
+	canonical, err := json.Marshal(job.Spec)
+	if err != nil {
+		return nil, "", fmt.Errorf("prove: hashing workload for run %s: %w", runID, err)
 	}
-	return nil
+	sum := sha256.Sum256(canonical)
+	hash := hex.EncodeToString(sum[:])
+
+	if job.Annotations == nil {
+		job.Annotations = map[string]string{}
+	}
+	job.Annotations[SpecHashAnnotation] = hash
+	return &job, hash, nil
 }
 
 // Delete removes the workload for runID with foreground propagation. Delete

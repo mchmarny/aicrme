@@ -31,9 +31,6 @@ cd "${REPO_ROOT}"
 
 CLUSTER="${CLUSTER:-aicrme-e2e-reset}"
 NS="${NS:-aicrme}"
-IMAGE="${IMAGE:-aicrme:e2e-reset}"
-PORT="${PORT:-18081}"
-ADDR="127.0.0.1:${PORT}"
 AGENT_NODE_LABEL="aicrme.e2e/agent=true"
 
 # BYSTANDER_RELEASE is deliberately a name the AICR recipe also installs, in
@@ -60,8 +57,6 @@ GANG_TIMEOUT="${GANG_TIMEOUT:-3m}"
 
 RUN_ID=""
 FAIL_RUN_ID=""
-JAR="$(mktemp -t aicrme-reset-jar.XXXXXX)"
-PF_PID=""
 CHART_DIR=""
 # Assigned by the EXIT trap; declared here for the same reason every other
 # script in this directory declares it (shellcheck SC2154).
@@ -88,12 +83,11 @@ cleanup() {
     for id in "${RUN_ID:-}" "${FAIL_RUN_ID:-}"; do
       [[ -z "${id}" ]] && continue
       echo "run ${id}:" >&2
-      curl -fsS --max-time 10 -b "${JAR}" "http://${ADDR}/api/runs/${id}" >&2 2>&1 || echo "  (no record)" >&2
+      e2e_api GET "/api/runs/${id}" --max-time 10 >&2 2>&1 || echo "  (no record)" >&2
       echo >&2
     done
   fi
-  [[ -n "${PF_PID}" ]] && kill "${PF_PID}" 2>/dev/null
-  rm -f "${JAR}"
+  e2e_console_cleanup
   [[ -n "${CHART_DIR}" ]] && rm -rf "${CHART_DIR}"
   kubectl delete validatingwebhookconfiguration aicrme-e2e-block-deploy-delete >/dev/null 2>&1 || true
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
@@ -114,7 +108,7 @@ helm_releases() {
 }
 
 run_json() {
-  curl -fsS --max-time 10 -b "${JAR}" "http://${ADDR}/api/runs/$1" 2>/dev/null || true
+  e2e_api GET "/api/runs/$1" --max-time 10 2>/dev/null || true
 }
 
 run_state() {
@@ -122,16 +116,15 @@ run_state() {
 }
 
 post() {
-  curl -fsS -b "${JAR}" -X POST "http://${ADDR}$1" -H 'Content-Type: application/json' "${@:2}"
+  e2e_api POST "$1" -H 'Content-Type: application/json' "${@:2}"
 }
 
 post_status() {
-  curl -s -o /dev/null -w '%{http_code}' -b "${JAR}" -X POST "http://${ADDR}$1" \
-    -H 'Content-Type: application/json' "${@:2}"
+  e2e_api_status POST "$1" -H 'Content-Type: application/json' "${@:2}"
 }
 
 delete_status() {
-  curl -s -o /dev/null -w '%{http_code}' -b "${JAR}" -X DELETE "http://${ADDR}$1"
+  e2e_api_status DELETE "$1"
 }
 
 await_state() {
@@ -240,26 +233,14 @@ kubectl create namespace "${BYSTANDER_KEPT_NS}" 2>/dev/null || true
 kubectl -n "${BYSTANDER_KEPT_NS}" create configmap somebody-elses-config \
   --from-literal=owner="a human, not this console"
 
-echo "--- build and load PRODUCTION console image"
-e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
-echo "--- install chart"
-e2e_install_chart "${NS}" "${IMAGE}"
-
-echo "--- pin the snapshot agent to a real worker, dry-run OFF"
+echo "--- start the console: agent pinned to a real worker, dry-run OFF"
 kubectl label node "${CLUSTER}-worker" "${AGENT_NODE_LABEL}" --overwrite
-kubectl -n "${NS}" set env deploy/aicrme \
-  "AICRME_SNAPSHOT_NODE_SELECTOR=${AGENT_NODE_LABEL}" \
-  'AICRME_SNAPSHOT_REQUESTS=cpu=200m' \
-  'AICRME_APPLY_DRY_RUN=false' \
-  "AICRME_PROVE_GANG_TIMEOUT=${GANG_TIMEOUT}"
-kubectl -n "${NS}" rollout status deploy/aicrme --timeout=180s
-
-kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &
-PF_PID=$!
-sleep 3
-
-echo "--- login"
-e2e_login "${ADDR}" "${JAR}" "${NS}"
+export AICRME_SNAPSHOT_NODE_SELECTOR="${AGENT_NODE_LABEL}"
+export AICRME_SNAPSHOT_REQUESTS='cpu=200m'
+export AICRME_APPLY_DRY_RUN='false'
+export AICRME_PROVE_GANG_TIMEOUT="${GANG_TIMEOUT}"
+e2e_start_console
+e2e_connect
 
 echo "--- drive the arc: discover, recommend, bundle, apply (real), prove"
 RUN_ID="$(drive_to_installed)"

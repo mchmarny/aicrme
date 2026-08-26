@@ -43,17 +43,12 @@ source "${SCRIPT_DIR}/lib.sh"
 
 CLUSTER="${CLUSTER:-aicrme-e2e-real}"
 NS="${NS:-aicrme}"
-IMAGE="${IMAGE:-aicrme:e2e-real}"
-PORT="${PORT:-18083}"
-ADDR="localhost:${PORT}"
 AGENT_NODE_LABEL="aicrme.e2e/agent=true"
 # Workloads are judged only after this settle window. kai-scheduler's
 # ReplicaSet transiently reports FailedCreate ("serviceaccount not found")
 # while its own chart is still applying, and converges shortly after --
 # observed on both verification runs. Judging immediately would pin a race.
 SETTLE_SECONDS="${SETTLE_SECONDS:-180}"
-JAR="$(mktemp -t aicrme-real-jar.XXXXXX)"
-PF_PID=""
 EVENTS_FILE=""
 ec=0
 
@@ -252,9 +247,10 @@ dump_run_baseline() {
 }
 
 dump_recent_events() {
+  [[ -n "${CONSOLE_URL:-}" ]] || return 0
   echo "--- last 80 SSE events ---" >&2
   set +e
-  curl -fsS -b "${JAR}" --max-time 5 "http://${ADDR}/api/events?since=0" 2>/dev/null \
+  e2e_api GET '/api/events?since=0' --max-time 5 2>/dev/null \
     | sed -n 's/^data: //p' | tail -n 80 >&2
   set -e
 }
@@ -280,10 +276,8 @@ cleanup() {
     kubectl get deploy,ds,sts -A >&2 2>&1 || true
     dump_recent_events
   fi
-  if [[ -n "${PF_PID}" ]]; then
-    kill "${PF_PID}" 2>/dev/null || true
-  fi
-  rm -f "${JAR}" "${EVENTS_FILE}"
+  e2e_console_cleanup
+  rm -f "${EVENTS_FILE}"
   # DIAG_DIR is deliberately left in place for the workflow's artifact upload.
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
@@ -307,34 +301,22 @@ e2e_install_kwok
 echo "--- apply simulated H100 nodes (2 system + 4x p5.48xlarge)"
 e2e_apply_kwok_nodes
 
-echo "--- build and load PRODUCTION console image"
-e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
-echo "--- install chart"
-e2e_install_chart "${NS}" "${IMAGE}"
-
 echo "--- label a worker for the snapshot agent (see header: workers taint the control-plane)"
 kubectl label node "${CLUSTER}-worker" "${AGENT_NODE_LABEL}" --overwrite
 
-echo "--- pin the snapshot agent onto that worker, dry-run OFF"
-kubectl -n "${NS}" set env deploy/aicrme \
-  "AICRME_SNAPSHOT_NODE_SELECTOR=${AGENT_NODE_LABEL}" \
-  'AICRME_SNAPSHOT_REQUESTS=cpu=200m' \
-  'AICRME_APPLY_DRY_RUN=false'
-kubectl -n "${NS}" rollout status deploy/aicrme --timeout=180s
-
-kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &
-PF_PID=$!
-sleep 3
+echo "--- start the console: agent pinned onto that worker, dry-run OFF"
+export AICRME_SNAPSHOT_NODE_SELECTOR="${AGENT_NODE_LABEL}"
+export AICRME_SNAPSHOT_REQUESTS='cpu=200m'
+export AICRME_APPLY_DRY_RUN='false'
+e2e_start_console
+e2e_connect
 
 # Started before the run, not before Apply: the memory trend leading INTO the
 # install is what makes a spike during it legible.
 start_instrumentation
 
-echo "--- login"
-e2e_login "${ADDR}" "${JAR}" "${NS}"
-
 echo "--- POST /api/runs"
-RUN_JSON="$(curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs" -H 'Content-Type: application/json')"
+RUN_JSON="$(e2e_api POST /api/runs -H 'Content-Type: application/json')"
 RUN_ID="$(echo "${RUN_JSON}" | jq -r '.id')"
 [[ -n "${RUN_ID}" && "${RUN_ID}" != "null" ]] || {
   echo "no run id in response: ${RUN_JSON}" >&2
@@ -345,7 +327,7 @@ echo "run id: ${RUN_ID}"
 echo "--- poll until awaiting_decision (Discover complete)"
 STATE=""
 for _ in $(seq 1 90); do
-  RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
+  RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 5
@@ -357,14 +339,14 @@ done
 }
 
 echo "--- decide {intent:training, platform:kubeflow}"
-curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
+e2e_api POST "/api/runs/${RUN_ID}/decide" \
   -H 'Content-Type: application/json' \
   -d '{"intent":"training","platform":"kubeflow"}' >/dev/null
 
 echo "--- poll until the confirm gate (Recommend + Bundle complete)"
 STATE=""
 for _ in $(seq 1 60); do
-  RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
+  RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 3
@@ -377,7 +359,7 @@ PENDING="$(echo "${RUN_JSON}" | jq -cS '.pending')"
 }
 
 echo "--- decide {apply:yes} -- REAL install begins"
-curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
+e2e_api POST "/api/runs/${RUN_ID}/decide" \
   -H 'Content-Type: application/json' \
   -d '{"apply":"yes"}' >/dev/null
 
@@ -397,7 +379,7 @@ for _ in $(seq 1 240); do
   # runs on main managed to explain nothing. Tolerating a few polls costs
   # nothing when healthy and is the difference between "it broke" and knowing
   # WHAT broke first -- the console or the API server underneath it.
-  if ! RUN_JSON="$(curl -fsS --max-time 10 -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}" 2>/dev/null)"; then
+  if ! RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}" --max-time 10 2>/dev/null)"; then
     CURL_FAILS=$((CURL_FAILS + 1))
     probe_at_failure "${CURL_FAILS}"
     if [[ "${CURL_FAILS}" -ge 3 ]]; then
@@ -490,7 +472,7 @@ UNCONVERGED="$(
 echo "--- fetch the full bus event stream for the cluster-telemetry assertions"
 EVENTS_FILE="$(mktemp -t aicrme-real-events.XXXXXX.json)"
 set +e
-curl -fsS -b "${JAR}" --max-time 15 "http://${ADDR}/api/events?since=0" \
+e2e_api GET '/api/events?since=0' --max-time 15 \
   | sed -n 's/^data: //p' \
   | jq -s '[.[] | select(has("kind"))]' >"${EVENTS_FILE}"
 set -e

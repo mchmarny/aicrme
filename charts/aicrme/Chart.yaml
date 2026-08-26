@@ -1,6 +1,0 @@
-apiVersion: v2
-name: aicrme
-description: Turns a vanilla GPU cluster into a working AI platform. Demo and eval clusters only.
-type: application
-version: 0.1.0
-appVersion: "0.1.0"

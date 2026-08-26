@@ -13,12 +13,32 @@ import (
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/gap"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 // DiscoverConfig configures the AICR snapshot agent Job.
 type DiscoverConfig struct {
 	Namespace string
 	Image     string
+	// Kubeconfig is set explicitly rather than left to AICR's own resolution.
+	// AgentConfig.Kubeconfig is documented as "the path (or empty for
+	// in-cluster)", and empty was exactly right in a pod. Locally, empty means
+	// AICR reads KUBECONFIG, else ~/.kube/config -- so Discover would snapshot
+	// whatever the operator's ambient config points at while Apply installs
+	// into the context they selected. That is a recipe generated for one
+	// cluster and installed into another, with nothing in the timeline saying
+	// so.
+	Kubeconfig string
+	// Kube is the connected cluster's client, used for exactly one thing:
+	// creating the namespace the agent Job runs in. Everything else Discover
+	// does goes through AICR's own client, which resolves Kubeconfig above.
+	//
+	// Required. Nil means this binary's wiring never handed Discover the
+	// connection, which Run reports rather than dereferences -- a panic in a
+	// step goroutine takes the console down with it.
+	Kube kubernetes.Interface
 	// JobName and ServiceAccountName name the transient Job and the
 	// ServiceAccount/Role/RoleBinding trio AICR's agent deployer creates for
 	// it (see NewDiscover for why they cannot be left blank). Both are
@@ -154,10 +174,71 @@ func agentTolerations(extra []corev1.Toleration) []corev1.Toleration {
 func (d *discover) Phase() engine.Phase { return engine.PhaseDiscover }
 func (d *discover) Requires() []string  { return nil }
 
+// ensureNamespace creates the namespace the agent Job runs in, and records on
+// the run whether this run is what brought it into existence.
+//
+// Here rather than at connect, deliberately. A probe that reports a server
+// version and a node count must not also write to the cluster: an operator
+// clicking through contexts to see which one they are pointed at would leave a
+// namespace behind on every cluster they looked at, including ones they never
+// installed to. Point of use is also what the cited precedent does --
+// prove.Client.EnsureNamespace creates Prove's namespace when Prove runs.
+//
+// Create-then-Get rather than Get-then-Create: the same idempotence
+// prove.Client.EnsureNamespace uses, and the only ordering with no window
+// between the check and the write.
+func (d *discover) ensureNamespace(ctx context.Context, r *engine.Run) error {
+	created, err := d.cfg.Kube.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: d.cfg.Namespace},
+	}, metav1.CreateOptions{})
+	if err == nil {
+		r.AgentNamespace = engine.AgentNamespace{
+			Name: created.Name, UID: string(created.UID), Created: true,
+		}
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable,
+			"creating namespace "+d.cfg.Namespace+" for the snapshot agent failed", err)
+	}
+
+	existing, err := d.cfg.Kube.CoreV1().Namespaces().Get(ctx, d.cfg.Namespace, metav1.GetOptions{})
+	if err != nil {
+		return aicrerrors.Wrap(aicrerrors.ErrCodeUnavailable,
+			"reading namespace "+d.cfg.Namespace+" for the snapshot agent failed", err)
+	}
+	// A retried Discover finds the namespace its own earlier attempt created,
+	// and must not now report it as pre-existing: Created is what tells the
+	// operator the namespace is theirs to remove, and a step that can be
+	// retried would otherwise disown what it made on the second attempt. The
+	// UID is what makes that safe to carry forward -- a namespace deleted and
+	// recreated at the same name in between is a different object, and not
+	// this run's.
+	sameObject := r.AgentNamespace.Created && r.AgentNamespace.UID == string(existing.UID)
+	r.AgentNamespace = engine.AgentNamespace{
+		Name: existing.Name, UID: string(existing.UID), Created: sameObject,
+	}
+	return nil
+}
+
 func (d *discover) Run(ctx context.Context, r *engine.Run, emit engine.Emit) error {
+	if d.cfg.Kube == nil {
+		return aicrerrors.New(aicrerrors.ErrCodeInternal,
+			"discover has no cluster client; the console was wired without a connection")
+	}
+	// Before the agent Job is submitted, not alongside it. CollectSnapshot
+	// passes Namespace straight to the Job spec and creates nothing; in-cluster
+	// `helm --create-namespace` did, and locally nothing does, so a Job into a
+	// missing namespace is rejected the moment it reaches the API server and
+	// surfaces ten minutes later as a snapshot timeout.
+	if err := d.ensureNamespace(ctx, r); err != nil {
+		return err
+	}
+
 	emit(bus.Event{Kind: bus.KindLog, Message: "deploying cluster snapshot agent"})
 
 	snap, err := d.client.CollectSnapshot(ctx, &aicr.AgentConfig{
+		Kubeconfig:         d.cfg.Kubeconfig,
 		Namespace:          d.cfg.Namespace,
 		Image:              d.cfg.Image,
 		JobName:            d.cfg.JobName,

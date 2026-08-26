@@ -17,28 +17,6 @@ import (
 // image: an unrecognized version is refused rather than partially decoded.
 const envelopeVersion = 1
 
-// maxPayload bounds the encoded record. Kubernetes caps a ConfigMap at
-// roughly 1MiB; stopping at 800KiB beats letting the API server reject an
-// oversized object with something opaque, and leaves room for the object's
-// own metadata.
-//
-// Exceeding it sheds artifacts rather than failing the write (see
-// encodeRun). It used to fail closed, and that turned a large cluster into
-// an unusable product: Decide is the one checkpoint that is mandatory rather
-// than best-effort, so an oversized snapshot made it fail deterministically,
-// roll the run back to awaiting_decision, and leave Discard refusing on
-// "run is live" -- no operator action anywhere reached a working console,
-// and a restart only replayed the same oversized artifact. Shedding keeps
-// every write path succeeding; what degrades is durability, loudly and in
-// one named place, instead of the product.
-const maxPayload = 800 << 10
-
-// maxDecompressed bounds what decodeRun will expand. A small stored payload
-// can inflate without limit, and the pod runs under a 512Mi cap, so an
-// unbounded reader turns a malformed record into an OOM kill instead of an
-// error.
-const maxDecompressed = 8 << 20
-
 // ephemeralArtifacts are dropped on encode. bundle.path points into the
 // chart's emptyDir, which does not survive a restart -- persisting it would
 // hand a recovered Apply a path to a directory that no longer exists, which
@@ -115,6 +93,28 @@ type envelope struct {
 	//
 	// omitzero, not omitempty: see Run.Residue's comment.
 	Residue Residue `json:"residue,omitzero"`
+	// ClusterUID is the same optional-on-both-sides addition, and it must
+	// survive the round trip for the same reason Residue must: it is what
+	// Recover and Reset revalidate against the connected cluster, and a
+	// record that lost it on save would be accepted by any cluster at all.
+	// Absent means "written before this field existed", which is not a
+	// mismatch -- see Run.ClusterUID.
+	ClusterUID string `json:"clusterUid,omitempty"`
+	// Toolchain is the same optional-on-both-sides addition. It must survive
+	// the round trip because the evidence bundle is built from the record, and
+	// a recovered run that lost its toolchain would produce evidence that
+	// cannot say what produced it.
+	Toolchain map[string]string `json:"toolchain,omitempty"`
+	// AgentNamespace is the same optional-on-both-sides addition, and it must
+	// survive the round trip for the reason Residue must: it is evidence about
+	// what is still on the cluster, and Reset reports it. A recovered run that
+	// lost it would leave the namespace Discover created standing with nothing
+	// telling the operator it is theirs to remove. Absent means "written
+	// before this field existed", which decodes to the zero value -- "Discover
+	// never ran" -- and that is a correct decode, not a degraded one.
+	//
+	// omitzero, not omitempty: see Run.AgentNamespace's comment.
+	AgentNamespace AgentNamespace `json:"agentNamespace,omitzero"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -133,7 +133,10 @@ func gzipJSON(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func gunzipJSON(blob []byte, v any) error {
+// gunzipJSON decompresses blob and unmarshals it into v. maxDecompressed
+// bounds the expansion -- see decodeRun for why that bound exists and how it
+// is sized.
+func gunzipJSON(blob []byte, v any, maxDecompressed int) error {
 	zr, err := gzip.NewReader(bytes.NewReader(blob))
 	if err != nil {
 		return err
@@ -141,7 +144,7 @@ func gunzipJSON(blob []byte, v any) error {
 	defer func() { _ = zr.Close() }()
 	// LimitReader + 1 so a record exactly at the bound is distinguishable
 	// from one that exceeds it.
-	raw, err := io.ReadAll(io.LimitReader(zr, maxDecompressed+1))
+	raw, err := io.ReadAll(io.LimitReader(zr, int64(maxDecompressed)+1))
 	if err != nil {
 		return err
 	}
@@ -151,14 +154,13 @@ func gunzipJSON(blob []byte, v any) error {
 	return json.Unmarshal(raw, v)
 }
 
-// encodeRun projects a Run into a compressed envelope. It never mutates the
-// caller's run.
+// encodeRun serializes r for persistence. It never mutates the caller's run.
 //
-// A record over maxPayload sheds artifacts, largest first, until it fits,
-// naming each dropped key in envelope.Truncated. Every other checkpoint in
-// this engine is best-effort-with-a-warning; this makes the size guard behave
-// the same way, because the alternative is a run no operator action can free
-// (see maxPayload).
+// maxPayload bounds the encoded record. It is a parameter rather than a
+// constant because it describes the STORE, not the run: a ConfigMap is capped
+// near 1 MiB by Kubernetes, a file is not. A record over the ceiling sheds
+// artifacts, largest first, until it fits, and names what it dropped in
+// Truncated.
 //
 // Largest-first minimizes HOW MUCH IS LOST -- the fewest artifacts shed to get
 // under the cap -- and nothing more than that. It does NOT preserve
@@ -180,7 +182,7 @@ func gunzipJSON(blob []byte, v any) error {
 // decisions and component rows alone exceed the limit is not a large
 // cluster, it is a bug, and silently persisting a record with fields
 // dropped from the state machine would be worse than refusing.
-func encodeRun(r *Run) ([]byte, error) {
+func encodeRun(r *Run, maxPayload int) ([]byte, error) {
 	env := envelope{
 		Version:            envelopeVersion,
 		ID:                 r.ID,
@@ -197,6 +199,9 @@ func encodeRun(r *Run) ([]byte, error) {
 		CleanupUnconfirmed: r.CleanupUnconfirmed,
 		Ownership:          r.Ownership,
 		Residue:            r.Residue,
+		ClusterUID:         r.ClusterUID,
+		Toolchain:          r.Toolchain,
+		AgentNamespace:     r.AgentNamespace,
 		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -232,10 +237,10 @@ func encodeRun(r *Run) ([]byte, error) {
 	}
 	if len(blob) > maxPayload {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-			fmt.Sprintf("run state too large to checkpoint: %d bytes compressed, limit %d", len(blob), maxPayload))
+			fmt.Sprintf("run state too large to checkpoint: %d bytes compressed exceeds the payload ceiling of %d bytes", len(blob), maxPayload))
 	}
 
-	slog.Warn("run checkpoint exceeded the ConfigMap payload limit; artifacts were dropped so the record could still be written. "+
+	slog.Warn("run checkpoint exceeded its payload ceiling; artifacts were dropped so the record could still be written. "+
 		"Durability is degraded: this run is still recoverable as a state machine, but a retry that reads one of the dropped artifacts will fail and the operator will have to discard and start over",
 		"run", r.ID, "dropped", env.Truncated, "droppedBytes", shedBytes,
 		"compressedBytes", len(blob), "limit", maxPayload)
@@ -260,12 +265,37 @@ func largestArtifact(artifacts map[string][]byte) string {
 	return best
 }
 
-// decodeRun reverses encodeRun. An unrecognized version is refused rather
-// than partially decoded: guessing at a format written by a different image
-// is how a newer record gets silently downgraded.
-func decodeRun(blob []byte) (*Run, error) {
+// decompressMultiplier scales maxPayload into decodeRun's decompression-bomb
+// guard. It is not sized to reproduce any particular old relationship
+// exactly -- an earlier version of this comment claimed the ×10 it replaced
+// reproduced the ConfigMap store's original 800 KiB to 8 MiB ratio "exactly",
+// and that arithmetic was wrong (819,200 × 10 = 8,192,000, which is narrower
+// than 8 << 20 = 8,388,608, so decodeRun would have newly rejected a
+// decompressed record between roughly 7.8 and 8 MiB that the old,
+// unparameterized bound accepted). The one property that matters is that
+// parameterizing the ceiling must never narrow what decodeRun accepts:
+// cmPayloadCeiling * decompressMultiplier (9,011,200) is deliberately kept
+// wider than the ConfigMap store's original 8 << 20, with headroom rather
+// than a value pinned to the boundary.
+const decompressMultiplier = 11
+
+// decodeRun deserializes a record written by encodeRun. An unrecognized
+// version is refused rather than partially decoded: guessing at a format
+// written by a different image is how a newer record gets silently
+// downgraded.
+//
+// maxPayload is the same ceiling encodeRun was given. Decompression is
+// bounded at maxPayload * decompressMultiplier: a decompression-bomb guard
+// scaled to whatever ceiling the store supplies, rather than a fixed number,
+// and deliberately never narrower than the ConfigMap store's original 8 MiB
+// -- so parameterizing the ceiling rejects nothing decodeRun previously
+// accepted. That bound is a property of this decoder, not of where the bytes
+// were kept.
+func decodeRun(blob []byte, maxPayload int) (*Run, error) {
+	maxDecompressed := maxPayload * decompressMultiplier
+
 	var env envelope
-	if err := gunzipJSON(blob, &env); err != nil {
+	if err := gunzipJSON(blob, &env, maxDecompressed); err != nil {
 		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, "decoding run failed", err)
 	}
 	if env.Version != envelopeVersion {
@@ -289,6 +319,9 @@ func decodeRun(blob []byte) (*Run, error) {
 		CleanupUnconfirmed: env.CleanupUnconfirmed,
 		Ownership:          env.Ownership,
 		Residue:            env.Residue,
+		ClusterUID:         env.ClusterUID,
+		Toolchain:          env.Toolchain,
+		AgentNamespace:     env.AgentNamespace,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Drives the full Discover -> Recommend arc against a live Kind cluster
 # through the real HTTP API: create the cluster, install the KWOK controller
-# and AICR's simulated H100 nodes, install the chart, log in, create a run,
-# answer intent=training/platform=kubeflow once the run parks, and assert it
+# and AICR's simulated H100 nodes, start the console against it, connect,
+# create a run, answer intent=training/platform=kubeflow once it parks, and
+# assert it
 # parks a SECOND time -- pending == ["apply"] -- with a resolved,
 # non-empty recipe. This is Phase 1's proof that the whole no-hardware demo
 # arc works on every PR.
@@ -35,7 +36,7 @@
 #
 # Getting a live run this far surfaced three gaps in aicrme's own Discover
 # wiring that would break Discover on ANY cluster, real or simulated, not
-# just KWOK -- fixed alongside this script (see cmd/aicrme/main.go and
+# just KWOK -- fixed alongside this script (see internal/console/console.go and
 # internal/steps/discover.go): the snapshot agent's Image, JobName, and
 # ServiceAccountName were never defaulted, so aicr.Client.CollectSnapshot
 # (the Go entry point this console calls, unlike its CLI) forwarded them to
@@ -52,21 +53,16 @@ source "${SCRIPT_DIR}/lib.sh"
 
 CLUSTER="${CLUSTER:-aicrme-e2e-kwok}"
 NS="${NS:-aicrme}"
-IMAGE="${IMAGE:-aicrme:e2e-kwok}"
-PORT="${PORT:-18081}"
-ADDR="localhost:${PORT}"
-
-JAR="$(mktemp -t aicrme-kwok-jar.XXXXXX)"
-PF_PID=""
 ec=0
 
 # dump_recent_events prints the last 50 SSE events for a failed run -- the
 # brief's diagnostic requirement. Best-effort: the SSE connection is
 # long-lived, so it is force-closed after a few seconds rather than awaited.
 dump_recent_events() {
+  [[ -n "${CONSOLE_URL:-}" ]] || return 0
   echo "--- last 50 SSE events ---" >&2
   set +e
-  curl -fsS -b "${JAR}" --max-time 5 "http://${ADDR}/api/events?since=0" 2>/dev/null \
+  e2e_api GET '/api/events?since=0' --max-time 5 2>/dev/null \
     | sed -n 's/^data: //p' | tail -n 50 >&2
   set -e
 }
@@ -83,18 +79,15 @@ fail_run() {
 
 cleanup() {
   local exit_code="$1"
-  # Diagnostics run BEFORE killing the port-forward, and exactly once here
+  # Diagnostics run BEFORE the console is stopped, and exactly once here
   # (fail_run no longer dumps its own copy): dump_recent_events curls the
-  # console through PF_PID, so dumping after the kill -- or twice, once from
-  # fail_run and again here -- was the previous, empty-on-failure bug.
+  # console, so dumping after it exits -- or twice, once from fail_run and
+  # again here -- was the previous, empty-on-failure bug.
   if [[ "${exit_code}" -ne 0 ]]; then
     e2e_diagnose "${NS}"
     dump_recent_events
   fi
-  if [[ -n "${PF_PID}" ]]; then
-    kill "${PF_PID}" 2>/dev/null || true
-  fi
-  rm -f "${JAR}"
+  e2e_console_cleanup
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
 # Exit status is captured before cleanup runs anything else, and re-asserted
@@ -110,12 +103,6 @@ e2e_install_kwok
 
 echo "--- apply simulated H100 nodes (2 system + 4x p5.48xlarge)"
 e2e_apply_kwok_nodes
-
-echo "--- build and load console image"
-e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
-
-echo "--- install chart"
-e2e_install_chart "${NS}" "${IMAGE}"
 
 # Every simulated GPU node carries the kwok.x-k8s.io/node=fake:NoSchedule
 # taint (see node_yaml above) and no real kubelet. AICR's Go client
@@ -139,21 +126,14 @@ e2e_install_chart "${NS}" "${IMAGE}"
 # minutes. The real request is right for a real cluster, where the agent
 # reads actual hardware; against KWOK's fake nodes there is no such work to
 # do, so 200m is ample. Test-path only -- never set this in values.yaml.
-echo "--- pin the snapshot agent off the simulated GPU nodes onto the real one"
-kubectl -n "${NS}" set env deploy/aicrme \
-  'AICRME_SNAPSHOT_NODE_SELECTOR=node-role.kubernetes.io/control-plane=' \
-  'AICRME_SNAPSHOT_REQUESTS=cpu=200m'
-kubectl -n "${NS}" rollout status deploy/aicrme --timeout=120s
-
-kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &
-PF_PID=$!
-sleep 3
-
-echo "--- login"
-e2e_login "${ADDR}" "${JAR}" "${NS}"
+echo "--- start the console, pinning the snapshot agent off the simulated GPU nodes"
+export AICRME_SNAPSHOT_NODE_SELECTOR='node-role.kubernetes.io/control-plane='
+export AICRME_SNAPSHOT_REQUESTS='cpu=200m'
+e2e_start_console
+e2e_connect
 
 echo "--- POST /api/runs"
-RUN_JSON="$(curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs" -H 'Content-Type: application/json')"
+RUN_JSON="$(e2e_api POST /api/runs -H 'Content-Type: application/json')"
 RUN_ID="$(echo "${RUN_JSON}" | jq -r '.id')"
 [[ -n "${RUN_ID}" && "${RUN_ID}" != "null" ]] || {
   echo "no run id in response: ${RUN_JSON}" >&2
@@ -166,7 +146,7 @@ echo "run id: ${RUN_ID}"
 echo "--- poll until awaiting_decision (Discover complete)"
 STATE=""
 for _ in $(seq 1 90); do
-  RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
+  RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 5
@@ -184,7 +164,7 @@ PENDING="$(echo "${RUN_JSON}" | jq -cS '.pending')"
 }
 
 echo "--- GET /api/options: training must offer kubeflow on this cluster"
-OPTIONS_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/options")"
+OPTIONS_JSON="$(e2e_api GET /api/options)"
 echo "${OPTIONS_JSON}" | jq -e '(.platformsByIntent.training // []) | index("kubeflow") != null' >/dev/null || {
   echo "options does not offer training/kubeflow -- the catalog change that would break the demo: ${OPTIONS_JSON}" >&2
   exit 1
@@ -193,14 +173,14 @@ PROVISIONAL="$(echo "${OPTIONS_JSON}" | jq -r '.provisional')"
 echo "options verified (provisional=${PROVISIONAL})"
 
 echo "--- POST /api/runs/${RUN_ID}/decide {intent:training, platform:kubeflow}"
-curl -fsS -b "${JAR}" -X POST "http://${ADDR}/api/runs/${RUN_ID}/decide" \
+e2e_api POST "/api/runs/${RUN_ID}/decide" \
   -H 'Content-Type: application/json' \
   -d '{"intent":"training","platform":"kubeflow"}' >/dev/null
 
 echo "--- poll until the run parks a second time (Recommend + Bundle complete, Apply's confirm gate)"
 STATE=""
 for _ in $(seq 1 60); do
-  RUN_JSON="$(curl -fsS -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}")"
+  RUN_JSON="$(e2e_api GET "/api/runs/${RUN_ID}")"
   STATE="$(echo "${RUN_JSON}" | jq -r '.state')"
   [[ "${STATE}" == "awaiting_decision" || "${STATE}" == "failed" ]] && break
   sleep 3
@@ -229,7 +209,7 @@ echo "--- recipe resolved; extracting component count from the SSE stream"
 # and the test should say so loudly.
 COMPONENT_COUNT=""
 set +e
-COMPONENT_COUNT="$(curl -fsS -b "${JAR}" --max-time 5 "http://${ADDR}/api/events?since=0" 2>/dev/null \
+COMPONENT_COUNT="$(e2e_api GET '/api/events?since=0' --max-time 5 2>/dev/null \
   | sed -n 's/^data: //p' \
   | jq -r 'select(.data.componentCount != null) | .data.componentCount' 2>/dev/null \
   | tail -n 1)"

@@ -222,7 +222,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 	r, err := e.loadCurrentWithRetry(ctx)
 	if err != nil {
-		// aicr@v0.19.0's errors package exposes no Code(err) helper -- New,
+		// aicr@v0.20.0's errors package exposes no Code(err) helper -- New,
 		// Wrap, IsTransient and friends only -- so the code is reached
 		// through errors.As, matching how the rest of this repo inspects it.
 		var se *aicrerrors.StructuredError
@@ -242,6 +242,19 @@ func (e *Engine) Recover(ctx context.Context) error {
 		slog.Error("persisted run failed validation; starting without it and leaving it untouched", "error", err)
 		e.markStoreUnreadable()
 		return nil
+	}
+
+	// Returned rather than degraded-past, unlike every other rejection here.
+	// The others mean "this record cannot be trusted", and starting cold is
+	// the recovery. This one means the caller pointed recovery at the wrong
+	// cluster's records, which is a wiring error in the connect path, not a
+	// runtime condition -- and continuing would quietly file this cluster's
+	// run alongside another's. The store is deliberately NOT marked
+	// unreadable: the record is perfectly readable and perfectly valid, it
+	// just is not ours, and nothing here should make it harder for the
+	// console that owns it to read it later.
+	if err := e.checkClusterMatch(r, "recover"); err != nil {
+		return err
 	}
 
 	// Pending names the decisions a now-nonexistent awaitDecisions goroutine

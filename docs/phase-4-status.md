@@ -96,10 +96,23 @@ Applied at the end of the session; **its effect was never measured**.
 ## Where the run stopped, and how to resume
 
 Run `1f3b67780cddd780` was `running/prove` when the control plane went away. **It would have
-failed regardless**: Prove **adopted the stale Job** from the previous attempt (identical pod
-names) rather than recreating it. That is the Phase 3 adoption rule working as designed — it
-will not delete a workload it did not start — but the adopted Job carries the pre-fix
-tolerations, so the fix could not reach it.
+failed regardless**: Prove reused the stale Job from the previous attempt (identical pod names)
+rather than recreating it, and that Job carries the pre-fix tolerations, so the fix could not
+reach it.
+
+> **Correction, 2026-08-24.** This paragraph originally blamed "the Phase 3 adoption rule
+> working as designed — it will not delete a workload it did not start." That is the wrong
+> mechanism. The adoption rule lives in `ReconcileWorkloads`
+> (`internal/engine/reconcile.go:95`), governs orphans found at startup, and is correct as
+> written. The actual carrier is `prove.Client.Apply` (`internal/prove/client.go:122`): the
+> workload name is `"prove-" + runID`, so a retried Apply for the same run gets `AlreadyExists`
+> from the API server and **reports success without writing anything**. Its comment justifies
+> that with "Render's output for a given run never changes" — which stopped being true the
+> moment this phase added `c.extraTolerations`, appended after decode from
+> `AICRME_GPU_TOLERATIONS`, i.e. from process configuration rather than from the run.
+> Hardening `ReconcileWorkloads` would have fixed nothing. Resolved in the local-binary spec,
+> revision 4 (§4, *Prove's workload can outlive the spec that produced it*): Apply stamps a
+> spec hash and recreates on drift.
 
 ```sh
 kubectl -n aicrme-prove delete job --all   # drop the stale adopted Job
@@ -107,9 +120,13 @@ kubectl -n aicrme-prove delete job --all   # drop the stale adopted Job
 ```
 
 **This is a real interaction worth deciding on, not just an operational note.** A fix to the
-workload spec cannot take effect while a previous workload is adoptable. Options: have Prove
-recreate rather than adopt when the spec differs, or leave it manual and document it. Not
-decided.
+workload spec cannot take effect while a previous workload of the same name is still there.
+
+**Decided 2026-08-24: recreate on spec drift, stay idempotent otherwise.** Apply stamps the
+rendered workload with a hash annotation; a matching hash is success with no write, a differing
+or absent hash means `EnsureAbsent` then create. See the local-binary spec, revision 4. The
+`kubectl -n aicrme-prove delete job --all` workaround above stops being necessary once that
+lands.
 
 ### Reproducing the environment
 
@@ -193,8 +210,10 @@ run** — the control plane went away first. It needs a completed run and a port
 
 ## Open decisions
 
-1. **Does Prove adopt or recreate** when the workload spec has changed? Today it adopted, and
-   that silently defeated a fix.
+1. ~~**Does Prove adopt or recreate** when the workload spec has changed? Today it adopted, and
+   that silently defeated a fix.~~ **Closed 2026-08-24 — recreate on drift.** See the correction
+   above: the mechanism was Apply's `AlreadyExists` swallow, not adoption. Local-binary spec,
+   revision 4.
 2. **Does pinning to a GPU-free pool eliminate the console churn**, or only reduce it? Shipped,
    unmeasured.
 3. **The premise question Mark raised mid-session** — whether the in-cluster design survives
@@ -207,9 +226,17 @@ run** — the control plane went away first. It needs a completed run and a port
 
 ## Branch state
 
+**Merged 2026-08-23. This section is kept for the reasoning, not as current state.**
+
 `phase-5-reset-shrink`, 16 commits, clean tree, Go suite green, `qualify` green at 89.7%.
 **Not merged.** The KWOK `reset.sh` e2e last passed at commit `b745130`; five commits have
 landed since, three of which touch scheduling (`discover` tolerations, `prove` tolerations,
 chart `nodeSelector`). Those are believed KWOK-safe — the e2e pins the agent via NodeSelector,
 and the added tolerations deliberately exclude `kwok.x-k8s.io/node` — but **that is reasoning,
 not a green run.** Re-run `test/e2e/reset.sh` before merging.
+
+**Outcome:** the branch merged to `main` along with a lint fix, ending at `41674f3`. The demand
+above was met rather than waived — both `ci` and `e2e` ran green on that commit
+(2026-08-23T20:43, e2e 23m52s), so the scheduling changes are confirmed KWOK-safe by a run and
+not only by reasoning. `main` and `origin/main` are level; nothing from this phase is
+outstanding.

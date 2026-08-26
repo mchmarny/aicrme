@@ -30,13 +30,14 @@ func newDecideTestServer(t *testing.T) (*httptest.Server, *http.Client) {
 	t.Helper()
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), decisionStep{}), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	return loggedInClient(t, srv.Handler())
+	return authedClient(t, srv.Handler())
 }
 
 func waitForRunState(t *testing.T, client *http.Client, url string, want engine.State) {

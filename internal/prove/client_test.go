@@ -540,3 +540,87 @@ func TestApplyAddsOperatorTolerationsAndKeepsTheBuiltIns(t *testing.T) {
 		t.Errorf("built-in tolerations were lost (nvidia.com/gpu=%v kwok=%v)", gpu, kwok)
 	}
 }
+
+// A second Apply for the same run from a differently-configured process --
+// here, one with an operator toleration the first process never had -- must
+// not be discarded as a no-op. WorkloadName is derived from the run ID
+// alone, so both Applies address the same object; the fix under test is what
+// stops the second one from being silently swallowed as AlreadyExists.
+func TestApplyRecreatesWhenTolerationsChanged(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	const runID = "abcdef0123456789"
+
+	first := prove.NewClient(kube)
+	if err := first.Apply(context.Background(), runID); err != nil {
+		t.Fatalf("first Apply() error = %v", err)
+	}
+
+	second := prove.NewClient(kube, corev1.Toleration{
+		Key: "dedicated", Operator: corev1.TolerationOpEqual,
+		Value: "gpu-workload", Effect: corev1.TaintEffectNoSchedule,
+	})
+	if err := second.Apply(context.Background(), runID); err != nil {
+		t.Fatalf("second Apply() error = %v", err)
+	}
+
+	job, err := kube.BatchV1().Jobs(prove.Namespace).Get(context.Background(), prove.WorkloadName(runID), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	var found bool
+	for _, tol := range job.Spec.Template.Spec.Tolerations {
+		if tol.Key == "dedicated" && tol.Value == "gpu-workload" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the recreated workload does not carry the new toleration -- a fix deployed between two Applies could not reach the run")
+	}
+}
+
+// A repeat Apply against an unchanged spec must not touch the object at all
+// -- not delete it, not recreate it -- because the workload it addresses may
+// already have a gang placed on it, and any delete/create pair risks
+// disturbing that placement.
+func TestApplyIsANoOpWhenNothingChanged(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	const runID = "abcdef0123456789"
+	c := prove.NewClient(kube)
+
+	if err := c.Apply(context.Background(), runID); err != nil {
+		t.Fatalf("first Apply() error = %v", err)
+	}
+	kube.ClearActions()
+	if err := c.Apply(context.Background(), runID); err != nil {
+		t.Fatalf("second Apply() error = %v", err)
+	}
+
+	for _, a := range kube.Actions() {
+		if a.GetVerb() == "delete" || a.GetVerb() == "create" {
+			t.Errorf("an unchanged Apply issued a %s -- it must not disturb a placed gang", a.GetVerb())
+		}
+	}
+}
+
+// A Job that predates SpecHashAnnotation entirely -- the shape a binary from
+// before this fix would have left behind -- must be recreated rather than
+// trusted just because an object with the expected name exists. This is the
+// exact shape of the Phase 4 defect: an object present under the right name
+// was treated as "this call's object" without checking whether it actually
+// was.
+func TestApplyRecreatesAWorkloadWithNoHashAnnotation(t *testing.T) {
+	const runID = "abcdef0123456789"
+	kube := fake.NewSimpleClientset(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: prove.WorkloadName(runID), Namespace: prove.Namespace},
+	})
+	if err := prove.NewClient(kube).Apply(context.Background(), runID); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	job, err := kube.BatchV1().Jobs(prove.Namespace).Get(context.Background(), prove.WorkloadName(runID), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if job.Annotations[prove.SpecHashAnnotation] == "" {
+		t.Error("a Job predating this change was trusted rather than recreated -- this is the Phase 4 shape exactly")
+	}
+}

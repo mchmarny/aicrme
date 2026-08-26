@@ -3,6 +3,8 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"io/fs"
 	"mime"
 	"net/http"
@@ -10,7 +12,6 @@ import (
 	"path"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/aicrclient"
@@ -18,15 +19,17 @@ import (
 	"github.com/mchmarny/aicrme/internal/engine"
 )
 
+// errNotConnected is what every gated route returns before a cluster has been
+// chosen. Conflict rather than unavailable: the server is healthy and the
+// request is well-formed, it just does not yet know which cluster it means.
+var errNotConnected = aicrerrors.New(aicrerrors.ErrCodeConflict, "connect to a cluster first")
+
 // Config is the server's runtime configuration.
 type Config struct {
-	Username   string
-	Password   string
-	SessionTTL time.Duration
-	// LoginRate is the burst and per-minute ceiling on login attempts.
-	LoginRate int
-	// TLS marks the session cookie Secure.
-	TLS bool
+	// Token is the launch token this console prints in its URL and exchanges
+	// once for a session cookie. See internal/api/token.go for why the
+	// exchange exists rather than a header.
+	Token string
 	// AICR backs GET /api/options: it asks the live recipe catalog which
 	// intents and platforms actually have an overlay for this cluster,
 	// rather than the console offering a static list that can dead-end.
@@ -35,33 +38,47 @@ type Config struct {
 	// run's bundle.path artifact must resolve inside this directory before
 	// handleBundle will open anything under it.
 	WorkDir string
+	// Cluster is the process's one cluster connection. Every route that needs
+	// a cluster is gated on it having been established.
+	Cluster Cluster
+}
+
+// Cluster is the connect-state seam. internal/console owns the connection and
+// implements this; the interface is declared here, in terms of values this
+// package only marshals and never inspects, so the dependency stays one-way --
+// console imports api, never the reverse.
+type Cluster interface {
+	// Contexts lists what the operator can connect to. It must not contact a
+	// cluster: most contexts in a working kubeconfig are unreachable from
+	// wherever the operator happens to be sitting.
+	Contexts() (any, error)
+	// Connect establishes the connection, or fails. It is single-assignment:
+	// a second call returns a conflict, which is what stops in-session
+	// cluster switching.
+	Connect(ctx context.Context, contextName string) (any, error)
+	// Connected reports whether a connection has been established.
+	Connected() bool
+	// Info returns the established connection, or false if there is none.
+	Info() (any, bool)
 }
 
 // Server wires the HTTP routes.
 type Server struct {
-	auth     *authenticator
+	launch   *launchToken
 	bus      *bus.Bus
 	engine   *engine.Engine
 	static   fs.FS
 	aicr     aicrclient.API
 	options  aicrclient.OptionsCache
 	workDir  string
+	cluster  Cluster
 	draining atomic.Bool
 }
 
 // New validates cfg and returns a Server.
 func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error) {
-	if cfg.Password == "" {
-		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "password must not be empty")
-	}
-	if cfg.Username == "" {
-		cfg.Username = "admin"
-	}
-	if cfg.SessionTTL <= 0 {
-		cfg.SessionTTL = 8 * time.Hour
-	}
-	if cfg.LoginRate <= 0 {
-		cfg.LoginRate = 10
+	if cfg.Token == "" {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "launch token must not be empty")
 	}
 	if cfg.AICR == nil {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "aicr client must not be nil")
@@ -69,8 +86,16 @@ func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error
 	if cfg.WorkDir == "" {
 		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "work dir must not be empty")
 	}
+	// Required rather than defaulted to something permissive: a nil Cluster
+	// would leave every cluster-touching route ungated, which is a false PASS
+	// that no test would notice -- the routes answer, they just answer about
+	// no cluster in particular.
+	if cfg.Cluster == nil {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "cluster must not be nil")
+	}
 	return &Server{
-		auth: newAuthenticator(cfg), bus: b, engine: e, static: static, aicr: cfg.AICR, workDir: cfg.WorkDir,
+		launch: newLaunchToken(cfg.Token), bus: b, engine: e, static: static, aicr: cfg.AICR, workDir: cfg.WorkDir,
+		cluster: cfg.Cluster,
 	}, nil
 }
 
@@ -107,6 +132,78 @@ func (s *Server) requireNotDraining(h http.Handler) http.Handler {
 	})
 }
 
+// requireConnected gates every route that needs a cluster behind an
+// established connection. This is a state gate, not an auth gate -- the auth
+// middleware is separate and runs first. 409 rather than 503: the request is
+// well-formed and the server is healthy, it just does not yet know which
+// cluster the operator means.
+func (s *Server) requireConnected(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.cluster.Connected() {
+			writeErr(w, errNotConnected)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// handleContexts lists what the operator can connect to. It reads the
+// kubeconfig and contacts nothing.
+func (s *Server) handleContexts(w http.ResponseWriter, _ *http.Request) {
+	contexts, err := s.cluster.Contexts()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, contexts)
+}
+
+// handleConnect establishes this process's one cluster connection. A second
+// call conflicts: the connection is single-assignment, and switching clusters
+// means restarting the binary.
+func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Context string `json:"context"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		http.Error(w, "malformed request", http.StatusBadRequest)
+		return
+	}
+	if req.Context == "" {
+		writeErr(w, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "context must not be empty"))
+		return
+	}
+	// r.Context() threads through directly rather than being detached: unlike
+	// a run, a connect that outlives the request it came from has nobody to
+	// report to, and the connector's own connectTimeout already bounds it.
+	info, err := s.cluster.Connect(r.Context(), req.Context)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// handleCluster reports the connection this process already has.
+//
+// It exists for the reload. A tab restored after a connect carries a live
+// session cookie and no memory of which cluster this console is on, and the
+// connection is single-assignment -- so POST /api/connect would answer 409 and
+// leave the operator stuck on a Connect screen refusing to connect them to the
+// cluster they are already connected to. This is how the SPA learns to skip it.
+//
+// Ungated, and 409 when there is no connection: this is one of the routes that
+// has to answer before a cluster exists, because "is there one" is the
+// question it is for.
+func (s *Server) handleCluster(w http.ResponseWriter, _ *http.Request) {
+	info, ok := s.cluster.Info()
+	if !ok {
+		writeErr(w, errNotConnected)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
 // Handler returns the fully routed http.Handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -115,29 +212,43 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("POST /api/login", s.auth.login)
-	mux.HandleFunc("POST /api/logout", s.auth.logout)
+	// Outside requireToken, because it is the exchange that produces what
+	// requireToken checks for.
+	mux.HandleFunc("POST /api/session", s.launch.exchange)
+
+	// gated carries every route that needs a cluster; protected carries the
+	// three that do not and delegates the rest to it through the connect gate.
+	// Choosing a cluster and probing the session both have to work before a
+	// connection exists -- the first two are how one comes to exist, and the
+	// third answers a question about the session rather than the cluster.
+	gated := http.NewServeMux()
+	gated.HandleFunc("GET /api/events", s.handleEvents)
+	gated.HandleFunc("GET /api/options", s.handleOptions)
+	gated.HandleFunc("POST /api/runs", s.handleCreateRun)
+	gated.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
+	gated.HandleFunc("POST /api/runs/{id}/decide", s.handleDecide)
+	gated.HandleFunc("POST /api/runs/{id}/retry", s.handleRetry)
+	gated.HandleFunc("POST /api/runs/{id}/stop", s.handleStop)
+	gated.HandleFunc("POST /api/runs/{id}/reset", s.handleReset)
+	gated.HandleFunc("DELETE /api/runs/{id}", s.handleDiscardRun)
+	gated.HandleFunc("GET /api/runs/{id}/bundle", s.handleBundle)
 
 	protected := http.NewServeMux()
-	protected.HandleFunc("GET /api/events", s.handleEvents)
-	protected.HandleFunc("GET /api/options", s.handleOptions)
-	protected.HandleFunc("POST /api/runs", s.handleCreateRun)
-	protected.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
-	protected.HandleFunc("POST /api/runs/{id}/decide", s.handleDecide)
-	// GET /api/session exists so the SPA can tell an expired session from a
+	protected.HandleFunc("GET /api/contexts", s.handleContexts)
+	protected.HandleFunc("POST /api/connect", s.handleConnect)
+	protected.HandleFunc("GET /api/cluster", s.handleCluster)
+	// GET /api/session exists so the SPA can tell a dead console from a
 	// network blip: EventSource surfaces no HTTP status on error, so without
-	// this probe the console had no way to learn its 8-hour session expired
-	// and stuck on "reconnecting..." forever. The auth middleware wrapping
-	// protected already supplies the 401; a live session just needs a 204.
+	// this probe the console had no way to learn its session was no longer
+	// recognized and stuck on "reconnecting..." forever. The cookie does not
+	// expire any more, but the process that minted it can exit -- and the one
+	// that replaces it will not know the old session. requireToken supplies
+	// the 401; a live session just needs a 204.
 	protected.HandleFunc("GET /api/session", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	protected.HandleFunc("POST /api/runs/{id}/retry", s.handleRetry)
-	protected.HandleFunc("POST /api/runs/{id}/stop", s.handleStop)
-	protected.HandleFunc("POST /api/runs/{id}/reset", s.handleReset)
-	protected.HandleFunc("DELETE /api/runs/{id}", s.handleDiscardRun)
-	protected.HandleFunc("GET /api/runs/{id}/bundle", s.handleBundle)
-	mux.Handle("/api/", s.auth.require(protected))
+	protected.Handle("/api/", s.requireConnected(gated))
+	mux.Handle("/api/", s.requireToken(protected))
 
 	// Unrestricted method, not "GET /": http.ServeMux (Go 1.22+) treats "GET /"
 	// and "/api/" as conflicting patterns — neither is a strict subset of the

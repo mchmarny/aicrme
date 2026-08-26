@@ -109,9 +109,30 @@ type Run struct {
 	// (fix round 3's Ruling 20) now checks every exported Run field is
 	// either carried by envelope or named in its exclusion list, so that
 	// class of gap fails a test instead of shipping again.
-	CleanupUnconfirmed bool      `json:"cleanupUnconfirmed,omitempty"`
-	StartedAt          time.Time `json:"startedAt"`
-	UpdatedAt          time.Time `json:"updatedAt"`
+	CleanupUnconfirmed bool `json:"cleanupUnconfirmed,omitempty"`
+	// ClusterUID is the kube-system UID of the cluster this run describes.
+	//
+	// Stored in the record as well as in the directory name it lives under:
+	// the directory says which cluster the record was FILED under, the field
+	// says which cluster it DESCRIBES. They should never disagree, and a
+	// record that does is refused rather than reconciled -- see
+	// ErrClusterMismatch.
+	//
+	// Empty is not a mismatch. Every record the ConfigMap store ever wrote
+	// has no UID, and one written inside the cluster it described could not
+	// have been about anywhere else.
+	ClusterUID string `json:"clusterUid,omitempty"`
+	// Toolchain is the version of every executable this run shelled out to --
+	// bash, helm, kubectl, and jq when present -- resolved once at startup.
+	//
+	// It is on the record rather than only in the log because the evidence
+	// bundle is the artifact anyone asks "which helm installed this" of, and
+	// a version that lives only in a terminal scrollback cannot answer it. The
+	// image used to make this question unnecessary by construction; a binary
+	// on an operator's laptop makes it unanswerable unless it is recorded.
+	Toolchain map[string]string `json:"toolchain,omitempty"`
+	StartedAt time.Time         `json:"startedAt"`
+	UpdatedAt time.Time         `json:"updatedAt"`
 	// Truncated names artifacts the store dropped to fit its size limit (see
 	// encodeRun). It is read-mostly state about the RECORD, not the run: the
 	// engine never sets it, decodeRun populates it on load, and encodeRun
@@ -147,6 +168,37 @@ type Run struct {
 	//
 	// omitzero, not omitempty: see Workload's comment.
 	Residue Residue `json:"residue,omitzero"`
+	// AgentNamespace is the namespace AICR's snapshot agent ran in, and
+	// whether Discover created it.
+	//
+	// It needs its own field because Ownership.Namespaces cannot carry it:
+	// that set is built from recipe.json's components (steps.recipeNamespaces)
+	// and the agent namespace is not one of them -- it exists before a recipe
+	// does. Recorded at all because Reset's whole vocabulary is "did this run
+	// create this", and a namespace nothing recorded is one the operator is
+	// never told about.
+	//
+	// omitzero, not omitempty: see Workload's comment.
+	AgentNamespace AgentNamespace `json:"agentNamespace,omitzero"`
+}
+
+// AgentNamespace is the namespace AICR's snapshot agent ran in.
+//
+// Its zero value means Discover never ran, which is the state of every run
+// that failed earlier and of every record written before this field existed.
+type AgentNamespace struct {
+	Name string `json:"name,omitempty"`
+	// UID is the namespace object's UID as Discover found or created it.
+	// Recorded for the same reason every other identity in this package is:
+	// a name is a label anyone can recreate, and the operator reading the
+	// residue should be able to tell the object they were told about from a
+	// later one wearing its name.
+	UID string `json:"uid,omitempty"`
+	// Created records that Discover brought the namespace into existence.
+	// The one thing Reset needs to know: a namespace this run made is one
+	// the operator may now want gone, and one that predates the install is
+	// none of this console's business.
+	Created bool `json:"created,omitempty"`
 }
 
 // ResidueItem is what happened to one thing a Reset considered. Exactly one

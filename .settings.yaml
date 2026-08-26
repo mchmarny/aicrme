@@ -3,7 +3,7 @@ quality:
   coverage_threshold: 80
 
 linting:
-  golangci_lint: 'v2.12.2'
+  golangci_lint: 'v2.13.1'
   # Pinned 2026-08-19 after an unpinned shellcheck cost a red main: CI installed
   # it from apt while a developer had a newer build, so `make lint-shell` passed
   # locally and failed in CI on the same file. Every other tool here is pinned
@@ -20,4 +20,4 @@ test_tools:
 
 dependencies:
   # renovate: datasource=go depName=github.com/NVIDIA/aicr depType=dependencies
-  aicr: 'v0.19.0'
+  aicr: 'v0.20.0'

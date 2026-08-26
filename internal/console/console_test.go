@@ -1,17 +1,14 @@
-package main
+package console
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"log/slog"
 	"maps"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime/debug"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,47 +16,80 @@ import (
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/observer"
 	"github.com/mchmarny/aicrme/internal/steps"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/rest"
 )
 
 const aicrModulePath = "github.com/NVIDIA/aicr"
 
-// linkedAICRVersion returns the github.com/NVIDIA/aicr version this test
-// binary was actually compiled against, read from the module graph the
-// toolchain stamps into every binary it links. This is the same version
-// go.mod records and `make check-aicr-pin` compares against .settings.yaml,
-// but taken from the build itself rather than from a file that could have
-// drifted from what was compiled.
+// requiredAICRVersion returns the github.com/NVIDIA/aicr version this module
+// builds against, read from go.mod's require directive.
 //
-// Only Deps is used, never info.Main.Version: for a plain `go build` with no
-// VCS stamping the main module reads "(devel)", so deriving the console's own
-// release tag at runtime is not reliable. Dependency versions carry no such
-// caveat -- the module graph resolves them exactly.
-func linkedAICRVersion(t *testing.T) string {
+// In cmd/aicrme this read the module graph the linker stamps into the binary
+// (debug.ReadBuildInfo), which is better evidence -- it is what was actually
+// compiled rather than what a file claims. That mechanism does not survive the
+// move into a library package: `go test` stamps the dependency list only into
+// the test binary of a package main, and a library package's test binary
+// reports info.Deps empty, so the check failed outright rather than silently
+// passing. go.mod is the next-best source and the one `make check-aicr-pin`
+// already compares .settings.yaml against, which makes the image tag, go.mod
+// and .settings.yaml a single chain rather than three independent pins.
+//
+// A replace directive would decouple the require line from what is compiled,
+// so one is treated as a failure rather than followed.
+func requiredAICRVersion(t *testing.T) string {
 	t.Helper()
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		t.Fatal("debug.ReadBuildInfo() unavailable; cannot verify the snapshot agent image against the linked AICR module")
+
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatalf("reading go.mod: %v", err)
 	}
-	for _, dep := range info.Deps {
-		if dep.Path != aicrModulePath {
+
+	version := ""
+	for line := range strings.Lines(string(raw)) {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
 			continue
 		}
-		if dep.Replace != nil {
-			return dep.Replace.Version
+		if fields[0] == "require" || fields[0] == "replace" {
+			fields = fields[1:]
 		}
-		return dep.Version
+		if len(fields) < 2 || fields[0] != aicrModulePath {
+			continue
+		}
+		if slices.Contains(fields, "=>") {
+			t.Fatalf("go.mod replaces %s; the snapshot agent image cannot be verified against the require line", aicrModulePath)
+		}
+		version = fields[1]
 	}
-	t.Fatalf("%s is not among this binary's module dependencies; the snapshot agent image pin cannot be verified", aicrModulePath)
-	return ""
+	if version == "" {
+		t.Fatalf("%s is not required by go.mod; the snapshot agent image pin cannot be verified", aicrModulePath)
+	}
+	return version
+}
+
+// moduleRoot walks up from the package directory -- `go test` runs a test in
+// it -- to the directory holding go.mod.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("resolving the working directory: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("no go.mod above %s", dir)
+		}
+		dir = parent
+	}
 }
 
 func splitImage(t *testing.T, image string) (repo, tag string) {
@@ -71,20 +101,20 @@ func splitImage(t *testing.T, image string) (repo, tag string) {
 	return repo, tag
 }
 
-// TestDefaultSnapshotAgentImageTracksLinkedAICRVersion is the guard that makes
+// TestDefaultSnapshotAgentImageTracksRequiredAICRVersion is the guard that makes
 // the image default load-bearing. Discover forwards it verbatim to the agent
 // Job's container spec -- aicr.Client.CollectSnapshot, unlike the `aicr` CLI,
 // applies no default of its own -- so deleting the constant or letting its tag
 // drift from the compiled-in AICR client breaks Discover on every cluster.
 // Before this test, both failure modes left the suite green.
-func TestDefaultSnapshotAgentImageTracksLinkedAICRVersion(t *testing.T) {
+func TestDefaultSnapshotAgentImageTracksRequiredAICRVersion(t *testing.T) {
 	repo, tag := splitImage(t, defaultSnapshotAgentImage)
 
 	if want := "ghcr.io/nvidia/aicr"; repo != want {
 		t.Errorf("defaultSnapshotAgentImage repo = %q, want %q (the CLI's own defaultAgentImage mapping)", repo, want)
 	}
-	if want := linkedAICRVersion(t); tag != want {
-		t.Errorf("defaultSnapshotAgentImage tag = %q, want %q (the linked %s version; see .settings.yaml dependencies.aicr and `make check-aicr-pin`)",
+	if want := requiredAICRVersion(t); tag != want {
+		t.Errorf("defaultSnapshotAgentImage tag = %q, want %q (go.mod's required %s version; see .settings.yaml dependencies.aicr and `make check-aicr-pin`)",
 			tag, want, aicrModulePath)
 	}
 }
@@ -268,14 +298,30 @@ func TestProveGangTimeout(t *testing.T) {
 	}
 }
 
-func TestEnsureWorkDirsCreatesEveryCacheDir(t *testing.T) {
+func TestEnsureWorkDirsCreatesEverySubdirectory(t *testing.T) {
 	root := t.TempDir()
 	if err := ensureWorkDirs(root); err != nil {
 		t.Fatalf("ensureWorkDirs() error = %v", err)
 	}
-	for _, sub := range []string{"tmp", "home", "helm/cache", "helm/config", "helm/data", "kube/cache", "runs"} {
+	for _, sub := range workSubdirs {
 		if _, err := os.Stat(filepath.Join(root, sub)); err != nil {
 			t.Errorf("missing %s: %v", sub, err)
+		}
+	}
+}
+
+// The helm and kube cache redirections were deleted with the image, not
+// forgotten: locally, pointing HELM_* at a scratch directory would hide the
+// operator's real chart repository credentials and registry auth from an
+// install that needs them.
+func TestEnsureWorkDirsDoesNotRedirectTheOperatorsToolCaches(t *testing.T) {
+	root := t.TempDir()
+	if err := ensureWorkDirs(root); err != nil {
+		t.Fatalf("ensureWorkDirs() error = %v", err)
+	}
+	for _, sub := range []string{"home", "helm", "kube"} {
+		if _, err := os.Stat(filepath.Join(root, sub)); err == nil {
+			t.Errorf("%s was created -- the console must use the operator's own tool configuration", sub)
 		}
 	}
 }
@@ -632,250 +678,5 @@ func TestParseResourceRequests(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestOwnerReferenceResolvesToTheDeployment guards the property the whole
-// task exists for: the run ConfigMap's ownerReference must name the
-// Deployment, never its ReplicaSet. A ReplicaSet is replaced on every
-// rollout, and ownerReference garbage collection would then delete the run
-// state as a side effect of upgrading the console. The fake clientset also
-// carries a ReplicaSet with the *same name* -- the shape a same-name lookup
-// across kinds could confuse this with -- so the test fails if the helper
-// ever resolves anything but the typed Deployment object.
-func TestOwnerReferenceResolvesToTheDeployment(t *testing.T) {
-	const (
-		ns   = "aicrme"
-		name = "aicrme"
-	)
-	client := fake.NewSimpleClientset(
-		&appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("deployment-uid")},
-		},
-		&appsv1.ReplicaSet{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("replicaset-uid")},
-		},
-	)
-
-	owner, err := resolveDeploymentOwner(context.Background(), client, ns, name)
-	if err != nil {
-		t.Fatalf("resolveDeploymentOwner() error = %v", err)
-	}
-	if owner.Kind != "Deployment" {
-		t.Errorf("Kind = %q, want Deployment -- a ReplicaSet owner is garbage-collected on every rollout and would delete run state with it", owner.Kind)
-	}
-	if owner.APIVersion != "apps/v1" {
-		t.Errorf("APIVersion = %q, want apps/v1", owner.APIVersion)
-	}
-	if owner.Name != name {
-		t.Errorf("Name = %q, want %q", owner.Name, name)
-	}
-	if owner.UID != types.UID("deployment-uid") {
-		t.Errorf("UID = %q, want the Deployment's UID (deployment-uid), not the same-named ReplicaSet's (replicaset-uid)", owner.UID)
-	}
-}
-
-// TestOwnerReferenceResolutionFailsWhenTheDeploymentIsMissing guards the
-// failure path newRunStore depends on to decide whether to degrade: a
-// missing or unreachable Deployment must return an error, not a zero-value
-// reference that would silently own the run ConfigMap by nothing at all.
-func TestOwnerReferenceResolutionFailsWhenTheDeploymentIsMissing(t *testing.T) {
-	client := fake.NewSimpleClientset()
-
-	if _, err := resolveDeploymentOwner(context.Background(), client, "aicrme", "aicrme"); err == nil {
-		t.Error("resolveDeploymentOwner() error = nil, want an error for a Deployment that does not exist")
-	}
-}
-
-// TestNoClientKeepsTheMemoryStore is Ruling 4 made concrete: with a nil
-// kubernetes.Interface, newRunStore must return a store that works with no
-// cluster at all, and must say so. A ConfigMapStore wired with a nil
-// kubernetes.Interface would panic the instant it touched kube.CoreV1(), so
-// a successful Save/LoadCurrent round trip here is proof of degradation, not
-// just a claim in a log line.
-func TestNoClientKeepsTheMemoryStore(t *testing.T) {
-	logs := captureWarnings(t)
-
-	store := newRunStore(context.Background(), nil, "aicrme", "aicrme")
-
-	run := &engine.Run{
-		ID:        "0123456789abcdef",
-		State:     engine.StateIdle,
-		StartedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatalf("Save() error = %v, want the in-memory store to accept a save with no cluster client", err)
-	}
-	got, err := store.LoadCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("LoadCurrent() error = %v", err)
-	}
-	if got.ID != run.ID {
-		t.Errorf("LoadCurrent().ID = %q, want %q", got.ID, run.ID)
-	}
-
-	if got := logs.String(); !strings.Contains(got, "no cluster client") {
-		t.Errorf("logged %q, want a warning naming the degradation (\"no cluster client\")", got)
-	}
-}
-
-// TestNewRunStoreDegradesWhenOwnerResolutionFails covers the other half of
-// newRunStore's fallback: a live cluster client but a Deployment lookup that
-// fails (RBAC, a control-plane blip, an unusual install order) must degrade
-// exactly like the no-client case, not fail startup.
-//
-// The discriminator is deliberately not "Save succeeded" or a log substring
-// match: the fake clientset accepts a Save against a ConfigMap carrying a
-// zero-value OwnerReference with no validation at all, so a build that
-// forgets the early return and falls through to a real ConfigMapStore
-// anyway would still make Save succeed and would still log a line
-// containing "aicrme" (present in nearly every message this package logs).
-// That is exactly the case the spec calls out as worse than no persistence
-// -- Kubernetes GC reaps a dependent whose owner UID does not resolve, so a
-// malformed ownerReference gets the run ConfigMap deleted on the first
-// sweep. Asserting against the fake clientset directly, that no ConfigMap
-// named "aicrme-run" was ever created, is the one check a fallthrough to
-// the real store cannot pass.
-func TestNewRunStoreDegradesWhenOwnerResolutionFails(t *testing.T) {
-	const ns = "aicrme"
-	logs := captureWarnings(t)
-	client := fake.NewSimpleClientset() // no Deployment object present
-
-	store := newRunStore(context.Background(), client, ns, "aicrme")
-
-	run := &engine.Run{
-		ID:        "fedcba9876543210",
-		State:     engine.StateIdle,
-		StartedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatalf("Save() error = %v, want the fallback store to accept a save", err)
-	}
-
-	if cm, getErr := client.CoreV1().ConfigMaps(ns).Get(context.Background(), "aicrme"+runStoreSuffix, metav1.GetOptions{}); getErr == nil {
-		t.Fatalf("run ConfigMap %s/%s was created against the fake clientset = %+v, want the in-memory fallback used instead and no ConfigMap ever written",
-			ns, "aicrme"+runStoreSuffix, cm)
-	} else if !apierrors.IsNotFound(getErr) {
-		t.Fatalf("unexpected error checking for the run ConfigMap: %v", getErr)
-	}
-
-	if got := logs.String(); !strings.Contains(got, "aicrme") {
-		t.Errorf("logged %q, want a warning naming the Deployment lookup failure", got)
-	}
-}
-
-// TestNewRunStoreBuildsAConfigMapStoreWithTheDeploymentOwner is the success
-// path's own test: main.go:247's `return engine.NewConfigMapStore(...)` had
-// zero coverage before this -- nothing exercised "valid client + resolvable
-// Deployment -> real ConfigMap-backed store, built with the right name and
-// the right owner." Asserting on the owner fields specifically, not just
-// the ConfigMap's name, matters: a store that writes to the right name with
-// the wrong owner is the data-loss case (a malformed ownerReference gets
-// the object reaped by Kubernetes GC), and a name-only assertion would miss
-// exactly that.
-func TestNewRunStoreBuildsAConfigMapStoreWithTheDeploymentOwner(t *testing.T) {
-	const (
-		ns   = "aicrme"
-		name = "aicrme"
-	)
-	client := fake.NewSimpleClientset(&appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID("deployment-uid")},
-	})
-
-	store := newRunStore(context.Background(), client, ns, name)
-
-	run := &engine.Run{
-		ID:        "0123456789abcdef",
-		State:     engine.StateIdle,
-		StartedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatalf("Save() error = %v", err)
-	}
-
-	wantName := name + runStoreSuffix
-	cm, err := client.CoreV1().ConfigMaps(ns).Get(context.Background(), wantName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Get(%s/%s) error = %v, want the run ConfigMap to have been created", ns, wantName, err)
-	}
-	if len(cm.OwnerReferences) != 1 {
-		t.Fatalf("OwnerReferences = %v, want exactly one", cm.OwnerReferences)
-	}
-	owner := cm.OwnerReferences[0]
-	if owner.Kind != "Deployment" {
-		t.Errorf("owner.Kind = %q, want Deployment", owner.Kind)
-	}
-	if owner.APIVersion != "apps/v1" {
-		t.Errorf("owner.APIVersion = %q, want apps/v1", owner.APIVersion)
-	}
-	if owner.Name != name {
-		t.Errorf("owner.Name = %q, want %q", owner.Name, name)
-	}
-	if owner.UID != types.UID("deployment-uid") {
-		t.Errorf("owner.UID = %q, want the Deployment's UID (deployment-uid) -- a store writing to the right name with the wrong owner is the data-loss case", owner.UID)
-	}
-}
-
-// blockingHandler returns an http.Handler that blocks every request until
-// release is closed, and a cleanup func that unblocks it and only then
-// closes srv. httptest.Server.Close blocks until every outstanding request
-// has completed, so calling it while a handler is still parked on <-release
-// deadlocks the test -- the cleanup func here is the one place that
-// ordering is allowed to matter, so it is centralized rather than left to
-// defer stacking at each call site.
-func blockingHandler() (handler http.Handler, release chan struct{}) {
-	release = make(chan struct{})
-	handler = http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		select {
-		case <-release:
-		case <-r.Context().Done():
-		}
-	})
-	return handler, release
-}
-
-// TestNewRunStoreBoundsTheDeploymentLookupAgainstARealTransport is the
-// bound's own regression test. cmstore.go's withCallTimeout wraps its
-// callee in a goroutine+select specifically because client-go's fake
-// clientset ignores ctx entirely (verified against
-// k8s.io/client-go/gentype.FakeClient.Get -- see withCallTimeout's own
-// doc). resolveDeploymentOwner takes the opposite approach and relies on
-// the real transport honoring ctx directly, which is correct against a real
-// apiserver but is not proven by any fake-clientset test: a future refactor
-// that reintroduced an unbounded call here would leave every other test in
-// this file green. This points a real *kubernetes.Clientset at an
-// httptest.Server whose handler never answers -- the exact wedged-apiserver
-// shape 2b-i's unbounded WaitForCacheSync crashlooped the whole console
-// over -- and asserts newRunStore still returns within
-// deploymentLookupTimeout's bound rather than hanging.
-func TestNewRunStoreBoundsTheDeploymentLookupAgainstARealTransport(t *testing.T) {
-	handler, release := blockingHandler()
-	srv := httptest.NewServer(handler)
-	t.Cleanup(func() {
-		close(release)
-		srv.Close()
-	})
-
-	client, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
-	if err != nil {
-		t.Fatalf("kubernetes.NewForConfig() error = %v", err)
-	}
-
-	start := time.Now()
-	store := newRunStore(context.Background(), client, "aicrme", "aicrme")
-	elapsed := time.Since(start)
-
-	// Generous slack over deploymentLookupTimeout: the property under test
-	// is "bounded", not "bounded to the millisecond" -- CI schedulers add
-	// jitter a tight bound would flake on.
-	const slack = 5 * time.Second
-	if elapsed > deploymentLookupTimeout+slack {
-		t.Fatalf("newRunStore took %v against a server that never answers, want it bounded near deploymentLookupTimeout (%v)", elapsed, deploymentLookupTimeout)
-	}
-	if store == nil {
-		t.Fatal("newRunStore() = nil, want the in-memory fallback")
 	}
 }

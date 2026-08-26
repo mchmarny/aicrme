@@ -40,18 +40,13 @@ cd "${REPO_ROOT}"
 
 CLUSTER="${CLUSTER:-aicrme-e2e-prove}"
 NS="${NS:-aicrme}"
-IMAGE="${IMAGE:-aicrme:e2e-prove}"
-PORT="${PORT:-18080}"
-ADDR="127.0.0.1:${PORT}"
 AGENT_NODE_LABEL="aicrme.e2e/agent=true"
 PROVE_NS="aicrme-prove"
 # Short enough that the gang-timeout assertion does not wait out the
 # production default, long enough that a slow runner's Job creation is not
-# mistaken for a placement failure. Read by cmd/aicrme's envDuration.
+# mistaken for a placement failure. Read by internal/console's proveGangTimeout.
 GANG_TIMEOUT="${GANG_TIMEOUT:-45s}"
 
-JAR="$(mktemp -t aicrme-prove-jar.XXXXXX)"
-PF_PID=""
 # Assigned by the EXIT trap below; declared here for the same reason every
 # other script in this directory declares it -- the trap's own assignment is
 # invisible to shellcheck (SC2154).
@@ -73,8 +68,7 @@ cleanup() {
     kubectl -n kai-scheduler get pods -o wide >&2 2>&1 || true
     kubectl -n kai-scheduler logs -l app=kai-scheduler-default --tail=50 >&2 2>&1 || true
   fi
-  [[ -n "${PF_PID}" ]] && kill "${PF_PID}" 2>/dev/null
-  rm -f "${JAR}"
+  e2e_console_cleanup
   kubectl delete validatingwebhookconfiguration aicrme-e2e-block-job-delete >/dev/null 2>&1 || true
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 }
@@ -83,7 +77,7 @@ trap 'ec=$?; cleanup "$ec"; exit "$ec"' EXIT
 # run_json fetches a run, or empty on a transport failure -- callers decide
 # whether a missed poll matters.
 run_json() {
-  curl -fsS --max-time 10 -b "${JAR}" "http://${ADDR}/api/runs/$1" 2>/dev/null || true
+  e2e_api GET "/api/runs/$1" --max-time 10 2>/dev/null || true
 }
 
 run_state() {
@@ -108,12 +102,11 @@ await_state() {
 # post is a mutating call that must succeed; post_status is one whose status
 # code is the thing under test.
 post() {
-  curl -fsS -b "${JAR}" -X POST "http://${ADDR}$1" -H 'Content-Type: application/json' "${@:2}"
+  e2e_api POST "$1" -H 'Content-Type: application/json' "${@:2}"
 }
 
 post_status() {
-  curl -s -o /dev/null -w '%{http_code}' -b "${JAR}" -X POST "http://${ADDR}$1" \
-    -H 'Content-Type: application/json' "${@:2}"
+  e2e_api_status POST "$1" -H 'Content-Type: application/json' "${@:2}"
 }
 
 # drive_to_prove runs the whole arc up to the Prove step and echoes the run
@@ -159,26 +152,14 @@ e2e_install_kwok
 echo "--- apply simulated H100 nodes (2 system + 4x p5.48xlarge)"
 e2e_apply_kwok_nodes
 
-echo "--- build and load PRODUCTION console image"
-e2e_build_and_load_image "${CLUSTER}" "${IMAGE}"
-echo "--- install chart"
-e2e_install_chart "${NS}" "${IMAGE}"
-
-echo "--- pin the snapshot agent to a real worker, dry-run OFF, short gang budget"
+echo "--- start the console: agent pinned to a real worker, dry-run OFF, short gang budget"
 kubectl label node "${CLUSTER}-worker" "${AGENT_NODE_LABEL}" --overwrite
-kubectl -n "${NS}" set env deploy/aicrme \
-  "AICRME_SNAPSHOT_NODE_SELECTOR=${AGENT_NODE_LABEL}" \
-  'AICRME_SNAPSHOT_REQUESTS=cpu=200m' \
-  'AICRME_APPLY_DRY_RUN=false' \
-  "AICRME_PROVE_GANG_TIMEOUT=${GANG_TIMEOUT}"
-kubectl -n "${NS}" rollout status deploy/aicrme --timeout=180s
-
-kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &
-PF_PID=$!
-sleep 3
-
-echo "--- login"
-e2e_login "${ADDR}" "${JAR}" "${NS}"
+export AICRME_SNAPSHOT_NODE_SELECTOR="${AGENT_NODE_LABEL}"
+export AICRME_SNAPSHOT_REQUESTS='cpu=200m'
+export AICRME_APPLY_DRY_RUN='false'
+export AICRME_PROVE_GANG_TIMEOUT="${GANG_TIMEOUT}"
+e2e_start_console
+e2e_connect
 
 echo "--- drive the arc: discover, recommend, bundle, apply (real), prove"
 RUN_ID="$(drive_to_prove)"
@@ -252,20 +233,24 @@ WORKER_MATCHES="$(echo "${GANG}" | jq --arg p "^${CLUSTER}-worker" '[.items[] | 
 echo "assertion 2: PASS"
 
 echo "--- assert 3: the console restarts over a live workload and can still stop it"
-# The record is recovered from its ConfigMap and reconciled against what is
+# The record is recovered from its file store -- which lives under a directory
+# named for this cluster's kube-system UID -- and reconciled against what is
 # actually in the cluster (internal/engine/reconcile.go). Both halves matter:
 # a run that came back as anything but active would have lost track of a
 # workload that is still there, and one that came back active over a workload
 # that had been deleted would be claiming something it cannot stop.
-kubectl -n "${NS}" delete pod -l app.kubernetes.io/name=aicrme --wait=true
-kubectl -n "${NS}" rollout status deploy/aicrme --timeout=180s
-kill "${PF_PID}" 2>/dev/null || true
-kubectl -n "${NS}" port-forward "svc/aicrme" "${PORT}:8080" >/dev/null 2>&1 &
-PF_PID=$!
-sleep 3
-# The session lived in the old pod's memory, so this is a new login, not a
-# reused cookie.
-e2e_login "${ADDR}" "${JAR}" "${NS}"
+#
+# A process restart, not a pod delete. That distinction is the point of the
+# whole restructure: there is no pod to reschedule, so recovery has nothing to
+# trigger it except the next connect. e2e_start_console reuses the same work
+# directory precisely so this second launch finds the first one's record.
+e2e_stop_console
+e2e_start_console
+# The session and the cluster connection both died with the old process: the
+# cookie was minted by it, and the connection is single-assignment per
+# process. e2e_start_console exchanges a new token; e2e_connect is what runs
+# recovery.
+e2e_connect
 RECOVERED_STATE="$(run_state "${RUN_ID}")"
 echo "after restart: state=${RECOVERED_STATE}"
 [[ "${RECOVERED_STATE}" == "active" ]] || fail "run came back as ${RECOVERED_STATE} after a restart, not active"

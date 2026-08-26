@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/api"
@@ -41,13 +40,14 @@ func newBundleTestServer(t *testing.T, workDir string, step engine.Step) (*httpt
 	t.Helper()
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: workDir,
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: workDir,
 	}, b, engine.New(b, engine.NewMemoryStore(), step), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {

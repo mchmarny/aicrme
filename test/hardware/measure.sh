@@ -20,36 +20,43 @@
 # probe that silently matches zero rows reads exactly like a clean result.
 #
 # USAGE
-#   test/hardware/measure.sh <run-id> [addr]
-# where <run-id> is a run that has COMPLETED an Apply on this cluster, and
-# addr defaults to 127.0.0.1:8080 (port-forward the console first).
+#   test/hardware/measure.sh <run-id> <tokenized-url>
+# where <run-id> is a run that has COMPLETED an Apply on this cluster and
+# <tokenized-url> is the URL the console printed on startup, verbatim --
+# http://127.0.0.1:PORT/?t=TOKEN. The token is exchanged once for a session
+# cookie, exactly as the browser does. Run this against the SAME console
+# process that produced the run: the cookie dies with it.
 set -euo pipefail
 
 RUN_ID="${1:-}"
-ADDR="${2:-127.0.0.1:8080}"
-NS="${NS:-aicrme}"
+LAUNCH_URL="${2:-}"
 
-if [[ -z "${RUN_ID}" ]]; then
-  echo "usage: $0 <run-id> [addr]" >&2
-  echo "  <run-id> must be a run that already completed Apply on this cluster" >&2
+if [[ -z "${RUN_ID}" || -z "${LAUNCH_URL}" ]]; then
+  echo "usage: $0 <run-id> <tokenized-url>" >&2
+  echo "  <run-id>         must be a run that already completed Apply on this cluster" >&2
+  echo "  <tokenized-url>  the http://127.0.0.1:PORT/?t=... line the console printed" >&2
   exit 2
 fi
-
-JAR="$(mktemp -t aicrme-measure-jar.XXXXXX)"
-trap 'rm -f "${JAR}"' EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../e2e/lib.sh
 source "${SCRIPT_DIR}/../e2e/lib.sh"
-e2e_login "${ADDR}" "${JAR}" "${NS}"
 
-run_json() { curl -fsS --max-time 15 -b "${JAR}" "http://${ADDR}/api/runs/$1" 2>/dev/null || true; }
+CONSOLE_URL="${LAUNCH_URL%%/\?t=*}"
+CONSOLE_JAR="$(mktemp -t aicrme-measure-jar.XXXXXX)"
+export CONSOLE_URL CONSOLE_JAR
+trap 'rm -f "${CONSOLE_JAR}"' EXIT
+curl -fsS -c "${CONSOLE_JAR}" -X POST "${CONSOLE_URL}/api/session" \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\":\"${LAUNCH_URL##*t=}\"}" >/dev/null
+
+run_json() { e2e_api GET "/api/runs/$1" --max-time 15 2>/dev/null || true; }
 
 hdr() { echo; echo "════════ $* ════════"; }
 missing() { echo "  ⚠ NOTHING MATCHED — treat as a broken probe until confirmed: $*"; }
 
 RECORD="$(run_json "${RUN_ID}")"
-[[ -n "${RECORD}" ]] || { echo "no run record for ${RUN_ID} at ${ADDR}" >&2; exit 1; }
+[[ -n "${RECORD}" ]] || { echo "no run record for ${RUN_ID} at ${CONSOLE_URL}" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 hdr "Q1  MIG resource names (docs/phase-2-handoff.md:272)"
@@ -73,16 +80,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-hdr "Q2  the 800 KiB envelope guard (docs/phase-2-handoff.md:282)"
-# maxPayload in internal/engine/envelope.go is sized against 66-73 KB, the only
-# figure this project had: KWOK snapshot fixtures. A real cluster's snapshot
-# carries more nodes and real device and driver detail. The guard fails closed
-# either way; what is unknown is whether 800 KiB is generous or tight.
-SNAP="$(curl -fsS --max-time 30 -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}/artifacts/snapshot.yaml" 2>/dev/null || true)"
+hdr "Q2  how large a real snapshot gets (docs/phase-2-handoff.md:282)"
+# The 800 KiB figure this question was written against was a ConfigMap limit
+# and is gone: a file store has no such cap, and filePayloadCeiling is 64 MiB
+# precisely so shedding is unreachable. The measurement is still worth taking
+# -- a real cluster's snapshot carries more nodes and real device and driver
+# detail than the 66-73 KB KWOK fixtures this project sized against -- but the
+# question it answers is now "how big does this actually get", not "does it
+# fit".
+SNAP="$(e2e_api GET "/api/runs/${RUN_ID}/artifacts/snapshot.yaml" --max-time 30 2>/dev/null || true)"
 if [[ -z "${SNAP}" ]]; then
-  # The artifact endpoint may not exist; fall back to the persisted record.
-  SNAP="$(kubectl -n "${NS}" get cm aicrme-runs -o jsonpath='{.data}' 2>/dev/null || true)"
-  echo "  (read from the ConfigMap store rather than an artifact endpoint)"
+  # The artifact endpoint may not exist; fall back to the persisted record,
+  # which is a file under <work-dir>/runs/<cluster-uid>/ rather than a
+  # ConfigMap. It is gzipped and envelope-encoded, so this reads its SIZE
+  # rather than its content -- which is all Q2 is asking about.
+  RECORD_FILE="$(find "${AICRME_WORK_DIR:-${HOME}/.aicrme}/runs" -name "${RUN_ID}.run" 2>/dev/null | head -1)"
+  if [[ -n "${RECORD_FILE}" ]]; then
+    echo "  (the artifact endpoint returned nothing; sizing the persisted record ${RECORD_FILE} instead)"
+    echo "  persisted record:    $(wc -c <"${RECORD_FILE}" | tr -d ' ') bytes, already gzipped"
+    echo "  filePayloadCeiling:  67108864 bytes (internal/engine/filestore.go)"
+  fi
 fi
 if [[ -z "${SNAP}" ]]; then
   missing "could not read snapshot.yaml by either route"
@@ -91,10 +108,10 @@ else
   GZ=$(printf '%s' "${SNAP}" | gzip -9 | wc -c | tr -d ' ')
   echo "  snapshot raw:        ${RAW} bytes"
   echo "  snapshot gzipped:    ${GZ} bytes"
-  echo "  maxPayload guard:    819200 bytes"
-  echo "  headroom:            $(( 819200 - GZ )) bytes"
-  [[ "${GZ}" -gt 819200 ]] && echo "  ⇒ OVER THE GUARD. Runs on this cluster will checkpoint truncated."
-  [[ "${GZ}" -gt 409600 ]] && echo "  ⇒ over half the budget. 800 KiB is tight, not generous."
+  echo "  filePayloadCeiling:  67108864 bytes"
+  echo "  headroom:            $(( 67108864 - GZ )) bytes"
+  [[ "${GZ}" -gt 67108864 ]] && echo "  ⇒ OVER THE CEILING. Runs on this cluster will checkpoint truncated."
+  [[ "${GZ}" -gt 819200 ]] && echo "  ⇒ over the OLD 800 KiB ConfigMap limit -- worth recording, since the in-cluster console could not have stored this run at all."
 fi
 
 # ---------------------------------------------------------------------------
@@ -122,7 +139,7 @@ echo "${RECORD}" | jq -r '
   "  updated:    \(.updatedAt)",
   "  components: \(.components | length)"' 2>/dev/null || missing "run record has no timing fields"
 echo "  per-component wall time is in the event stream; capture it with:"
-echo "    curl -b <jar> http://${ADDR}/api/runs/${RUN_ID}/events > events.jsonl"
+echo "    curl -b <jar> ${CONSOLE_URL}/api/runs/${RUN_ID}/events > events.jsonl"
 
 # ---------------------------------------------------------------------------
 hdr "Q5  event volume on a real driver rollout (docs/phase-2-handoff.md:230)"
@@ -130,12 +147,12 @@ hdr "Q5  event volume on a real driver rollout (docs/phase-2-handoff.md:230)"
 # siblings: ten identical informer deliveries publish one bus event. What is
 # unmeasured is the real-world number on an 8-node driver rollout, where pods
 # genuinely churn rather than repeating one state.
-EVENTS="$(curl -fsS --max-time 30 -b "${JAR}" "http://${ADDR}/api/runs/${RUN_ID}/events" 2>/dev/null | wc -l | tr -d ' ' || true)"
+EVENTS="$(e2e_api GET "/api/runs/${RUN_ID}/events" --max-time 30 2>/dev/null | wc -l | tr -d ' ' || true)"
 if [[ -z "${EVENTS}" || "${EVENTS}" == "0" ]]; then
   missing "the events endpoint returned nothing — check the path before concluding the bus is quiet"
 else
   echo "  events published for this run: ${EVENTS}"
-  echo "  replayCapacity (cmd/aicrme/main.go): 20000"
+  echo "  replayCapacity (internal/console/console.go): 20000"
   [[ "${EVENTS}" -gt 20000 ]] && echo "  ⇒ OVER the ring. A late-joining tab cannot replay the whole run."
 fi
 

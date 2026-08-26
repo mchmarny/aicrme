@@ -2,7 +2,7 @@ version: "2"
 
 # Run configuration
 run:
-  go: "1.26"
+  go: "1.27"
   # 10m, not 5m: the Phase 2b-i observer pulled client-go's informer and
   # typed-lister machinery into the type-check graph, and the first CI run
   # after that merge reported "0 issues" and then failed on the 5m timeout

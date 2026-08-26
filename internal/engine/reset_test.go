@@ -245,6 +245,55 @@ func TestResetReportsEveryNamespaceAndDeletesNone(t *testing.T) {
 	}
 }
 
+// The namespace AICR's snapshot agent ran in is residue too, and it is the one
+// namespace the ownership snapshot cannot describe: recipeNamespaces builds
+// that set from recipe.json's components and the agent namespace is not one of
+// them. A run that reached Discover and stopped there installed nothing, so
+// this is the ONLY thing it left behind -- and before this it was reported
+// nowhere.
+func TestNamespaceResidueReportsTheAgentNamespaceThisRunCreated(t *testing.T) {
+	items := namespaceResidue(Ownership{}, AgentNamespace{
+		Name: "aicrme", UID: "u-1", Created: true,
+	})
+
+	if len(items) != 1 {
+		t.Fatalf("reported %d namespaces, want the agent namespace: %+v", len(items), items)
+	}
+	if items[0].Name != "aicrme" || items[0].Kind != KindNamespace {
+		t.Errorf("item = %+v, want the aicrme namespace", items[0])
+	}
+	if !items[0].Created {
+		t.Error("Created is false -- the console shows the cleanup command only for namespaces it made")
+	}
+	if items[0].Removed {
+		t.Error("the agent namespace was removed; namespaces are reported, never reclaimed")
+	}
+}
+
+// A namespace that predates the install is not residue. It is somebody else's
+// namespace that a Job briefly ran in, and reporting it would send an operator
+// to delete something this console never created.
+func TestNamespaceResidueOmitsAnAgentNamespaceThisRunDidNotCreate(t *testing.T) {
+	items := namespaceResidue(Ownership{}, AgentNamespace{Name: "kube-system", UID: "u-1"})
+
+	if len(items) != 0 {
+		t.Errorf("reported %+v for a namespace this run did not create", items)
+	}
+}
+
+// Nothing stops an operator pointing AICRME_NAMESPACE at a namespace the
+// recipe also installs into. Two rows for one namespace would double it in the
+// counts resetSummary reports, which is the number an operator reads to tell a
+// clean teardown from a partial one.
+func TestNamespaceResidueDoesNotReportOneNamespaceTwice(t *testing.T) {
+	own := Ownership{Namespaces: []NamespaceRef{{Name: "aicrme"}}}
+	items := namespaceResidue(own, AgentNamespace{Name: "aicrme", UID: "u-1", Created: true})
+
+	if len(items) != 1 {
+		t.Fatalf("reported %d rows for one namespace: %+v", len(items), items)
+	}
+}
+
 // The clean path end to end: the workload is stopped, the releases are
 // uninstalled, the run ends at StateDone, and the persisted record is gone
 // so the console is free and a restart recovers nothing.
@@ -506,5 +555,48 @@ func TestResetDoesNotCancelTheCommandContext(t *testing.T) {
 	}
 	if td.cmdCtxErr != nil {
 		t.Errorf("the command context was canceled too (%v) -- helm would be SIGTERMed mid-uninstall", td.cmdCtxErr)
+	}
+}
+
+// The guard that matters most. Reset acts on release names, and a release
+// name only means something in the cluster it was installed into --
+// uninstalling "gpu-operator" against the wrong one removes a stranger's
+// working install and reports success.
+func TestResetRefusesARecordFromADifferentCluster(t *testing.T) {
+	const (
+		recordUID    = "11111111-2222-3333-4444-555555555555"
+		connectedUID = "99999999-8888-7777-6666-555555555555"
+	)
+	td := &fakeTeardown{}
+	e := newResetEngine(t, td)
+	run := resettableRun(t, e, StateDone)
+	e.mu.Lock()
+	e.current.ClusterUID = recordUID
+	e.mu.Unlock()
+	e.SetClusterUID(connectedUID)
+
+	err := e.Reset(context.Background(), run.ID)
+	if !errors.Is(err, ErrClusterMismatch) {
+		t.Fatalf("Reset() error = %v, want ErrClusterMismatch", err)
+	}
+	if !strings.Contains(err.Error(), recordUID) || !strings.Contains(err.Error(), connectedUID) {
+		t.Errorf("the error names neither UID: %v", err)
+	}
+	if td.releasesRan {
+		t.Error("the teardown ran against the wrong cluster")
+	}
+}
+
+func TestResetProceedsForTheConnectedCluster(t *testing.T) {
+	const uid = "11111111-2222-3333-4444-555555555555"
+	e := newResetEngine(t, &fakeTeardown{})
+	run := resettableRun(t, e, StateDone)
+	e.mu.Lock()
+	e.current.ClusterUID = uid
+	e.mu.Unlock()
+	e.SetClusterUID(uid)
+
+	if got := resetAndWait(t, e, run.ID); got != nil && got.State == StateFailed {
+		t.Errorf("Reset() left the run failed for its own cluster: %s", got.Err)
 	}
 }

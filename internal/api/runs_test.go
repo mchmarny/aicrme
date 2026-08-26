@@ -22,13 +22,14 @@ import (
 func TestCreateAndGetRun(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
@@ -60,10 +61,11 @@ func TestCreateAndGetRun(t *testing.T) {
 func TestGetUnknownRunIs404(t *testing.T) {
 	b := bus.New(8)
 	srv, _ := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore()), testfs.Static())
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Get(ts.URL + "/api/runs/does-not-exist")
 	if err != nil {
@@ -89,13 +91,14 @@ func (failingStep) Run(_ context.Context, _ *engine.Run, _ engine.Emit) error {
 func TestRetryReturnsTheRun(t *testing.T) {
 	b := bus.New(64)
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, engine.New(b, engine.NewMemoryStore(), failingStep{}), testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
@@ -154,7 +157,7 @@ func TestRetryOnRunningRunConflicts(t *testing.T) {
 }
 
 func TestRetryOnUnknownRunNotFound(t *testing.T) {
-	ts, client := loggedInClient(t, newTestServer(t))
+	ts, client := authedClient(t, newTestServer(t))
 
 	resp, err := client.Post(ts.URL+"/api/runs/does-not-exist/retry", "application/json", nil)
 	if err != nil {
@@ -167,7 +170,7 @@ func TestRetryOnUnknownRunNotFound(t *testing.T) {
 }
 
 func TestSessionProbeReturns204WhenAuthed(t *testing.T) {
-	ts, client := loggedInClient(t, newTestServer(t))
+	ts, client := authedClient(t, newTestServer(t))
 
 	resp, err := client.Get(ts.URL + "/api/session")
 	if err != nil {
@@ -245,13 +248,14 @@ func TestCreateRunReturns409WhenRecoveryPending(t *testing.T) {
 	e := seedRecoveredRun(t, b, store)
 
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	resp, err := client.Post(ts.URL+"/api/runs", "application/json", strings.NewReader("{}"))
 	if err != nil {
@@ -280,13 +284,14 @@ func TestDiscardRunDeletesAndAllowsRestart(t *testing.T) {
 	e := seedRecoveredRun(t, b, store)
 
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
-	ts, client := loggedInClient(t, srv.Handler())
+	ts, client := authedClient(t, srv.Handler())
 
 	delReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/runs/"+recoveredRunID, nil)
 	if err != nil {
@@ -336,7 +341,7 @@ func TestDiscardRunRequiresCSRFAndAuth(t *testing.T) {
 	// from "the same-origin check was bypassed and the handler ran" (404).
 	t.Run("requires same-origin", func(t *testing.T) {
 		h := newTestServer(t)
-		ts, client := loggedInClient(t, h)
+		ts, client := authedClient(t, h)
 
 		req, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/runs/does-not-exist", nil)
 		if err != nil {
@@ -394,24 +399,25 @@ func (s *blockingLoadStore) LoadCurrent(context.Context) (*engine.Run, error) {
 
 func (s *blockingLoadStore) Delete(context.Context) error { return nil }
 
-// directLogin logs in via a direct ServeHTTP call (no real network) and
-// returns the session cookie, so a subsequent request built the same way can
-// attach it -- needed here because the test below drives the handler with a
-// caller-controlled, cancelable context, which a real *http.Client request
-// cannot do (the Transport refuses to even send a request whose context is
-// already canceled, so cancellation could never race the handler).
-func directLogin(t *testing.T, h http.Handler) *http.Cookie {
+// directSession exchanges the launch token via a direct ServeHTTP call (no
+// real network) and returns the session cookie, so a subsequent request built
+// the same way can attach it -- needed here because the test below drives the
+// handler with a caller-controlled, cancelable context, which a real
+// *http.Client request cannot do (the Transport refuses to even send a
+// request whose context is already canceled, so cancellation could never race
+// the handler).
+func directSession(t *testing.T, h http.Handler) *http.Cookie {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(
-		`{"username":"admin","password":"correct-horse"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader(
+		`{"token":"`+testToken+`"}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
-		t.Fatalf("login status = %d, want %d", rec.Code, http.StatusNoContent)
+		t.Fatalf("POST /api/session status = %d, want %d", rec.Code, http.StatusNoContent)
 	}
 	cookies := rec.Result().Cookies()
 	if len(cookies) == 0 {
-		t.Fatal("login set no session cookie")
+		t.Fatal("the exchange set no session cookie")
 	}
 	return cookies[0]
 }
@@ -427,14 +433,15 @@ func TestRequestCancellationReachesTheStore(t *testing.T) {
 	store := &blockingLoadStore{entered: make(chan struct{}), release: make(chan struct{})}
 	e := engine.New(b, store)
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
 	h := srv.Handler()
-	cookie := directLogin(t, h)
+	cookie := directSession(t, h)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/api/runs/not-current", nil).WithContext(ctx)
@@ -649,14 +656,15 @@ func TestCreateRunCheckpointSurvivesRequestCancellation(t *testing.T) {
 	store.Arm() // Start's own checkpoint is the very first Save this store sees.
 	e := engine.New(b, store, failingStep{})
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
 	h := srv.Handler()
-	cookie := directLogin(t, h)
+	cookie := directSession(t, h)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodPost, "/api/runs", strings.NewReader("{}")).WithContext(ctx)
@@ -696,14 +704,15 @@ func TestRetryCheckpointSurvivesRequestCancellation(t *testing.T) {
 	store := newProbeStore()
 	e := engine.New(b, store, failingStep{})
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
 	h := srv.Handler()
-	cookie := directLogin(t, h)
+	cookie := directSession(t, h)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/api/runs", strings.NewReader("{}"))
 	createReq.AddCookie(cookie)
@@ -767,14 +776,15 @@ func TestRetryExecutionSurvivesRequestCancellation(t *testing.T) {
 	step := &retryProbeStep{entered: make(chan struct{}), release: make(chan struct{})}
 	e := engine.New(b, engine.NewMemoryStore(), step)
 	srv, err := api.New(api.Config{
-		Username: "admin", Password: "correct-horse", SessionTTL: time.Hour, LoginRate: 100,
-		AICR: &aicrclient.Fake{}, WorkDir: t.TempDir(),
+		Cluster: connectedCluster(),
+		Token:   testToken,
+		AICR:    &aicrclient.Fake{}, WorkDir: t.TempDir(),
 	}, b, e, testfs.Static())
 	if err != nil {
 		t.Fatalf("api.New() error = %v", err)
 	}
 	h := srv.Handler()
-	cookie := directLogin(t, h)
+	cookie := directSession(t, h)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/api/runs", strings.NewReader("{}"))
 	createReq.AddCookie(cookie)

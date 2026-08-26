@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes/fake"
-
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
@@ -665,18 +663,23 @@ func waitForPersistedState(t *testing.T, store engine.Store, id string, want eng
 // TestUnconfirmedCleanupSurvivesRestart is fix round 2's N1 regression:
 // envelope.go is a hand-maintained projection -- its own doc comment says
 // it deliberately does not reuse Run's json tags -- and Run.CleanupUnconfirmed
-// went a full fix round without a producer there, so a pod restart silently
+// went a full fix round without a producer there, so a restart silently
 // dropped Ruling 12's guard while the OLD Run.Err text it replaced would
 // have survived just fine. This is why NewMemoryStore cannot be used here:
 // its Save/Load clone the Run struct directly in-process and never touch
 // encodeRun/decodeRun at all, so it would report this field surviving
-// correctly whether or not envelope.go actually carries it. The real
-// ConfigMap-backed store, and a genuinely SECOND *engine.Engine instance
-// over the same persisted record, is what simulates the pod restart spec
-// §9's own recovered-StateActive flow describes.
+// correctly whether or not envelope.go actually carries it. A real
+// envelope-backed store, and a genuinely SECOND *engine.Engine instance over
+// the same persisted record, is what simulates the restart.
+//
+// The file store, since the ConfigMap store this originally used is gone.
+// Same envelope, same property, and now it is also the store production runs
+// on rather than one only this test would exercise.
 func TestUnconfirmedCleanupSurvivesRestart(t *testing.T) {
-	client := fake.NewSimpleClientset()
-	store := engine.NewConfigMapStore(client, testNamespace, testName, testOwner())
+	store, err := engine.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
 
 	proveStep := newFakeStep(engine.PhaseProve)
 	proveStep.err = fmt.Errorf("run failed: %w", engine.ErrUnconfirmedCleanup)
@@ -698,9 +701,8 @@ func TestUnconfirmedCleanupSurvivesRestart(t *testing.T) {
 		t.Fatal("fixture check: Discard() succeeded before restart, want the unconfirmed-cleanup guard blocking")
 	}
 
-	// A genuinely second engine instance over the same underlying
-	// ConfigMap, not a second call on `before` -- the shape an actual pod
-	// restart produces.
+	// A genuinely second engine instance over the same underlying record,
+	// not a second call on `before` -- the shape an actual restart produces.
 	after := engine.New(bus.New(64), store, newFakeStep(engine.PhaseBundle), newFakeStep(engine.PhaseProve))
 	if recoverErr := after.Recover(context.Background()); recoverErr != nil {
 		t.Fatalf("Recover() error = %v", recoverErr)
@@ -1023,5 +1025,128 @@ func TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRecoverRefusesARecordFromADifferentCluster is the guard the local
+// binary needs and the in-cluster deployment never did: the store lived
+// inside the cluster it described, so a record could not be about anywhere
+// else. A file on the operator's laptop can be.
+func TestRecoverRefusesARecordFromADifferentCluster(t *testing.T) {
+	const (
+		recordUID    = "11111111-2222-3333-4444-555555555555"
+		connectedUID = "99999999-8888-7777-6666-555555555555"
+	)
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 3)
+	run.ClusterUID = recordUID
+	store.loadCurrent = run
+
+	e := fourStepEngine(store)
+	e.SetClusterUID(connectedUID)
+
+	err := e.Recover(context.Background())
+	if !errors.Is(err, engine.ErrClusterMismatch) {
+		t.Fatalf("Recover() error = %v, want ErrClusterMismatch", err)
+	}
+	if !strings.Contains(err.Error(), recordUID) || !strings.Contains(err.Error(), connectedUID) {
+		t.Errorf("the error names neither UID: %v", err)
+	}
+	if e.Current() != nil {
+		t.Error("a record from another cluster was installed anyway")
+	}
+}
+
+// A record with no UID is not a mismatch: it predates the field, and every
+// record the ConfigMap store ever wrote is one of those.
+func TestRecoverAcceptsARecordWithNoClusterUID(t *testing.T) {
+	store := newRecoverStore()
+	store.loadCurrent = baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 3)
+
+	e := fourStepEngine(store)
+	e.SetClusterUID("11111111-2222-3333-4444-555555555555")
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v, want a record written before the field existed to recover", err)
+	}
+	if e.Current() == nil {
+		t.Error("Current() = nil, want the recovered run installed")
+	}
+}
+
+func TestRecoverAcceptsARecordFromTheConnectedCluster(t *testing.T) {
+	const uid = "11111111-2222-3333-4444-555555555555"
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateFailed, engine.PhaseApply, 3)
+	run.ClusterUID = uid
+	store.loadCurrent = run
+
+	e := fourStepEngine(store)
+	e.SetClusterUID(uid)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if e.Current() == nil {
+		t.Fatal("Current() = nil, want the recovered run installed")
+	}
+}
+
+// A run has to acquire the cluster's identity when it is created, not when it
+// is next saved: a record that lacked a UID for any window is, for that
+// window, indistinguishable from one written before the field existed -- and
+// those are accepted by any cluster.
+func TestStartStampsTheConnectedClusterOnTheRun(t *testing.T) {
+	const uid = "11111111-2222-3333-4444-555555555555"
+	store := newRecoverStore()
+	e := fourStepEngine(store)
+	e.SetClusterUID(uid)
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if run.ClusterUID != uid {
+		t.Errorf("ClusterUID = %q, want %q -- a run with no identity is recoverable by any cluster", run.ClusterUID, uid)
+	}
+}
+
+// The evidence bundle is built from the record, so the toolchain has to be on
+// the record rather than only in the log. A run that lost it would produce
+// evidence that cannot say which helm installed anything.
+func TestStartStampsTheResolvedToolchainOnTheRun(t *testing.T) {
+	store := newRecoverStore()
+	e := fourStepEngine(store)
+	e.SetToolchain(map[string]string{"helm": "v3.19.0", "kubectl": "v1.34.2"})
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if run.Toolchain["helm"] != "v3.19.0" {
+		t.Errorf("Toolchain[helm] = %q, want the version preflight resolved", run.Toolchain["helm"])
+	}
+}
+
+// The engine hands each run its own copy: a map shared across runs would let
+// one record's mutation reach another's, and these records are persisted
+// independently.
+func TestEachRunGetsItsOwnToolchainMap(t *testing.T) {
+	e := fourStepEngine(newRecoverStore())
+	source := map[string]string{"helm": "v3.19.0"}
+	e.SetToolchain(source)
+	source["helm"] = "mutated-after-the-fact"
+
+	run, err := e.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if run.Toolchain["helm"] != "v3.19.0" {
+		t.Errorf("Toolchain[helm] = %q; the engine kept a reference to the caller's map", run.Toolchain["helm"])
+	}
+	run.Toolchain["helm"] = "mutated-by-a-holder"
+	second, err := e.Start(context.Background())
+	if err == nil && second.Toolchain["helm"] != "v3.19.0" {
+		t.Errorf("a second run saw %q; the runs share one map", second.Toolchain["helm"])
 	}
 }

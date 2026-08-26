@@ -56,7 +56,7 @@ type FailureData struct {
 }
 
 // Marker patterns, transcribed from pkg/bundler/deployer/helm/templates/
-// deploy.sh.tmpl at aicr v0.19.0 (_step_header, _step_ok, _step_fail,
+// deploy.sh.tmpl at aicr v0.20.0 (_step_header, _step_ok, _step_fail,
 // _step_retry, _ok, _warn_line, _fail). Every color variable expands empty
 // because the applier exports NO_COLOR=1, so these match the bare text.
 //
