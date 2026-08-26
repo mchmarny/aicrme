@@ -1,20 +1,49 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Connect } from './Connect'
-import type { ClusterInfo } from '../api'
+import type { ClusterInfo, NodeComposition } from '../api'
 
 const contexts = [
   { name: 'alpha', server: 'https://alpha.example:6443', current: false },
   { name: 'beta', server: 'https://beta.example:6443', current: true },
 ]
 
+/**
+ * blockedNodes is the layout of the GKE cluster this feature was written for:
+ * two H100 nodes behind a taint of the platform team's own choosing, beside
+ * four ordinary ones.
+ */
+const blockedNodes: NodeComposition = {
+  total: 6,
+  gpuNodes: 2,
+  groups: [
+    {
+      count: 2,
+      instanceType: 'a3-megagpu-8g',
+      accelerator: 'nvidia-h100-mega-80gb',
+      gpusPerNode: 8,
+      taints: ['dedicated=gpu-workload:NoSchedule'],
+      blocked: true,
+    },
+    { count: 3, instanceType: 'e2-standard-4' },
+    { count: 1, instanceType: 'n2-standard-8' },
+  ],
+  remedy: 'dedicated=gpu-workload:NoSchedule',
+}
+
 const clusterInfo: ClusterInfo = {
   context: 'beta',
   server: 'https://beta.example:6443',
   version: 'v1.31.4',
   nodeCount: 6,
+  nodes: blockedNodes,
   uid: '1111-2222',
   toolchain: { helm: 'v3.19.0', kubectl: 'v1.31.0', bash: '5.2.15', jq: '1.7' },
+}
+
+/** withNodes swaps the composition, leaving the rest of the response alone. */
+function withNodes(nodes: NodeComposition): ClusterInfo {
+  return { ...clusterInfo, nodes }
 }
 
 /**
@@ -86,9 +115,80 @@ describe('Connect', () => {
     fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
 
     expect(await screen.findByText('v1.31.4')).toBeDefined()
-    expect(screen.getByText('6 nodes')).toBeDefined()
+    expect(screen.getByText(/6 total/)).toBeDefined()
     expect(screen.getByText('v3.19.0')).toBeDefined()
     expect(screen.getByText('1111-2222')).toBeDefined()
+  })
+
+  // A node count is a scalar an operator cannot act on. What they are deciding
+  // is whether this is the cluster they meant, and the shapes answer that:
+  // "two H100 nodes and four small ones" is recognisable in a way "6" is not.
+  it('shows what the cluster is made of, folded into shapes', async () => {
+    mockFetch()
+    render(<Connect onConnected={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    expect(await screen.findByText(/2 × a3-megagpu-8g/)).toBeDefined()
+    expect(screen.getByText(/nvidia-h100-mega-80gb/)).toBeDefined()
+    expect(screen.getByText(/8 GPU each/)).toBeDefined()
+    expect(screen.getByText(/3 × e2-standard-4/)).toBeDefined()
+    expect(screen.getByText(/2 with GPUs/)).toBeDefined()
+  })
+
+  // The Phase 4 failure, moved to the only screen where it is cheap to fix:
+  // tolerations are read from the environment at startup, so the answer is
+  // "quit and relaunch", which costs nothing before anything is installed.
+  it('names the variable to set when the agent cannot reach the GPU nodes', async () => {
+    mockFetch()
+    render(<Connect onConnected={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    expect(await screen.findByText(/AICRME_GPU_TOLERATIONS/)).toBeDefined()
+    expect(screen.getAllByText(/dedicated=gpu-workload:NoSchedule/).length).toBeGreaterThan(0)
+  })
+
+  // The counterpart, and the more important of the two. A warning that shows
+  // on every healthy cluster is a warning nobody reads on the broken one.
+  it('says nothing about tolerations when every GPU node is reachable', async () => {
+    const healthy: NodeComposition = {
+      total: 6,
+      gpuNodes: 2,
+      groups: [
+        {
+          count: 2,
+          instanceType: 'a3-megagpu-8g',
+          accelerator: 'nvidia-h100-mega-80gb',
+          gpusPerNode: 8,
+          taints: ['nvidia.com/gpu=present:NoSchedule'],
+        },
+        { count: 4, instanceType: 'e2-standard-4' },
+      ],
+    }
+    mockFetch({ connect: () => new Response(JSON.stringify(withNodes(healthy)), { status: 200 }) })
+    render(<Connect onConnected={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    await screen.findByText(/2 × a3-megagpu-8g/)
+    expect(screen.queryByText(/AICRME_GPU_TOLERATIONS/)).toBeNull()
+  })
+
+  // Capping is honest only if it says it capped.
+  it('counts the shapes it did not have room to show', async () => {
+    const many: NodeComposition = {
+      total: 90,
+      gpuNodes: 0,
+      groups: [{ count: 10, instanceType: 'e2-standard-4' }],
+      more: 3,
+    }
+    mockFetch({ connect: () => new Response(JSON.stringify(withNodes(many)), { status: 200 }) })
+    render(<Connect onConnected={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    expect(await screen.findByText(/3 more shapes/)).toBeDefined()
   })
 
   // Nothing installs until the operator says so. Confirming is the whole

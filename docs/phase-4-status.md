@@ -130,6 +130,29 @@ lands.
 
 ### Reproducing the environment
 
+> **Correction, 2026-08-26.** The commands below were the in-cluster path and **none of them
+> work now**: `scripts/demo-remote.sh`, the chart, the image and the `aicrme` Deployment were all
+> deleted by the local-binary merge (`5e46351`). There is no image to pull, so the ghcr pull
+> secret and the private-package note are moot too. The environment variables survived unchanged
+> — they are read by the process itself (`internal/console/console.go:410,647`), so they are
+> exported to the binary rather than pushed into a Deployment.
+
+```sh
+gcloud container clusters get-credentials <cluster> --region <region> --project <project>
+make build
+AICRME_SNAPSHOT_NODE_SELECTOR='cloud.google.com/gke-accelerator=nvidia-h100-mega-80gb' \
+AICRME_GPU_TOLERATIONS='dedicated=gpu-workload:NoSchedule' \
+  ./bin/aicrme --context <context>
+```
+
+Both variables carry the same meaning they did here: the first biases the snapshot agent onto a
+GPU node, the second is the cluster's own GPU taint, fed to the agent Job *and* the Prove
+workload. A GPU pool whose taint is the standard `nvidia.com/gpu` needs neither — that one is
+built in.
+
+<details>
+<summary>The superseded in-cluster commands, kept for the record</summary>
+
 ```sh
 gcloud container clusters get-credentials aicr-uat-day-gh1-0-32641587213 \
   --region us-central1 --project eidosx
@@ -141,9 +164,7 @@ kubectl -n aicrme set env deploy/aicrme \
   'AICRME_GPU_TOLERATIONS=dedicated=gpu-workload:NoSchedule'
 ```
 
-The ghcr package `aicrme/aicrme` is **private**; GitHub exposes no REST endpoint to change that,
-so either keep using the pull secret or flip it in the UI at
-`github.com/users/mchmarny/packages/container/aicrme%2Faicrme/settings`.
+</details>
 
 ---
 
