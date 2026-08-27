@@ -24,6 +24,12 @@ const resetWorkloadTimeout = stopWaitAbsentTimeout
 const (
 	KindRelease   = "release"
 	KindNamespace = "namespace"
+	// KindObject is a single named cluster object a component's chart
+	// created and then instructed helm to keep, so that `helm uninstall`
+	// leaves it standing. Reported separately from the release it came with
+	// because it is a different claim: the release is gone, and this is what
+	// the release left behind and what the teardown did about it.
+	KindObject = "object"
 )
 
 // Teardown removes from the cluster what one run installed.

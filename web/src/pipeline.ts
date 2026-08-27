@@ -30,8 +30,16 @@ export interface ComponentData {
    * thing an operator watching a destructive operation must not see.
    */
   operation?: 'teardown'
-  /** 'release' or 'namespace'. Only teardown events carry it. */
-  kind?: 'release' | 'namespace'
+  /**
+   * 'release', 'namespace', or 'object'. Only teardown events carry it.
+   *
+   * 'object' is a single named cluster object a chart created and then told
+   * helm to keep -- kai-scheduler's SchedulingShard and its two default
+   * Queues, today. Its name carries the resource type too
+   * ('queue.scheduling.run.ai/default-queue'), because the shape has no field
+   * for one and the bare names are not unique across the table.
+   */
+  kind?: 'release' | 'namespace' | 'object'
   /** Why a teardown skipped this, or why removing it failed. */
   reason?: string
 }

@@ -349,7 +349,60 @@ helm_releases "${BYSTANDER_NS}" | grep -qx "${BYSTANDER_RELEASE}" \
   || fail "assertion 2's matcher cannot see a release that IS present"
 echo "assertion 2: PASS"
 
-echo "--- assert 3: NO namespace is deleted, and every one is reported"
+echo "--- assert 3: the objects kai's chart tells helm to KEEP are gone anyway"
+# Assertion 2's claim one layer down, and the one that makes a cluster
+# reusable. `helm uninstall` removes a release's manifest; it deliberately
+# does not remove an object annotated helm.sh/resource-policy: keep, and it
+# never owned a pre-install hook resource at all. kai-scheduler's chart
+# creates four objects of exactly those two kinds, so all four outlive the
+# release by design.
+#
+# The SchedulingShard is the one that decides whether the next demo works.
+# It owns the kai-scheduler-default Deployment -- which helm therefore does
+# not own either -- so a reinstall finds the shard already present, never
+# recreates the Deployment, and leaves the cluster running the PREVIOUS
+# install's scheduler pod against a control plane replaced underneath it.
+# That pod does not schedule new gangs. Measured on KWOK across two runs of
+# test/hardware/repro-kai-reinstall.sh: a gang placed in 8s and 17s on a
+# fresh cluster, TIMEOUT on a reset one, and 2s and 4s once these four were
+# removed between the uninstall and the reinstall.
+#
+# This asserts on the CLUSTER first and the run's own account second, in that
+# order and for the same reason assertion 1 does: a teardown that never ran
+# would satisfy a report-only check by saying nothing.
+KAI_LEFT=""
+for obj in "schedulingshard.kai.scheduler default" \
+           "queue.scheduling.run.ai default-queue" \
+           "queue.scheduling.run.ai default-parent-queue"; do
+  # shellcheck disable=SC2086 # deliberately word-split into resource + name
+  if e2e_kubectl get ${obj} >/dev/null 2>&1; then
+    KAI_LEFT="${KAI_LEFT} ${obj// /\/}"
+  fi
+done
+if e2e_kubectl -n kai-scheduler get config.kai.scheduler kai-config >/dev/null 2>&1; then
+  KAI_LEFT="${KAI_LEFT} kai-scheduler/config.kai.scheduler/kai-config"
+fi
+echo "kai objects still present after Reset:${KAI_LEFT:-  none}"
+[[ -z "${KAI_LEFT}" ]] \
+  || fail "Reset left kai objects standing:${KAI_LEFT} -- the next install will inherit them and its gang will not place"
+
+# Self-check on an inverted input. The loop above reports success when
+# `kubectl get` fails, and it fails for a cluster that is unreachable exactly
+# as it does for an object that is absent -- so a broken connection would
+# print "none" and pass. Something that MUST be found proves the matcher is
+# actually reading the cluster.
+e2e_kubectl get ns kai-scheduler >/dev/null 2>&1 \
+  || fail "assertion 3's matcher cannot see the kai-scheduler namespace, which Reset does not delete -- it is not reading the cluster"
+
+# And the run's own account: the purge must be reported, not silent. An
+# object removed without a residue row is work the operator cannot audit.
+PURGED="$(echo "${RESIDUE}" | jq '[.items[]? | select(.kind == "object" and .removed == true)] | length')"
+echo "residue rows for purged objects: ${PURGED}"
+[[ "${PURGED}" -eq 4 ]] \
+  || fail "Reset reported ${PURGED} purged objects, want 4 -- the cluster is clean but the inventory does not say so"
+echo "assertion 3: PASS"
+
+echo "--- assert 4: NO namespace is deleted, and every one is reported"
 # Reset deletes no namespaces at all. Whoever applied the bundle owns the
 # cleanup of what it applied, and this console is the bash deployer: a
 # namespace left standing is one command for the operator, one deleted out
@@ -388,9 +441,9 @@ echo "namespaces reported: ${NS_TOTAL}, each with a reason: ${NS_NAMED}, flagged
 PRE="$(echo "${RESIDUE}" | jq --arg ns "${BYSTANDER_KEPT_NS}" \
   '[.items[]? | select(.kind == "namespace" and .name == $ns and .created == true)] | length')"
 [[ "${PRE}" -eq 0 ]] || fail "${BYSTANDER_KEPT_NS} predates the install but is flagged as created by this run"
-echo "assertion 3: PASS"
+echo "assertion 4: PASS"
 
-echo "--- assert 4: a FAILED reset blocks Start, Retry and Discard, and Reset again succeeds"
+echo "--- assert 5: a FAILED reset blocks Start, Retry and Discard, and Reset again succeeds"
 FAIL_RUN_ID="$(drive_to_installed)"
 echo "second run id: ${FAIL_RUN_ID}"
 STATE=""
@@ -517,11 +570,11 @@ AGAIN_INCOMPLETE="$(echo "${AGAIN_JSON}" | jq -r '.residue.incomplete // false')
 echo "second reset settled at state=${AGAIN_STATE} incomplete=${AGAIN_INCOMPLETE}"
 [[ "${AGAIN_INCOMPLETE}" != "true" ]] \
   || fail "the guard is still set after the documented manual cleanup -- DEMO.md's remedy does not work"
-echo "assertion 4: PASS"
+echo "assertion 5: PASS"
 
-echo "--- assert 5: the console accepts a new run afterward"
-# LAST, deliberately -- numbered 5 because it runs fifth, not because it
-# is the fifth thing the plan listed. It is the only assertion that leaves a run in flight,
+echo "--- assert 6: the console accepts a new run afterward"
+# LAST, deliberately -- numbered 6 because it runs sixth, not because it
+# is the sixth thing the plan listed. It is the only assertion that leaves a run in flight,
 # and there is no way to clean one up: a run parked at a decision gate is
 # live, and engine.Discard refuses a live run with 409 -- correctly, since
 # discarding one would nil e.current out from under its own goroutine.
@@ -540,7 +593,7 @@ NEW_STATE="$(await_state "${NEW_ID}" awaiting_decision 90)"
 [[ "${NEW_STATE}" == "awaiting_decision" ]] \
   || fail "the new run reached ${NEW_STATE}, expected a decision gate -- the console is not usable again"
 echo "a new run was accepted and reached its first gate: ${NEW_ID}"
-echo "assertion 5: PASS"
+echo "assertion 6: PASS"
 
 echo
 echo "PASS: Reset removed what the run created and left what it did not"

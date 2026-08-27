@@ -42,13 +42,50 @@ func (a *Engine) Releases(ctx, cancel context.Context, comps []engine.ComponentS
 	own engine.Ownership, emit func(engine.ResidueItem)) []engine.ResidueItem {
 
 	out := Releases(ctx, cancel, a.exec, comps, own, Options{Timeout: defaultUninstallTimeout},
-		func(o ReleaseOutcome) { emit(releaseItem(o)) })
+		func(o ReleaseOutcome) {
+			for _, it := range outcomeItems(o) {
+				emit(it)
+			}
+		})
 
 	items := make([]engine.ResidueItem, 0, len(out))
 	for _, o := range out {
-		items = append(items, releaseItem(o))
+		items = append(items, outcomeItems(o)...)
 	}
 	return items
+}
+
+// outcomeItems projects one component's teardown onto the inventory: the
+// release row, then a row per object purged after it.
+//
+// The object rows follow their release rather than being collected into a
+// section of their own, because that is the order the operator watches them
+// resolve in and the order that makes them legible -- "kai-scheduler removed,
+// and these four things it left behind removed with it".
+func outcomeItems(o ReleaseOutcome) []engine.ResidueItem {
+	items := make([]engine.ResidueItem, 0, 1+len(o.Objects))
+	items = append(items, releaseItem(o))
+	for _, ob := range o.Objects {
+		items = append(items, objectItem(ob))
+	}
+	return items
+}
+
+// objectItem projects one purged object onto the inventory shape.
+//
+// Name carries the resource as well as the object's own name. The shape has
+// no field for a resource type, and "object default" would name three
+// different things in kai's table alone; "queue.scheduling.run.ai/default-queue"
+// names exactly one, and is also directly pasteable into a kubectl command
+// when a purge failed and the operator has to finish it by hand.
+func objectItem(o ObjectOutcome) engine.ResidueItem {
+	return engine.ResidueItem{
+		Kind:      engine.KindObject,
+		Name:      o.Resource + "/" + o.Name,
+		Namespace: o.Namespace,
+		Removed:   o.Err == "",
+		Err:       o.Err,
+	}
 }
 
 // releaseItem projects one outcome onto the engine's inventory shape.

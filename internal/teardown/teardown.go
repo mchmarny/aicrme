@@ -47,6 +47,11 @@ type ReleaseOutcome struct {
 	// Err is why the uninstall failed. The release may be partially
 	// removed; the teardown does not stop.
 	Err string
+	// Objects is what was purged after a confirmed uninstall: the objects
+	// this component's chart creates and then tells helm to keep, which
+	// therefore outlive the release. Empty for every component with no entry
+	// in componentPurges, which today is all of them but one -- see purge.go.
+	Objects []ObjectOutcome
 }
 
 // Releases uninstalls each component's helm release in reverse install
@@ -105,6 +110,16 @@ func Releases(ctx, cancel context.Context, e Exec, comps []engine.ComponentState
 		default:
 			if err := e.Run(ctx, uninstallArgv(c, opts.Timeout), io.Discard); err != nil {
 				out.Err = err.Error()
+			}
+			// The purge follows a CONFIRMED removal and nothing else. Its
+			// placement inside this branch is the ownership argument: every
+			// other arm above is a release this run cannot prove it created,
+			// and an object belonging to somebody else's release is equally
+			// theirs. A failed uninstall is excluded too -- see purge's own
+			// comment for why deleting objects out from under controllers
+			// that may still be running is worse than leaving them.
+			if out.Err == "" && cancel.Err() == nil {
+				out.Objects = purge(ctx, cancel, e, c.Name)
 			}
 			// Checked after the command, not before the next iteration's
 			// work, so the outcome of the command that WAS in flight is
