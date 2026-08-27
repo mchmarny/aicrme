@@ -1,5 +1,12 @@
 # Phase 2 handoff
 
+> **SUPERSEDED for status. Read [STATE.md](STATE.md) for where the project actually is.**
+>
+> This file is still the deepest reference for the design decisions behind the engine, the bus and
+> the run store, and is worth reading for those. Its status claims, its branch names and the
+> ConfigMap-backed run store it describes are all obsolete — the store is file-backed and the
+> in-cluster deployment is gone.
+
 **Status:** Phases 0, 1, 2a, and 2b-i are complete and merged to `main`. Phase 2b-ii (the ConfigMap-backed run store, restart recovery, and the bus epoch) is complete on this branch (`phase-2b-ii`, not yet merged).
 **Spec:** `approach.md`. **Phase 2b-ii plan:** `docs/superpowers/plans/2026-08-17-aicrme-phase-2b-ii.md`. **Phase 2b-ii design:** `docs/superpowers/specs/2026-08-17-aicrme-phase-2b-ii-design.md` — its "Open questions" and "Constraint carried for Phase 3" sections carry inputs 2b-iii needs. **Phase 2a plan:** `docs/superpowers/plans/2026-08-15-aicrme-phase-2a.md`. **Phase 2a design:** `docs/superpowers/specs/2026-08-15-aicrme-phase-2a-design.md`. **Phase 0-1 plan:** `docs/superpowers/plans/2026-08-13-aicrme-phase-0-1.md`.
 

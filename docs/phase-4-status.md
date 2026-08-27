@@ -1,5 +1,13 @@
 # Phase 4 — first contact with real hardware
 
+> **SUPERSEDED. Read [STATE.md](STATE.md) for where the project actually is.**
+>
+> This is a working note from the session of 2026-08-23, kept for its reasoning and its list of
+> defects. Its headline claims are no longer true: Prove has since completed on real H100s, every
+> question under "Still unmeasured" except `ValidateState` has been answered, and the in-cluster
+> deployment this document assumes has been deleted. Do not reconcile it — it will be replaced
+> wholesale when the docs are collapsed.
+
 **Date:** 2026-08-23. **Cluster:** GKE `aicr-uat-day-gh1-0-32641587213`, `us-central1`, project
 `eidosx`. 6 nodes (scaled to 7 mid-run), Container-Optimized OS, 2× `nvidia-h100-mega-80gb`
 with 8 GPUs each. Session ended when the control plane became unreachable, not when the work

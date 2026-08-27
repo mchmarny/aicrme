@@ -1,5 +1,8 @@
 # Phase 3 (Prove) — all 11 tasks complete, not yet merged
 
+> **SUPERSEDED. Read [STATE.md](STATE.md) for where the project actually is.** This branch merged
+> long ago; the title is stale. Kept as a working note, not maintained.
+
 **Branch:** `phase-3-prove`, pushed to origin. Forked from `main` at `ab84834`.
 **State:** `make qualify` green, aggregate coverage 90.1%. `test/e2e/prove.sh` verified end to
 end on a real cluster (13 minutes, all six assertions).

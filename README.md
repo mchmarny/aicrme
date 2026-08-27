@@ -67,6 +67,10 @@ make qualify   # full local gate: SPA build, lint, tests with coverage floor, AI
 make help      # all targets
 ```
 
+**[docs/STATE.md](docs/STATE.md)** is where to start: what is proven and on what hardware, what is
+left to do, and how to run each verification. The `docs/phase-*.md` files are unmaintained working
+notes from the phase that produced them.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
