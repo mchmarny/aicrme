@@ -1,0 +1,92 @@
+name: repro-kai
+# Manual only. This is an EXPERIMENT, not a gate: it answers "does a
+# reinstalled kai-scheduler still place a gang", and the answer is a
+# measurement to read rather than a pass/fail to enforce. Putting it on push
+# would spend runner minutes on a question that only changes when someone
+# changes kai's version or aicrme's teardown.
+#
+# WHY IT LIVES IN CI AT ALL
+# It cannot run on the developer laptop it was written on: no docker CLI (the
+# docker socket is a podman machine), a 3.6 GB podman VM that loses a kind
+# control plane mid-bringup, and a corporate SSL_CERT_FILE the local sandbox
+# will not read. A GitHub runner has Docker, ~14 GB of disk once the
+# preinstalled toolchains are reclaimed, and working TLS.
+on:
+  workflow_dispatch:
+    inputs:
+      cycles:
+        description: 'install/place/uninstall cycles to run'
+        required: false
+        default: '3'
+      purge:
+        description: 'first cycle to purge kai residue before (99 = never, pure control run)'
+        required: false
+        default: '3'
+      kai_version:
+        description: 'kai-scheduler chart version'
+        required: false
+        default: 'v0.14.1'
+      place_budget:
+        description: 'seconds to wait for a gang to place before calling it TIMEOUT'
+        required: false
+        default: '180'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repro-kai-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    # Three cycles of (helm install --wait, place a gang, helm uninstall
+    # --wait) against a two-node Kind cluster. kai's six deployments install
+    # in a couple of minutes; the budget is slow-runner headroom for the image
+    # pulls, which happen once and are then cached in the nodes.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      # kai's images are small next to a full recipe, but the Kind nodes still
+      # hold them and a full disk surfaces as ImagePullBackOff -- which this
+      # experiment would misread as "the gang did not place". Same reclaim the
+      # apply-real and reset jobs do, for the same reason.
+      - name: reclaim runner disk for image pulls
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/android "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          df -h / | tail -1
+      # No setup-go and no setup-node, unlike every job in e2e.yaml: this
+      # script never runs `make build`. It does not start the console, drive
+      # the API, or touch aicrme's binary at all -- it installs one helm chart
+      # and submits one Job. kind, kubectl, helm and jq are the whole
+      # dependency set, and the runner ships jq.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - name: reproduce
+        env:
+          CYCLES: ${{ inputs.cycles }}
+          PURGE: ${{ inputs.purge }}
+          KAI_VERSION: ${{ inputs.kai_version }}
+          PLACE_BUDGET: ${{ inputs.place_budget }}
+        run: |
+          mkdir -p .repro
+          # tee, so the result is both in the live log and in an artifact: the
+          # per-cycle placement times are the output of this job, and reading
+          # them out of a scrolled-away runner log is worse than downloading
+          # a file.
+          test/hardware/repro-kai-reinstall.sh 2>&1 | tee .repro/repro-kai.log
+      # if: always() -- a run that times out or dies mid-cycle still produced
+      # the cycles before it, and those are exactly the measurements worth
+      # keeping. Same reasoning as apply-real's collector.
+      - name: collect the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-kai-log
+          path: .repro/
+          if-no-files-found: warn
+          retention-days: 14
