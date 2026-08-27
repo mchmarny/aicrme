@@ -106,11 +106,28 @@ e2e_start_console() {
     -d "{\"token\":\"${token}\"}" >/dev/null
 }
 
-# e2e_connect points the console at the current kubectl context. Every
+# e2e_connect points the console at this script's Kind cluster. Every
 # cluster-touching route answers 409 until this succeeds.
+#
+# Pinned to kind-${CLUSTER}, like every other cluster call in this file, and
+# for the reason e2e_diagnose already states at length: an unpinned kubectl
+# means the operator's current-context, which on a laptop is a real cluster
+# behind a VPN. This call is the one that decides what the console -- and so
+# every teardown assertion downstream of it -- operates on, which makes it the
+# worst possible place to inherit ambient state. On 2026-08-26 a
+# `gcloud container clusters get-credentials` rewrote current-context in the
+# shared kubeconfig while reset.sh was running; the run was killed before it
+# reconnected, and nothing here would have stopped it.
+#
+# CLUSTER unset is a caller error rather than a licence to fall back: a
+# fallback to current-context is precisely the behaviour being removed.
 e2e_connect() {
   local context
-  context="$(kubectl config current-context)"
+  if [[ -z "${CLUSTER:-}" ]]; then
+    echo "e2e_connect: CLUSTER is unset; refusing to connect to an ambient context" >&2
+    return 1
+  fi
+  context="kind-${CLUSTER}"
   echo "--- connecting the console to ${context}"
   e2e_api POST /api/connect -H 'Content-Type: application/json' \
     -d "{\"context\":\"${context}\"}" >/dev/null
@@ -166,6 +183,22 @@ e2e_console_cleanup() {
   return 0
 }
 
+# e2e_kubectl is kubectl pinned to this script's Kind cluster.
+#
+# Every mutating call in this file goes through it. The functions below apply
+# CRDs and fake Node objects, and an unpinned kubectl means the operator's
+# current-context -- so the failure mode is not a confusing test result, it is
+# KWOK's controller and six fake H100 nodes landing in a real cluster. In CI
+# this is a no-op, because `kind create cluster` has already made this the
+# current context; on a laptop it is the whole difference.
+e2e_kubectl() {
+  if [[ -z "${CLUSTER:-}" ]]; then
+    echo "e2e_kubectl: CLUSTER is unset; refusing to run against an ambient context" >&2
+    return 1
+  fi
+  kubectl --context "kind-${CLUSTER}" "$@"
+}
+
 # e2e_install_kwok installs the KWOK controller (CRDs plus the stage-fast
 # rules that fake Ready/Running status with no real kubelet) at KWOK_VERSION
 # and waits for its Deployment to roll out.
@@ -173,11 +206,11 @@ e2e_install_kwok() {
   echo "--- install KWOK controller (v${KWOK_VERSION})"
   curl -fsSL --connect-timeout 10 --max-time 60 \
     "https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/kwok.yaml" \
-    | kubectl apply --request-timeout=30s -f -
+    | e2e_kubectl apply --request-timeout=30s -f -
   curl -fsSL --connect-timeout 10 --max-time 60 \
     "https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/stage-fast.yaml" \
-    | kubectl apply --request-timeout=30s -f -
-  kubectl -n kube-system rollout status deploy/kwok-controller --timeout=120s
+    | e2e_kubectl apply --request-timeout=30s -f -
+  e2e_kubectl -n kube-system rollout status deploy/kwok-controller --timeout=120s
 }
 
 # e2e_node_yaml emits one fake KWOK Node object to stdout. Field values
@@ -282,7 +315,7 @@ e2e_apply_kwok_nodes() {
     zone="${KWOK_ZONES[$((i % 2))]}"
     e2e_node_yaml "gpu-${i}" accelerated p5.48xlarge "${zone}" 192 2048Gi 3800Gi 250 >"${tmp}/gpu-${i}.yaml"
   done
-  kubectl apply -f "${tmp}/"
-  kubectl wait --for=condition=Ready nodes -l type=kwok --timeout=60s
+  e2e_kubectl apply -f "${tmp}/"
+  e2e_kubectl wait --for=condition=Ready nodes -l type=kwok --timeout=60s
   rm -rf "${tmp}"
 }
