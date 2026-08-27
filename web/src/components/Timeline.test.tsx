@@ -129,9 +129,11 @@ describe('Timeline noise', () => {
 })
 
 describe('Timeline remedies', () => {
-  // The kai-scheduler timeout embeds two shell commands inside a wrapped red
-  // paragraph. An operator cannot tell where the prose stops and the command
-  // starts, let alone select one cleanly.
+  // Any error that embeds a shell command sits inside a wrapped red paragraph,
+  // where an operator cannot tell where the prose stops and the command starts,
+  // let alone select one cleanly. The fixture below is the kai-scheduler
+  // timeout as it read before 439a7f8 withdrew that advice -- kept because it
+  // is the shape this renders, not because the product still says it.
   it('renders embedded commands as code rather than prose', () => {
     render(<Timeline events={[
       ev({
