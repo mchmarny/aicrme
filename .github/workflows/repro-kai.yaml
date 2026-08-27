@@ -30,6 +30,12 @@ on:
         description: 'seconds to wait for a gang to place before calling it TIMEOUT'
         required: false
         default: '180'
+      purge_scope:
+        description: 'chart = the four named objects the chart creates; all = every kai CR plus the namespace'
+        required: false
+        default: 'chart'
+        type: choice
+        options: [chart, all]
 
 permissions:
   contents: read
@@ -79,6 +85,7 @@ jobs:
           PURGE: ${{ inputs.purge }}
           KAI_VERSION: ${{ inputs.kai_version }}
           PLACE_BUDGET: ${{ inputs.place_budget }}
+          PURGE_SCOPE: ${{ inputs.purge_scope }}
         run: |
           mkdir -p .repro
           # tee, so the result is both in the live log and in an artifact: the

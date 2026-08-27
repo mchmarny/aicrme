@@ -198,8 +198,40 @@ place_gang() {
 # requires: named kinds from kai's OWN api groups, nothing discovered by
 # walking namespaces, and nothing outside the two groups the chart installs
 # CRDs for. It is what "reset aicrme's own recipes" means for this component.
+# PURGE_SCOPE selects how wide the remedy is, so the two can be compared:
+#
+#   chart  (default) delete the FOUR NAMED OBJECTS the chart itself creates
+#          and then tells helm to keep. This is what aicrme can defensibly
+#          remove: it installed kai, so the objects kai's chart created are
+#          its own -- and a Queue an operator wrote by hand has a different
+#          name and is left alone. This is the scope internal/teardown
+#          implements.
+#   all    delete every instance of every kai CRD plus the namespace. Wider
+#          than ownership justifies -- it would take an operator's own Queues
+#          with it -- and kept only as the comparison that proves `chart` is
+#          sufficient rather than merely smaller.
+PURGE_SCOPE="${PURGE_SCOPE:-chart}"
+
+# The four objects, by name, with the reason each survives. All four are
+# created by the chart and all four outlive `helm uninstall` by design:
+#   SchedulingShard/default        templates/default-shard.yaml, resource-policy: keep
+#   Queue/default-parent-queue     templates/default-queue.yaml, resource-policy: keep
+#   Queue/default-queue            templates/default-queue.yaml, resource-policy: keep
+#   Config/kai-config              templates/kai-config.yaml, a pre-install HOOK, and
+#                                  hook resources are not in the release manifest
+# The shard is the one that matters -- it owns the kai-scheduler-default
+# Deployment, which is why a reinstall keeps running the PREVIOUS
+# generation's scheduler pod -- but all four are equally ours and equally
+# invisible to helm.
 purge_kai_residue() {
-  echo "  purging kai residue:"
+  echo "  purging kai residue (scope=${PURGE_SCOPE}):"
+  if [[ "${PURGE_SCOPE}" == "chart" ]]; then
+    e2e_kubectl delete schedulingshard.kai.scheduler default --ignore-not-found --timeout=60s 2>&1 | sed 's/^/    /' || true
+    e2e_kubectl delete queue.scheduling.run.ai default-queue --ignore-not-found --timeout=60s 2>&1 | sed 's/^/    /' || true
+    e2e_kubectl delete queue.scheduling.run.ai default-parent-queue --ignore-not-found --timeout=60s 2>&1 | sed 's/^/    /' || true
+    e2e_kubectl -n kai-scheduler delete config.kai.scheduler kai-config --ignore-not-found --timeout=60s 2>&1 | sed 's/^/    /' || true
+    return 0
+  fi
   # Order matters: the CRs first, then the CRDs that define them. Deleting a
   # CRD removes its instances without running their finalizers, which strands
   # nothing here but would if any instance were still owned by a live
