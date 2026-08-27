@@ -51,12 +51,19 @@ jobs:
       # kai's images are small next to a full recipe, but the Kind nodes still
       # hold them and a full disk surfaces as ImagePullBackOff -- which this
       # experiment would misread as "the gang did not place". Same reclaim the
-      # apply-real and reset jobs do, for the same reason.
+      # apply-real and reset jobs do, MINUS the tool cache.
+      #
+      # Those jobs delete AGENT_TOOLSDIRECTORY too and get away with it because
+      # setup-go and setup-node run afterwards and recreate it. This job has
+      # neither -- it does not build anything -- so deleting the tool cache
+      # leaves helm/kind-action with nowhere to install, and it fails with
+      # "Cache directory '/opt/hostedtoolcache' does not exist". Measured, on
+      # the first dispatch of this workflow.
       - name: reclaim runner disk for image pulls
         run: |
           df -h / | tail -1
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
-            /usr/local/lib/android "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+            /usr/local/lib/android || true
           df -h / | tail -1
       # No setup-go and no setup-node, unlike every job in e2e.yaml: this
       # script never runs `make build`. It does not start the console, drive
