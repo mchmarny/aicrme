@@ -341,6 +341,17 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	// Same argument as preflight's, one layer down: a helm registry config
+	// naming a credential helper this machine lacks fails every oci:// chart,
+	// and does it at Apply rather than at startup. Not fatal -- the config may
+	// name a helper for a registry this recipe never touches -- so it is
+	// reported and carried to the Connect screen, where the operator is
+	// already deciding whether to proceed.
+	registryWarning := checkHelmCredentialHelpers(ctx)
+	if registryWarning != "" {
+		slog.Warn("helm cannot resolve registry credentials", "problem", registryWarning)
+	}
+
 	workDir := opts.WorkDir
 	releaseWorkDir, err := prepareWorkDir(workDir)
 	if err != nil {
@@ -374,6 +385,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	conn := newConnector(opts.Kubeconfig, liveProber{})
 	conn.toolchain = toolchain
+	conn.registryWarning = registryWarning
 	conn.preferred = opts.Context
 	conn.gpuTolerations = gpuTolerations
 

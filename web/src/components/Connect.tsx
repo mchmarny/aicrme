@@ -125,6 +125,12 @@ function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => vo
           {tools.map(([name, version]) => <Row key={name} label={name} value={version} />)}
         </dl>
       )}
+      {info.registryWarning && (
+        <div className="rounded border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs">
+          <p className="text-amber-400">Helm cannot resolve registry credentials</p>
+          <p className="mt-1 text-amber-200">{info.registryWarning}</p>
+        </div>
+      )}
       {info.recoveredRun && (
         <p className="text-amber-400 text-sm">
           A previous run on this cluster was interrupted and has been recovered.

@@ -106,6 +106,13 @@ export interface ClusterInfo {
   uid: string
   toolchain?: Record<string, string>
   /**
+   * registryWarning: a helm credential helper this machine does not have,
+   * named by helm's own registry config. Every oci:// chart fails on it,
+   * including public ones, so it is worth reading before an install rather
+   * than during one.
+   */
+  registryWarning?: string
+  /**
    * recoveredRun is the run this cluster's store was holding, recovered
    * during the connect that produced this response. In-cluster the pod
    * restart triggered recovery and the console simply found a run waiting;

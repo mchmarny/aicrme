@@ -57,6 +57,11 @@ type ClusterInfo struct {
 	// resolved versions; §5 asks the run to record them. Preflight runs once,
 	// before connect, so one map answers both.
 	Toolchain Toolchain `json:"toolchain,omitempty"`
+	// RegistryWarning names a helm credential helper this machine does not
+	// have, when helm's registry config names one. Empty on a healthy machine,
+	// which is the ordinary case. See checkHelmCredentialHelpers for why this
+	// is worth saying before an install rather than during one.
+	RegistryWarning string `json:"registryWarning,omitempty"`
 	// RecoveredRun is the run this cluster's store was holding, if any.
 	//
 	// It travels in the connect response because connect is now the only
@@ -215,6 +220,12 @@ type connector struct {
 	// any connection exists -- it describes this machine, not the cluster --
 	// so it is set once at construction rather than discovered in dial.
 	toolchain Toolchain
+	// registryWarning is checkHelmCredentialHelpers' finding, resolved at
+	// startup alongside the toolchain and for the same reason: it describes
+	// this machine, not the cluster. It rides on the connect response so the
+	// operator reads it on the screen where they are already deciding whether
+	// to proceed, rather than in a terminal they may not be watching.
+	registryWarning string
 	// preferred is --context: the one the Connect screen arrives preselected
 	// on. Empty leaves the kubeconfig's own current-context marked. See
 	// Contexts for why this preselects rather than connects.
@@ -412,6 +423,10 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 		Nodes:     composition,
 		UID:       string(ns.UID),
 		Toolchain: c.toolchain,
+		// Carried on every connect response, not just the first: the Connect
+		// screen is re-rendered per attempt and the condition does not change
+		// between them.
+		RegistryWarning: c.registryWarning,
 		// The set the run will really carry, handed to the wiring rather than
 		// re-derived there: the agent Job and the Prove workload must tolerate
 		// the same taints as the pool this screen just judged reachable, and

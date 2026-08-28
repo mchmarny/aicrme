@@ -185,6 +185,36 @@ describe('Connect', () => {
     expect(screen.queryByText(/will tolerate/i)).toBeNull()
   })
 
+  // The 2026-08-28 install failure, moved to second zero. helm consults its
+  // credential helper before it will try an anonymous pull, so a config naming
+  // a helper this machine lacks fails every oci:// chart -- public ones
+  // included. It surfaced as component 3 of 16 dying five minutes into Apply,
+  // naming a Docker binary the operator never asked for.
+  it('warns when helm names a credential helper this machine does not have', async () => {
+    const warned: ClusterInfo = {
+      ...clusterInfo,
+      registryWarning: 'helm\'s registry config (/x/config.json) names a credential helper this machine does not have: docker-credential-osxkeychain (every registry).',
+    }
+    mockFetch({ connect: () => new Response(JSON.stringify(warned), { status: 200 }) })
+    render(<Connect onConnected={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    expect(await screen.findByText(/docker-credential-osxkeychain/)).toBeDefined()
+  })
+
+  // The counterpart: a healthy machine says nothing, or the warning stops
+  // being read on the machine that has the problem.
+  it('says nothing about registry credentials on a healthy machine', async () => {
+    mockFetch()
+    render(<Connect onConnected={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    await screen.findByText(/2 × a3-megagpu-8g/)
+    expect(screen.queryByText(/credential helper/i)).toBeNull()
+  })
+
   // Capping is honest only if it says it capped.
   it('counts the shapes it did not have room to show', async () => {
     const many: NodeComposition = {
