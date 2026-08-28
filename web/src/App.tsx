@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { ApiError, currentCluster, establishSession, probeSession, startRun } from './api'
+import { ApiError, currentCluster, establishSession, probeSession, startRun, type ClusterInfo } from './api'
 import { Connect } from './components/Connect'
 import { Wizard } from './components/Wizard'
 import { useEvents } from './useEvents'
@@ -17,6 +17,10 @@ type Stage = 'authenticating' | 'connecting' | 'console'
 export default function App() {
   const [stage, setStage] = useState<Stage>('authenticating')
   const [authError, setAuthError] = useState('')
+  // Held for the header. Connect answers "which cluster" and then every later
+  // screen forgot it, including the gate that grants cluster-admin -- see the
+  // ClusterBadge doc comment.
+  const [cluster, setCluster] = useState<ClusterInfo | null>(null)
 
   // Two ways in, and both end at the same cookie. A fresh launch arrives with
   // ?t= and exchanges it; a reload, a restored tab, or a retyped address
@@ -40,7 +44,12 @@ export default function App() {
       // Skipping Connect is not a convenience: the connection is
       // single-assignment, so a second attempt would answer 409 and leave the
       // operator on a screen that will not let them past.
-      return (await currentCluster()) ? 'console' : 'connecting'
+      // The response, not just its truthiness: this is the reload path, and
+      // the header needs the same cluster identity a fresh connect provides.
+      const connected = await currentCluster()
+      if (!connected) return 'connecting'
+      setCluster(connected)
+      return 'console'
     }
 
     bootstrap()
@@ -67,13 +76,16 @@ export default function App() {
       {!authError && stage === 'authenticating' && (
         <p className="mx-auto mt-32 w-[28rem] text-slate-500 text-sm">Starting…</p>
       )}
-      {stage === 'connecting' && <Connect onConnected={() => setStage('console')} />}
+      {stage === 'connecting' && (
+        <Connect onConnected={info => { setCluster(info); setStage('console') }} />
+      )}
       {/* A 401 on the event stream means this cookie is not recognized, which
           in a process-lifetime session means the process that minted it is
           gone. There is nothing to retry and no token left in the URL to
           re-exchange, so the console says so rather than looping. */}
       {stage === 'console' && (
         <Console
+          cluster={cluster}
           onUnauthorized={() => {
             setStage('authenticating')
             setAuthError('This console session has expired. Re-open the tokenized URL aicrme printed at startup — the one ending in ?t=…')
@@ -84,7 +96,36 @@ export default function App() {
   )
 }
 
-function Console({ onUnauthorized }: { onUnauthorized: () => void }) {
+/**
+ * ClusterBadge names the cluster every screen after Connect is acting on.
+ *
+ * Connect exists to answer "which cluster", and the answer used to stop being
+ * visible the moment it was given: from there the header said only
+ * "connected", including on the confirm gate where the operator grants
+ * cluster-admin to install fourteen components. The kubeconfig this was built
+ * against holds 144 contexts, so "am I pointed at the right one" stays a live
+ * question long past the screen that asked it.
+ *
+ * Context name and cluster-wide GPU count, because those are the two facts
+ * that distinguish the intended cluster from its neighbours -- and both are
+ * already computed at connect. Truncated with the full value in `title`: a GKE
+ * context name runs to sixty characters and the header is not where it earns
+ * its space.
+ */
+function ClusterBadge({ cluster }: { cluster: ClusterInfo | null }) {
+  if (!cluster) return null
+  const gpus = cluster.nodes?.totalGPUs
+  return (
+    <span className="flex min-w-0 items-baseline gap-2 text-xs text-slate-500">
+      <span className="truncate font-mono text-slate-400" title={cluster.context}>
+        {cluster.context}
+      </span>
+      {gpus ? <span className="shrink-0">{gpus} GPUs</span> : null}
+    </span>
+  )
+}
+
+function Console({ cluster, onUnauthorized }: { cluster: ClusterInfo | null; onUnauthorized: () => void }) {
   // useEvents depends on this callback's identity to decide whether to
   // re-run its connection effect (see useEvents.ts's doc comment): wrapping
   // it in useCallback keeps it stable across Console's own re-renders, even
@@ -124,6 +165,7 @@ function Console({ onUnauthorized }: { onUnauthorized: () => void }) {
         <span className={connected ? 'text-emerald-400 text-xs' : 'text-slate-500 text-xs'}>
           {connected ? 'connected' : 'reconnecting…'}
         </span>
+        <ClusterBadge cluster={cluster} />
       </header>
       {eventsLost > 0 && (
         <p className="mb-4 text-amber-400 text-xs">

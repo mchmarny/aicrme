@@ -122,6 +122,24 @@ export function Prove({ events, run, busy, onStop }: {
           {failed && 'The reference workload did not run'}
           {!active && !stopped && !failed && 'Placing the reference workload…'}
         </h2>
+        {/* THE SUCCESS SIGNAL, and it earns its place by ruling out a
+            specific wrong conclusion rather than by decorating a good one.
+            StateActive is this step's TERMINAL success state -- the reference
+            workload is `sleep infinity` and holds its placement by design, so
+            no later state ever arrives and nothing polls for one. Without a
+            line saying so, the screen shows a neutral heading between two red
+            destructive controls, and it was read as a failure on real
+            hardware by the person who built it.
+
+            Deliberately about the RUN, not the hardware: it is equally true
+            on a simulated cluster, where the placement is exactly as real.
+            Claim, below, is what keeps the hardware story honest. */}
+        {active && (
+          <p data-testid="prove-success" className="text-sm text-emerald-400">
+            This run succeeded. Prove is the last step and it ends here — the workload
+            holds its placement until you stop it, so nothing further happens on its own.
+          </p>
+        )}
         {/* The claim is about what the placement below means, so it is shown
             only when there is a placement to mean anything about. A run that
             failed before anything was bound has nothing to say here, and the
@@ -157,18 +175,36 @@ export function Prove({ events, run, busy, onStop }: {
 
       {active && (
         <div className="space-y-2">
+          {/* Outlined rather than solid, and matching ResetGate's first-stage
+              button: this is a destructive action on a screen whose news is
+              good, and two solid red blocks were the loudest thing on the
+              successful outcome. Still red, still named plainly -- demoted in
+              weight, not in clarity. */}
           <button
             data-testid="prove-stop"
             disabled={busy}
             onClick={onStop}
-            className="rounded bg-red-700 px-4 py-2 text-white disabled:opacity-50"
+            className="rounded border border-red-500/60 px-4 py-2 text-red-300 disabled:opacity-50"
           >
-            Stop workload
+            {busy ? 'Stopping…' : 'Stop workload'}
           </button>
-          <p className="text-xs text-slate-500">
-            The workload keeps running until you stop it. Stopping deletes it and waits
-            for its pods to actually be gone before the run is closed.
-          </p>
+          {/* Stop is synchronous over a wait that is minutes long on a real
+              cluster -- it deletes the workload and then waits for the pods to
+              actually be gone. A disabled button was the entire feedback, so
+              the screen was indistinguishable from a dead click for the whole
+              operation. Naming what it is waiting on is what makes the wait
+              read as work. */}
+          {busy ? (
+            <p data-testid="prove-stopping" className="text-xs text-slate-400">
+              Deleting the workload and waiting for its pods to actually be gone. On a real
+              cluster this takes a minute or two; the run closes when they are.
+            </p>
+          ) : (
+            <p className="text-xs text-slate-500">
+              The workload keeps running until you stop it. Stopping deletes it and waits
+              for its pods to actually be gone before the run is closed.
+            </p>
+          )}
         </div>
       )}
 

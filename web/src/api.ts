@@ -86,6 +86,15 @@ export interface NodeComposition {
   groups?: NodeGroup[]
   /** more: shapes beyond the display cap, counted rather than dropped. */
   more?: number
+  /**
+   * totalGPUs is capacity and usableGPUs is allocatable, both summed across
+   * every node — the only cluster-wide GPU figures there are, since the
+   * snapshot's own count is an in-pod probe of the single node the agent
+   * landed on. Both are `omitempty` in Go and absent on a cluster whose
+   * device plugin has not come up.
+   */
+  totalGPUs?: number
+  usableGPUs?: number
   /** remedy: the AICRME_GPU_TOLERATIONS value that would clear every block. */
   remedy?: string
   /**

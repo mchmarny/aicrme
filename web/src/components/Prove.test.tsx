@@ -131,10 +131,57 @@ describe('Prove', () => {
     expect(screen.queryByTestId('prove-simulated')).toBeNull()
   })
 
-  it('disables Stop while a stop is already in flight', () => {
+  // A stop deletes the workload and then waits for its pods to ACTUALLY be
+  // gone, which is minutes on a real cluster. Disabling the button was the
+  // whole of the feedback, so the screen looked identical to a dead click for
+  // the entire operation -- observed on real hardware, where the operator
+  // reasonably concluded nothing had happened.
+  it('says it is stopping, and why it takes a while, while a stop is in flight', () => {
     render(<Prove events={placementEvents()} run={runState()} busy={true} onStop={vi.fn()} />)
 
-    expect(screen.getByRole('button', { name: /stop workload/i }).hasAttribute('disabled')).toBe(true)
+    const button = screen.getByRole('button', { name: /stopping/i })
+    expect(button.hasAttribute('disabled')).toBe(true)
+    // The wait has a stated reason, so a slow stop reads as work rather than
+    // as a hang.
+    expect(screen.getByTestId('prove-stopping').textContent).toMatch(/pods/i)
+  })
+
+  // THE SCREEN THAT LOOKED LIKE A FAILURE.
+  //
+  // StateActive is Prove's terminal SUCCESS state: the gang placed, and the
+  // reference workload is `sleep infinity` holding that placement by design,
+  // so no later state ever arrives. Before this, the only coloured things on
+  // the screen were a red Stop and a red Reset, with no success signal at
+  // all -- and it was read as an error by the person who built it.
+  it('marks an active run as the successful end state', () => {
+    render(<Prove events={placementEvents()} run={runState()} busy={false} onStop={vi.fn()} />)
+
+    const success = screen.getByTestId('prove-success')
+    expect(success.textContent).toMatch(/succeeded/i)
+    // Says the run ENDS here. Waiting for something further is the specific
+    // mistake this state invites, and nothing else on the screen rules it out.
+    expect(success.textContent).toMatch(/last step|ends here|nothing further/i)
+  })
+
+  // The success line is about the run, not the hardware, so it holds on a
+  // simulated cluster too -- where the placement is exactly as real. The
+  // separate simulated caveat is what keeps the hardware claim honest.
+  it('marks success on a simulated cluster without claiming hardware', () => {
+    render(<Prove events={placementEvents()} run={runState()} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByTestId('prove-success')).toBeDefined()
+    expect(screen.getByTestId('prove-simulated')).toBeDefined()
+  })
+
+  // The counterpart: a stopped or failed run must not claim success. A signal
+  // that shows in every state is not a signal.
+  it('claims no success once the run is no longer active', () => {
+    for (const state of ['done', 'failed'] as const) {
+      const { unmount } = render(
+        <Prove events={placementEvents()} run={runState({ state })} busy={false} onStop={vi.fn()} />)
+      expect(screen.queryByTestId('prove-success'), state).toBeNull()
+      unmount()
+    }
   })
 
   // Once the workload is gone the button must go with it: engine.Stop answers

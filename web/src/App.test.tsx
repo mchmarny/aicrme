@@ -9,6 +9,7 @@ const clusterInfo = {
   server: 'https://alpha.example:6443',
   version: 'v1.31.4',
   nodeCount: 6,
+  nodes: { total: 6, gpuNodes: 2, totalGPUs: 16, usableGPUs: 16 },
   uid: '1111-2222',
   toolchain: {},
 }
@@ -104,6 +105,26 @@ describe('App bootstrap', () => {
   // A cookie the server does not recognize means the process that minted it is
   // gone. There is nothing to retry and no token left in the URL, so saying so
   // is the only useful thing left.
+  // WHICH CLUSTER AM I ABOUT TO INSTALL INTO.
+  //
+  // Connect answers it and then throws the answer away: past that screen the
+  // header said only "connected", so every later screen -- including the gate
+  // where the operator grants cluster-admin to install fourteen components --
+  // named no cluster at all. On the laptop this was built against, the
+  // kubeconfig holds 144 contexts.
+  it('keeps the connected cluster named in the header', async () => {
+    mockFetch({ cluster: () => new Response(JSON.stringify(clusterInfo), { status: 200 }) })
+
+    render(<App />)
+
+    // The context is the name the operator chose it by, so it is the name the
+    // header has to carry.
+    expect(await screen.findByText('alpha')).toBeDefined()
+    // And the cluster-wide GPU count, which is the other half of "is this the
+    // right one" and is already computed at connect.
+    expect(screen.getByText(/16 GPUs/)).toBeDefined()
+  })
+
   it('says the session is gone rather than looping when the cookie is not recognized', async () => {
     mockFetch({ sessionProbe: () => new Response(null, { status: 401 }) })
 
