@@ -16,7 +16,7 @@ installs nothing of itself into the cluster it configures.
 
 | | Proven on | Evidence |
 |---|---|---|
-| Discover → Prove | real GKE H100s (2× a3-megagpu-8g, 16 GPUs) | Discover <45s, Apply 16/16 in 15m18s, Prove placed the gang one pod per H100 and the container body executed |
+| Discover → Prove | real GKE H100s (2× a3-megagpu-8g, 16 GPUs) | Discover <45s, Apply 16/16 in 15m18s, Prove placed the gang one pod per H100 and the container body executed. Re-run end to end in a browser 2026-08-28 on the reworked UI: 16/16 in 10m54s, gang of 2 placed, Discover 6s |
 | Discover → Prove | Kind + KWOK simulated H100s | `test/e2e/` — six jobs, on every push to main |
 | Reset | real GKE H100s, helm 4.2.4 | 16 releases → 0 in 2m29s |
 | Same-cluster reuse **via Reset** | **real GKE H100s**, and Kind + KWOK | 2026-08-28: Discover→Prove→Reset→Discover→Prove on one cluster; cycle 2 installed 16/16 and **placed its gang**, one pod per H100. Also `repro-kai` and `reset.sh` assertion 3 on every push |
@@ -36,8 +36,18 @@ than the five kai Deployments beside them; the run records showed **no Reset had
 though the operator believed one had, because Stop and Reset are silent and a new run appears the
 instant the old one ends.
 
-`internal/steps`' `alreadyInstalled` now refuses this at Apply, before anything is touched. The
-purge cannot cover it: it runs only after a **confirmed uninstall**, and here there was none.
+`internal/steps`' `alreadyInstalled` refuses this at Apply, before anything is touched. The purge
+cannot cover it: it runs only after a **confirmed uninstall**, and here there was none.
+
+**The guard is deliberately narrow — kai-scheduler only.** Installing over a *pre-existing
+dependency* is supported and tested: a cluster that already runs cert-manager is the ordinary
+case, `helm upgrade --install` replaces the manifest correctly, and the ownership snapshot exists
+so Reset then spares what it did not create. `test/e2e/reset.sh` is built on exactly that
+collision — its bystander release is named `cert-manager`, in the `cert-manager` namespace. A
+first version of the guard refused every pre-existing recipe release and failed that job on its
+first run. What makes kai-scheduler different is a property, not a suspicion: its chart leaves a
+cluster-scoped object that OWNS a workload, so helm cannot replace it. Add to `reinstallHazards`
+only on that criterion.
 
 **The signature, if it is ever seen again:** `kubectl -n kai-scheduler get deploy` — if
 `kai-scheduler-default` is older than the Deployments beside it, that is this.
@@ -113,7 +123,17 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    claims Prove rather than Validate.
 4. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
-5. **Collapse the docs.** When the work is done, rewrite from current state and delete
+5. **UI follow-ups** from the 2026-08-28 real-hardware pass. 27 of 30 shipped; what is left is in
+   `docs/ux-feedback.md` entry 3 — the timeline still renders Discover's gap findings as bare
+   amber warnings on the decision screen (the framing heading only reached the Discover panel),
+   the mark is absent from the Confirm screen, and the primary button is a large expanse of
+   accent. None blocks a demo.
+6. **Three residue classes block a manual cleanup** — see below. Nothing inventories them, and two
+   of them deadlock a teardown rather than merely lingering.
+7. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
+   `ephemeralArtifacts` and is dropped on encode, so the download is broken on exactly the path
+   where debugging matters most. The run-log export does not fix it.
+8. **Collapse the docs.** When the work is done, rewrite from current state and delete
    `docs/phase-*.md` rather than editing them.
 
 ### Known and deliberately not fixed
