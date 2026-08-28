@@ -88,6 +88,12 @@ export interface NodeComposition {
   more?: number
   /** remedy: the AICRME_GPU_TOLERATIONS value that would clear every block. */
   remedy?: string
+  /**
+   * tolerating: GPU-pool taints Connect derived from the cluster and added to
+   * this run. Absent when the built-in nvidia.com/gpu toleration covered
+   * everything, which is the ordinary case.
+   */
+  tolerating?: string
 }
 
 /** ClusterInfo mirrors Go's console.ClusterInfo (internal/console/connect.go). */

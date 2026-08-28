@@ -315,13 +315,21 @@ func TestGroupNodesLeavesStandardGPUTaintAlone(t *testing.T) {
 	}
 }
 
-// TestConnectReportsUnreachableGPUNodes runs the real probe against a fake
-// cluster, so the List, the fold and the verdict are exercised together rather
-// than each in isolation.
+// TestConnectToleratesTheGPUPoolItFinds runs the real probe against a fake
+// cluster, so the List, the fold, the derivation and the verdict are
+// exercised together rather than each in isolation.
 //
 // It connects with the tolerations an operator who set nothing would have,
 // against the node layout of the GKE cluster this feature was written for.
-func TestConnectReportsUnreachableGPUNodes(t *testing.T) {
+//
+// This test previously asserted the opposite outcome -- that the pool came
+// back Blocked with a Remedy naming the taint -- and that was the whole
+// defect. The console knew the taint, printed it, and made the operator
+// relaunch with it exported. It now adopts it: nothing is Blocked, Remedy is
+// empty, Tolerating names what was adopted, and GPUTolerations carries it to
+// the run. The Blocked/Remedy machinery is kept for a pool derivation
+// deliberately will not fix.
+func TestConnectToleratesTheGPUPoolItFinds(t *testing.T) {
 	gpuA := gpuNode("gpu-a", "a3-megagpu-8g", "nvidia-h100-mega-80gb", taint("dedicated", "gpu-workload"))
 	gpuB := gpuNode("gpu-b", "a3-megagpu-8g", "nvidia-h100-mega-80gb", taint("dedicated", "gpu-workload"))
 	cpu := cpuNode("cpu-a", "e2-standard-4")
@@ -339,15 +347,123 @@ func TestConnectReportsUnreachableGPUNodes(t *testing.T) {
 	if info.Nodes.GPUNodes != 2 {
 		t.Errorf("Nodes.GPUNodes = %d, want 2", info.Nodes.GPUNodes)
 	}
-	if want := "dedicated=gpu-workload:NoSchedule"; info.Nodes.Remedy != want {
-		t.Errorf("Nodes.Remedy = %q, want %q", info.Nodes.Remedy, want)
+	const taintStr = "dedicated=gpu-workload:NoSchedule"
+	if info.Nodes.Tolerating != taintStr {
+		t.Errorf("Nodes.Tolerating = %q, want %q -- the screen must say which taint it adopted", info.Nodes.Tolerating, taintStr)
 	}
-	// The two GPU nodes share a shape, so they fold; the blocked group sorts
-	// first because that is the one the operator has to read.
+	if info.Nodes.Remedy != "" {
+		t.Errorf("Nodes.Remedy = %q, want empty -- there is nothing left for the operator to do", info.Nodes.Remedy)
+	}
+	// The two GPU nodes share a shape and fold into one group, now unblocked.
 	if len(info.Nodes.Groups) != 2 {
 		t.Fatalf("groups = %d, want 2", len(info.Nodes.Groups))
 	}
-	if !info.Nodes.Groups[0].Blocked || info.Nodes.Groups[0].Count != 2 {
-		t.Errorf("first group = %+v, want the blocked 2-node GPU shape", info.Nodes.Groups[0])
+	for _, g := range info.Nodes.Groups {
+		if g.Blocked {
+			t.Errorf("group %+v is Blocked, want reachable: its taint was adopted", g)
+		}
+	}
+	// The verdict above is only honest if the run carries the same set. This
+	// is the field connectHook hands to the agent Job and the Prove workload.
+	if len(info.GPUTolerations) != 1 {
+		t.Fatalf("GPUTolerations = %+v, want exactly the one derived toleration", info.GPUTolerations)
+	}
+	if got := info.GPUTolerations[0]; got.Key != "dedicated" || got.Value != "gpu-workload" ||
+		got.Operator != corev1.TolerationOpEqual || got.Effect != corev1.TaintEffectNoSchedule {
+
+		t.Errorf("GPUTolerations[0] = %+v, want a narrow Equal match on the pool's taint", got)
+	}
+}
+
+// The tests below cover auto-derived GPU tolerations.
+//
+// Before this, the console computed the exact taint blocking the agent, put
+// it on screen as `AICRME_GPU_TOLERATIONS=<taint>`, and asked the operator to
+// quit and relaunch with it exported. The value was already known; only the
+// wiring made it a flag. These pin the derivation, and above all the two
+// things it must NOT do.
+
+// TestGPUPoolTaintsDerivesThePlatformTeamsTaint is the case the flag existed
+// for: a GPU pool tainted with something of the platform team's choosing.
+func TestGPUPoolTaintsDerivesThePlatformTeamsTaint(t *testing.T) {
+	nodes := []corev1.Node{
+		gpuNode("gpu-a", "a3-megagpu-8g", "nvidia-h100-mega-80gb", taint("dedicated", "gpu-workload")),
+		gpuNode("gpu-b", "a3-megagpu-8g", "nvidia-h100-mega-80gb", taint("dedicated", "gpu-workload")),
+		cpuNode("cpu-a", "e2-standard-4"),
+	}
+
+	got := untoleratedGPUPoolTaints(nodes, steps.AgentTolerations(nil))
+
+	// One, not two: both GPU nodes carry it and the operator needs it once.
+	if len(got) != 1 {
+		t.Fatalf("derived %d taints, want 1 deduped: %+v", len(got), got)
+	}
+	if s := formatTaint(got[0]); s != "dedicated=gpu-workload:NoSchedule" {
+		t.Errorf("derived %q, want dedicated=gpu-workload:NoSchedule", s)
+	}
+	// The toleration must match that taint and nothing wider.
+	tol := tolerationFor(got[0])
+	if tol.Operator != corev1.TolerationOpEqual || tol.Key != "dedicated" ||
+		tol.Value != "gpu-workload" || tol.Effect != corev1.TaintEffectNoSchedule {
+
+		t.Errorf("tolerationFor = %+v, want a narrow Equal match on key, value and effect", tol)
+	}
+}
+
+// TestGPUPoolTaintsNeverDerivesTheKWOKTaint is the one that must never
+// regress.
+//
+// steps.AgentTolerations deliberately refuses a blanket Exists because KWOK
+// fakes Running/Succeeded for anything scheduled onto a fake node without
+// executing it -- so an agent that tolerates the KWOK taint reports a
+// successful snapshot having collected nothing. Deriving tolerations from
+// whatever the nodes carry would reintroduce exactly that, automatically and
+// invisibly, on the console's own e2e cluster. A timeout is a bad outcome; a
+// false success is a worse one.
+func TestGPUPoolTaintsNeverDerivesTheKWOKTaint(t *testing.T) {
+	fake := gpuNode("kwok-gpu-0", "a3-megagpu-8g", "nvidia-h100-mega-80gb",
+		taint(kwokNodeTaint, "fake"), taint("nvidia.com/gpu", "present"))
+
+	got := untoleratedGPUPoolTaints([]corev1.Node{fake}, steps.AgentTolerations(nil))
+
+	if len(got) != 0 {
+		t.Fatalf("derived %+v from a simulated node, want nothing -- a tolerated KWOK taint is a silent false success", got)
+	}
+}
+
+// TestGPUPoolTaintsIgnoresWhatIsNotTheGPUPoolsBusiness covers the three
+// categories that look like candidates and are not.
+func TestGPUPoolTaintsIgnoresWhatIsNotTheGPUPoolsBusiness(t *testing.T) {
+	gpu := gpuNode("gpu-a", "a3-megagpu-8g", "nvidia-h100-mega-80gb",
+		// Already covered by the built-in toleration.
+		taint("nvidia.com/gpu", "present"),
+		// Transient: a draining node is not a misconfigured pool, and
+		// tolerating unreachable would be absurd advice.
+		taint(corev1.TaintNodeUnreachable, ""))
+	// A tainted CPU node is somebody else's reservation. The agent has no
+	// business there and the Prove workload needs a GPU anyway.
+	cpu := cpuNode("cpu-a", "e2-standard-4", taint("team", "analytics"))
+
+	got := untoleratedGPUPoolTaints([]corev1.Node{gpu, cpu}, steps.AgentTolerations(nil))
+
+	if len(got) != 0 {
+		t.Fatalf("derived %+v, want nothing", got)
+	}
+}
+
+// TestGPUPoolTaintsSkipsWhatTheOperatorAlreadySupplied keeps AICRME_GPU_TOLERATIONS
+// meaningful as an override: a value passed explicitly must not be derived a
+// second time and handed to the agent twice.
+func TestGPUPoolTaintsSkipsWhatTheOperatorAlreadySupplied(t *testing.T) {
+	nodes := []corev1.Node{
+		gpuNode("gpu-a", "a3-megagpu-8g", "nvidia-h100-mega-80gb",
+			taint("dedicated", "gpu-workload"), taint("pool", "reserved")),
+	}
+	configured := parseTolerations("dedicated=gpu-workload:NoSchedule")
+
+	got := untoleratedGPUPoolTaints(nodes, steps.AgentTolerations(configured))
+
+	if len(got) != 1 || got[0].Key != "pool" {
+		t.Fatalf("derived %+v, want only the taint the operator did not supply", got)
 	}
 }

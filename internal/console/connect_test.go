@@ -526,7 +526,7 @@ func TestConnectBuildsEveryStepInOrder(t *testing.T) {
 	w := clusterWiring{workDir: t.TempDir(), namespace: "aicrme", aicr: &aicrclient.Fake{}}
 
 	kube := fake.NewClientset()
-	got := w.steps(kube, "/tmp/session-1/kubeconfig", prove.NewClient(kube), gap.ClusterGPUs{})
+	got := w.steps(kube, "/tmp/session-1/kubeconfig", prove.NewClient(kube), gap.ClusterGPUs{}, nil)
 
 	want := []engine.Phase{
 		engine.PhaseDiscover, engine.PhaseRecommend, engine.PhaseBundle,

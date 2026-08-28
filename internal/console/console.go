@@ -598,14 +598,22 @@ func connectHook(w clusterWiring) func(context.Context, *ClusterInfo, kubernetes
 			return fmt.Errorf("opening the run store for cluster %s: %w", info.UID, err)
 		}
 
+		// info.GPUTolerations, not w.gpuTolerations: Connect adds this
+		// cluster's own GPU pool taints to whatever the environment supplied,
+		// and the workload has to tolerate the same pool the Connect screen
+		// just reported as reachable. Reading the startup value here instead
+		// would place the agent fine and then leave Prove's gang pending on a
+		// taint nothing tolerates -- the two-knobs-that-can-disagree failure
+		// AICRME_GPU_TOLERATIONS was made a single knob to avoid.
+		//
 		// One prove.Client instance, built here and handed to both the Prove
 		// step and Stop. Both are stateless beyond the clientset and the
 		// tolerations they hold, but a second construction site is a second
 		// place for the two to diverge if either ever grows real state.
-		prover := prove.NewClient(kube, w.gpuTolerations...)
+		prover := prove.NewClient(kube, info.GPUTolerations...)
 
 		w.engine.SetStore(store)
-		w.engine.SetSteps(w.steps(kube, path, prover, clusterGPUs(info))...)
+		w.engine.SetSteps(w.steps(kube, path, prover, clusterGPUs(info), info.GPUTolerations)...)
 		w.engine.SetProveClient(prover)
 		w.engine.SetTeardown(teardown.NewEngineTeardown(teardown.BashExec{}))
 		// Before Recover, not after: the identity check is what lets recovery
@@ -632,7 +640,7 @@ func connectHook(w clusterWiring) func(context.Context, *ClusterInfo, kubernetes
 // steps builds the pipeline against the connected cluster. kube is the
 // clientset dial just built, sessionKubeconfig is the frozen file every
 // subprocess in the chain reads, and prover is the same instance Stop holds.
-func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string, prover *prove.Client, gpus gap.ClusterGPUs) []engine.Step {
+func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string, prover *prove.Client, gpus gap.ClusterGPUs, gpuTolerations []corev1.Toleration) []engine.Step {
 	return []engine.Step{
 		steps.NewDiscover(w.aicr, steps.DiscoverConfig{
 			Namespace: w.namespace,
@@ -664,8 +672,10 @@ func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string
 			// simulated GPU nodes and onto a real one.
 			NodeSelector: parseNodeSelector(os.Getenv("AICRME_SNAPSHOT_NODE_SELECTOR")),
 			// Added to the built-in nvidia.com/gpu toleration, for a cluster
-			// whose GPU pool carries a different taint. See parseTolerations.
-			ExtraTolerations: w.gpuTolerations,
+			// whose GPU pool carries a different taint. Derived from the GPU
+			// nodes at connect and unioned with AICRME_GPU_TOLERATIONS -- see
+			// untoleratedGPUPoolTaints, and parseTolerations for the override.
+			ExtraTolerations: gpuTolerations,
 			// Unset (nil) on every real deployment, where AICR's own 1000m
 			// CPU default applies. Exists so the KWOK e2e can fit the agent
 			// onto the one real node it is pinned to -- see the Requests

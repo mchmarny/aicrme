@@ -186,15 +186,30 @@ diff /tmp/r0.txt /tmp/r1.txt
 
 ```sh
 make build
-AICRME_SNAPSHOT_NODE_SELECTOR='<a label only GPU nodes carry>' \
-AICRME_GPU_TOLERATIONS='<the cluster's own GPU taint>' \
-  ./bin/aicrme --context <context>
+./bin/aicrme --context <context>
 ```
 
-Both variables exist because a platform team routinely taints its GPU pool with something other
-than `nvidia.com/gpu` (GKE used `dedicated=gpu-workload`). The first biases AICR's snapshot agent
-onto a GPU node — the accelerator is read from an in-pod PCI probe, so an agent that lands
-anywhere else produces a snapshot with no accelerator and *no recipe resolves*, which surfaces at
-Recommend, far from the cause. The second is fed to the agent Job **and** the Prove workload,
-deliberately one knob rather than two: two that can disagree is how you fix Discover and still
-fail Prove twenty minutes later. A pool tainted with the standard `nvidia.com/gpu` needs neither.
+**No variables.** A tainted GPU pool used to need `AICRME_GPU_TOLERATIONS`, and that was never a
+discovery problem: Connect already read the nodes, computed the exact taint the agent could not
+tolerate, and printed `AICRME_GPU_TOLERATIONS=<taint>` on screen with instructions to quit and
+relaunch. It now derives that set and adopts it, reporting what it adopted as
+"this run will tolerate …". The variable still works as an override and as a way to add a
+toleration the derivation deliberately will not.
+
+Two exclusions in `untoleratedGPUPoolTaints` are load-bearing and must survive any refactor:
+**simulated nodes are skipped** (tolerating the KWOK taint turns the demo into a silent false
+success — see `steps.AgentTolerations`) and **non-GPU nodes are skipped** (a taint on a CPU node
+is somebody else's reservation). The derived toleration is a narrow `Equal` on key, value and
+effect, never `Exists`, so `dedicated=gpu-workload` cannot also buy
+`dedicated=someone-elses-reservation`.
+
+One knob, still, rather than two: the same derived set is fed to the agent Job **and** the Prove
+workload, because two that can disagree is how you fix Discover and still fail Prove twenty
+minutes later.
+
+**`AICRME_SNAPSHOT_NODE_SELECTOR` should not be set on a real cluster.** `console.go` and
+`steps.DiscoverConfig` both document it as a KWOK-only knob — unset, AICR's own client auto-targets
+a real GPU node — and it exists so the simulated e2e can pin the agent off fake-executing nodes.
+Every real run so far has set it anyway, copied from this runbook, so **nobody has tested dropping
+it**. Do that on the next real cluster; if Discover lands on a GPU node without it, delete this
+paragraph.

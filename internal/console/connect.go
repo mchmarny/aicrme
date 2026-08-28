@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,13 @@ type ClusterInfo struct {
 	// so or the SPA lands in an empty state over a record that still describes
 	// releases on the cluster.
 	RecoveredRun *engine.Run `json:"recoveredRun,omitempty"`
+	// GPUTolerations is what the agent Job and the Prove workload will carry:
+	// AICRME_GPU_TOLERATIONS, plus whatever Connect derived from this
+	// cluster's GPU pool. Not serialized -- the browser is shown
+	// Nodes.Tolerating, which is the same information in the spelling an
+	// operator reads. This field exists so connectHook wires the run with the
+	// set the verdict above was computed against.
+	GPUTolerations []corev1.Toleration `json:"-"`
 }
 
 // ContextInfo is one row of the Connect screen's list.
@@ -374,12 +382,27 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 		return ClusterInfo{}, nil, nil, fmt.Errorf("reading this cluster's identity from kube-system: %w", err)
 	}
 
+	// Derive the GPU pool's own taints and adopt them, rather than reporting
+	// them and asking the operator to relaunch. This is the whole of what
+	// AICRME_GPU_TOLERATIONS did on a real cluster, and it was never a
+	// discovery problem: this function already had the nodes in hand and the
+	// screen already printed the exact string. What it could not do was reach
+	// the process's own startup configuration, which is where the value lived.
+	//
 	// Computed against steps.AgentTolerations rather than against
 	// c.gpuTolerations alone, because what decides whether the agent Job can
 	// land is the whole set it will carry -- the built-in nvidia.com/gpu
-	// toleration included. Reporting a pool unreachable that the built-in
-	// already covers would warn on the ordinary cluster.
-	composition := groupNodes(nodes, steps.AgentTolerations(c.gpuTolerations))
+	// toleration included. Deriving a pool the built-in already covers would
+	// add a redundant toleration on the ordinary cluster.
+	var derived []string
+	effective := c.gpuTolerations
+	for _, t := range untoleratedGPUPoolTaints(nodes, steps.AgentTolerations(c.gpuTolerations)) {
+		effective = append(effective, tolerationFor(t))
+		derived = append(derived, formatTaint(t))
+	}
+
+	composition := groupNodes(nodes, steps.AgentTolerations(effective))
+	composition.Tolerating = strings.Join(derived, ",")
 
 	return ClusterInfo{
 		Context:   contextName,
@@ -389,6 +412,11 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 		Nodes:     composition,
 		UID:       string(ns.UID),
 		Toolchain: c.toolchain,
+		// The set the run will really carry, handed to the wiring rather than
+		// re-derived there: the agent Job and the Prove workload must tolerate
+		// the same taints as the pool this screen just judged reachable, and
+		// two derivation sites is how those drift apart.
+		GPUTolerations: effective,
 	}, restCfg, kube, nil
 }
 

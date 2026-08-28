@@ -9,11 +9,16 @@ const contexts = [
 ]
 
 /**
- * blockedNodes is the layout of the GKE cluster this feature was written for:
+ * taintedNodes is the layout of the GKE cluster this feature was written for:
  * two H100 nodes behind a taint of the platform team's own choosing, beside
  * four ordinary ones.
+ *
+ * The group is no longer `blocked` and there is no `remedy`: Connect derives
+ * that taint from the nodes and adopts it, reporting what it adopted in
+ * `tolerating`. This fixture used to carry the opposite, which is what the
+ * operator had to fix by hand.
  */
-const blockedNodes: NodeComposition = {
+const taintedNodes: NodeComposition = {
   total: 6,
   gpuNodes: 2,
   groups: [
@@ -23,12 +28,11 @@ const blockedNodes: NodeComposition = {
       accelerator: 'nvidia-h100-mega-80gb',
       gpusPerNode: 8,
       taints: ['dedicated=gpu-workload:NoSchedule'],
-      blocked: true,
     },
     { count: 3, instanceType: 'e2-standard-4' },
     { count: 1, instanceType: 'n2-standard-8' },
   ],
-  remedy: 'dedicated=gpu-workload:NoSchedule',
+  tolerating: 'dedicated=gpu-workload:NoSchedule',
 }
 
 const clusterInfo: ClusterInfo = {
@@ -36,7 +40,7 @@ const clusterInfo: ClusterInfo = {
   server: 'https://beta.example:6443',
   version: 'v1.31.4',
   nodeCount: 6,
-  nodes: blockedNodes,
+  nodes: taintedNodes,
   uid: '1111-2222',
   toolchain: { helm: 'v3.19.0', kubectl: 'v1.31.0', bash: '5.2.15', jq: '1.7' },
 }
@@ -136,17 +140,20 @@ describe('Connect', () => {
     expect(screen.getByText(/2 with GPUs/)).toBeDefined()
   })
 
-  // The Phase 4 failure, moved to the only screen where it is cheap to fix:
-  // tolerations are read from the environment at startup, so the answer is
-  // "quit and relaunch", which costs nothing before anything is installed.
-  it('names the variable to set when the agent cannot reach the GPU nodes', async () => {
+  // The Phase 4 failure, now handled rather than delegated. The screen used to
+  // print `AICRME_GPU_TOLERATIONS=<taint>` and ask the operator to quit and
+  // relaunch; it names the taint it adopted instead. Both halves are asserted:
+  // saying what it did, and no longer asking for anything.
+  it('names the GPU taint it adopted, and asks the operator for nothing', async () => {
     mockFetch()
     render(<Connect onConnected={() => {}} />)
 
     fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
 
-    expect(await screen.findByText(/AICRME_GPU_TOLERATIONS/)).toBeDefined()
+    expect(await screen.findByText(/will tolerate/i)).toBeDefined()
     expect(screen.getAllByText(/dedicated=gpu-workload:NoSchedule/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/AICRME_GPU_TOLERATIONS/)).toBeNull()
+    expect(screen.queryByText(/relaunch/i)).toBeNull()
   })
 
   // The counterpart, and the more important of the two. A warning that shows
@@ -173,6 +180,9 @@ describe('Connect', () => {
 
     await screen.findByText(/2 × a3-megagpu-8g/)
     expect(screen.queryByText(/AICRME_GPU_TOLERATIONS/)).toBeNull()
+    // Nor the adoption notice: nvidia.com/gpu is covered by the built-in
+    // toleration, so nothing was derived and there is nothing to report.
+    expect(screen.queryByText(/will tolerate/i)).toBeNull()
   })
 
   // Capping is honest only if it says it capped.

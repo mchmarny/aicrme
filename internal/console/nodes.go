@@ -116,7 +116,23 @@ type NodeComposition struct {
 	UsableGPUs int64 `json:"usableGPUs,omitempty"`
 	// Remedy is the AICRME_GPU_TOLERATIONS value that would clear every
 	// blocked group, in the exact spelling parseTolerations reads back.
+	//
+	// Now a genuine last resort rather than the normal path: Connect derives
+	// the GPU pool's own taints and tolerates them, so a group is Blocked only
+	// if it is unreachable for a reason derivation deliberately will not fix --
+	// today that means a simulated pool, which is excluded from the verdict
+	// anyway. Kept because "the agent cannot reach your GPUs and here is the
+	// exact string" is still the right thing to say if that ever changes.
 	Remedy string `json:"remedy,omitempty"`
+	// Tolerating is what Connect derived from this cluster's GPU nodes and
+	// added to the run, same spelling as Remedy. Empty when the built-in
+	// nvidia.com/gpu toleration already covered everything.
+	//
+	// Rendered rather than kept internal on purpose. Tolerating a taint is a
+	// scheduling decision made on the operator's behalf, and a taint can exist
+	// precisely to keep other people's workloads off a pool -- so the screen
+	// has to say which ones this run will ignore, before it installs anything.
+	Tolerating string `json:"tolerating,omitempty"`
 }
 
 // groupNodes folds a node list into shapes and reports which GPU shapes the
@@ -191,6 +207,67 @@ func describe(n *corev1.Node, tolerations []corev1.Toleration) NodeGroup {
 	}
 	g.Blocked = g.GPUsPerNode > 0 && !g.Simulated && len(untoleratedTaints(n, tolerations)) > 0
 	return g
+}
+
+// untoleratedGPUPoolTaints returns the distinct taints carried by this
+// cluster's REAL GPU nodes that tolerations does not already match.
+//
+// This is what makes the GPU taint stop being a flag. The console already
+// computed exactly this set in order to print
+// `AICRME_GPU_TOLERATIONS=<taint>` on the Connect screen and ask the operator
+// to quit and relaunch; the value was never unknown, it was only unreachable
+// from the running process. Deriving it here and wiring it into the run is
+// the same answer applied instead of displayed.
+//
+// TWO EXCLUSIONS ARE LOAD-BEARING, and both are the reason this is a
+// narrow derivation rather than `{Operator: Exists}`:
+//
+// Simulated nodes are skipped entirely. KWOK fakes Running/Succeeded for
+// anything scheduled onto a fake node without executing it, so an agent that
+// tolerates kwok.x-k8s.io/node reports a successful snapshot having collected
+// nothing -- see steps.AgentTolerations, which refuses a blanket toleration
+// for this reason. Deriving from whatever the nodes carry would have
+// reintroduced that automatically, and on the console's own e2e cluster.
+//
+// Non-GPU nodes are skipped. A taint on a CPU node is somebody else's
+// reservation, and neither consumer of this set has any business there: the
+// agent must land on a GPU node to probe an accelerator, and the Prove
+// workload requests GPUs.
+//
+// Transient taints are dropped by the same filter the verdict uses -- a
+// draining node is not a misconfigured pool.
+func untoleratedGPUPoolTaints(nodes []corev1.Node, tolerations []corev1.Toleration) []corev1.Taint {
+	var out []corev1.Taint
+	seen := map[string]bool{}
+	for i := range nodes {
+		g := describe(&nodes[i], tolerations)
+		if g.GPUsPerNode == 0 || g.Simulated {
+			continue
+		}
+		for _, t := range untoleratedTaints(&nodes[i], tolerations) {
+			if key := formatTaint(t); !seen[key] {
+				seen[key] = true
+				out = append(out, t)
+			}
+		}
+	}
+	return out
+}
+
+// tolerationFor is the narrowest toleration that matches one taint.
+//
+// Equal on the key AND the value AND the effect, never Exists: a derived
+// toleration is one the operator did not ask for, so it must buy exactly the
+// node it was derived from and nothing else. Exists on a key would tolerate
+// every value of it -- a `dedicated=gpu-workload` derivation would silently
+// also accept `dedicated=someone-elses-reservation`.
+func tolerationFor(t corev1.Taint) corev1.Toleration {
+	return corev1.Toleration{
+		Key:      t.Key,
+		Operator: corev1.TolerationOpEqual,
+		Value:    t.Value,
+		Effect:   t.Effect,
+	}
 }
 
 // untoleratedTaints returns the taints on n that nothing in tolerations

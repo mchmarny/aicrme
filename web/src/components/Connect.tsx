@@ -146,10 +146,15 @@ function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => vo
  * this console met tainted its GPU pool `dedicated=gpu-workload:NoSchedule`,
  * which the built-in toleration does not match, and the only symptom was
  * Discover sitting Pending for ten minutes before returning a snapshot with no
- * accelerator in it. Nothing named the taint. Here it is named before anything
- * is installed, which is also the only time the fix is cheap: the tolerations
- * are read from the environment at startup, so the remedy is to quit and
- * relaunch.
+ * accelerator in it. Nothing named the taint.
+ *
+ * Connect now derives that taint and adopts it, so the amber remedy block is a
+ * last resort rather than the normal path, and the ordinary case is the quiet
+ * grey one above it: "this run will tolerate X". Naming it is not decoration.
+ * Tolerating a taint is a scheduling decision taken on the operator's behalf,
+ * and a taint can exist precisely to keep other people's workloads off a pool
+ * -- so the screen says which ones this run will ignore, while nothing has
+ * been installed yet and the answer is still cheap to act on.
  */
 function Composition({ nodes }: { nodes: NodeComposition }) {
   const groups = nodes.groups ?? []
@@ -171,6 +176,15 @@ function Composition({ nodes }: { nodes: NodeComposition }) {
       {nodes.more ? (
         <p className="text-slate-500 text-xs">{`and ${nodes.more} more shapes`}</p>
       ) : null}
+
+      {nodes.tolerating && (
+        <div className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-xs">
+          <p className="text-slate-400">
+            Your GPU nodes are tainted. This run will tolerate:
+          </p>
+          <code className="mt-1 block break-all text-slate-200">{nodes.tolerating}</code>
+        </div>
+      )}
 
       {nodes.remedy && (
         <div className="rounded border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs">
