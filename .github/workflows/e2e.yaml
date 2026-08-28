@@ -251,6 +251,31 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           install_only: true
+      # THIS JOB, AND ONLY THIS JOB, RUNS HELM 4.
+      #
+      # The console shells out to whatever helm is on PATH, and every other
+      # job here gets the runner's own -- v3.21.4, measured in run
+      # 33172700011. Teardown is the half of the product whose helm-4 behaviour
+      # was never observed in CI: a real cluster proved a full install and
+      # uninstall under v4.2.4 by hand, but reset.sh's FAILED-teardown
+      # assertion -- a blocked uninstall that must then block Start, Retry and
+      # Discard -- had only ever run under helm 3, because that is what the
+      # runner ships. Uninstall is where the two majors differ most (helm 4
+      # changed --wait's default and its resource-deletion ordering), and it is
+      # exactly the path this job exercises twice.
+      #
+      # Pinning it here rather than globally is deliberate and buys MORE
+      # coverage, not less: the other five jobs keep exercising helm 3, so one
+      # workflow now spans both majors instead of moving wholesale to the newer
+      # one. Deliberately after kind-action, which puts the runner's helm on
+      # PATH -- this step must be the one that wins.
+      #
+      # v4.2.4 exactly, because that is the version a real GKE H100 cluster
+      # installed and uninstalled 16 releases under. Bump the two together.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+      - run: helm version --short
       - run: test/e2e/reset.sh
       # The residue inventory and the cluster's own before/after are the
       # whole evidence base for an ownership claim, and a script that dies
