@@ -19,8 +19,47 @@ installs nothing of itself into the cluster it configures.
 | Discover → Prove | real GKE H100s (2× a3-megagpu-8g, 16 GPUs) | Discover <45s, Apply 16/16 in 15m18s, Prove placed the gang one pod per H100 and the container body executed |
 | Discover → Prove | Kind + KWOK simulated H100s | `test/e2e/` — six jobs, on every push to main |
 | Reset | real GKE H100s, helm 4.2.4 | 16 releases → 0 in 2m29s |
-| Same-cluster reuse | **real GKE H100s**, and Kind + KWOK | 2026-08-28: Discover→Prove→Reset→Discover→Prove on one cluster; cycle 2 installed 16/16 and **placed its gang**, one pod per H100. Also `repro-kai` and `reset.sh` assertion 3 on every push |
+| Same-cluster reuse **via Reset** | **real GKE H100s**, and Kind + KWOK | 2026-08-28: Discover→Prove→Reset→Discover→Prove on one cluster; cycle 2 installed 16/16 and **placed its gang**, one pod per H100. Also `repro-kai` and `reset.sh` assertion 3 on every push |
+| Same-cluster reuse **without a Reset** | **does not work, and is now refused** | see below |
 | helm 4 | real cluster, **and CI on every push** | a full install *and* uninstall under v4.2.4 by hand; the `reset` e2e job now pins v4.2.4, so all six assertions — including the FAILED-teardown one — run under helm 4 while the other five jobs keep exercising helm 3.21.4 |
+
+### Installing twice without a Reset
+
+**A second run over an existing install produces a cluster that reports success and does not
+work.** kai-scheduler's `SchedulingShard` is `resource-policy: keep` and owns the
+`kai-scheduler-default` Deployment, which helm therefore does not own either. A second install
+rolls every other kai component and leaves those two, so the cluster runs the *first* install's
+scheduler against a control plane replaced underneath it — Apply reports 16/16, Prove places 0/2.
+
+Observed 2026-08-28 on real H100s. The shard and the scheduler Deployment were two hours older
+than the five kai Deployments beside them; the run records showed **no Reset had ever completed**,
+though the operator believed one had, because Stop and Reset are silent and a new run appears the
+instant the old one ends.
+
+`internal/steps`' `alreadyInstalled` now refuses this at Apply, before anything is touched. The
+purge cannot cover it: it runs only after a **confirmed uninstall**, and here there was none.
+
+**The signature, if it is ever seen again:** `kubectl -n kai-scheduler get deploy` — if
+`kai-scheduler-default` is older than the Deployments beside it, that is this.
+
+### Three residue classes that block cleanup, and nothing inventories
+
+Found while cleaning up after the above. All three are the same shape as the kai objects —
+cluster-scoped things a release created that helm does not own — but worse, because they stop a
+teardown finishing at all:
+
+- **Stale APIServices.** `prometheus-adapter` registers `v1beta1.custom.metrics.k8s.io` and
+  `v1beta1.external.metrics.k8s.io`. Once its Service is gone, discovery fails cluster-wide and
+  **every namespace deletion hangs**, including namespaces this tool never touched.
+- **Orphaned admission webhooks.** `reset-residue.sh` R5 reports them and nothing acts. Skyhook's
+  mutating webhook blocked the write that would have removed a finalizer — the CR could not be
+  patched, so its CRD could not delete. A genuine deadlock, breakable only by deleting the webhook
+  first.
+- **Orphaned finalizers.** `Skyhook/tuning` held `skyhook.nvidia.com/skyhook` after its controller
+  was uninstalled.
+
+None is fixed. A full manual clean currently needs, in order: delete namespaces, delete stale
+APIServices, delete orphaned webhooks, strip finalizers, delete CRDs.
 
 **A component count and a deployment-action count are different numbers.** The GKE recipe resolves
 **14 components**; `deploy.sh` runs **16 deployment actions**, because `gpu-operator-pre` and

@@ -153,6 +153,38 @@ it.
 
 ---
 
+## 4. A run over an existing install reports success and does not work — SHIPPED 2026-08-28
+
+**Observed:** 2026-08-28, Mark, immediately after the UI pass above. Apply reported 16/16 and
+Prove placed 0/2 on the cluster it had just succeeded on an hour earlier.
+
+**Not a regression.** A second run had installed over the first with no Reset between them.
+kai-scheduler's `SchedulingShard` survives by design and owns the `kai-scheduler-default`
+Deployment, so the cluster ran the *first* install's scheduler against a control plane replaced
+underneath it. The shard and that Deployment were two hours older than the five kai Deployments
+beside them.
+
+**The UX defect caused it.** Item 28 above — Stop and Reset both run silently for minutes — meant
+the operator could not tell which had happened. A new run appears the same second Stop closes the
+old one, which reads exactly like a completed Reset. The run records show no Reset ever ran. That
+is the strongest argument in this file for treating silent long operations as correctness bugs
+rather than polish.
+
+**Fixed:** `internal/steps`' `alreadyInstalled` refuses Apply when the recipe's own releases are
+already installed, naming them and both ways out. Two traps it had to avoid: Retry re-runs Apply
+over the run's own partial install (keyed on first attempt), and the ownership snapshot was being
+re-taken on retry, which recorded a run's own releases as pre-existing and would have left them
+behind at Reset. `prove.sh` assert 5 drove exactly this path and now resets first.
+
+**Also corrected:** the Prove timeout message had blamed the pod-grouper and said the failure
+follows a Reset. Both wrong — the pod-grouper chatter appears on healthy installs, and this
+cluster was never reset. It now names the mechanism and a five-second check.
+
+**Still open:** the three residue classes that blocked the manual cleanup afterwards (stale
+APIServices, orphaned webhooks, orphaned finalizers). See `STATE.md`.
+
+---
+
 ## Observed in the same screenshot, not raised as feedback
 
 Recorded only so they are not re-discovered as surprises. Neither is a request.
