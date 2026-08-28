@@ -216,6 +216,28 @@ func recipeReleaseNames(run *engine.Run) map[string]bool {
 	return out
 }
 
+// reinstallHazards are the components a second install cannot safely run
+// over, keyed by the property that makes them dangerous rather than by
+// suspicion: the chart leaves behind a cluster-scoped object that OWNS a
+// workload, so helm never owns that workload and a reinstall cannot replace
+// it.
+//
+// kai-scheduler is the only one known. Its SchedulingShard is annotated
+// `helm.sh/resource-policy: keep` and owns the kai-scheduler-default
+// Deployment; installing over it leaves the previous install's scheduler pod
+// running against a control plane replaced underneath it.
+//
+// DELIBERATELY NOT "any release that already exists". Installing over a
+// pre-existing release is a supported and tested scenario -- a cluster that
+// already runs cert-manager is the ordinary case, `helm upgrade --install`
+// replaces the manifest correctly, and the ownership snapshot exists
+// precisely so Reset then spares what it did not create. test/e2e/reset.sh
+// is built on that collision: its bystander release IS named cert-manager,
+// in the cert-manager namespace, and assertion 1 requires the install to
+// proceed over it. A guard that refused every pre-existing recipe release
+// would break the adopted-dependency design this console is built around.
+var reinstallHazards = map[string]bool{"kai-scheduler": true}
+
 // alreadyInstalled returns the recipe's own releases that were already on the
 // cluster before this Apply.
 //
@@ -246,7 +268,7 @@ func recipeReleaseNames(run *engine.Run) map[string]bool {
 func alreadyInstalled(own engine.Ownership, names map[string]bool) []engine.ReleaseRef {
 	var out []engine.ReleaseRef
 	for _, r := range own.Releases {
-		if names[r.Name] {
+		if names[r.Name] && reinstallHazards[r.Name] {
 			out = append(out, r)
 		}
 	}

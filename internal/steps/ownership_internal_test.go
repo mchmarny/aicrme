@@ -324,6 +324,8 @@ func (c *countingExec) Run(_ context.Context, _ applier.Spec, out io.Writer) err
 // throughout.
 func TestApplyRefusesToInstallOverAnExistingInstall(t *testing.T) {
 	h := &fakeHelmLister{byNamespace: map[string][]string{
+		// cert-manager is here to prove it is NOT what triggers the refusal:
+		// only kai-scheduler is a reinstall hazard.
 		"cert-manager":  {"cert-manager"},
 		"kai-scheduler": {"kai-scheduler"},
 	}}
@@ -341,10 +343,39 @@ func TestApplyRefusesToInstallOverAnExistingInstall(t *testing.T) {
 		t.Errorf("deploy.sh ran %d times, want 0 -- the refusal must precede any cluster mutation", exec.runs)
 	}
 	// The message has to be actionable: what is in the way, and the way out.
-	for _, want := range []string{"cert-manager", "kai-scheduler", "Reset", "helm uninstall"} {
+	for _, want := range []string{"kai-scheduler", "SchedulingShard", "Reset", "helm uninstall"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %q: %v", want, err)
 		}
+	}
+}
+
+// INSTALLING OVER A PRE-EXISTING DEPENDENCY IS SUPPORTED, and the first
+// version of this guard broke it.
+//
+// A cluster that already runs cert-manager is the ordinary case, not a fault:
+// `helm upgrade --install` replaces the manifest correctly, and the ownership
+// snapshot exists precisely so Reset then spares what it did not create.
+// test/e2e/reset.sh is built on exactly this collision -- its bystander
+// release IS named cert-manager, in the cert-manager namespace -- and its
+// first assertion requires the install to proceed over it. A guard that
+// refused every pre-existing recipe release failed that job on the first run.
+//
+// Only kai-scheduler is refused, and for a property no other component has:
+// its SchedulingShard outlives the release and owns a Deployment helm
+// therefore cannot replace.
+func TestApplyInstallsOverAPreexistingDependency(t *testing.T) {
+	h := &fakeHelmLister{byNamespace: map[string][]string{
+		"cert-manager": {"cert-manager"},
+	}}
+	exec := &countingExec{}
+	step := NewApply(applier.New(exec), ApplyConfig{Helm: h, Kube: fake.NewSimpleClientset()})
+
+	if err := step.Run(context.Background(), recipeRun(), func(bus.Event) {}); err != nil {
+		t.Fatalf("Apply refused over a pre-existing cert-manager, which is the adopted-dependency case: %v", err)
+	}
+	if exec.runs != 1 {
+		t.Errorf("deploy.sh ran %d times, want 1", exec.runs)
 	}
 }
 

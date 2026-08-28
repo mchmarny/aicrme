@@ -189,11 +189,20 @@ func installedAlreadyMessage(clash []engine.ReleaseRef) string {
 		list = fmt.Sprintf("%s, and %d more", list, len(clash)-len(shown))
 	}
 	return fmt.Sprintf(
-		"%d of this recipe's releases are already installed on this cluster (%s). "+
-			"Installing over them would appear to succeed and then not work: kai-scheduler's "+
-			"SchedulingShard survives a reinstall by design, the scheduler Deployment it owns is "+
-			"never recreated, and the gang fails to place twenty minutes from now. "+
-			"Reset the run that installed them first. If no run owns them any more, remove them "+
+		"%s is already installed on this cluster (%s), and cannot be safely installed over. "+
+			"Its SchedulingShard survives a reinstall by design and owns the "+
+			"kai-scheduler-default Deployment, so helm cannot replace it: the cluster would keep "+
+			"running the previous install's scheduler against a control plane replaced underneath "+
+			"it, Apply would report success, and the gang would fail to place twenty minutes from "+
+			"now. Reset the run that installed it first. If no run owns it any more, remove it "+
 			"with `helm uninstall`.",
-		len(clash), list)
+		plural(len(clash)), list)
+}
+
+// plural names what is in the way when the hazard set grows past one entry.
+func plural(n int) string {
+	if n == 1 {
+		return "kai-scheduler"
+	}
+	return fmt.Sprintf("%d components that cannot be reinstalled over", n)
 }

@@ -330,17 +330,23 @@ echo "--- assert 5: a gang that never places is cleaned up, and says why"
 # around it.
 echo "--- reset the first run so the second has a clean cluster to install into"
 post "/api/runs/${RUN_ID}/reset" -d '{"confirm":"reset"}' >/dev/null
+# Waits on the CLUSTER, not on the run record. reset.sh says why in as many
+# words: "the record is deleted on a clean teardown, so the run may
+# legitimately be unreachable here". A first version of this polled for
+# .residue.summary and could never succeed -- the teardown worked, the record
+# was gone, and the wait ran out. The releases being gone is the condition
+# this assertion actually depends on anyway, since it is what lets the next
+# install proceed.
 RESET_DONE=""
 for _ in $(seq 1 90); do
-  # The residue summary is written when the teardown finishes, so it is the
-  # signal that the reset is over -- the run's state is `done` both before
-  # and after, having already been stopped.
-  RESET_DONE="$(run_json "${RUN_ID}" | jq -r '.residue.summary // empty')"
-  [[ -n "${RESET_DONE}" ]] && break
+  if [[ "$(helm list --namespace kai-scheduler --short 2>/dev/null | wc -l | tr -d ' ')" == "0" ]]; then
+    RESET_DONE="yes"
+    break
+  fi
   sleep 5
 done
-[[ -n "${RESET_DONE}" ]] || fail "the reset before assert 5 never finished"
-echo "reset: ${RESET_DONE}"
+[[ -n "${RESET_DONE}" ]] || fail "the reset before assert 5 never removed kai-scheduler"
+echo "reset: kai-scheduler releases gone"
 
 TIMEOUT_RUN_ID="$(drive_to_prove)"
 echo "second run id: ${TIMEOUT_RUN_ID}"
