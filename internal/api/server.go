@@ -232,6 +232,7 @@ func (s *Server) Handler() http.Handler {
 	gated.HandleFunc("POST /api/runs/{id}/reset", s.handleReset)
 	gated.HandleFunc("DELETE /api/runs/{id}", s.handleDiscardRun)
 	gated.HandleFunc("GET /api/runs/{id}/bundle", s.handleBundle)
+	gated.HandleFunc("GET /api/runs/{id}/log", s.handleRunLog)
 
 	protected := http.NewServeMux()
 	protected.HandleFunc("GET /api/contexts", s.handleContexts)

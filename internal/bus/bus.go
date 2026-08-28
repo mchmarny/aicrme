@@ -131,6 +131,14 @@ func (b *Bus) Replay(since uint64) []Event {
 	return b.since(since)
 }
 
+// Capacity is how many events this Bus retains for replay.
+//
+// Exported for one reason: an export of a run's events has to be able to say
+// whether the ring may already have dropped some. A caller comparing a
+// replay's length against a constant it declared itself would be comparing
+// against its own assumption rather than against this Bus.
+func (b *Bus) Capacity() int { return b.capacity }
+
 // Subscribe returns a channel that first yields retained events newer than
 // since, then streams live events. The channel is sized to hold the entire
 // backlog plus subscriberBuffer live events, so a reconnecting browser never

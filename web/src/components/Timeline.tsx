@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { runLogUrl } from '../api'
 import type { AicrEvent } from '../useEvents'
 
 const levelClass: Record<AicrEvent['level'], string> = {
@@ -100,6 +101,20 @@ export function Timeline({ events, runId }: { events: AicrEvent[]; runId?: strin
           >
             {showCluster ? 'hide cluster activity' : 'show cluster activity'}
           </button>
+        )}
+        {/* The export lives here because this is the panel it exports: what
+            the timeline shows is held in an in-memory ring that dies with
+            the console, so the log from the run that just failed is exactly
+            the one an operator otherwise cannot keep. */}
+        {runId && (
+          <a
+            href={runLogUrl(runId)}
+            download
+            data-testid="download-run-log"
+            className="text-ink-faint underline decoration-dotted"
+          >
+            download run log
+          </a>
         )}
         {earlier.length > 0 && !showEarlier && (
           <button

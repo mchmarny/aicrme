@@ -261,6 +261,19 @@ export function bundleUrl(runId: string): string {
 }
 
 /**
+ * runLogUrl is the whole run as one downloadable file: the record plus every
+ * event this console published for it.
+ *
+ * A plain link rather than a fetch, so the browser saves it with the filename
+ * the server sets. The events are otherwise reachable only over SSE, which
+ * never ends and so cannot be saved -- and they live in an in-memory ring
+ * that dies with the console process.
+ */
+export function runLogUrl(runId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/log`
+}
+
+/**
  * resetRun tears down what one run installed: its workload, the helm
  * releases it created, and the namespaces it created and left empty
  * (POST /api/runs/{id}/reset -> engine.Reset).

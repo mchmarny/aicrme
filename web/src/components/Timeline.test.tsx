@@ -150,3 +150,24 @@ describe('Timeline remedies', () => {
     expect(screen.getByText('kubectl rollout restart deploy -n kai-scheduler').tagName).toBe('CODE')
   })
 })
+
+// The timeline is the one panel whose contents cannot outlive the process:
+// the events are held in an in-memory ring, and stopping the console
+// discards them. Exporting them is offered here, beside what it exports.
+describe('Timeline export', () => {
+  it('offers the run log for download when the run is known', () => {
+    render(<Timeline events={events} runId="run1" />)
+
+    const link = screen.getByTestId('download-run-log')
+    expect(link.getAttribute('href')).toBe('/api/runs/run1/log')
+    expect(link.hasAttribute('download')).toBe(true)
+  })
+
+  // Without a run there is nothing to name in the export, and a link to
+  // /api/runs//log would 404 in a way that looks like the export is broken.
+  it('offers nothing to download before a run exists', () => {
+    render(<Timeline events={events} />)
+
+    expect(screen.queryByTestId('download-run-log')).toBeNull()
+  })
+})
