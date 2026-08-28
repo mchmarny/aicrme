@@ -20,7 +20,7 @@ installs nothing of itself into the cluster it configures.
 | Discover → Prove | Kind + KWOK simulated H100s | `test/e2e/` — six jobs, on every push to main |
 | Reset | real GKE H100s, helm 4.2.4 | 16 releases → 0 in 2m29s |
 | Same-cluster reuse | **real GKE H100s**, and Kind + KWOK | 2026-08-28: Discover→Prove→Reset→Discover→Prove on one cluster; cycle 2 installed 16/16 and **placed its gang**, one pod per H100. Also `repro-kai` and `reset.sh` assertion 3 on every push |
-| helm 4 | real cluster | a full install *and* uninstall under v4.2.4 |
+| helm 4 | real cluster, **and CI on every push** | a full install *and* uninstall under v4.2.4 by hand; the `reset` e2e job now pins v4.2.4, so all six assertions — including the FAILED-teardown one — run under helm 4 while the other five jobs keep exercising helm 3.21.4 |
 
 **A component count and a deployment-action count are different numbers.** The GKE recipe resolves
 **14 components**; `deploy.sh` runs **16 deployment actions**, because `gpu-operator-pre` and
@@ -63,21 +63,18 @@ by design and holds its placement. Nothing polls for `succeeded`; it never comes
 
 Ordered by what unblocks the most. Each item says what it costs and what it is waiting on.
 
-1. **Close the helm 4 obligation.** Everything in `test/e2e/reset.sh` has run under helm 4 except
-   the FAILED-reset assertion — a failed teardown blocking Start, Retry and Discard. Match on that
-   description, not on an assertion number; the numbers have moved twice. Costs one local
-   `reset.sh` run against a helm 4 host. **This gates the first release, not any merge.**
-2. **Release automation.** goreleaser + brew + an install script, macOS and Linux, no Windows.
-   Waiting on item 1.
-3. **Time a node image that ships no driver.** Every real run so far has been on GKE H100 pools
+1. **Release automation.** goreleaser + brew + an install script, macOS and Linux, no Windows.
+   Nothing blocks it: the helm 4 obligation that used to gate the first release closed on
+   2026-08-28.
+2. **Time a node image that ships no driver.** Every real run so far has been on GKE H100 pools
    with a pre-installed driver, so the one claim in `slowSteps.ts` nobody has measured is the
    `gpu-operator` driver compile. Costs one Apply on any GPU cluster whose nodes come up
    driverless.
-4. **`ValidateState` false-passes on simulated nodes.** Known and deferred; it is why the demo
+3. **`ValidateState` false-passes on simulated nodes.** Known and deferred; it is why the demo
    claims Prove rather than Validate.
-5. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
+4. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
-6. **Collapse the docs.** When the work is done, rewrite from current state and delete
+5. **Collapse the docs.** When the work is done, rewrite from current state and delete
    `docs/phase-*.md` rather than editing them.
 
 ### Known and deliberately not fixed
