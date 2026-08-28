@@ -640,8 +640,11 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     // thing that works, so the screen that carries Stop has to win here or
     // the operator is stranded on a panel of dead buttons.
     if (run.state === 'active') {
+      // Same column as Prove. ResetGate rendered full-width beside a
+      // centered max-w-2xl Prove, which put "Reset this run" alone in the
+      // left margin, aligned with nothing.
       return (
-        <div className="space-y-6">
+        <div className="mx-auto max-w-2xl space-y-6">
           <Prove events={events} run={run} busy={busy} onStop={handleStop} />
           <ResetGate
             run={run}
@@ -673,8 +676,11 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     // fell through to the report branch below and redrew the Discover screen
     // over a finished demo, which reads as the console having started over.
     if (run.phase === 'prove') {
+      // Same column as Prove. ResetGate rendered full-width beside a
+      // centered max-w-2xl Prove, which put "Reset this run" alone in the
+      // left margin, aligned with nothing.
       return (
-        <div className="space-y-6">
+        <div className="mx-auto max-w-2xl space-y-6">
           <Prove events={events} run={run} busy={busy} onStop={handleStop} />
           <ResetGate
             run={run}

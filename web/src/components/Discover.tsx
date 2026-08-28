@@ -35,6 +35,17 @@ export function Discover({ report }: { report: CapabilityReport }) {
         {report.detail && <p className="mt-1 text-sm text-ink-soft">{report.detail}</p>}
       </div>
 
+      {report.analyzed && gaps.length > 0 && (
+        <div>
+          <h3 className="text-xs uppercase tracking-wide text-ink-faint">
+            What this cluster is missing today
+          </h3>
+          <p className="mt-1 text-xs text-ink-faint">
+            Each one is closed by a component in the bundle you review next.
+          </p>
+        </div>
+      )}
+
       {!report.analyzed ? (
         <p data-testid="no-snapshot" className="text-warn">
           No cluster snapshot is available yet, so nothing has been measured — this is not a clean bill of health.
@@ -44,7 +55,12 @@ export function Discover({ report }: { report: CapabilityReport }) {
           Every capability this workload needs is already installed — there is nothing left to close.
         </p>
       ) : (
-        <ul className="space-y-2">
+        /* A heading, because these read as alarms without one. Each line is a
+           capability the cluster lacks TODAY and a component in the bundle
+           closes -- the justification for everything the operator is about to
+           approve -- and unlabelled they scan as "something is wrong with my
+           cluster" immediately before a Continue button. */
+        <ul className="space-y-2" aria-label="What this cluster is missing today">
           {gaps.map(g => (
             <li key={g.id} data-testid={`gap-${g.id}`} className="rounded border border-line bg-panel p-3">
               <p className="text-ink">{g.title}</p>

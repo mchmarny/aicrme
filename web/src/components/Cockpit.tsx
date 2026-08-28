@@ -108,19 +108,11 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
       <div>
         <h2 className="text-2xl font-semibold text-ink-strong">Review the bundle before it touches the cluster</h2>
         <p className="mt-1 text-sm text-ink-soft">
-          {recipe
-            ? `${recipe.componentCount} components, every version pinned.`
-            : 'Resolving the bundle…'}
+          {recipe ? pinnedClaim(recipe) : 'Resolving the bundle…'}
         </p>
       </div>
 
-      {recipe && (
-        <ul className="space-y-1 font-mono text-xs text-ink-soft">
-          {recipe.components.map(c => (
-            <li key={c.name}>{c.name} {c.version} → {c.namespace}</li>
-          ))}
-        </ul>
-      )}
+      {recipe && <GateComponents recipe={recipe} gaps={run.report?.gaps ?? []} />}
 
       <div className="flex items-center gap-6">
         <button
@@ -136,6 +128,77 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
         )}
       </div>
     </section>
+  )
+}
+
+
+/**
+ * pinnedClaim states what is actually pinned.
+ *
+ * "every version pinned" was a blanket claim the very next lines
+ * contradicted: a real GKE recipe carries gke-nccl-tcpxo and
+ * nodewright-customizations, AICR-generated local charts with no upstream
+ * version to pin. This is the one screen whose entire job is honesty -- it
+ * is where cluster-admin is granted -- so it counts rather than asserts, and
+ * only says "every" when every is true.
+ */
+export function pinnedClaim(recipe: { componentCount: number; components: { version?: string }[] }): string {
+  const total = recipe.components.length || recipe.componentCount
+  const pinned = recipe.components.filter(c => (c.version ?? '').trim() !== '').length
+  if (total === 0) return 'Resolving the bundle…'
+  if (pinned === total) return `${recipe.componentCount} components, every version pinned.`
+  return `${recipe.componentCount} components, ${pinned} of ${total} pinned to an upstream version; the rest are generated locally.`
+}
+
+/**
+ * GateComponents lists what is about to be installed, grouped by the
+ * namespace it lands in and annotated with the gap it closes.
+ *
+ * Namespaces, because that is the one grouping the gate already knows and
+ * alphabetical is the one order that says nothing: four components of a real
+ * recipe land in `monitoring`, which was invisible with them scattered down
+ * a flat list. Install order would carry more meaning still, but the bundle's
+ * own numbering is not in this event -- the gate sees the resolved recipe,
+ * not deploy.sh.
+ *
+ * The gap annotation closes the loop Discover opens. Its findings ("No
+ * GPU-aware scheduler", "No device plugin") read as alarms on the screen
+ * before this one, and the components that answer them read as a bill on
+ * this one. gap.Gap already carries the component name, so the join costs
+ * nothing and turns a list into a justification.
+ */
+function GateComponents({ recipe, gaps }: {
+  recipe: NonNullable<RunState['recipe']>
+  gaps: { title: string; component: string }[]
+}) {
+  const byNamespace = new Map<string, typeof recipe.components>()
+  for (const c of recipe.components) {
+    const ns = c.namespace || 'default'
+    byNamespace.set(ns, [...(byNamespace.get(ns) ?? []), c])
+  }
+  const gapFor = new Map(gaps.map(g => [g.component, g.title]))
+
+  return (
+    <div className="space-y-3">
+      {[...byNamespace.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([ns, items]) => (
+        <div key={ns} data-testid={`gate-namespace-${ns}`}>
+          <h3 className="text-xs uppercase tracking-wide text-ink-faint">{ns}</h3>
+          <ul className="mt-1 space-y-1">
+            {items.map(c => (
+              <li key={c.name} data-testid={`gate-component-${c.name}`} className="font-mono text-xs">
+                <span className="text-ink">{c.name}</span>{' '}
+                {c.version
+                  ? <span className="text-ink-faint">{c.version}</span>
+                  : <span className="text-ink-faint">(generated locally, no upstream version)</span>}
+                {gapFor.has(c.name) && (
+                  <span className="text-accent"> — closes: {gapFor.get(c.name)}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
   )
 }
 

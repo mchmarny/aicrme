@@ -81,6 +81,19 @@ export function Recommend({ options, onDecide }: {
       >
         Continue
       </button>
+      {/* Nothing is preselected here, deliberately -- unlike Connect, which
+          preselects because the kubeconfig's current-context is a real
+          signal about what the operator meant. There is no equivalent signal
+          for intent, and inventing a default would put a recipe choice in
+          the console's hands. What a disabled button owes the operator is a
+          reason, which this had none of. */}
+      {(!intent || !platform) && (
+        <p className="text-xs text-ink-faint">
+          {!intent && !platform && 'Choose what the cluster is for, and how you submit work.'}
+          {intent && !platform && 'Choose how you submit work.'}
+          {!intent && platform && 'Choose what the cluster is for.'}
+        </p>
+      )}
     </section>
   )
 }

@@ -33,8 +33,12 @@ describe('Cockpit', () => {
     const run = baseRun({ state: 'awaiting_decision', phase: 'apply' })
     render(<Cockpit events={[]} run={run} onDecide={onDecide} onRetry={vi.fn()} />)
 
+    // By testid, not by text: several components share a name with the
+    // namespace they land in (cert-manager, gpu-operator, kai-scheduler), so
+    // once the list is grouped a bare text match finds both the heading and
+    // the row and cannot tell which it wanted.
     for (const c of recipe.components) {
-      expect(screen.getByText(new RegExp(c.name))).toBeDefined()
+      expect(screen.getByTestId(`gate-component-${c.name}`).textContent).toMatch(c.name)
     }
 
     const link = screen.getByRole('link', { name: /download bundle/i })
@@ -59,6 +63,68 @@ describe('Cockpit', () => {
 
     expect(screen.getByText(/every version pinned/)).toBeDefined()
     expect(screen.queryByText(/signed/i)).toBeNull()
+  })
+
+  // NAMESPACES ARE THE ONE GROUPING THE GATE ALREADY KNOWS.
+  //
+  // Fourteen components in a flat alphabetical list carried no information:
+  // four of them land in `monitoring` and that was invisible with them
+  // scattered across the list. Alphabetical is the one order that says
+  // nothing about what is being approved.
+  it('gate: groups the components by the namespace they land in', () => {
+    const run = baseRun({ state: 'awaiting_decision', phase: 'apply' })
+    render(<Cockpit events={[]} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    const group = screen.getByTestId('gate-namespace-kubeflow')
+    expect(group.textContent).toMatch(/kubeflow-trainer/)
+    expect(group.textContent).not.toMatch(/cert-manager/)
+  })
+
+  // WHY IS THIS COMPONENT IN MY CLUSTER.
+  //
+  // Discover names the gaps -- "No GPU-aware scheduler", "No GPU metrics" --
+  // and the gate lists the components that close them, and nothing connected
+  // the two. gap.Gap carries the component name already, so the join is
+  // free; without it the gaps read as alarms and the list reads as a bill.
+  it('gate: says which gap each component closes', () => {
+    const run = baseRun({
+      state: 'awaiting_decision',
+      phase: 'apply',
+      report: {
+        headline: 'h', punchline: 'p', usableGpus: 16, totalGpus: 16, analyzed: true,
+        gaps: [{ id: 'sched', title: 'No GPU-aware scheduler', component: 'kai-scheduler' }],
+      },
+    })
+    render(<Cockpit events={[]} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    expect(screen.getByTestId('gate-component-kai-scheduler').textContent)
+      .toMatch(/No GPU-aware scheduler/)
+    // A component that closes no gap makes no claim about one.
+    expect(screen.getByTestId('gate-component-cert-manager').textContent)
+      .not.toMatch(/No GPU-aware scheduler/)
+  })
+
+  // "every version pinned" was contradicted two rows later on a real recipe:
+  // gke-nccl-tcpxo and nodewright-customizations are AICR-generated local
+  // charts with no upstream version to pin, and the screen made a blanket
+  // claim and then showed the exceptions. On the one screen whose whole job
+  // is honesty, that is the expensive kind of small wrong.
+  it('gate: does not claim every version is pinned when some have none', () => {
+    const mixed = {
+      ...recipe,
+      componentCount: 5,
+      components: [
+        ...recipe.components,
+        { name: 'gke-nccl-tcpxo', kind: 'Helm', version: '', namespace: 'kube-system' },
+      ],
+    }
+    const run = baseRun({ state: 'awaiting_decision', phase: 'apply', recipe: mixed })
+    render(<Cockpit events={[]} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    expect(screen.queryByText(/every version pinned/)).toBeNull()
+    expect(screen.getByText(/4 of 5 pinned/)).toBeDefined()
+    // and the two without one are explained rather than left blank.
+    expect(screen.getByTestId('gate-component-gke-nccl-tcpxo').textContent).toMatch(/generated/i)
   })
 
   it('running: renders component rows with status, and a retrying component shows its attempt count', () => {
