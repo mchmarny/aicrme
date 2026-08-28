@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/aicrclient"
@@ -122,7 +123,39 @@ func (r *recommend) Run(ctx context.Context, run *engine.Run, emit engine.Emit) 
 
 	emit(bus.Event{
 		Kind: bus.KindLog, Data: encoded,
-		Message: fmt.Sprintf("%d components, every version pinned", summary.ComponentCount),
+		Message: pinnedSummary(summary),
 	})
 	return nil
 }
+
+// pinnedSummary says how much of the recipe is pinned, and claims "every"
+// only when every is true.
+//
+// This said "every version pinned" unconditionally, and on a real GKE recipe
+// the console then contradicted itself on one screen: the timeline carried
+// that sentence while the gate beside it listed gke-nccl-tcpxo and
+// nodewright-customizations with no version at all. They are AICR-generated
+// local charts -- there is no upstream version to pin -- so the claim was
+// never true there.
+//
+// The confirm gate makes the same count in the SPA (pinnedClaim, Cockpit.tsx).
+// Two places say it because two surfaces show it; they must agree, and a
+// screenshot of this screen is the test.
+func pinnedSummary(summary RecipeSummary) string {
+	pinned := 0
+	for _, c := range summary.Components {
+		if strings.TrimSpace(c.Version) != "" {
+			pinned++
+		}
+	}
+	total := len(summary.Components)
+	if total == 0 || pinned == total {
+		return fmt.Sprintf("%d components, every version pinned", summary.ComponentCount)
+	}
+	return fmt.Sprintf("%d components, %d of %d pinned to an upstream version; the rest are generated locally",
+		summary.ComponentCount, pinned, total)
+}
+
+// PinnedSummaryForTest exposes pinnedSummary to the package's external test,
+// which is where every other Recommend assertion lives.
+func PinnedSummaryForTest(summary RecipeSummary) string { return pinnedSummary(summary) }

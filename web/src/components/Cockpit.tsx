@@ -176,7 +176,17 @@ function GateComponents({ recipe, gaps }: {
     const ns = c.namespace || 'default'
     byNamespace.set(ns, [...(byNamespace.get(ns) ?? []), c])
   }
-  const gapFor = new Map(gaps.map(g => [g.component, g.title]))
+  // Grouped, not keyed. internal/gap has THREE rules naming gpu-operator --
+  // gpu-driver, device-plugin and gpu-metrics -- so a Map keyed by component
+  // keeps only the last and silently drops the rest. Observed on a real
+  // cluster: the gate credited gpu-operator with "No GPU metrics" and never
+  // mentioned "No device plugin, Kubernetes cannot schedule nvidia.com/gpu",
+  // which is the one that actually explains why the cluster cannot run GPU
+  // work at all.
+  const gapsFor = new Map<string, string[]>()
+  for (const g of gaps) {
+    gapsFor.set(g.component, [...(gapsFor.get(g.component) ?? []), g.title])
+  }
 
   return (
     <div className="space-y-3">
@@ -190,8 +200,8 @@ function GateComponents({ recipe, gaps }: {
                 {c.version
                   ? <span className="text-ink-faint">{c.version}</span>
                   : <span className="text-ink-faint">(generated locally, no upstream version)</span>}
-                {gapFor.has(c.name) && (
-                  <span className="text-accent"> — closes: {gapFor.get(c.name)}</span>
+                {gapsFor.has(c.name) && (
+                  <span className="text-accent"> — closes: {gapsFor.get(c.name)!.join('; ')}</span>
                 )}
               </li>
             ))}

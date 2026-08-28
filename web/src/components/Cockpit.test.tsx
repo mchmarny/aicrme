@@ -92,13 +92,25 @@ describe('Cockpit', () => {
       phase: 'apply',
       report: {
         headline: 'h', punchline: 'p', usableGpus: 16, totalGpus: 16, analyzed: true,
-        gaps: [{ id: 'sched', title: 'No GPU-aware scheduler', component: 'kai-scheduler' }],
+        gaps: [
+          { id: 'sched', title: 'No GPU-aware scheduler', component: 'kai-scheduler' },
+          { id: 'device-plugin', title: 'No device plugin', component: 'gpu-operator' },
+          { id: 'gpu-metrics', title: 'No GPU metrics', component: 'gpu-operator' },
+        ],
       },
     })
     render(<Cockpit events={[]} run={run} onDecide={vi.fn()} onRetry={vi.fn()} />)
 
     expect(screen.getByTestId('gate-component-kai-scheduler').textContent)
       .toMatch(/No GPU-aware scheduler/)
+    // THREE of internal/gap's rules name gpu-operator -- gpu-driver,
+    // device-plugin and gpu-metrics -- so a map keyed by component keeps only
+    // the last and silently drops the other two. On a real cluster that hid
+    // "No device plugin, Kubernetes cannot schedule nvidia.com/gpu", which is
+    // the most consequential of the three, behind "No GPU metrics".
+    const gpu = screen.getByTestId('gate-component-gpu-operator').textContent ?? ''
+    expect(gpu).toMatch(/No device plugin/)
+    expect(gpu).toMatch(/No GPU metrics/)
     // A component that closes no gap makes no claim about one.
     expect(screen.getByTestId('gate-component-cert-manager').textContent)
       .not.toMatch(/No GPU-aware scheduler/)

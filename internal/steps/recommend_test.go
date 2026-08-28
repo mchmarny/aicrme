@@ -525,3 +525,33 @@ func TestRecommendResolvesAgainstSimulatedH100Fixture(t *testing.T) {
 		}
 	}
 }
+
+// The console contradicted itself on one screen: the timeline said "14
+// components, every version pinned" while the confirm gate beside it listed
+// gke-nccl-tcpxo and nodewright-customizations with no version at all. They
+// are AICR-generated local charts, so there is nothing upstream to pin and
+// the claim was simply false on a real GKE recipe.
+//
+// The gate counts (pinnedClaim, Cockpit.tsx) and this must agree with it.
+func TestPinnedSummaryClaimsEveryOnlyWhenEveryIsTrue(t *testing.T) {
+	all := steps.RecipeSummary{ComponentCount: 2, Components: []steps.ComponentSummary{
+		{Name: "cert-manager", Version: "v1.20.2"},
+		{Name: "kai-scheduler", Version: "v0.14.1"},
+	}}
+	if got := steps.PinnedSummaryForTest(all); !strings.Contains(got, "every version pinned") {
+		t.Errorf("all pinned: %q, want the plain claim", got)
+	}
+
+	mixed := steps.RecipeSummary{ComponentCount: 3, Components: []steps.ComponentSummary{
+		{Name: "cert-manager", Version: "v1.20.2"},
+		{Name: "kai-scheduler", Version: "v0.14.1"},
+		{Name: "gke-nccl-tcpxo", Version: ""},
+	}}
+	got := steps.PinnedSummaryForTest(mixed)
+	if strings.Contains(got, "every version pinned") {
+		t.Errorf("mixed recipe still claims every: %q", got)
+	}
+	if !strings.Contains(got, "2 of 3") {
+		t.Errorf("mixed recipe = %q, want the count", got)
+	}
+}
