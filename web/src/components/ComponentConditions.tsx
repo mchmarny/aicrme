@@ -1,9 +1,9 @@
 import { activeCondition, type ClusterCondition } from '../pipeline'
 
 const severityClass: Record<number, string> = {
-  0: 'text-slate-400',
-  1: 'text-amber-400',
-  2: 'text-red-400',
+  0: 'text-ink-soft',
+  1: 'text-warn',
+  2: 'text-fail',
 }
 
 /**
@@ -85,10 +85,10 @@ export function ComponentConditions({ name, conditions, terminalState }: { name:
       : `cluster activity while ${name} installs`
 
   return (
-    <p data-testid={`condition-${name}`} className={`mt-1 max-w-2xl text-xs ${severityClass[active.severity] ?? 'text-slate-400'}`}>
+    <p data-testid={`condition-${name}`} className={`mt-1 max-w-2xl text-xs ${severityClass[active.severity] ?? 'text-ink-soft'}`}>
       {!reasonInMessage && <span className="font-mono">{active.reason}</span>}
-      {active.message && <span className={`text-slate-500 ${reasonInMessage ? '' : 'ml-1'}`}>{active.message}</span>}
-      <span className="ml-1 text-slate-600">({note})</span>
+      {active.message && <span className={`text-ink-faint ${reasonInMessage ? '' : 'ml-1'}`}>{active.message}</span>}
+      <span className="ml-1 text-notrun">({note})</span>
     </p>
   )
 }

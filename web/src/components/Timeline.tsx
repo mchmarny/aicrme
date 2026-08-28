@@ -2,9 +2,9 @@ import { useState } from 'react'
 import type { AicrEvent } from '../useEvents'
 
 const levelClass: Record<AicrEvent['level'], string> = {
-  info: 'text-slate-300',
-  warn: 'text-amber-400',
-  error: 'text-red-400',
+  info: 'text-ink',
+  warn: 'text-warn',
+  error: 'text-fail',
 }
 
 /**
@@ -33,7 +33,7 @@ function isRoutineCluster(e: AicrEvent): boolean {
 function renderMessage(message: string) {
   return message.split(/`([^`]+)`/g).map((part, i) =>
     i % 2 === 1
-      ? <code key={i} className="rounded bg-slate-800 px-1 text-slate-100">{part}</code>
+      ? <code key={i} className="rounded bg-panel-2 px-1 text-ink-strong">{part}</code>
       : <span key={i}>{part}</span>,
   )
 }
@@ -66,7 +66,7 @@ export function Timeline({ events, runId }: { events: AicrEvent[]; runId?: strin
   const [showCluster, setShowCluster] = useState(false)
 
   if (events.length === 0) {
-    return <p className="text-slate-500 text-sm">Waiting for events…</p>
+    return <p className="text-ink-faint text-sm">Waiting for events…</p>
   }
 
   // An event with no runId belongs to the session rather than to a run --
@@ -84,8 +84,8 @@ export function Timeline({ events, runId }: { events: AicrEvent[]; runId?: strin
       <ol className="font-mono text-sm space-y-1">
         {newestFirst.map(e => (
           <li key={e.id} data-testid={`event-${e.id}`} className={levelClass[e.level]}>
-            <span className="text-slate-600 mr-2">{new Date(e.at).toLocaleTimeString()}</span>
-            {e.component && <span className="text-slate-400 mr-2">[{e.component}]</span>}
+            <span className="text-notrun mr-2">{new Date(e.at).toLocaleTimeString()}</span>
+            {e.component && <span className="text-ink-soft mr-2">[{e.component}]</span>}
             {renderMessage(e.message)}
           </li>
         ))}
@@ -96,7 +96,7 @@ export function Timeline({ events, runId }: { events: AicrEvent[]; runId?: strin
           <button
             type="button"
             onClick={() => setShowCluster(v => !v)}
-            className="text-slate-500 underline decoration-dotted"
+            className="text-ink-faint underline decoration-dotted"
           >
             {showCluster ? 'hide cluster activity' : 'show cluster activity'}
           </button>
@@ -105,7 +105,7 @@ export function Timeline({ events, runId }: { events: AicrEvent[]; runId?: strin
           <button
             type="button"
             onClick={() => setShowEarlier(true)}
-            className="text-slate-500 underline decoration-dotted"
+            className="text-ink-faint underline decoration-dotted"
           >
             {`${earlier.length} events from earlier runs`}
           </button>

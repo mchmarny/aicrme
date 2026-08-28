@@ -6,18 +6,18 @@ import { ComponentConditions } from './ComponentConditions'
 import type { RunState } from './Wizard'
 
 const statusClass: Record<ComponentState['status'], string> = {
-  started: 'text-slate-300',
-  installed: 'text-emerald-400',
-  retrying: 'text-amber-400',
-  failed: 'text-red-400',
+  started: 'text-ink',
+  installed: 'text-pass',
+  retrying: 'text-warn',
+  failed: 'text-fail',
   // Teardown statuses. `removed` is deliberately NOT emerald: a removal
   // succeeding is not the same good news as an install succeeding, and
   // colouring the two alike would make a torn-down cluster read as a
   // healthy one at a glance. `skipped` is amber because a skipped release
   // is something the operator now has to deal with by hand.
-  removing: 'text-slate-300',
-  removed: 'text-slate-400',
-  skipped: 'text-amber-400',
+  removing: 'text-ink',
+  removed: 'text-ink-soft',
+  skipped: 'text-warn',
 }
 
 /**
@@ -43,20 +43,20 @@ function ComponentRow({ c, terminalState }: { c: ComponentState; terminalState?:
   return (
     <li
       data-testid={`component-${c.name}`}
-      className={c.generated ? 'ml-6 border-l border-slate-800 pl-3' : ''}
+      className={c.generated ? 'ml-6 border-l border-line pl-3' : ''}
     >
       <div className={`flex items-baseline gap-2 font-mono text-sm ${statusClass[c.status]} ${c.generated ? 'text-xs opacity-70' : ''}`}>
         <span>{c.name}</span>
-        <span className="text-xs uppercase text-slate-500">{c.status}</span>
+        <span className="text-xs uppercase text-ink-faint">{c.status}</span>
         {c.status === 'retrying' && (
-          <span className="text-xs text-amber-400">attempt {c.attempt}/{c.maxAttempts}</span>
+          <span className="text-xs text-warn">attempt {c.attempt}/{c.maxAttempts}</span>
         )}
-        {c.reason && <span className="text-xs text-slate-400">{c.reason}</span>}
+        {c.reason && <span className="text-xs text-ink-soft">{c.reason}</span>}
         {c.status === 'failed' && c.attempt !== undefined && (
-          <span className="text-xs text-red-400">after {c.attempt} attempts</span>
+          <span className="text-xs text-fail">after {c.attempt} attempts</span>
         )}
       </div>
-      {note && <p className="mt-1 max-w-2xl text-xs text-slate-500">{note}</p>}
+      {note && <p className="mt-1 max-w-2xl text-xs text-ink-faint">{note}</p>}
       <ComponentConditions name={c.name} conditions={c.conditions} terminalState={terminalState} />
     </li>
   )
@@ -76,8 +76,8 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
   return (
     <section className="space-y-6">
       <div>
-        <h2 className="text-2xl font-semibold text-slate-100">Review the bundle before it touches the cluster</h2>
-        <p className="mt-1 text-sm text-slate-400">
+        <h2 className="text-2xl font-semibold text-ink-strong">Review the bundle before it touches the cluster</h2>
+        <p className="mt-1 text-sm text-ink-soft">
           {recipe
             ? `${recipe.componentCount} components, every version pinned.`
             : 'Resolving the bundle…'}
@@ -85,7 +85,7 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
       </div>
 
       {recipe && (
-        <ul className="space-y-1 font-mono text-xs text-slate-400">
+        <ul className="space-y-1 font-mono text-xs text-ink-soft">
           {recipe.components.map(c => (
             <li key={c.name}>{c.name} {c.version} → {c.namespace}</li>
           ))}
@@ -95,12 +95,12 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
       <div className="flex items-center gap-6">
         <button
           onClick={() => onDecide({ apply: 'yes' })}
-          className="rounded bg-emerald-600 px-4 py-2 text-white"
+          className="rounded bg-accent px-4 py-2 font-medium text-bg"
         >
           Install
         </button>
         {run.runId && (
-          <a href={bundleUrl(run.runId)} className="text-sm text-slate-400 underline">
+          <a href={bundleUrl(run.runId)} className="text-sm text-ink-soft underline">
             Download bundle
           </a>
         )}
@@ -119,7 +119,7 @@ function Gate({ run, onDecide }: { run: RunState; onDecide: (d: Record<string, s
  */
 function RecipeUnknownNote() {
   return (
-    <p className="text-amber-400 text-xs">
+    <p className="text-warn text-xs">
       The approved recipe hasn't loaded yet — steps below are shown as ordinary components until it does.
     </p>
   )
@@ -128,7 +128,7 @@ function RecipeUnknownNote() {
 /** ProgressLine states the two counts side by side -- see OVERRIDE 1: a resolved recipe's component count and deploy.sh's own deployment-action total are different things and must never share one label. */
 function ProgressLine({ recipeCount, actionTotal }: { recipeCount?: number; actionTotal?: number }) {
   return (
-    <p className="text-sm text-slate-400">
+    <p className="text-sm text-ink-soft">
       {recipeCount !== undefined && <span>{recipeCount} components</span>}
       {recipeCount !== undefined && actionTotal !== undefined && <span>, </span>}
       {actionTotal !== undefined && <span>{actionTotal} deployment actions</span>}
@@ -141,11 +141,11 @@ function Running({ components, recipeCount }: { components: ComponentState[]; re
 
   return (
     <section className="space-y-4">
-      <h2 className="text-2xl font-semibold text-slate-100">Installing the bundle</h2>
+      <h2 className="text-2xl font-semibold text-ink-strong">Installing the bundle</h2>
       {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       {components.length === 0 ? (
-        <p className="text-slate-500 text-sm">Generating the bundle…</p>
+        <p className="text-ink-faint text-sm">Generating the bundle…</p>
       ) : (
         <ul className="space-y-3">
           {components.map(c => <ComponentRow key={c.name} c={c} />)}
@@ -167,7 +167,7 @@ function Failed({
 
   return (
     <section className="space-y-4">
-      <h2 className="text-2xl font-semibold text-red-400">Install failed</h2>
+      <h2 className="text-2xl font-semibold text-fail">Install failed</h2>
       {recipeCount === undefined && <RecipeUnknownNote />}
       <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
       <ul className="space-y-3">
@@ -175,12 +175,12 @@ function Failed({
       </ul>
 
       {failure && (
-        <div className="space-y-2 rounded border border-red-900 bg-red-950/30 p-3">
-          <p className="text-red-400 text-sm">
+        <div className="space-y-2 rounded border border-fail/40 bg-fail/10 p-3">
+          <p className="text-fail text-sm">
             {failure.component && <span className="font-mono">{failure.component}: </span>}
             {failure.exitError}
           </p>
-          <details className="text-sm text-slate-500">
+          <details className="text-sm text-ink-faint">
             <summary className="cursor-pointer">Diagnostic tail</summary>
             <pre data-testid="failure-tail" className="mt-2 overflow-auto text-xs">{failure.tail.join('\n')}</pre>
           </details>
@@ -189,7 +189,7 @@ function Failed({
 
       <button
         onClick={onRetry}
-        className="rounded border border-slate-700 px-3 py-1 text-sm text-slate-200"
+        className="rounded border border-line px-3 py-1 text-sm text-ink"
       >
         Retry
       </button>
@@ -202,8 +202,8 @@ function Done({ components, recipeCount }: { components: ComponentState[]; recip
 
   return (
     <section className="space-y-4">
-      <h2 className="text-2xl font-semibold text-slate-100">Bundle installed</h2>
-      <p data-testid="cockpit-success" className="text-emerald-400">
+      <h2 className="text-2xl font-semibold text-ink-strong">Bundle installed</h2>
+      <p data-testid="cockpit-success" className="text-pass">
         Every component in the bundle installed successfully.
       </p>
       {recipeCount === undefined && <RecipeUnknownNote />}

@@ -31,30 +31,30 @@ export function Discover({ report }: { report: CapabilityReport }) {
   return (
     <section className="mx-auto max-w-2xl space-y-6">
       <div>
-        <h2 className="text-2xl font-semibold text-slate-100">{report.headline}</h2>
-        {report.detail && <p className="mt-1 text-sm text-slate-400">{report.detail}</p>}
+        <h2 className="text-2xl font-semibold text-ink-strong">{report.headline}</h2>
+        {report.detail && <p className="mt-1 text-sm text-ink-soft">{report.detail}</p>}
       </div>
 
       {!report.analyzed ? (
-        <p data-testid="no-snapshot" className="text-amber-400">
+        <p data-testid="no-snapshot" className="text-warn">
           No cluster snapshot is available yet, so nothing has been measured — this is not a clean bill of health.
         </p>
       ) : gaps.length === 0 ? (
-        <p data-testid="no-gaps" className="text-emerald-400">
+        <p data-testid="no-gaps" className="text-pass">
           Every capability this workload needs is already installed — there is nothing left to close.
         </p>
       ) : (
         <ul className="space-y-2">
           {gaps.map(g => (
-            <li key={g.id} data-testid={`gap-${g.id}`} className="rounded border border-slate-800 bg-slate-900 p-3">
-              <p className="text-slate-200">{g.title}</p>
-              <p className="mt-1 text-xs text-slate-500">Closed by {g.component}</p>
+            <li key={g.id} data-testid={`gap-${g.id}`} className="rounded border border-line bg-panel p-3">
+              <p className="text-ink">{g.title}</p>
+              <p className="mt-1 text-xs text-ink-faint">Closed by {g.component}</p>
             </li>
           ))}
         </ul>
       )}
 
-      <p data-testid="punchline" className="text-xl font-semibold text-amber-400">
+      <p data-testid="punchline" className="text-xl font-semibold text-warn">
         {report.punchline}
       </p>
 
@@ -66,7 +66,7 @@ export function Discover({ report }: { report: CapabilityReport }) {
         offering "node detail, driver versions, taints, labels, raw
         snapshot" here would be advertising data this screen cannot show.
       */}
-      <details className="text-sm text-slate-500">
+      <details className="text-sm text-ink-faint">
         <summary className="cursor-pointer">Full capability report as JSON</summary>
         <pre className="mt-2 overflow-auto text-xs">{JSON.stringify(report, null, 2)}</pre>
       </details>

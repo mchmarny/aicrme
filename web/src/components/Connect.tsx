@@ -58,41 +58,44 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
 
   return (
     <form onSubmit={submit} className="mx-auto mt-32 w-[28rem] space-y-4">
-      <h1 className="text-2xl font-semibold text-slate-100">Connect a cluster</h1>
-      <p className="text-slate-400 text-sm">
+      <div className="flex items-center gap-3">
+        <img src="/aicr-mark.png" alt="" className="h-9 w-9 rounded" />
+        <h1 className="text-2xl font-semibold text-ink-strong">Connect a cluster</h1>
+      </div>
+      <p className="text-ink-soft text-sm">
         aicrme drives the cluster with your own credentials, for as long as it runs.
       </p>
 
-      {contexts === null && !error && <p className="text-slate-500 text-sm">Reading your kubeconfig…</p>}
+      {contexts === null && !error && <p className="text-ink-faint text-sm">Reading your kubeconfig…</p>}
       {contexts?.length === 0 && (
-        <p className="text-amber-400 text-sm">Your kubeconfig has no contexts.</p>
+        <p className="text-warn text-sm">Your kubeconfig has no contexts.</p>
       )}
 
       {contexts && contexts.length > 0 && (
         <ul className="space-y-2">
           {contexts.map(c => (
             <li key={c.name}>
-              <label className="flex cursor-pointer items-baseline gap-3 rounded border border-slate-700 bg-slate-900 px-3 py-2">
+              <label className="flex cursor-pointer items-baseline gap-3 rounded border border-line bg-panel px-3 py-2">
                 <input
                   type="radio" name="context" value={c.name}
                   checked={selected === c.name}
                   onChange={() => setSelected(c.name)}
                 />
-                <span className="text-slate-100">{c.name}</span>
-                <span className="text-slate-500 text-xs">{c.server}</span>
-                {c.current && <span className="text-slate-500 text-xs">current</span>}
+                <span className="text-ink-strong">{c.name}</span>
+                <span className="text-ink-faint text-xs">{c.server}</span>
+                {c.current && <span className="text-ink-faint text-xs">current</span>}
               </label>
             </li>
           ))}
         </ul>
       )}
 
-      {error && <p className="text-red-400 text-sm">{error}</p>}
+      {error && <p className="text-fail text-sm">{error}</p>}
 
       <button
         type="submit"
         disabled={!selected || connecting}
-        className="w-full rounded bg-emerald-600 py-2 text-white disabled:opacity-50"
+        className="w-full rounded bg-accent py-2 font-medium text-bg disabled:opacity-50"
       >
         {connecting ? 'Connecting…' : 'Connect'}
       </button>
@@ -112,7 +115,7 @@ function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => vo
   const tools = Object.entries(info.toolchain ?? {}).sort(([a], [b]) => a.localeCompare(b))
   return (
     <div className="mx-auto mt-32 w-[28rem] space-y-4">
-      <h1 className="text-2xl font-semibold text-slate-100">Connected</h1>
+      <h1 className="text-2xl font-semibold text-ink-strong">Connected</h1>
       <dl className="space-y-1 text-sm">
         <Row label="context" value={info.context} />
         <Row label="server" value={info.server} />
@@ -126,17 +129,17 @@ function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => vo
         </dl>
       )}
       {info.registryWarning && (
-        <div className="rounded border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs">
-          <p className="text-amber-400">Helm cannot resolve registry credentials</p>
-          <p className="mt-1 text-amber-200">{info.registryWarning}</p>
+        <div className="rounded border border-warn/40 bg-warn/10 px-3 py-2 text-xs">
+          <p className="text-warn">Helm cannot resolve registry credentials</p>
+          <p className="mt-1 text-warn">{info.registryWarning}</p>
         </div>
       )}
       {info.recoveredRun && (
-        <p className="text-amber-400 text-sm">
+        <p className="text-warn text-sm">
           A previous run on this cluster was interrupted and has been recovered.
         </p>
       )}
-      <button onClick={onContinue} className="w-full rounded bg-emerald-600 py-2 text-white">
+      <button onClick={onContinue} className="w-full rounded bg-accent py-2 font-medium text-bg">
         Continue
       </button>
     </div>
@@ -167,37 +170,37 @@ function Composition({ nodes }: { nodes: NodeComposition }) {
   return (
     <div className="space-y-2">
       <div className="flex gap-3 text-sm">
-        <span className="w-20 shrink-0 text-slate-500">nodes</span>
-        <span className="text-slate-200">
+        <span className="w-20 shrink-0 text-ink-faint">nodes</span>
+        <span className="text-ink">
           {`${nodes.total} total · ${nodes.gpuNodes} with GPUs`}
         </span>
       </div>
 
       {groups.length > 0 && (
-        <ul className="divide-y divide-slate-800 rounded border border-slate-700 bg-slate-900">
+        <ul className="divide-y divide-line rounded border border-line bg-panel">
           {groups.map((g, i) => <GroupRow key={i} group={g} />)}
         </ul>
       )}
 
       {nodes.more ? (
-        <p className="text-slate-500 text-xs">{`and ${nodes.more} more shapes`}</p>
+        <p className="text-ink-faint text-xs">{`and ${nodes.more} more shapes`}</p>
       ) : null}
 
       {nodes.tolerating && (
-        <div className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-xs">
-          <p className="text-slate-400">
+        <div className="rounded border border-line bg-panel px-3 py-2 text-xs">
+          <p className="text-ink-soft">
             Your GPU nodes are tainted. This run will tolerate:
           </p>
-          <code className="mt-1 block break-all text-slate-200">{nodes.tolerating}</code>
+          <code className="mt-1 block break-all text-ink">{nodes.tolerating}</code>
         </div>
       )}
 
       {nodes.remedy && (
-        <div className="rounded border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs">
-          <p className="text-amber-400">
+        <div className="rounded border border-warn/40 bg-warn/10 px-3 py-2 text-xs">
+          <p className="text-warn">
             Quit and relaunch to reach them:
           </p>
-          <code className="mt-1 block break-all text-amber-200">
+          <code className="mt-1 block break-all text-warn">
             {`AICRME_GPU_TOLERATIONS=${nodes.remedy}`}
           </code>
         </div>
@@ -211,23 +214,23 @@ function GroupRow({ group }: { group: NodeGroup }) {
   return (
     <li className="px-3 py-2 text-xs">
       <div className="flex items-baseline justify-between gap-2">
-        <span className={hasGPUs ? 'text-slate-100' : 'text-slate-400'}>
+        <span className={hasGPUs ? 'text-ink-strong' : 'text-ink-soft'}>
           {`${group.count} × ${group.instanceType || 'unlabelled'}`}
         </span>
-        <span className="shrink-0 text-slate-500">
+        <span className="shrink-0 text-ink-faint">
           {hasGPUs ? `${group.gpusPerNode} GPU each` : 'no GPUs'}
         </span>
       </div>
 
-      {group.accelerator && <p className="text-slate-500">{group.accelerator}</p>}
+      {group.accelerator && <p className="text-ink-faint">{group.accelerator}</p>}
 
       {/* Simulated is stated rather than warned about: a KWOK fake node is
           unreachable on purpose, and treating it as a fault would put a
           warning on every demo run. */}
-      {group.simulated && <p className="text-slate-500">simulated (KWOK)</p>}
+      {group.simulated && <p className="text-ink-faint">simulated (KWOK)</p>}
 
       {group.blocked && (
-        <p className="mt-1 text-amber-400">
+        <p className="mt-1 text-warn">
           {group.taints?.join(', ')} — not tolerated, the agent cannot land here
         </p>
       )}
@@ -238,8 +241,8 @@ function GroupRow({ group }: { group: NodeGroup }) {
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex gap-3">
-      <dt className="w-20 shrink-0 text-slate-500">{label}</dt>
-      <dd className="text-slate-200">{value}</dd>
+      <dt className="w-20 shrink-0 text-ink-faint">{label}</dt>
+      <dd className="text-ink">{value}</dd>
     </div>
   )
 }

@@ -49,7 +49,7 @@ function Claim({ run }: { run: RunState }) {
 
   if (simulated === undefined) {
     return (
-      <p className="text-sm text-slate-400">
+      <p className="text-sm text-ink-soft">
         This console has no capability report for this run, so it makes no claim about
         the hardware underneath — only that the workload below is placed and running.
       </p>
@@ -58,8 +58,8 @@ function Claim({ run }: { run: RunState }) {
 
   if (simulated) {
     return (
-      <p data-testid="prove-simulated" className="text-sm text-slate-400">
-        <span className="text-amber-400">Simulated cluster, no GPU hardware.</span>{' '}
+      <p data-testid="prove-simulated" className="text-sm text-ink-soft">
+        <span className="text-warn">Simulated cluster, no GPU hardware.</span>{' '}
         Nothing here computed a result, and this screen claims none. What is real is the
         decision below: a gang-scheduled job was admitted and every member was bound to a
         node together, by the scheduler this console installed.
@@ -68,7 +68,7 @@ function Claim({ run }: { run: RunState }) {
   }
 
   return (
-    <p data-testid="prove-real" className="text-sm text-slate-400">
+    <p data-testid="prove-real" className="text-sm text-ink-soft">
       Discover found <strong>{run.report?.usableGpus} of {run.report?.totalGpus} GPUs</strong>{' '}
       usable by a workload. The gang below is placed and running on the components this
       console installed since.
@@ -111,7 +111,7 @@ export function Prove({ events, run, busy, onStop }: {
   return (
     <section data-testid="prove" className="mx-auto max-w-2xl space-y-5">
       <div>
-        <h2 className="text-2xl font-semibold text-slate-100">
+        <h2 className="text-2xl font-semibold text-ink-strong">
           {/* "placed", not "running": on a simulated cluster KWOK completes
               every pod in the same second it binds it, so a heading that
               claimed a running computation would be false on the substrate
@@ -135,7 +135,7 @@ export function Prove({ events, run, busy, onStop }: {
             on a simulated cluster, where the placement is exactly as real.
             Claim, below, is what keeps the hardware story honest. */}
         {active && (
-          <p data-testid="prove-success" className="text-sm text-emerald-400">
+          <p data-testid="prove-success" className="text-sm text-pass">
             This run succeeded. Prove is the last step and it ends here — the workload
             holds its placement until you stop it, so nothing further happens on its own.
           </p>
@@ -153,20 +153,20 @@ export function Prove({ events, run, busy, onStop }: {
           engine accepts for an active run. Saying so here is what keeps the
           two from contradicting each other. */}
       {active && run.recovered && (
-        <p data-testid="prove-recovered" className="text-xs text-amber-400">
+        <p data-testid="prove-recovered" className="text-xs text-warn">
           This workload was already running when the console started. Stopping it is the
           only action available for it.
         </p>
       )}
 
       {placed.length > 0 ? (
-        <ul data-testid="prove-placements" className="space-y-1 font-mono text-xs text-slate-400">
+        <ul data-testid="prove-placements" className="space-y-1 font-mono text-xs text-ink-soft">
           {placed.map(e => (
             <li key={e.id}>{e.message}</li>
           ))}
         </ul>
       ) : (
-        <p className="text-sm text-slate-500">
+        <p className="text-sm text-ink-faint">
           {failed
             ? 'No gang member was ever bound to a node.'
             : 'Waiting for the scheduler to place every member of the gang…'}
@@ -184,7 +184,7 @@ export function Prove({ events, run, busy, onStop }: {
             data-testid="prove-stop"
             disabled={busy}
             onClick={onStop}
-            className="rounded border border-red-500/60 px-4 py-2 text-red-300 disabled:opacity-50"
+            className="rounded border border-fail/60 px-4 py-2 text-fail disabled:opacity-50"
           >
             {busy ? 'Stopping…' : 'Stop workload'}
           </button>
@@ -195,12 +195,12 @@ export function Prove({ events, run, busy, onStop }: {
               operation. Naming what it is waiting on is what makes the wait
               read as work. */}
           {busy ? (
-            <p data-testid="prove-stopping" className="text-xs text-slate-400">
+            <p data-testid="prove-stopping" className="text-xs text-ink-soft">
               Deleting the workload and waiting for its pods to actually be gone. On a real
               cluster this takes a minute or two; the run closes when they are.
             </p>
           ) : (
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-ink-faint">
               The workload keeps running until you stop it. Stopping deletes it and waits
               for its pods to actually be gone before the run is closed.
             </p>
@@ -209,7 +209,7 @@ export function Prove({ events, run, busy, onStop }: {
       )}
 
       {stopped && (
-        <p data-testid="prove-stopped" className="text-sm text-slate-400">
+        <p data-testid="prove-stopped" className="text-sm text-ink-soft">
           The workload was deleted and its pods are gone. Nothing this console started is
           still holding the cluster's accelerators.
         </p>
@@ -223,7 +223,7 @@ export function Prove({ events, run, busy, onStop }: {
           holding your accelerators" here would be the console asserting
           something it did not observe. */}
       {failed && (
-        <p data-testid="prove-failed" className="text-sm text-slate-400">
+        <p data-testid="prove-failed" className="text-sm text-ink-soft">
           This run failed at the Prove step; the error above is what it reported. The step
           removes what it created before failing, and if it could not confirm that, the
           console will refuse to start a new run until you resolve it.

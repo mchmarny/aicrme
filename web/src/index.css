@@ -1,2 +1,53 @@
 @config "../tailwind.config.js";
 @import "tailwindcss";
+
+/**
+ * The AICR console palette, taken verbatim from the recipe-validation
+ * dashboard at https://validation.aicr.run so the two services read as one
+ * product rather than two dark themes that happen to both be dark.
+ *
+ * Semantic names, not Tailwind's scale names. Every colour in this app now
+ * says what it MEANS -- `text-pass`, `border-line`, `bg-panel` -- instead of
+ * how dark a grey it is, which is what made the previous palette impossible
+ * to change: "is text-slate-400 a label, a caption, or disabled text" had no
+ * answer, and 38 uses of text-slate-500 encoded three different intentions.
+ *
+ * The accent is NVIDIA green (#76b900), which is also the family the AICR
+ * logo is drawn in (measured hue 91-124 across the mark). The console
+ * previously used Tailwind emerald at hue 162 -- a blue-green that visibly
+ * clashed with the mark it sat beside.
+ */
+@theme {
+  /* Surfaces, darkest first. */
+  --color-bg: #0b0f14;
+  --color-bg-2: #0d1117;
+  --color-panel: #11161f;
+  --color-panel-2: #151c28;
+
+  /* Borders. `line-hi` is for a border that has to be found rather than felt. */
+  --color-line: #1c2532;
+  --color-line-hi: #2a3647;
+
+  /* Text, strongest first. `ink` is body copy; `faint` is for text that must
+     be present but must not compete -- captions, units, secondary counts. */
+  --color-ink-strong: #eef3fb;
+  --color-ink: #cdd6e4;
+  --color-ink-soft: #93a0b4;
+  --color-ink-faint: #7f8b9c;
+
+  /* NVIDIA green: the primary action, and nothing else. Bright enough that
+     text on top of it must be --color-bg rather than white. */
+  --color-accent: #76b900;
+  --color-accent-dim: #5c9200;
+
+  /* Outcome colours. pass/fail/warn are states of the RUN; cli is the
+     code-affordance blue the validation dashboard uses for commands and
+     copyable strings, deliberately not a state hue. */
+  --color-pass: #3ddc84;
+  --color-fail: #ff4d5e;
+  --color-fail-fill: #b8313f;
+  --color-warn: #ffae34;
+  --color-warn-fill: #94601c;
+  --color-notrun: #54606f;
+  --color-cli: #4d9de0;
+}

@@ -253,14 +253,14 @@ export const PROVISIONAL_OPTIONS_RETRY_BASE_DELAY_MS = 250
 
 function ResolvedRecommend({ recipe }: { recipe: RecipeSummary | null }) {
   if (!recipe) {
-    return <p className="text-slate-500 text-sm">Resolving the recipe for the answers you gave…</p>
+    return <p className="text-ink-faint text-sm">Resolving the recipe for the answers you gave…</p>
   }
   return (
     <section className="mx-auto max-w-2xl space-y-4">
-      <p className="text-slate-300">
+      <p className="text-ink">
         Decisions submitted — <strong>{recipe.componentCount} components</strong> resolved, every version pinned.
       </p>
-      <ul className="space-y-1 font-mono text-xs text-slate-400">
+      <ul className="space-y-1 font-mono text-xs text-ink-soft">
         {recipe.components.map(c => (
           <li key={c.name}>{c.name} {c.version} → {c.namespace}</li>
         ))}
@@ -336,24 +336,24 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
   return (
     <section data-testid="recovered-run" className="mx-auto max-w-2xl space-y-5">
       <div>
-        <h2 className="text-2xl font-semibold text-amber-400">A previous run is waiting for you</h2>
-        <p className="mt-2 text-sm text-slate-300">{recoverySummary(run)}</p>
+        <h2 className="text-2xl font-semibold text-warn">A previous run is waiting for you</h2>
+        <p className="mt-2 text-sm text-ink">{recoverySummary(run)}</p>
       </div>
 
-      {showOwnError && <p className="text-sm text-red-400">{run.error}</p>}
+      {showOwnError && <p className="text-sm text-fail">{run.error}</p>}
 
       {components.length > 0 && (
-        <ul className="space-y-1 font-mono text-xs text-slate-400">
+        <ul className="space-y-1 font-mono text-xs text-ink-soft">
           {components.map(c => (
             <li key={c.name} data-testid={`recovered-component-${c.name}`}>
-              {c.name} <span className="uppercase text-slate-500">{c.status}</span>
+              {c.name} <span className="uppercase text-ink-faint">{c.status}</span>
             </li>
           ))}
         </ul>
       )}
 
       {truncated.length > 0 && (
-        <p data-testid="recovery-truncated" className="rounded border border-amber-900 bg-amber-950/30 p-3 text-xs text-amber-400">
+        <p data-testid="recovery-truncated" className="rounded border border-warn/40 bg-warn/10 p-3 text-xs text-warn">
           This run's checkpoint was too large to store in full, so{' '}
           <span className="font-mono">{truncated.join(', ')}</span>{' '}
           {truncated.length === 1 ? 'was' : 'were'} dropped from it. Retrying will
@@ -362,7 +362,7 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
         </p>
       )}
 
-      <p className="text-xs text-slate-500">
+      <p className="text-xs text-ink-faint">
         The console will not start a new run until you choose.
       </p>
 
@@ -372,7 +372,7 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
             data-testid="recovery-retry"
             disabled={busy}
             onClick={onRetry}
-            className="rounded bg-emerald-600 px-4 py-2 text-white disabled:opacity-50"
+            className="rounded bg-accent px-4 py-2 font-medium text-bg disabled:opacity-50"
           >
             Retry this run
           </button>
@@ -381,7 +381,7 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
           data-testid="recovery-discard"
           disabled={busy}
           onClick={onDiscard}
-          className="rounded border border-slate-700 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+          className="rounded border border-line px-3 py-2 text-sm text-ink disabled:opacity-50"
         >
           Discard and start over
         </button>
@@ -573,10 +573,10 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     if (optionsError) {
       return (
         <div className="mx-auto max-w-2xl space-y-3">
-          <p className="text-red-400 text-sm">{optionsError}</p>
+          <p className="text-fail text-sm">{optionsError}</p>
           <button
             onClick={() => setRetryToken(n => n + 1)}
-            className="rounded border border-slate-700 px-3 py-1 text-sm text-slate-200"
+            className="rounded border border-line px-3 py-1 text-sm text-ink"
           >
             Retry
           </button>
@@ -585,13 +585,13 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     }
 
     if (!options) {
-      return <p className="text-slate-500 text-sm">Loading the two questions this console asks…</p>
+      return <p className="text-ink-faint text-sm">Loading the two questions this console asks…</p>
     }
 
     return (
       <div className="mx-auto max-w-2xl space-y-4">
         {options.provisional && (
-          <p className="text-amber-400 text-xs">
+          <p className="text-warn text-xs">
             These options could not be verified against the cluster snapshot — some may not resolve.
           </p>
         )}
@@ -657,7 +657,7 @@ export function Wizard({ events, onDiscarded, onStopped }: {
       // App.tsx's POST /api/runs is in flight. Say so rather than re-offering
       // an action against a run that no longer exists.
       if (run.runId && run.runId === discardedRunId) {
-        return <p className="text-slate-500 text-sm">Discarded. Starting a new run…</p>
+        return <p className="text-ink-faint text-sm">Discarded. Starting a new run…</p>
       }
       return (
         <Recovered
@@ -690,7 +690,7 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     }
     if (run.phase === 'recommend') return renderRecommend()
     if (run.report) return <Discover report={run.report} />
-    return <p className="text-slate-500 text-sm">Discovering the cluster…</p>
+    return <p className="text-ink-faint text-sm">Discovering the cluster…</p>
   }
 
   return (
@@ -699,13 +699,13 @@ export function Wizard({ events, onDiscarded, onStopped }: {
         {/* Suppressed for a recovered run: Recovered states the situation in
             its own words, and repeating the raw engine error above it reads
             as a second, unrelated failure. */}
-        {!recovered && run.error && <p className="mb-4 text-red-400 text-sm">{run.error}</p>}
-        {actionError && <p className="mb-4 text-red-400 text-sm">{actionError}</p>}
+        {!recovered && run.error && <p className="mb-4 text-fail text-sm">{run.error}</p>}
+        {actionError && <p className="mb-4 text-fail text-sm">{actionError}</p>}
 
         {renderBody()}
       </div>
 
-      <aside className={`${cockpit ? 'w-80' : 'w-96'} shrink-0 border-l border-slate-800 pl-8`}>
+      <aside className={`${cockpit ? 'w-80' : 'w-96'} shrink-0 border-l border-line pl-8`}>
         <Timeline events={events} runId={run.runId} />
       </aside>
     </div>

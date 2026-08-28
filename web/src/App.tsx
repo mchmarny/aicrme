@@ -71,10 +71,10 @@ export default function App() {
   // that much of the page's default white above it. flow-root gives this
   // div its own block formatting context so the margin stays inside it.
   return (
-    <div className="min-h-screen flow-root bg-slate-950 text-slate-100">
-      {authError && <p className="mx-auto mt-32 w-[28rem] text-red-400 text-sm">{authError}</p>}
+    <div className="min-h-screen flow-root bg-bg text-ink-strong">
+      {authError && <p className="mx-auto mt-32 w-[28rem] text-fail text-sm">{authError}</p>}
       {!authError && stage === 'authenticating' && (
-        <p className="mx-auto mt-32 w-[28rem] text-slate-500 text-sm">Starting…</p>
+        <p className="mx-auto mt-32 w-[28rem] text-ink-faint text-sm">Starting…</p>
       )}
       {stage === 'connecting' && (
         <Connect onConnected={info => { setCluster(info); setStage('console') }} />
@@ -116,8 +116,8 @@ function ClusterBadge({ cluster }: { cluster: ClusterInfo | null }) {
   if (!cluster) return null
   const gpus = cluster.nodes?.totalGPUs
   return (
-    <span className="flex min-w-0 items-baseline gap-2 text-xs text-slate-500">
-      <span className="truncate font-mono text-slate-400" title={cluster.context}>
+    <span className="flex min-w-0 items-baseline gap-2 text-xs text-ink-faint">
+      <span className="truncate font-mono text-ink-soft" title={cluster.context}>
         {cluster.context}
       </span>
       {gpus ? <span className="shrink-0">{gpus} GPUs</span> : null}
@@ -161,23 +161,28 @@ function Console({ cluster, onUnauthorized }: { cluster: ClusterInfo | null; onU
   return (
     <main className="p-8">
       <header className="mb-6 flex items-center gap-3">
-        <h1 className="text-xl font-semibold">aicrme</h1>
-        <span className={connected ? 'text-emerald-400 text-xs' : 'text-slate-500 text-xs'}>
+        {/* The AICR mark is matted onto its own dark backdrop rather than
+            being transparent, so it is rendered as a small rounded tile --
+            treating it as a free-floating glyph would show its square
+            edge against a page background it does not match. */}
+        <img src="/aicr-mark.png" alt="" className="h-7 w-7 rounded" />
+        <h1 className="text-xl font-semibold text-ink-strong">aicrme</h1>
+        <span className={connected ? 'text-pass text-xs' : 'text-ink-faint text-xs'}>
           {connected ? 'connected' : 'reconnecting…'}
         </span>
         <ClusterBadge cluster={cluster} />
       </header>
       {eventsLost > 0 && (
-        <p className="mb-4 text-amber-400 text-xs">
+        <p className="mb-4 text-warn text-xs">
           {eventsLost} event{eventsLost === 1 ? '' : 's'} could not be recovered after a connection gap.
         </p>
       )}
       {startError && (
         <div className="mb-4 space-y-2">
-          <p className="text-red-400 text-sm">{startError}</p>
+          <p className="text-fail text-sm">{startError}</p>
           <button
             onClick={() => setRetryToken(n => n + 1)}
-            className="rounded border border-slate-700 px-3 py-1 text-sm text-slate-200"
+            className="rounded border border-line px-3 py-1 text-sm text-ink"
           >
             Retry
           </button>

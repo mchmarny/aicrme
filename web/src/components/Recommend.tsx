@@ -34,13 +34,13 @@ function Choice({ name, legend, values, value, onChange, describe }: {
 }) {
   return (
     <fieldset role="radiogroup" aria-label={legend} className="space-y-2">
-      <legend className="text-sm font-medium text-slate-300">{legend}</legend>
+      <legend className="text-sm font-medium text-ink">{legend}</legend>
       {values.map(v => (
-        <label key={v} className="flex cursor-pointer items-center gap-3 rounded border border-slate-800 bg-slate-900 p-3">
+        <label key={v} className="flex cursor-pointer items-center gap-3 rounded border border-line bg-panel p-3">
           <input type="radio" name={name} value={v} aria-label={v}
             checked={value === v} onChange={() => onChange(v)} />
-          <span className="text-slate-200">{v}</span>
-          {describe && <code className="ml-auto text-xs text-slate-500">{describe(v)}</code>}
+          <span className="text-ink">{v}</span>
+          {describe && <code className="ml-auto text-xs text-ink-faint">{describe(v)}</code>}
         </label>
       ))}
     </fieldset>
@@ -76,7 +76,7 @@ export function Recommend({ options, onDecide }: {
 
       <button
         onClick={() => { if (intent && platform) onDecide({ intent, platform }) }}
-        className="w-full rounded bg-emerald-600 py-2 text-white disabled:opacity-40"
+        className="w-full rounded bg-accent py-2 font-medium text-bg disabled:opacity-40"
         disabled={!intent || !platform}
       >
         Continue

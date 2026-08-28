@@ -15,9 +15,12 @@ describe('Timeline', () => {
     expect(screen.getByText('FailedScheduling')).toBeDefined()
   })
 
+  // Asserts the SEMANTIC class, not a hue. It used to check for `text-amber`,
+  // which pinned one palette's spelling of "warning" -- and duly broke when
+  // the console adopted the AICR palette without changing what it meant.
   it('marks warnings so they are surfaced, not buried', () => {
     render(<Timeline events={events} />)
-    expect(screen.getByTestId('event-2').className).toContain('text-amber')
+    expect(screen.getByTestId('event-2').className).toContain('text-warn')
   })
 
   it('renders an empty state with no events', () => {
