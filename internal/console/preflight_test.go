@@ -132,7 +132,13 @@ func TestAToolThatWillNotReportItsVersionIsRecordedAsUnknown(t *testing.T) {
 	}
 }
 
-// bash prints a paragraph; only its first line is a version.
+// bash prints a paragraph, and none of it past the version is a version.
+//
+// This asserted the whole first line until the Connect screen showed what
+// that costs: "GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin…)"
+// wrapped to two lines and outweighed the helm version beside it. The
+// second line being dropped is still the property under test -- the first
+// line is now reduced further, to the version itself.
 func TestMultiLineVersionOutputIsReducedToItsFirstLine(t *testing.T) {
 	dir := t.TempDir()
 	for _, tool := range []string{"helm", "kubectl", "jq"} {
@@ -148,7 +154,7 @@ func TestMultiLineVersionOutputIsReducedToItsFirstLine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight() error = %v", err)
 	}
-	if want := "GNU bash, version 5.2.37(1)-release"; tc["bash"] != want {
+	if want := "5.2.37"; tc["bash"] != want {
 		t.Errorf("bash version = %q, want %q", tc["bash"], want)
 	}
 }
@@ -165,5 +171,32 @@ func TestKubectlVersionPrefersGitVersionFromJSON(t *testing.T) {
 func TestKubectlVersionFallsBackToRawOutput(t *testing.T) {
 	if got := kubectlVersion("Client Version: v1.30.0\n"); got != "Client Version: v1.30.0" {
 		t.Errorf("kubectlVersion() = %q, want the raw first line", got)
+	}
+}
+
+// TestBashVersionIsAVersionNotABanner is a screen-space argument with a
+// correctness edge.
+//
+// `bash --version` prints a paragraph, and firstLine kept all of it:
+// "GNU bash, version 5.3.15(1)-release (aarch64-apple-darwin25.4.0)" wrapped
+// to two lines on the Connect screen and was given the same weight as
+// "helm v4.2.4", which is the one an operator might actually act on. The
+// other three tools are already reduced to a version; bash was the outlier.
+//
+// The banner is still the fallback: a bash whose output this cannot parse is
+// better recorded verbatim than dropped, exactly as kubectlVersion decided
+// for the same reason.
+func TestBashVersionIsAVersionNotABanner(t *testing.T) {
+	cases := map[string]string{
+		"GNU bash, version 5.3.15(1)-release (aarch64-apple-darwin25.4.0)": "5.3.15",
+		"GNU bash, version 3.2.57(1)-release (x86_64-apple-darwin23)":      "3.2.57",
+		"GNU bash, version 5.2.21(1)-release":                              "5.2.21",
+		// Unparseable: kept whole rather than discarded.
+		"something else entirely": "something else entirely",
+	}
+	for in, want := range cases {
+		if got := bashVersion(in); got != want {
+			t.Errorf("bashVersion(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

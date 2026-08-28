@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -53,7 +54,7 @@ var tools = []tool{
 	// about a missing file rather than a missing shell. deploy.sh is
 	// AICR-generated and this repo does not control whether it stays
 	// POSIX-clean.
-	{name: "bash", args: []string{"--version"}, required: true, parse: firstLine},
+	{name: "bash", args: []string{"--version"}, required: true, parse: bashVersion},
 	{name: "helm", args: []string{"version", "--template", "{{.Version}}"}, required: true, parse: strings.TrimSpace},
 	{name: "kubectl", args: []string{"version", "--client", "-o", "json"}, required: true, parse: kubectlVersion},
 	{name: "jq", args: []string{"--version"}, required: false, degrades: "deploy.sh's webhook preflight", parse: firstLine},
@@ -120,6 +121,23 @@ func probeVersion(ctx context.Context, path string, t tool) (string, error) {
 	}
 	return version, nil
 }
+
+// bashVersion reduces `bash --version`'s banner to the version itself.
+//
+// The other three tools already report a version and bash reported a
+// paragraph, which on the Connect screen wrapped to two lines and outweighed
+// the helm version beside it. Unparseable output falls back to the whole
+// first line, for the reason kubectlVersion gives: a version this cannot
+// parse is still better recorded verbatim than dropped.
+func bashVersion(s string) string {
+	line := firstLine(s)
+	if m := bashVersionPattern.FindStringSubmatch(line); m != nil {
+		return m[1]
+	}
+	return line
+}
+
+var bashVersionPattern = regexp.MustCompile(`version ([0-9]+(?:\.[0-9]+)+)`)
 
 func firstLine(s string) string {
 	line, _, _ := strings.Cut(strings.TrimSpace(s), "\n")

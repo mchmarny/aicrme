@@ -9,6 +9,22 @@ const contexts = [
 ]
 
 /**
+ * manyContexts is the shape of a working engineer's kubeconfig rather than a
+ * test's: the laptop this screen was built against holds 144 contexts, and
+ * the current one sorted to row 89 of them. Alphabetical order put the one
+ * answer the operator wanted below eighty-eight they did not.
+ */
+const manyContexts = [
+  ...Array.from({ length: 40 }, (_, i) => ({
+    name: `aicr-test${String(i).padStart(2, '0')}`,
+    server: `https://aicr-test${i}.example:443`,
+    current: false,
+  })),
+  { name: 'gke_eidosx_us-central1_aicr-uat-day-gh1-0-33169125469', server: 'https://34.55.124.240', current: true },
+  { name: 'zzz-last', server: 'https://zzz.example:443', current: false },
+]
+
+/**
  * taintedNodes is the layout of the GKE cluster this feature was written for:
  * two H100 nodes behind a taint of the platform team's own choosing, beside
  * four ordinary ones.
@@ -81,6 +97,50 @@ describe('Connect', () => {
     expect(await screen.findByText('alpha')).toBeDefined()
     expect(screen.getByText('beta')).toBeDefined()
     expect(screen.getByText('https://alpha.example:6443')).toBeDefined()
+  })
+
+  // THE ONE THE OPERATOR ALMOST CERTAINLY WANTS GOES FIRST.
+  //
+  // The list was sorted by name alone, so on a real kubeconfig the
+  // preselected current-context sat at row 89 of 144: the screen opened on
+  // eighty-eight unselected radios, the selection was off-screen, and the
+  // Connect button was below all of them. Selection was correct the whole
+  // time and invisible, which is the same as broken.
+  it('puts the current context at the top of the list', async () => {
+    mockFetch({ contexts: () => new Response(JSON.stringify(manyContexts), { status: 200 }) })
+    render(<Connect onConnected={() => {}} />)
+
+    const radios = await screen.findAllByRole('radio')
+    expect(radios[0].getAttribute('value')).toBe('gke_eidosx_us-central1_aicr-uat-day-gh1-0-33169125469')
+    // and it is still the selected one.
+    expect((radios[0] as HTMLInputElement).checked).toBe(true)
+  })
+
+  // 144 rows is not a list, it is a wall. Filtering is what makes the screen
+  // independent of how many clusters the operator has ever touched.
+  it('filters the list by name', async () => {
+    mockFetch({ contexts: () => new Response(JSON.stringify(manyContexts), { status: 200 }) })
+    render(<Connect onConnected={() => {}} />)
+
+    await screen.findAllByRole('radio')
+    fireEvent.change(screen.getByRole('textbox', { name: /filter/i }), { target: { value: 'zzz' } })
+
+    const radios = screen.getAllByRole('radio')
+    expect(radios).toHaveLength(1)
+    expect(radios[0].getAttribute('value')).toBe('zzz-last')
+  })
+
+  // Filtering must not silently strand the operator on a selection they can
+  // no longer see -- and must say so rather than showing an empty box.
+  it('says when a filter matches nothing', async () => {
+    mockFetch({ contexts: () => new Response(JSON.stringify(manyContexts), { status: 200 }) })
+    render(<Connect onConnected={() => {}} />)
+
+    await screen.findAllByRole('radio')
+    fireEvent.change(screen.getByRole('textbox', { name: /filter/i }), { target: { value: 'nothing-matches-this' } })
+
+    expect(screen.queryAllByRole('radio')).toHaveLength(0)
+    expect(screen.getByText(/no context matches/i)).toBeDefined()
   })
 
   // Preselected, never auto-connected: the current-context is the operator's

@@ -15,9 +15,46 @@ import { connect, fetchContexts, type ClusterInfo, type ContextInfo, type NodeCo
  * cluster actually said -- its server version, how many nodes it has, and the
  * bash/jq/helm/kubectl this machine resolved -- and only then offers to go on.
  */
+/**
+ * ordered puts the current-context first and leaves the rest alphabetical.
+ *
+ * The server sorts by name, deliberately, so two consecutive loads of the
+ * same kubeconfig cannot list it differently -- that ordering is kept here
+ * for everything except the one row the operator is overwhelmingly likely to
+ * want. On the laptop this was built against, 144 contexts sorted the
+ * preselected one to row 89: the screen opened on eighty-eight unselected
+ * radios with the actual selection off-screen, which reads as "nothing is
+ * selected, pick one from this wall".
+ */
+/**
+ * filterThreshold is where a list stops being readable and starts needing a
+ * search box. Below it the input is pure chrome; above it the screen is a
+ * wall. Six is roughly where a glance stops working.
+ */
+const filterThreshold = 6
+
+export function ordered(contexts: ContextInfo[]): ContextInfo[] {
+  const current = contexts.filter(c => c.current)
+  return [...current, ...contexts.filter(c => !c.current)]
+}
+
+/**
+ * matches is the filter predicate: substring, case-insensitive, over the two
+ * fields on screen. Deliberately not fuzzy -- an operator filtering 144
+ * clusters is usually typing a fragment they already know ("uat", "us-east"),
+ * and a fuzzy match that surfaces near-misses above the exact one would make
+ * the wrong cluster easier to hit.
+ */
+export function matches(c: ContextInfo, query: string): boolean {
+  const q = query.trim().toLowerCase()
+  if (!q) return true
+  return c.name.toLowerCase().includes(q) || (c.server ?? '').toLowerCase().includes(q)
+}
+
 export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => void }) {
   const [contexts, setContexts] = useState<ContextInfo[] | null>(null)
   const [selected, setSelected] = useState('')
+  const [query, setQuery] = useState('')
   const [info, setInfo] = useState<ClusterInfo | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [error, setError] = useState('')
@@ -27,7 +64,7 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
     fetchContexts()
       .then(list => {
         if (canceled) return
-        setContexts(list)
+        setContexts(ordered(list))
         // Preselected, not auto-connected. The kubeconfig's current-context is
         // the operator's best guess at what they meant, and it is still a
         // guess -- connecting on their behalf would make the first thing this
@@ -54,10 +91,12 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
     }
   }
 
+  const visible = (contexts ?? []).filter(c => matches(c, query))
+
   if (info) return <Confirm info={info} onContinue={() => onConnected(info)} />
 
   return (
-    <form onSubmit={submit} className="mx-auto mt-32 w-[28rem] space-y-4">
+    <form onSubmit={submit} className="mx-auto mt-24 w-full max-w-3xl px-8 space-y-4">
       <div className="flex items-center gap-3">
         <img src="/aicr-mark.png" alt="" className="h-9 w-9 rounded" />
         <h1 className="text-2xl font-semibold text-ink-strong">Connect a cluster</h1>
@@ -71,19 +110,48 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
         <p className="text-warn text-sm">Your kubeconfig has no contexts.</p>
       )}
 
-      {contexts && contexts.length > 0 && (
-        <ul className="space-y-2">
-          {contexts.map(c => (
+      {contexts && contexts.length > filterThreshold && (
+        <input
+          type="text"
+          aria-label="Filter contexts"
+          placeholder={`Filter ${contexts.length} contexts…`}
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          className="w-full rounded border border-line bg-panel px-3 py-2 text-sm text-ink placeholder:text-ink-faint"
+        />
+      )}
+
+      {contexts && contexts.length > 0 && visible.length === 0 && (
+        <p className="text-ink-soft text-sm">No context matches “{query}”.</p>
+      )}
+
+      {visible.length > 0 && (
+        /* Capped and scrollable rather than infinite: the Connect button has
+           to stay reachable without paging past every cluster the operator
+           has ever touched. */
+        <ul className="max-h-[26rem] space-y-2 overflow-y-auto pr-1">
+          {visible.map(c => (
             <li key={c.name}>
-              <label className="flex cursor-pointer items-baseline gap-3 rounded border border-line bg-panel px-3 py-2">
+              {/* Name over server, not beside it. Side by side, a full EKS
+                  ARN wrapped to three lines while short names wrapped to two
+                  and the server URL -- the lower-value field -- won the
+                  horizontal argument. */}
+              <label className="flex cursor-pointer items-start gap-3 rounded border border-line bg-panel px-3 py-2">
                 <input
                   type="radio" name="context" value={c.name}
                   checked={selected === c.name}
                   onChange={() => setSelected(c.name)}
+                  className="mt-1 shrink-0"
                 />
-                <span className="text-ink-strong">{c.name}</span>
-                <span className="text-ink-faint text-xs">{c.server}</span>
-                {c.current && <span className="text-ink-faint text-xs">current</span>}
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-baseline gap-2">
+                    <span className="break-all font-mono text-sm text-ink-strong">{c.name}</span>
+                    {c.current && (
+                      <span className="shrink-0 rounded bg-accent/15 px-1.5 text-xs text-accent">current</span>
+                    )}
+                  </span>
+                  <span className="block truncate text-xs text-ink-faint">{c.server}</span>
+                </span>
               </label>
             </li>
           ))}
@@ -114,8 +182,13 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
 function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => void }) {
   const tools = Object.entries(info.toolchain ?? {}).sort(([a], [b]) => a.localeCompare(b))
   return (
-    <div className="mx-auto mt-32 w-[28rem] space-y-4">
+    <div className="mx-auto mt-24 w-full max-w-3xl px-8 space-y-4">
       <h1 className="text-2xl font-semibold text-ink-strong">Connected</h1>
+      {/* Four kinds of fact were rendered at one weight, separated only by
+          whitespace: what the cluster is, what it is made of, what this run
+          will tolerate, and what is installed on the operator's own laptop.
+          Nothing said which was which. */}
+      <SectionLabel>Cluster</SectionLabel>
       <dl className="space-y-1 text-sm">
         <Row label="context" value={info.context} />
         <Row label="server" value={info.server} />
@@ -123,6 +196,9 @@ function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => vo
         <Row label="cluster" value={info.uid} />
       </dl>
       <Composition nodes={info.nodes} />
+      {tools.length > 0 && (
+        <SectionLabel>This machine</SectionLabel>
+      )}
       {tools.length > 0 && (
         <dl className="space-y-1 text-sm">
           {tools.map(([name, version]) => <Row key={name} label={name} value={version} />)}
@@ -209,15 +285,25 @@ function Composition({ nodes }: { nodes: NodeComposition }) {
   )
 }
 
+/** SectionLabel groups the Confirm screen's four kinds of fact. */
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <h2 className="pt-2 text-xs uppercase tracking-wide text-ink-faint">{children}</h2>
+  )
+}
+
 function GroupRow({ group }: { group: NodeGroup }) {
   const hasGPUs = (group.gpusPerNode ?? 0) > 0
   return (
-    <li className="px-3 py-2 text-xs">
+    /* The GPU row decides whether this cluster can do the job at all, and it
+       read exactly like the two "no GPUs" rows around it. Accent on the count
+       is the cheapest way to make the answer findable in one glance. */
+    <li className={`px-3 py-2 text-xs ${hasGPUs ? 'bg-accent/5' : ''}`}>
       <div className="flex items-baseline justify-between gap-2">
         <span className={hasGPUs ? 'text-ink-strong' : 'text-ink-soft'}>
           {`${group.count} × ${group.instanceType || 'unlabelled'}`}
         </span>
-        <span className="shrink-0 text-ink-faint">
+        <span className={`shrink-0 ${hasGPUs ? 'text-accent' : 'text-ink-faint'}`}>
           {hasGPUs ? `${group.gpusPerNode} GPU each` : 'no GPUs'}
         </span>
       </div>
