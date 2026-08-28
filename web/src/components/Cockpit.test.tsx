@@ -77,6 +77,54 @@ describe('Cockpit', () => {
     expect(kaiRow.textContent).toContain('1/2')
   })
 
+  // AGGREGATE PROGRESS. The screen listed every component's status and never
+  // summed them, so sixteen minutes into an install there was no way to tell
+  // minute 3 from minute 13. The counts it did show -- "14 components, 16
+  // deployment actions" -- are both denominators with no numerator.
+  it('running: says how many of the deployment actions are done', () => {
+    const events: AicrEvent[] = [
+      componentEvent(1, 'cert-manager', { index: 1, total: 4, status: 'started' }),
+      componentEvent(2, 'cert-manager', { status: 'installed' }),
+      componentEvent(3, 'nfd', { index: 2, total: 4, status: 'started' }),
+      componentEvent(4, 'nfd', { status: 'installed' }),
+      componentEvent(5, 'gpu-operator', { index: 3, total: 4, status: 'started' }),
+    ]
+    render(<Cockpit events={events} run={baseRun({ state: 'running' })} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    expect(screen.getByTestId('cockpit-progress').textContent).toMatch(/2 of 4/)
+  })
+
+  // The in-flight row has to be findable at a glance. Every finished row
+  // carried the identical word INSTALLED, so the one row that differed was
+  // styled exactly like the eleven that did not.
+  it('running: marks the component actually in flight', () => {
+    const events: AicrEvent[] = [
+      componentEvent(1, 'cert-manager', { index: 1, total: 2, status: 'started' }),
+      componentEvent(2, 'cert-manager', { status: 'installed' }),
+      componentEvent(3, 'gpu-operator', { index: 2, total: 2, status: 'started' }),
+    ]
+    render(<Cockpit events={events} run={baseRun({ state: 'running' })} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    expect(screen.getByTestId('active-gpu-operator')).toBeDefined()
+    expect(screen.queryByTestId('active-cert-manager')).toBeNull()
+    // The finished row still says so for a screen reader, even though sighted
+    // users get a glyph instead of an eleventh copy of the word.
+    expect(screen.getByTestId('component-cert-manager').textContent).toMatch(/installed/i)
+  })
+
+  // Durations were already on every row -- ComponentState carries startedAt
+  // and endedAt, with a comment saying they exist "so the UI can show elapsed
+  // time" -- and nothing rendered them.
+  it('running: shows how long each component took', () => {
+    const events: AicrEvent[] = [
+      { ...componentEvent(1, 'cert-manager', { index: 1, total: 2, status: 'started' }), at: '2026-08-28T13:00:00Z' },
+      { ...componentEvent(2, 'cert-manager', { status: 'installed' }), at: '2026-08-28T13:02:09Z' },
+    ]
+    render(<Cockpit events={events} run={baseRun({ state: 'running' })} onDecide={vi.fn()} onRetry={vi.fn()} />)
+
+    expect(screen.getByTestId('component-cert-manager').textContent).toMatch(/2m 9s/)
+  })
+
   it('slow-step callout: an active gpu-operator renders its note; an active cert-manager renders none', () => {
     const events: AicrEvent[] = [
       componentEvent(1, 'cert-manager', { index: 1, total: 4, status: 'started' }),

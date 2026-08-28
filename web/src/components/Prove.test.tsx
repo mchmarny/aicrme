@@ -64,6 +64,43 @@ describe('Prove', () => {
     expect(screen.getByRole('button', { name: /stop workload/i })).toBeDefined()
   })
 
+  // THE SCREENSHOT ANYONE WOULD PUT IN A SLIDE, and the numbers for it were
+  // scattered across forty timeline lines. This is the moment the run is
+  // proven; it should state what it achieved without the operator counting
+  // rows.
+  it('summarises what the run achieved', () => {
+    const events: AicrEvent[] = [
+      { id: 1, runId: RUN_ID, at: '2026-08-28T13:00:00Z', kind: 'component', level: 'info', phase: 'apply',
+        component: 'cert-manager', message: 'installing cert-manager',
+        data: { name: 'cert-manager', index: 1, total: 2, status: 'started' } },
+      { id: 2, runId: RUN_ID, at: '2026-08-28T13:02:00Z', kind: 'component', level: 'info', phase: 'apply',
+        component: 'cert-manager', message: 'cert-manager installed',
+        data: { name: 'cert-manager', status: 'installed' } },
+      { id: 3, runId: RUN_ID, at: '2026-08-28T13:02:00Z', kind: 'component', level: 'info', phase: 'apply',
+        component: 'nfd', message: 'installing nfd',
+        data: { name: 'nfd', index: 2, total: 2, status: 'started' } },
+      { id: 4, runId: RUN_ID, at: '2026-08-28T13:14:30Z', kind: 'component', level: 'info', phase: 'apply',
+        component: 'nfd', message: 'nfd installed', data: { name: 'nfd', status: 'installed' } },
+      ...placementEvents(),
+    ]
+    render(<Prove events={events} run={runState({ report: report(16, 16) })} busy={false} onStop={vi.fn()} />)
+
+    const summary = screen.getByTestId('prove-summary').textContent ?? ''
+    expect(summary).toMatch(/2 of 2/)        // actions installed
+    expect(summary).toMatch(/14m 30s/)       // wall clock across the install
+    expect(summary).toMatch(/2/)             // gang members placed
+    expect(summary).toMatch(/16 of 16 GPUs/) // what the cluster offered
+  })
+
+  // A simulated cluster has no GPU figure worth printing, and "0 of 0 GPUs"
+  // is worse than silence -- the separate simulated caveat already says what
+  // is true there.
+  it('omits the GPU figure on a cluster that reported none', () => {
+    render(<Prove events={placementEvents()} run={runState()} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByTestId('prove-summary').textContent).not.toMatch(/GPUs/)
+  })
+
   // The claim this screen must NOT make on a cluster with no GPUs in it. The
   // design is explicit that the simulated finale is labeled "without apology"
   // -- what it may not do is imply a throughput number nothing measured.

@@ -1,5 +1,6 @@
+import { useEffect, useState } from 'react'
 import { bundleUrl } from '../api'
-import { deriveComponents, deriveFailure, deploymentActionsTotal, type ComponentState } from '../pipeline'
+import { componentSeconds, deriveComponents, deriveFailure, deploymentActionsTotal, formatSeconds, installedCount, runElapsed, type ComponentState } from '../pipeline'
 import { slowStepNote } from '../slowSteps'
 import type { AicrEvent } from '../useEvents'
 import { ComponentConditions } from './ComponentConditions'
@@ -36,9 +37,14 @@ const statusClass: Record<ComponentState['status'], string> = {
  * comment on `terminalState` for why "installed" is a true claim on Done
  * and a false one on Failed.
  */
-function ComponentRow({ c, terminalState }: { c: ComponentState; terminalState?: 'done' | 'failed' }) {
+function ComponentRow({ c, now, terminalState }: {
+  c: ComponentState
+  now: number
+  terminalState?: 'done' | 'failed'
+}) {
   const active = c.status === 'started' || c.status === 'retrying'
   const note = active ? slowStepNote(c.name) : undefined
+  const seconds = componentSeconds(c, now)
 
   return (
     <li
@@ -46,8 +52,32 @@ function ComponentRow({ c, terminalState }: { c: ComponentState; terminalState?:
       className={c.generated ? 'ml-6 border-l border-line pl-3' : ''}
     >
       <div className={`flex items-baseline gap-2 font-mono text-sm ${statusClass[c.status]} ${c.generated ? 'text-xs opacity-70' : ''}`}>
+        {/* A glyph for the ordinary outcome and a word for every other one.
+            Eleven identical INSTALLEDs down a column is a column of noise
+            that hides the one row differing from it -- but the word still
+            reaches a screen reader, which is what sr-only is for. */}
+        {c.status === 'installed' ? (
+          <span className="text-pass" aria-hidden="true">✓</span>
+        ) : null}
         <span>{c.name}</span>
-        <span className="text-xs uppercase text-ink-faint">{c.status}</span>
+        {c.status === 'installed' ? (
+          <span className="sr-only">installed</span>
+        ) : (
+          <span className="text-xs uppercase text-ink-faint">{c.status}</span>
+        )}
+        {/* The in-flight row has to be findable without reading the column.
+            A pulse says "working" in the one place a stalled install is
+            indistinguishable from a finished one. */}
+        {active && (
+          <span
+            data-testid={`active-${c.name}`}
+            className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent"
+            aria-label="in progress"
+          />
+        )}
+        {seconds !== undefined && (
+          <span className="text-xs text-ink-faint">{formatSeconds(seconds)}</span>
+        )}
         {c.status === 'retrying' && (
           <span className="text-xs text-warn">attempt {c.attempt}/{c.maxAttempts}</span>
         )}
@@ -125,30 +155,77 @@ function RecipeUnknownNote() {
   )
 }
 
-/** ProgressLine states the two counts side by side -- see OVERRIDE 1: a resolved recipe's component count and deploy.sh's own deployment-action total are different things and must never share one label. */
-function ProgressLine({ recipeCount, actionTotal }: { recipeCount?: number; actionTotal?: number }) {
+/**
+ * ProgressLine states the two counts side by side -- see OVERRIDE 1: a
+ * resolved recipe's component count and deploy.sh's own deployment-action
+ * total are different things and must never share one label -- and now gives
+ * the action total the numerator it was missing.
+ *
+ * Both counts were denominators: the screen said "14 components, 16
+ * deployment actions" and then listed statuses one by one, so an operator
+ * sixteen minutes into an install could not tell minute 3 from minute 13
+ * without counting rows by eye. `done` counts ACTIONS, matching the only
+ * total that advances during Apply.
+ */
+function ProgressLine({ recipeCount, actionTotal, done, elapsed }: {
+  recipeCount?: number
+  actionTotal?: number
+  done: number
+  elapsed?: number
+}) {
+  const pct = actionTotal ? Math.round((done / actionTotal) * 100) : 0
   return (
-    <p className="text-sm text-ink-soft">
-      {recipeCount !== undefined && <span>{recipeCount} components</span>}
-      {recipeCount !== undefined && actionTotal !== undefined && <span>, </span>}
-      {actionTotal !== undefined && <span>{actionTotal} deployment actions</span>}
-    </p>
+    <div data-testid="cockpit-progress" className="space-y-2">
+      <p className="text-sm text-ink-soft">
+        {actionTotal !== undefined && (
+          <span className="text-ink">{done} of {actionTotal} installed</span>
+        )}
+        {recipeCount !== undefined && <span> · {recipeCount} components</span>}
+        {elapsed !== undefined && <span> · {formatSeconds(elapsed)} elapsed</span>}
+      </p>
+      {actionTotal !== undefined && (
+        <div className="h-1 w-full max-w-xl overflow-hidden rounded bg-panel-2">
+          <div className="h-full bg-accent transition-all duration-500" style={{ width: `${pct}%` }} />
+        </div>
+      )}
+    </div>
   )
+}
+
+/**
+ * useNow ticks once a second while a run is in flight, and not at all when it
+ * is not.
+ *
+ * The elapsed figures are derived from event timestamps rather than stored,
+ * so something has to re-render for a live one to advance -- but a timer that
+ * kept running on a finished screen would repaint a static result forever.
+ */
+function useNow(live: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!live) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [live])
+  return now
 }
 
 function Running({ components, recipeCount }: { components: ComponentState[]; recipeCount?: number }) {
   const actionTotal = deploymentActionsTotal(components)
+  const now = useNow(true)
+  const done = installedCount(components)
+  const elapsed = runElapsed(components, now)
 
   return (
     <section className="space-y-4">
       <h2 className="text-2xl font-semibold text-ink-strong">Installing the bundle</h2>
       {recipeCount === undefined && <RecipeUnknownNote />}
-      <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
+      <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} done={done} elapsed={elapsed} />
       {components.length === 0 ? (
         <p className="text-ink-faint text-sm">Generating the bundle…</p>
       ) : (
         <ul className="space-y-3">
-          {components.map(c => <ComponentRow key={c.name} c={c} />)}
+          {components.map(c => <ComponentRow key={c.name} c={c} now={now} />)}
         </ul>
       )}
     </section>
@@ -164,14 +241,17 @@ function Failed({
   onRetry: () => void
 }) {
   const actionTotal = deploymentActionsTotal(components)
+  const now = useNow(false)
+  const done = installedCount(components)
+  const elapsed = runElapsed(components, now)
 
   return (
     <section className="space-y-4">
       <h2 className="text-2xl font-semibold text-fail">Install failed</h2>
       {recipeCount === undefined && <RecipeUnknownNote />}
-      <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
+      <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} done={done} elapsed={elapsed} />
       <ul className="space-y-3">
-        {components.map(c => <ComponentRow key={c.name} c={c} terminalState="failed" />)}
+        {components.map(c => <ComponentRow key={c.name} c={c} now={now} terminalState="failed" />)}
       </ul>
 
       {failure && (
@@ -199,6 +279,9 @@ function Failed({
 
 function Done({ components, recipeCount }: { components: ComponentState[]; recipeCount?: number }) {
   const actionTotal = deploymentActionsTotal(components)
+  const now = useNow(false)
+  const done = installedCount(components)
+  const elapsed = runElapsed(components, now)
 
   return (
     <section className="space-y-4">
@@ -207,9 +290,9 @@ function Done({ components, recipeCount }: { components: ComponentState[]; recip
         Every component in the bundle installed successfully.
       </p>
       {recipeCount === undefined && <RecipeUnknownNote />}
-      <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} />
+      <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} done={done} elapsed={elapsed} />
       <ul className="space-y-3">
-        {components.map(c => <ComponentRow key={c.name} c={c} terminalState="done" />)}
+        {components.map(c => <ComponentRow key={c.name} c={c} now={now} terminalState="done" />)}
       </ul>
     </section>
   )

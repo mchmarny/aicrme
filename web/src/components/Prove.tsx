@@ -1,3 +1,4 @@
+import { deriveComponents, deploymentActionsTotal, formatSeconds, installedCount, runElapsed } from '../pipeline'
 import type { AicrEvent } from '../useEvents'
 import type { RunState } from './Wizard'
 
@@ -77,6 +78,30 @@ function Claim({ run }: { run: RunState }) {
 }
 
 /**
+ * Summary is the run's own result line.
+ *
+ * The GPU figure appears only when the cluster reported one: on a simulated
+ * cluster totalGpus is 0, and "0 of 0 GPUs" claims a measurement where there
+ * was none -- the simulated caveat below already says the true thing.
+ */
+function Summary({ events, run, placed }: { events: AicrEvent[]; run: RunState; placed: number }) {
+  const components = deriveComponents(events, run.recipe?.components.map(c => c.name))
+  const actions = deploymentActionsTotal(components)
+  const done = installedCount(components)
+  const seconds = runElapsed(components, Date.now())
+  const gpus = run.report && run.report.totalGpus > 0 ? run.report : undefined
+
+  return (
+    <p data-testid="prove-summary" className="mt-1 font-mono text-xs text-ink-faint">
+      {actions !== undefined && <span>{done} of {actions} installed</span>}
+      {seconds !== undefined && <span> in {formatSeconds(seconds)}</span>}
+      {placed > 0 && <span> · gang of {placed} placed</span>}
+      {gpus && <span> · {gpus.usableGpus} of {gpus.totalGpus} GPUs usable</span>}
+    </p>
+  )
+}
+
+/**
  * Prove is the payoff screen and the console's only exit from an active run.
  *
  * It replaces the cockpit rather than extending it (the design's own open
@@ -140,6 +165,14 @@ export function Prove({ events, run, busy, onStop }: {
             holds its placement until you stop it, so nothing further happens on its own.
           </p>
         )}
+        {/* WHAT THE RUN ACHIEVED, in one line.
+            This is the frame that ends up in a slide, and every number in it
+            was already on the screen -- scattered across forty timeline
+            lines, which is the same as not being there. Derived, never
+            parsed: the counts come from the component events and the GPU
+            figures from the capability report, so nothing here re-reads
+            another package's prose. */}
+        {active && <Summary events={events} run={run} placed={placed.length} />}
         {/* The claim is about what the placement below means, so it is shown
             only when there is a placement to mean anything about. A run that
             failed before anything was bound has nothing to say here, and the

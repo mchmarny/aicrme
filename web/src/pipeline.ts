@@ -523,3 +523,67 @@ export function deriveFailure(events: AicrEvent[]): FailureInfo | null {
   }
   return null
 }
+
+/**
+ * installedCount is how many deployment actions have finished successfully.
+ *
+ * Counted over actions rather than over recipe components, to match the
+ * denominator deploymentActionsTotal reports: deploy.sh's own numbering is
+ * what advances during Apply, and mixing the two counts is the confusion
+ * OVERRIDE 1 exists to prevent (a 14-component recipe runs 16 actions).
+ */
+export function installedCount(components: ComponentState[]): number {
+  return components.filter(c => c.status === 'installed').length
+}
+
+/**
+ * componentSeconds is how long one component took, or has been taking.
+ *
+ * `now` is passed rather than read, so a caller renders a live figure for the
+ * step in flight and a fixed one for a step that finished, from the same
+ * function -- and so tests are not at the mercy of the clock.
+ *
+ * Undefined when the header event has not arrived: a row with no start has no
+ * duration, and rendering 0s would claim it was instantaneous.
+ */
+export function componentSeconds(c: ComponentState, now: number): number | undefined {
+  if (!c.startedAt) return undefined
+  const start = Date.parse(c.startedAt)
+  if (Number.isNaN(start)) return undefined
+  const end = c.endedAt ? Date.parse(c.endedAt) : now
+  if (Number.isNaN(end)) return undefined
+  return Math.max(0, Math.round((end - start) / 1000))
+}
+
+/**
+ * formatSeconds renders a duration the way an operator reads a wait: seconds
+ * up to a minute, then minutes and seconds. Never fractional -- this labels a
+ * multi-minute install, and a decimal place would imply a precision the event
+ * timestamps do not carry.
+ */
+export function formatSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return s === 0 ? `${m}m` : `${m}m ${s}s`
+}
+
+/**
+ * runElapsed is how long Apply has been going, measured from the first
+ * component header rather than from the run's own startedAt: the run clock
+ * includes Discover, Recommend and however long the operator spent at the
+ * confirm gate, and what someone watching this screen wants is how long the
+ * INSTALL has been running. A finished run freezes at its last event rather
+ * than counting on forever.
+ */
+export function runElapsed(components: ComponentState[], now: number): number | undefined {
+  const parsed = (v?: string) => (v ? Date.parse(v) : NaN)
+  const starts = components.map(c => parsed(c.startedAt)).filter(n => !Number.isNaN(n))
+  if (starts.length === 0) return undefined
+  const first = Math.min(...starts)
+  const ends = components.map(c => parsed(c.endedAt)).filter(n => !Number.isNaN(n))
+  const allDone = components.length > 0 && components.every(c => c.endedAt)
+  const until = allDone && ends.length > 0 ? Math.max(...ends) : now
+  return Math.max(0, Math.round((until - first) / 1000))
+}
+

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { activeCondition, clusterConditionSupersedes, compareAt, deriveComponents, deriveFailure, deploymentActionsTotal, type ClusterCondition } from './pipeline'
+import { activeCondition, clusterConditionSupersedes, compareAt, componentSeconds, deriveComponents, deriveFailure, deploymentActionsTotal, formatSeconds, installedCount, type ClusterCondition, type ComponentState } from './pipeline'
 import type { AicrEvent } from './useEvents'
 import applyRun from './fixtures/apply-run.json'
 
@@ -550,5 +550,49 @@ describe('activeCondition', () => {
     const newer = condition({ uid: 'uid-new', reason: 'ImagePullBackOff', severity: 2, at: '2026-08-15T09:09:00Z' })
     expect(activeCondition([older, newer])?.uid).toBe('uid-new')
     expect(activeCondition([newer, older])?.uid).toBe('uid-new')
+  })
+})
+
+// Progress arithmetic. The screen showed "14 components, 16 deployment
+// actions" and then twelve individual statuses, and never said "11 of 16" --
+// so an operator sixteen minutes into an install had no way to tell minute 3
+// from minute 13.
+describe('progress', () => {
+  const row = (name: string, status: ComponentState['status'], startedAt?: string, endedAt?: string) =>
+    ({ name, status, generated: false, conditions: [], startedAt, endedAt }) as ComponentState
+
+  it('counts installed actions, not recipe components', () => {
+    const rows = [
+      row('cert-manager', 'installed'),
+      row('nfd', 'installed'),
+      row('gpu-operator', 'started'),
+      row('kai-scheduler', 'failed'),
+    ]
+    expect(installedCount(rows)).toBe(2)
+  })
+
+  it('measures a finished component from its own two events', () => {
+    const c = row('cert-manager', 'installed', '2026-08-28T13:00:00Z', '2026-08-28T13:02:09Z')
+    // now is ignored for a finished row: its end is recorded, not current.
+    expect(componentSeconds(c, Date.parse('2026-08-28T14:00:00Z'))).toBe(129)
+  })
+
+  it('measures a running component against now, so the figure is live', () => {
+    const c = row('kube-prometheus-stack', 'started', '2026-08-28T13:00:00Z')
+    expect(componentSeconds(c, Date.parse('2026-08-28T13:01:30Z'))).toBe(90)
+  })
+
+  it('reports no duration for a row that never started', () => {
+    // Rendering 0s here would claim the step was instantaneous rather than
+    // unmeasured.
+    expect(componentSeconds(row('nfd', 'started'), Date.now())).toBeUndefined()
+  })
+
+  it('formats a wait the way it is read', () => {
+    expect(formatSeconds(9)).toBe('9s')
+    expect(formatSeconds(59)).toBe('59s')
+    expect(formatSeconds(60)).toBe('1m')
+    expect(formatSeconds(129)).toBe('2m 9s')
+    expect(formatSeconds(441)).toBe('7m 21s')
   })
 })
