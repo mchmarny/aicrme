@@ -209,9 +209,13 @@ fi
 # ---------------------------------------------------------------------------
 hdr "Q4  Apply duration and the slow-step map (approach.md:503)"
 # approach.md predicts 10-20 minutes on real hardware, most of it driver
-# compilation. web/src/slowSteps.ts tells the operator which steps are
-# expected to hang; on KWOK every step is fast, so the map has never been
-# calibrated against a step that genuinely takes ten minutes.
+# compilation. The first run to answer this found neither half true on GKE:
+# 15m18s, but with the driver already on the node image, so the two slowest
+# steps were kube-prometheus-stack (137s) and cert-manager (128s) at 44% of
+# Apply and nothing else above 49s. web/src/slowSteps.ts was calibrated to
+# that. Re-running this on a different cluster -- one whose nodes have no
+# driver, above all -- is how that calibration gets checked rather than
+# assumed: anything flagged below is a stall the operator is not told about.
 echo "${RECORD}" | jq -r '
   "  run state:  \(.state)   phase: \(.phase)",
   "  started:    \(.startedAt)",
@@ -234,7 +238,15 @@ else
            else (if (.z|startswith("-")) then -1 else 1 end)
                 * ((.z[1:3]|tonumber) * 3600 + (.z[4:6]|tonumber) * 60)
            end);
-    def covered: endswith("-readiness") or . == "gpu-operator" or . == "kai-scheduler";
+    # Keep in step with EXACT in web/src/slowSteps.ts, or this question
+    # re-reports components the console already explains. The name is bound
+    # before the list is piped: inside `[...] | index(.)` the input is the
+    # LIST, so index(.) searches the array for itself, finds it at 0, and
+    # every component reads as covered.
+    def covered: . as $name
+      | endswith("-readiness")
+      or (["gpu-operator", "kai-scheduler", "cert-manager", "kube-prometheus-stack"]
+          | index($name) != null);
     map(select(.kind == "component" and ((.component // "") != "")))
     | group_by(.component)
     | map({ name:    .[0].component,
@@ -248,8 +260,9 @@ else
       "    ----- \($total)s summed across \(length) components"
   ' 2>/dev/null || missing "could not time any component — the events carried no started/installed pair"
   echo "  any component above with ⇐ takes real time and the operator is told nothing"
-  echo "  about it; web/src/slowSteps.ts explains only gpu-operator, kai-scheduler"
-  echo "  and *-readiness. That gap IS this question's answer."
+  echo "  about it; web/src/slowSteps.ts explains cert-manager, kube-prometheus-stack,"
+  echo "  gpu-operator, kai-scheduler and *-readiness. That gap IS this question's"
+  echo "  answer, and it is empty on the cluster the notes were calibrated against."
 fi
 
 # ---------------------------------------------------------------------------

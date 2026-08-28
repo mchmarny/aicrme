@@ -30,7 +30,10 @@ by design and holds its placement. Nothing polls for `succeeded`; it never comes
 - **MIG resource names:** none. Nodes advertise only `nvidia.com/gpu`, so `gpuResource`'s single
   constant is sufficient.
 - **Apply cost:** `kube-prometheus-stack` 137s and `cert-manager` 128s are **44% of Apply**;
-  every other component is ≤49s.
+  every other component is ≤49s. Both now carry a note in `web/src/slowSteps.ts`.
+- **`gpu-operator` is not the long pole**, at least where the node image already ships a driver —
+  GKE's H100 pools do, so it had nothing to compile and finished inside the ≤49s band. The
+  console used to call it the longest step of the install; it no longer does.
 - **Event volume:** 397 events for a full Apply+Prove against a 20000-entry replay ring — 2%.
   The ring is sized correctly.
 
@@ -42,21 +45,20 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
 
 1. **Confirm the same-cluster reuse fix on real GPU hardware.** It is proven on KWOK only. The
    original failure was on GKE, so the fix should be seen there before it is trusted. Needs a GPU
-   cluster; costs one Discover→Prove→Reset→Discover→Prove cycle.
-2. **Calibrate `web/src/slowSteps.ts`.** The measurement exists (above) and is not shipped, so the
-   two components that account for 44% of Apply are the two the operator is told nothing about.
-   Costs about an hour, needs no cluster.
-3. **Close the helm 4 obligation.** Everything in `test/e2e/reset.sh` has run under helm 4 except
+   cluster; costs one Discover→Prove→Reset→Discover→Prove cycle. Run `measure.sh` on it too: the
+   slow-step notes are calibrated against one cluster, and a cluster whose node image ships no
+   driver is the case they are least sure about.
+2. **Close the helm 4 obligation.** Everything in `test/e2e/reset.sh` has run under helm 4 except
    the FAILED-reset assertion — a failed teardown blocking Start, Retry and Discard. Match on that
    description, not on an assertion number; the numbers have moved twice. Costs one local
    `reset.sh` run against a helm 4 host. **This gates the first release, not any merge.**
-4. **Release automation.** goreleaser + brew + an install script, macOS and Linux, no Windows.
-   Waiting on item 3.
-5. **`ValidateState` false-passes on simulated nodes.** Known and deferred; it is why the demo
+3. **Release automation.** goreleaser + brew + an install script, macOS and Linux, no Windows.
+   Waiting on item 2.
+4. **`ValidateState` false-passes on simulated nodes.** Known and deferred; it is why the demo
    claims Prove rather than Validate.
-6. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
+5. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
-7. **Collapse the docs.** When the work is done, rewrite from current state and delete
+6. **Collapse the docs.** When the work is done, rewrite from current state and delete
    `docs/phase-*.md` rather than editing them.
 
 ### Known and deliberately not fixed
