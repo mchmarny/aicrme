@@ -264,5 +264,43 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+hdr "R8  volumes, which R1 cannot see and helm never owned"
+# `kubectl get all` does not list PersistentVolumeClaims, so R1 reports a
+# namespace holding a 50Gi disk as "0 core objects". Observed 2026-08-28: a
+# full Reset left monitoring at 0 core objects while
+# prometheus-kube-prometheus-prometheus-db-... stayed Bound to a 50Gi PV, and
+# survived into the next cycle still holding the previous install's TSDB.
+#
+# This is the SAME CLASS as the kai objects internal/teardown/purge.go deletes
+# by name -- something a release created that helm does not own -- but it
+# arrives by a different route: a StatefulSet volumeClaimTemplate creates PVCs
+# outside the release manifest, so `helm uninstall` has nothing to delete and
+# is not at fault. It is reported here rather than purged, per the standing
+# ruling that Reset is best-effort about completeness and never destructive:
+# a volume holds the operator's data, and deleting one to tidy up is the
+# single most expensive mistake this tool could make.
+#
+# The reclaim policy is printed because it decides what happens to the backing
+# disk if the claim is ever deleted -- Delete releases it, Retain bills for it
+# until someone removes it by hand.
+VOLS=""
+for ns in "${RECIPE_NS[@]}"; do
+  claims="$("${KC[@]}" -n "${ns}" get pvc -o json 2>/dev/null \
+    | jq -r --arg ns "${ns}" '.items[]? |
+        "    \($ns)/\(.metadata.name)  \(.status.phase)  \(.spec.resources.requests.storage // "?")  → \(.spec.volumeName // "unbound")"')"
+  [[ -n "${claims}" ]] && VOLS+="${claims}"$'\n'
+done
+if [[ -z "${VOLS}" ]]; then
+  echo "  no PersistentVolumeClaim in any recipe namespace"
+else
+  printf '%s' "${VOLS}"
+  echo "  ⇒ these outlive a Reset and the next install reuses them by name"
+  "${KC[@]}" get pv -o json 2>/dev/null \
+    | jq -r --argjson ns "$(printf '%s\n' "${RECIPE_NS[@]}" | jq -R . | jq -s .)" '
+        .items[]? | select(.spec.claimRef.namespace as $c | $ns | index($c))
+        | "    pv/\(.metadata.name)  \(.spec.capacity.storage)  reclaim=\(.spec.persistentVolumeReclaimPolicy)  \(.status.phase)"'
+fi
+
 echo
 echo "════════ end of inventory (${MOMENT}) ════════"

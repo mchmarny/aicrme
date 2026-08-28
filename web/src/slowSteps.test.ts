@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import { slowStepNote } from './slowSteps'
 
-// Calibrated against run 715521fe05b0248a on real GKE H100s (2x a3-megagpu-8g),
-// timed by test/hardware/measure.sh's Q4 and recorded in docs/STATE.md:
-// kube-prometheus-stack 137s and cert-manager 128s are 44% of a 15m18s Apply,
-// and every other component -- gpu-operator included -- came in at or under
-// 49s. Q4's own output flags any timed component missing from this map with
-// "⇐ NOT in slowSteps.ts"; those two were the whole of that gap.
+// Calibrated by test/hardware/measure.sh's Q4 against three real Applies on
+// two GKE 2x a3-megagpu-8g H100 clusters, recorded in docs/STATE.md:
+//
+//   cert-manager           128s  129s  125s
+//   kube-prometheus-stack  137s  441s   99s
+//   gpu-operator            ≤49s  36s   32s
+//
+// Q4's own output flags any timed component missing from this map with
+// "⇐ NOT in slowSteps.ts"; cert-manager and kube-prometheus-stack were that
+// gap, and nothing else has been slow on more than one run.
 //
 // These tests pin the claims that measurement licenses, and no more. They
 // deliberately match on fragments rather than whole sentences: the wording is
@@ -17,26 +21,34 @@ describe('slowStepNote', () => {
     for (const name of ['kube-prometheus-stack', 'cert-manager']) {
       const note = slowStepNote(name)
       expect(note, name).toBeDefined()
-      // The point of calibrating: an operator watching a two-minute stall is
-      // told it is two minutes, not merely that it is slow.
-      expect(note, name).toMatch(/two minutes/)
+      // The point of calibrating: an operator watching a multi-minute stall
+      // is told how many minutes, not merely that it is slow.
+      expect(note, name).toMatch(/minutes/)
       // Every duration carries the cluster it was measured on, because this
       // same note renders during a KWOK demo where both install in seconds.
       expect(note, name).toMatch(/real hardware/)
     }
   })
 
-  it('stops calling gpu-operator the longest step of the install', () => {
-    // It was never timed when that claim was written, and on the one cluster
-    // where it has been, it was not: GKE's H100 node image ships the driver,
-    // so the compile the note describes did not happen and the step came in
-    // under 49s. The driver explanation survives -- a node image without a
-    // driver still compiles one -- but the superlative moves to the component
-    // that measured 137s.
-    const note = slowStepNote('gpu-operator')
-    expect(note).toMatch(/driver/)
-    expect(note).not.toMatch(/longest/)
-    expect(slowStepNote('kube-prometheus-stack')).toMatch(/longest/)
+  it('brackets kube-prometheus-stack rather than predicting it', () => {
+    // 137s, 441s, 99s across three runs -- the cold-cluster run pulled every
+    // image and provisioned the Prometheus PVC, the warm one reused both. A
+    // single figure here would be wrong by 4x on one run in three.
+    expect(slowStepNote('kube-prometheus-stack')).toMatch(/two to seven minutes/i)
+  })
+
+  it('claims no component is THE longest step', () => {
+    // Which component is slowest changed between runs of the same recipe on
+    // the same cluster: kube-prometheus-stack led the cold run at 441s,
+    // cert-manager led the warm one at 125s against its 99s. The first
+    // calibration shipped that superlative on gpu-operator, then moved it to
+    // kube-prometheus-stack; both were unsupportable for the same reason.
+    for (const name of ['gpu-operator', 'kube-prometheus-stack', 'cert-manager', 'kai-scheduler']) {
+      expect(slowStepNote(name), name).not.toMatch(/longest/)
+    }
+    // The gpu-operator note still explains the driver compile, which is the
+    // part that survives: it is real on a node image that ships no driver.
+    expect(slowStepNote('gpu-operator')).toMatch(/driver/)
   })
 
   it('keeps kai-scheduler, the one component installed without --wait', () => {

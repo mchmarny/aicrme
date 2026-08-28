@@ -19,8 +19,13 @@ installs nothing of itself into the cluster it configures.
 | Discover → Prove | real GKE H100s (2× a3-megagpu-8g, 16 GPUs) | Discover <45s, Apply 16/16 in 15m18s, Prove placed the gang one pod per H100 and the container body executed |
 | Discover → Prove | Kind + KWOK simulated H100s | `test/e2e/` — six jobs, on every push to main |
 | Reset | real GKE H100s, helm 4.2.4 | 16 releases → 0 in 2m29s |
-| Same-cluster reuse | Kind + KWOK | `repro-kai` workflow, and `reset.sh` assertion 3 on every push |
+| Same-cluster reuse | **real GKE H100s**, and Kind + KWOK | 2026-08-28: Discover→Prove→Reset→Discover→Prove on one cluster; cycle 2 installed 16/16 and **placed its gang**, one pod per H100. Also `repro-kai` and `reset.sh` assertion 3 on every push |
 | helm 4 | real cluster | a full install *and* uninstall under v4.2.4 |
+
+**A component count and a deployment-action count are different numbers.** The GKE recipe resolves
+**14 components**; `deploy.sh` runs **16 deployment actions**, because `gpu-operator-pre` and
+`kubeflow-trainer-post` are generated. "16/16" throughout this file is actions. `pipeline.ts`
+keeps the two apart deliberately (OVERRIDE 1) and so should any note about them.
 
 **`StateActive` is Prove's terminal success state.** The reference workload is `sleep infinity`
 by design and holds its placement. Nothing polls for `succeeded`; it never comes.
@@ -29,13 +34,28 @@ by design and holds its placement. Nothing polls for `succeeded`; it never comes
 
 - **MIG resource names:** none. Nodes advertise only `nvidia.com/gpu`, so `gpuResource`'s single
   constant is sufficient.
-- **Apply cost:** `kube-prometheus-stack` 137s and `cert-manager` 128s are **44% of Apply**;
-  every other component is ≤49s. Both now carry a note in `web/src/slowSteps.ts`.
-- **`gpu-operator` is not the long pole**, at least where the node image already ships a driver —
-  GKE's H100 pools do, so it had nothing to compile and finished inside the ≤49s band. The
-  console used to call it the longest step of the install; it no longer does.
-- **Event volume:** 397 events for a full Apply+Prove against a 20000-entry replay ring — 2%.
-  The ring is sized correctly.
+- **Apply cost**, three runs on two clusters (`measure.sh` Q4). Only two components are ever slow
+  enough to explain, and only one of them is predictable:
+
+  | | 08-26 | 08-28 cold | 08-28 warm |
+  |---|---|---|---|
+  | `cert-manager` | 128s | 129s | 125s |
+  | `kube-prometheus-stack` | 137s | **441s** | 99s |
+  | `gpu-operator` | ≤49s | 36s | 32s |
+  | Apply+Prove total | 15m18s | 16m13s | 9m49s |
+
+  `cert-manager` reproduces to within 4s across both clusters. `kube-prometheus-stack` varies 4×
+  — the cold run pulled every image and provisioned Prometheus a volume, the warm one reused
+  both — so `slowSteps.ts` gives it a range and **no component is called "the longest step"**:
+  which one leads changed between two runs of the same recipe on the same cluster.
+- **`gpu-operator` is not the long pole** where the node image already ships a driver. AICR
+  detects that and logs `auto-disabled gpu-operator driver install: pre-installed driver detected
+  in snapshot`. It also warns that this is decided from a **single sampled node** and applies
+  cluster-wide, so a mixed pool can come up driverless (AICR #464). **A node image that ships no
+  driver has still never been timed** — that is the open case for the slow-step notes.
+- **Event volume:** 1706 events for a full Apply+Prove against a 20000-entry replay ring — 8.5%,
+  of which 1648 are cluster events. The earlier 397 was the same measurement on a quieter run;
+  the ring is sized correctly either way.
 
 ---
 
@@ -43,17 +63,16 @@ by design and holds its placement. Nothing polls for `succeeded`; it never comes
 
 Ordered by what unblocks the most. Each item says what it costs and what it is waiting on.
 
-1. **Confirm the same-cluster reuse fix on real GPU hardware.** It is proven on KWOK only. The
-   original failure was on GKE, so the fix should be seen there before it is trusted. Needs a GPU
-   cluster; costs one Discover→Prove→Reset→Discover→Prove cycle. Run `measure.sh` on it too: the
-   slow-step notes are calibrated against one cluster, and a cluster whose node image ships no
-   driver is the case they are least sure about.
-2. **Close the helm 4 obligation.** Everything in `test/e2e/reset.sh` has run under helm 4 except
+1. **Close the helm 4 obligation.** Everything in `test/e2e/reset.sh` has run under helm 4 except
    the FAILED-reset assertion — a failed teardown blocking Start, Retry and Discard. Match on that
    description, not on an assertion number; the numbers have moved twice. Costs one local
    `reset.sh` run against a helm 4 host. **This gates the first release, not any merge.**
-3. **Release automation.** goreleaser + brew + an install script, macOS and Linux, no Windows.
-   Waiting on item 2.
+2. **Release automation.** goreleaser + brew + an install script, macOS and Linux, no Windows.
+   Waiting on item 1.
+3. **Time a node image that ships no driver.** Every real run so far has been on GKE H100 pools
+   with a pre-installed driver, so the one claim in `slowSteps.ts` nobody has measured is the
+   `gpu-operator` driver compile. Costs one Apply on any GPU cluster whose nodes come up
+   driverless.
 4. **`ValidateState` false-passes on simulated nodes.** Known and deferred; it is why the demo
    claims Prove rather than Validate.
 5. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
@@ -66,6 +85,14 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
 - **Uninstall is best-effort about completeness, never about destructiveness.** Reset removes helm
   releases and the named objects a chart tells helm to keep (see below). It deletes no namespaces
   and chases no orphans — it reports them and prints the command. Do not add code to chase them.
+- **A Reset leaves Prometheus's 50Gi volume behind, and this is correct.** `kube-prometheus-stack`
+  brings up a StatefulSet whose `volumeClaimTemplate` creates the PVC *outside* the release
+  manifest, so `helm uninstall` never owned it and has nothing to delete. The next install reuses
+  it by name, still holding the previous run's TSDB. It is the same class as the kai objects the
+  purge deletes, but it must **not** join them: that table exists because those four break the
+  next install, and a volume holds the operator's data. `reset-residue.sh` R8 reports PVCs and
+  their reclaim policy — `kubectl get all`, and so R1, cannot see them, which is how a namespace
+  holding 50Gi read as "0 core objects" until 2026-08-28.
 - **AICR's kai-scheduler values set `postCleanup.enabled: false`**, disabling the chart's own
   post-delete cleanup. Its stated reason — the hook "does not inherit global.tolerations" — is not
   true of the pinned chart v0.14.1, whose `post-delete-job.yaml` renders them. This costs nothing
