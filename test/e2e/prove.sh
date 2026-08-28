@@ -319,14 +319,54 @@ echo "after Stop: ${LEFTOVER_JOBS} owned jobs, ${LEFTOVER_PODS} owned pods"
 echo "assertion 4: PASS"
 
 echo "--- assert 5: a gang that never places is cleaned up, and says why"
+# RESET FIRST, because a second run over an existing install is now refused.
+# internal/steps' alreadyInstalled stops Apply when the recipe's own releases
+# are already on the cluster: kai-scheduler's SchedulingShard survives a
+# reinstall by design and owns the scheduler Deployment, so installing twice
+# leaves the cluster running the FIRST install's scheduler against a control
+# plane replaced underneath it -- observed on real GKE H100s on 2026-08-28,
+# where Apply reported 16/16 and the gang then placed 0/2. This assertion
+# therefore goes through the supported path (reset, then install) rather than
+# around it.
+echo "--- reset the first run so the second has a clean cluster to install into"
+post "/api/runs/${RUN_ID}/reset" -d '{"confirm":"reset"}' >/dev/null
+RESET_DONE=""
+for _ in $(seq 1 90); do
+  # The residue summary is written when the teardown finishes, so it is the
+  # signal that the reset is over -- the run's state is `done` both before
+  # and after, having already been stopped.
+  RESET_DONE="$(run_json "${RUN_ID}" | jq -r '.residue.summary // empty')"
+  [[ -n "${RESET_DONE}" ]] && break
+  sleep 5
+done
+[[ -n "${RESET_DONE}" ]] || fail "the reset before assert 5 never finished"
+echo "reset: ${RESET_DONE}"
+
+TIMEOUT_RUN_ID="$(drive_to_prove)"
+echo "second run id: ${TIMEOUT_RUN_ID}"
+
 # Placement is made impossible by taking the scheduler away, which is closer
 # to a real cluster's failure mode (a full or unschedulable cluster) than
 # breaking the manifest would be -- and it leaves the workload genuinely
 # pending, which is what the cleanup has to race.
+#
+# Done DURING Apply, and that timing is the whole point. Before the run, the
+# reinstall would simply bring the scheduler back; after Apply, the gang binds
+# in about two seconds on KWOK and would place before any scale command
+# landed. Scaling once kai-scheduler itself is installed leaves a dozen
+# components still to go, so the scheduler is at zero replicas for minutes
+# before Prove ever starts.
+echo "--- waiting for kai-scheduler to install, then taking the scheduler away"
+SCHED_READY=""
+for _ in $(seq 1 120); do
+  SCHED_READY="$(run_json "${TIMEOUT_RUN_ID}" \
+    | jq -r '[.components[]? | select(.name == "kai-scheduler" and .status == "installed")] | length')"
+  [[ "${SCHED_READY}" == "1" ]] && break
+  sleep 5
+done
+[[ "${SCHED_READY}" == "1" ]] || fail "kai-scheduler never installed in the second run"
 kubectl -n kai-scheduler scale deploy/kai-scheduler-default --replicas=0
 kubectl -n kai-scheduler rollout status deploy/kai-scheduler-default --timeout=120s
-TIMEOUT_RUN_ID="$(drive_to_prove)"
-echo "second run id: ${TIMEOUT_RUN_ID}"
 STATE=""
 for _ in $(seq 1 240); do
   STATE="$(run_state "${TIMEOUT_RUN_ID}")"

@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
@@ -64,7 +65,27 @@ func (a *apply) Run(ctx context.Context, run *engine.Run, emit engine.Emit) erro
 	// and `--create-namespace` both destroy the created-vs-adopted
 	// distinction the instant they run, so this is the last moment the
 	// answer exists. Never fails the step -- see snapshotOwnership.
-	run.Ownership = snapshotOwnership(ctx, a.cfg.Helm, a.cfg.Kube, recipeNamespaces(run))
+	//
+	// Taken ONCE per run, and a retry keeps the original. Apply re-runs on
+	// Retry, and by then this run's own partial install is on the cluster --
+	// so re-snapshotting would record a run's own releases as things that
+	// pre-existed it, handing them to teardown as somebody else's and
+	// leaving them behind at Reset. The first answer is the only true one.
+	first := len(run.Ownership.Namespaces) == 0
+	if first {
+		run.Ownership = snapshotOwnership(ctx, a.cfg.Helm, a.cfg.Kube, recipeNamespaces(run))
+	}
+
+	// Refuse a second install over the first, and only on the first attempt:
+	// a Retry is this run finishing its own work, not a new run climbing on
+	// top of another's. See alreadyInstalled for what the second install
+	// does to kai-scheduler, and why the purge cannot clean up after it.
+	if first {
+		if clash := alreadyInstalled(run.Ownership, recipeReleaseNames(run)); len(clash) > 0 {
+			return aicrerrors.New(aicrerrors.ErrCodeConflict, installedAlreadyMessage(clash))
+		}
+	}
+
 	if unprovable := unsnapshotted(run.Ownership); len(unprovable) > 0 {
 		// Said out loud, during Apply, because the alternative is an
 		// operator who finds out at Reset time -- after the demo, with a
@@ -145,4 +166,34 @@ func upsertComponent(run *engine.Run, data applier.ComponentData) {
 		Namespace: data.Namespace,
 		Status:    data.Status,
 	})
+}
+
+// installedAlreadyMessage names what is in the way and both ways out.
+//
+// It names releases rather than counting them because the operator has to act
+// on this, and it offers the manual command as well as Reset: a run that was
+// discarded no longer exists to be Reset, and its releases are then nobody's
+// -- refusing without saying how to clear them would strand the operator on a
+// cluster the console will not install into.
+func installedAlreadyMessage(clash []engine.ReleaseRef) string {
+	shown := clash
+	if len(shown) > 3 {
+		shown = shown[:3]
+	}
+	names := make([]string, 0, len(shown))
+	for _, r := range shown {
+		names = append(names, r.Name+" in "+r.Namespace)
+	}
+	list := strings.Join(names, ", ")
+	if len(clash) > len(shown) {
+		list = fmt.Sprintf("%s, and %d more", list, len(clash)-len(shown))
+	}
+	return fmt.Sprintf(
+		"%d of this recipe's releases are already installed on this cluster (%s). "+
+			"Installing over them would appear to succeed and then not work: kai-scheduler's "+
+			"SchedulingShard survives a reinstall by design, the scheduler Deployment it owns is "+
+			"never recreated, and the gang fails to place twenty minutes from now. "+
+			"Reset the run that installed them first. If no run owns them any more, remove them "+
+			"with `helm uninstall`.",
+		len(clash), list)
 }

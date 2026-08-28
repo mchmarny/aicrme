@@ -231,26 +231,43 @@ func (p *proveStep) gangTimeoutErr(runID string, placed int) error {
 	// there is one known cause of that: a kai-scheduler left inconsistent by
 	// an earlier teardown.
 	//
-	// This used to prescribe two commands -- delete the SchedulingShard,
-	// restart the kai-scheduler deployments -- on the strength of a KWOK
-	// measurement from 2026-08-23. That remedy was tested on real GKE H100
-	// hardware on 2026-08-26 and DOES NOT WORK: all six kai-scheduler
-	// deployments rolled out cleanly, the run was retried, and it failed
-	// identically, with a fresh PodGroup UUID and the same pod-grouper loop
-	// (`already exists`, then `the object has been modified`).
+	// The cause is a STALE SCHEDULER, and this text has been wrong twice
+	// before, so it is worth being precise about what is known.
 	//
-	// So the advice is withdrawn rather than reworded. Naming what does not
-	// work is worth the words: without it the next operator spends the same
-	// three minutes discovering it again, at the end of an install.
+	// kai-scheduler's chart annotates its SchedulingShard
+	// `helm.sh/resource-policy: keep`, and the shard owns the
+	// kai-scheduler-default Deployment -- which helm therefore does not own
+	// either. Any path that leaves the shard behind and then installs again
+	// leaves the cluster running the PREVIOUS install's scheduler pod against
+	// a control plane replaced underneath it. It schedules nothing.
 	//
-	// Offered as a possibility, not a diagnosis -- this console cannot tell
-	// from here whether the cluster was ever reset.
+	// Two earlier versions of this message were wrong, and both errors cost
+	// real time:
+	//
+	// It first prescribed deleting the shard and restarting the deployments,
+	// on a KWOK measurement. That was tested on real GKE H100s on 2026-08-26
+	// and DOES NOT WORK -- all six deployments rolled cleanly, the retry
+	// failed identically. The advice was withdrawn.
+	//
+	// It then blamed the pod-grouper ("cannot read back the PodGroup it
+	// creates") and said the failure follows a Reset. Both are wrong. The
+	// pod-grouper's `already exists` / `object has been modified` pair
+	// appears on HEALTHY first installs too -- it is noise, not the signal.
+	// And on 2026-08-28 this failed on a cluster that had never been reset:
+	// a second run had installed over the first, which internal/steps'
+	// alreadyInstalled now refuses for exactly this reason.
+	//
+	// So the message names the mechanism and, above all, a CHECK the operator
+	// can run in five seconds -- the age of the scheduler Deployment against
+	// its siblings is the signature, and it is unambiguous.
 	if placed == 0 {
-		msg += ". Nothing placed at all. If this cluster has been reset before, this is a known" +
-			" kai-scheduler failure: its pod-grouper cannot read back the PodGroup it creates," +
-			" so the scheduler sees none. Deleting the SchedulingShard and restarting" +
-			" kai-scheduler was measured not to clear it, on real hardware. A cluster that" +
-			" has not been reset is the only path known to work today"
+		msg += ". Nothing placed at all, which is usually a stale scheduler rather than a full" +
+			" cluster: kai-scheduler's SchedulingShard survives an uninstall by design and owns" +
+			" the kai-scheduler-default Deployment, so a cluster that has been installed into" +
+			" before can still be running the previous install's scheduler." +
+			" Check with `kubectl -n kai-scheduler get deploy` -- if kai-scheduler-default is" +
+			" older than the other kai deployments beside it, that is this." +
+			" A Reset removes the shard and the next install is clean"
 	}
 	return aicrerrors.New(aicrerrors.ErrCodeTimeout, msg)
 }

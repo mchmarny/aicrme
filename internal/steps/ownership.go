@@ -194,3 +194,61 @@ func recipeNamespaces(run *engine.Run) []string {
 	}
 	return out
 }
+
+// recipeReleaseNames is the set of release names this recipe installs.
+//
+// deploy.sh names each release after its component, so the recipe's own
+// component list is the authority on what Apply is about to create. Derived
+// rather than assumed from the namespace: a namespace can hold releases this
+// recipe knows nothing about -- a bystander -- and those are none of Apply's
+// business.
+func recipeReleaseNames(run *engine.Run) map[string]bool {
+	var summary RecipeSummary
+	if err := json.Unmarshal(run.Artifacts["recipe.json"], &summary); err != nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, c := range summary.Components {
+		if c.Name != "" {
+			out[c.Name] = true
+		}
+	}
+	return out
+}
+
+// alreadyInstalled returns the recipe's own releases that were already on the
+// cluster before this Apply.
+//
+// # WHY APPLY REFUSES ON A NON-EMPTY ANSWER
+//
+// `helm upgrade --install` over an existing install succeeds, and then the
+// cluster does not work. kai-scheduler's chart annotates its SchedulingShard
+// `helm.sh/resource-policy: keep`, and the shard owns the
+// kai-scheduler-default Deployment -- which helm therefore does not own
+// either. A second install rolls every other kai component and leaves those
+// two untouched, so the cluster runs the FIRST install's scheduler pod
+// against a control plane replaced underneath it. It schedules nothing.
+//
+// Observed on real hardware 2026-08-28: a run whose Apply reported 16/16
+// installed, and whose gang then failed to place 0/2. The shard and the
+// scheduler Deployment were two hours older than the five kai Deployments
+// beside them. Nothing in the install said anything was wrong.
+//
+// internal/teardown/purge.go removes those objects, but only after a
+// CONFIRMED uninstall -- correctly, since a skipped or failed uninstall
+// leaves controllers that would recreate them. So the purge cannot help
+// here: no uninstall happened. Refusing is what closes the gap, and the
+// remedy is a Reset, which is the path that IS proven.
+//
+// Bystanders are excluded by name. A release the recipe does not install is
+// somebody else's and must not make this run refuse -- the same distinction
+// teardown draws when it declines to uninstall one.
+func alreadyInstalled(own engine.Ownership, names map[string]bool) []engine.ReleaseRef {
+	var out []engine.ReleaseRef
+	for _, r := range own.Releases {
+		if names[r.Name] {
+			out = append(out, r)
+		}
+	}
+	return out
+}

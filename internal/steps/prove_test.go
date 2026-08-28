@@ -283,20 +283,28 @@ func TestProveGangTimeoutNamesTheDeadlineAndTheCount(t *testing.T) {
 
 // Nothing placed at all is a different failure from a gang that placed some
 // members, and there is one known cause: a kai-scheduler left inconsistent by
-// an earlier teardown, whose pod-grouper cannot read back the PodGroup it just
-// created, so the scheduler sees none at all.
+// an earlier install: kai-scheduler's SchedulingShard survives an uninstall by
+// design and owns the kai-scheduler-default Deployment, so a cluster installed
+// into twice can be running the previous install's scheduler against a control
+// plane replaced underneath it.
 //
-// The two-command remedy this message used to prescribe -- delete the
-// SchedulingShard, restart the kai-scheduler deployments -- was measured NOT to
-// work on 2026-08-26, on real GKE H100 hardware: all six deployments rolled out
-// cleanly, the run was retried, and it failed identically with a fresh PodGroup
-// UUID and the same pod-grouper loop. The earlier 2026-08-23 KWOK measurement
-// that justified it did not survive contact with a real cluster.
+// THIS MESSAGE HAS BEEN WRONG TWICE, and each error cost real time, so the
+// assertions below pin what is known rather than what was believed:
 //
-// So the message names the cause and says what does NOT clear it. Sending an
-// operator through two commands that will not help, at the end of a
-// three-minute wait, is worse than saying plainly that a fresh cluster is the
-// only path known to work.
+// It first prescribed deleting the shard and restarting the deployments, from
+// a KWOK measurement. Measured NOT to work on real GKE H100s on 2026-08-26 --
+// all six deployments rolled cleanly and the retry failed identically. Those
+// commands must never come back, which the second loop below enforces.
+//
+// It then blamed the pod-grouper and said the failure follows a Reset. Both
+// were wrong. The pod-grouper's `already exists` pair appears on healthy first
+// installs too, and on 2026-08-28 this failed on a cluster that had NEVER been
+// reset -- a second run had installed over the first. Asserting "pod-grouper"
+// and "has not been reset", as this test used to, pinned the wrong diagnosis
+// in place.
+//
+// What an operator needs at the end of a three-minute wait is a check they can
+// run in five seconds, so that is what is asserted.
 func TestProveGangTimeoutPointsAtTheKnownCauseWhenNothingPlaced(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	run := newRun()
@@ -306,9 +314,18 @@ func TestProveGangTimeoutPointsAtTheKnownCauseWhenNothingPlaced(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run() succeeded though the gang never placed")
 	}
-	for _, want := range []string{"kai-scheduler", "pod-grouper", "has not been reset"} {
+	for _, want := range []string{"kai-scheduler", "SchedulingShard", "get deploy", "Reset"} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Run() error = %q, want it to name the cause and the path that works (%q)", err.Error(), want)
+			t.Errorf("Run() error = %q, want it to name the mechanism and the check (%q)", err.Error(), want)
+		}
+	}
+	// The withdrawn diagnosis must not come back either. The pod-grouper
+	// chatter is noise that appears on healthy installs, and "a cluster that
+	// has not been reset is the only path that works" is false: Reset then
+	// install is proven on real hardware, twice.
+	for _, gone := range []string{"pod-grouper", "has not been reset"} {
+		if strings.Contains(err.Error(), gone) {
+			t.Errorf("Run() error = %q, still carries the withdrawn diagnosis %q", err.Error(), gone)
 		}
 	}
 	// The disproven commands must not come back. This assertion is the only
