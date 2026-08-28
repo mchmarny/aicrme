@@ -108,6 +108,51 @@ is the "amber row on a green run" outcome the Pod path was explicitly changed to
 
 ---
 
+## 3. The first full UI run on real GPU hardware — 2026-08-28
+
+**Observed:** 2026-08-28, Mark, driving the whole arc against a GKE cluster (2x a3-megagpu-8g,
+144 contexts in the kubeconfig) in a browser, screenshot by screenshot. Thirty observations. All
+but four shipped the same day; what follows records them so the reasoning is not re-derived.
+
+### Shipped
+
+| # | Observation | Fix |
+|---|---|---|
+| 25 | **The success screen read as a failure.** `StateActive` is Prove's terminal success state, and the only coloured things on it were a solid red Stop and a red Reset. Read as an error by the person who built it. | An explicit success line that also rules out the wrong conclusion the state invites — the run *ends* here. Stop demoted to the outlined style ResetGate already used. |
+| 28 | **Stop looked like a dead click.** It is synchronous over a wait that is minutes long (delete the workload, wait for pods to actually be gone), and a disabled button was the entire feedback. The cluster had already done it. | "Stopping…", plus a caption naming what it waits on. |
+| 10 | **The cluster stopped being named after Connect.** The header said only "connected" — including on the gate where cluster-admin is granted. | Context name and GPU count in the header, on the fresh-connect and reload paths. |
+| 17, 18 | **The app's green was not the brand green** (emerald hue 162 vs the logo's 91–124), and there was no mark or favicon. | The palette from https://validation.aicr.run verbatim, as semantic tokens; NVIDIA green #76b900; mark and favicon generated small from the source PNGs. |
+| 19, 20, 21, 23 | **No aggregate progress, no time, no way to find the in-flight row.** Two denominators and no numerator; `INSTALLED` eleven times in one column. | "11 of 16 installed", a bar, per-row durations, elapsed clock, a pulse on the working row, a glyph for the rest. The timing data was already on `ComponentState` and unrendered. |
+| 27 | **No run summary at the moment of success** — the numbers were spread over forty timeline lines. | One line: actions, wall clock, gang size, GPUs (the last only when the cluster reported any). |
+| 1, 2, 3, 4, 5, 6, 11 | **Connect was unusable on a real kubeconfig.** 144 contexts, the preselected one at row 89, no filter, a 448px column against full EKS ARNs. | Current context pinned first and badged, a filter past six contexts, name over server, `max-w-3xl` on both screens. |
+| 7, 8, 9 | Confirm had no hierarchy, bash printed a two-line banner, the GPU row read like the "no GPUs" rows. | Section headings, `bashVersion` reduces to `5.3.15`, GPU row accented. |
+| 12, 14, 15, 16 | **The gate did not justify itself.** Flat alphabetical list; "every version pinned" contradicted two rows later by AICR-generated local charts; nothing linked Discover's findings to the components that close them. | Grouped by namespace, each component naming the gap it closes, and a claim that counts rather than asserts. Discover's gap list gains a framing heading. |
+| 26, 30 | Reset sat alone in the left margin; the disabled Continue gave no reason. | Same column as Prove; the button says what it is waiting for. |
+| 24 | **No way to export the run log**, and the events die with the process. | `GET /api/runs/{id}/log` — record plus events, as a named attachment, with a download link on the timeline. |
+
+### Not fixed, deliberately
+
+**13. The timeline reads newest-first.** Raised as "the narrative reads backwards". It does — and
+that is item 1 of this file, shipped 2026-08-23 from a real demo, trading chronological reading
+for never scrolling during a live install. Reversing it would undo a decision already made with
+the evidence in hand. Left as is.
+
+**22. "The timeline disappears during Apply."** Does not reproduce: `Wizard` renders the timeline
+aside unconditionally for every phase. The screenshot reporting it is 1723px wide where the
+others are 2000px, so it was almost certainly cropped. Recorded rather than closed, in case it
+turns out to be real on a narrow window.
+
+**29. The screen did not advance after Stop.** It did eventually, so the run state was never
+stuck. Whether it lagged because of an SSE drop or because nothing renders during teardown is
+still open; the refresh test that would distinguish them was not run.
+
+**Related bug, still open:** `GET /api/runs/{id}/bundle` 404s for a *recovered* run —
+`bundle.path` lives in `ephemeralArtifacts` and is dropped on encode. The existing download is
+broken on exactly the path where debugging matters most, and the log export above does not fix
+it.
+
+---
+
 ## Observed in the same screenshot, not raised as feedback
 
 Recorded only so they are not re-discovered as surprises. Neither is a request.
