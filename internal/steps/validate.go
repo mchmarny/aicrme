@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,6 +15,20 @@ import (
 	"github.com/mchmarny/aicrme/internal/bus"
 	"github.com/mchmarny/aicrme/internal/engine"
 )
+
+// aicrValidationNamespace is where ValidateState creates its ServiceAccount,
+// a per-run cluster-admin ClusterRoleBinding, and validator Jobs -- the
+// default pkg/validator uses when this step's call (below) does not
+// override it with aicr.WithValidationNamespace. RBAC and ConfigMaps are
+// cleaned on a fresh context.Background() so they survive cancellation, but
+// the Job itself is cleaned with the run context (so a deadline or SIGTERM
+// leaves it), and nothing deletes the namespace. Unlike Apply, this step
+// records no ownership for Reset to act on, so a failure here is entirely
+// outside Reset's reach and absent from the residue inventory. The standing
+// ruling is that the deployer owns its cleanup and orphans are printed, not
+// chased -- this constant exists so the warning below can name where to
+// look, not so this step can go clean it up itself.
+const aicrValidationNamespace = "aicr-validation"
 
 // ValidateConfig configures the Validate step.
 type ValidateConfig struct {
@@ -92,8 +107,21 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 		aicr.WithValidationTimeout(v.cfg.Timeout),
 	)
 	if err != nil {
-		run.Validation = engine.Validation{Skipped: "validation could not run: " + err.Error()}
-		publish(emit, run, bus.LevelWarn, "validation could not run: "+err.Error())
+		// This step created RBAC and Jobs in aicrValidationNamespace before
+		// this error arrived, and this step -- unlike Apply -- has no
+		// ownership record for Reset to clean up against. slog rather than
+		// only the bus event: an operator watching this pod's own logs (the
+		// channel that works even when the SPA never connects) gets the same
+		// pointer to where to look. "may still hold", not "does hold": the
+		// Job's own cleanup can have succeeded right up until the failure
+		// that follows it, so claiming leftovers exist would itself be a
+		// false-pass in the other direction.
+		slog.Warn("validation failed; the namespace it used may still hold leftover objects",
+			"run", run.ID, "namespace", aicrValidationNamespace, "error", err)
+		reason := fmt.Sprintf("validation could not run: %s -- check the %s namespace for leftover objects this step could not confirm it removed",
+			err.Error(), aicrValidationNamespace)
+		run.Validation = engine.Validation{Skipped: reason}
+		publish(emit, run, bus.LevelWarn, reason)
 		return nil
 	}
 
@@ -104,8 +132,28 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
 			Message: "validation ran but its report could not be written: " + werr.Error()})
 	}
-	publish(emit, run, "", verdict(run.Validation.Phases))
+	// A verdict with failures is not routine narration -- it publishes at the
+	// same warn level every skip already does, so "validation: 11 of 14
+	// checks passed, 3 failed" does not render in the same neutral ink as
+	// ordinary progress lines while the panel colors it red and the
+	// timeline does not.
+	level := bus.Level("")
+	if anyPhaseFailed(run.Validation.Phases) {
+		level = bus.LevelWarn
+	}
+	publish(emit, run, level, verdict(run.Validation.Phases))
 	return nil
+}
+
+// anyPhaseFailed reports whether any validation phase recorded a failed
+// check.
+func anyPhaseFailed(phases []engine.PhaseSummary) bool {
+	for _, p := range phases {
+		if p.Failed > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // publish sends the outcome as a payload as well as a sentence. The console

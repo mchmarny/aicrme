@@ -123,6 +123,14 @@ func TestValidateNeverFailsTheRun(t *testing.T) {
 		if run.Validation.Skipped == "" {
 			t.Error("an errored validation must record why, or the screen shows nothing at all")
 		}
+		// Finding 5 (final-review): this step has no ownership record for
+		// Reset to clean up against, so a ValidateState error can leave the
+		// aicr-validation namespace's RBAC and Jobs behind with nothing in
+		// aicrme's own inventory pointing at them. No new cleanup code -- the
+		// fix is that the operator reading the screen is told where to look.
+		if !strings.Contains(run.Validation.Skipped, "aicr-validation") {
+			t.Errorf("Skipped = %q, want it to name the aicr-validation namespace so the operator knows where to look for leftovers", run.Validation.Skipped)
+		}
 		if len(run.Validation.Phases) != 0 {
 			t.Errorf("Phases = %+v, want none recorded when validation fails to run", run.Validation.Phases)
 		}
@@ -242,6 +250,55 @@ func TestValidatePublishesTheVerdictAsData(t *testing.T) {
 		}
 		if len(got.Phases) != 1 || got.Phases[0].Passed != 14 {
 			t.Errorf("published Phases = %+v, want one phase with 14 passed", got.Phases)
+		}
+	})
+}
+
+// Finding 7 (final-review): the verdict used to publish at level "" (which
+// bus.Publish normalizes to info) regardless of outcome, so "validation: 11
+// of 14 checks passed, 3 failed" rendered in the same neutral ink as routine
+// narration while every skip already went out at warn and the panel colors
+// a failure red. The fix keys the verdict event's level off whether any
+// phase actually failed.
+func TestValidatePublishesAFailingVerdictAtWarnLevel(t *testing.T) {
+	run := func(t *testing.T, failed int) []bus.Event {
+		t.Helper()
+		recipe := recipeFixture()
+		status := "passed"
+		if failed > 0 {
+			status = "failed"
+		}
+		fake := &aicrclient.Fake{
+			Recipe: recipe,
+			PhaseResults: []*aicr.PhaseResult{{
+				Phase: aicr.PhaseDeployment, Status: status,
+				Summary:   aicr.ReportSummary{Tests: 14, Passed: 14 - failed, Failed: failed},
+				RawReport: []byte(`{"results":{}}`),
+			}},
+		}
+		step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
+		r := newRunWithRealCluster(t, recipe)
+
+		var events []bus.Event
+		if err := step.Run(context.Background(), r, func(e bus.Event) { events = append(events, e) }); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		return events
+	}
+
+	t.Run("a failure warns", func(t *testing.T) {
+		events := run(t, 3)
+		last := events[len(events)-1]
+		if last.Level != bus.LevelWarn {
+			t.Errorf("verdict event Level = %q, want %q for a run with 3 failed checks", last.Level, bus.LevelWarn)
+		}
+	})
+
+	t.Run("a clean pass stays at info", func(t *testing.T) {
+		events := run(t, 0)
+		last := events[len(events)-1]
+		if last.Level != "" {
+			t.Errorf("verdict event Level = %q, want empty (bus.Publish normalizes empty to info) for a clean pass", last.Level)
 		}
 	})
 }
