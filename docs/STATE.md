@@ -3,8 +3,9 @@
 Where this project is, what is proven and on what, and what is left. Present tense only — no
 history. When something changes, edit this file rather than appending to it.
 
-The `docs/phase-*.md` files are working notes from the phase that produced them. They are not
-maintained and several of their claims are superseded. Read this file instead.
+This is the only status document. The per-phase working notes it used to point at were deleted
+when the repo went public: they were unmaintained and several of their claims were superseded.
+Git history has them if a decision ever needs archaeology.
 
 ---
 
@@ -13,8 +14,8 @@ maintained and several of their claims are superseded. Read this file instead.
 The whole arc — Discover, Recommend, Bundle, Apply, Validate, Prove, Reset — runs end to end,
 driven from a laptop over the operator's own kubeconfig. `aicrme` is a local binary; it installs
 nothing of itself into the cluster it configures. Every phase but Validate has run against real
-GPU hardware; Validate is proven so far only on KWOK's simulated nodes — see the Validation row
-below and Open work item 3.
+GPU hardware; Validate is proven so far only on KWOK's simulated nodes — see the two Validation
+rows below and Open work item 2.
 
 | | Proven on | Evidence |
 |---|---|---|
@@ -25,7 +26,8 @@ below and Open work item 3.
 | Same-cluster reuse **without a Reset** | **does not work, and is now refused** | see below |
 | helm 4 | real cluster, **and CI on every push** | a full install *and* uninstall under v4.2.4 by hand; the `reset` e2e job now pins v4.2.4, so all six assertions — including the FAILED-teardown one — run under helm 4 while the other five jobs keep exercising helm 3.21.4 |
 | Validation — the **skip** path | Kind + KWOK, **CI on every push** | `prove.sh` assert 7, first green 2026-08-29: the run record reads `{"skipped":"simulated cluster -- kwok-controller is running its fake nodes…"}` with no phase results. That cluster advertises 32 GPUs across four fake nodes, so the skip is keyed off `gap.Report.Simulated` (kwok-controller in the snapshot's image list), **not** a GPU count — a count check passes it and validates against fakes |
-| Validation — the **verdict** path | **not yet run on real hardware** | `deployment` phase runs between Apply and Prove and records a verdict on the run (`internal/steps/validate.go`). Proven so far only by `internal/steps` unit tests: no run has yet driven `ValidateState` to completion against real GPUs. Open work item 3 below |
+| Release automation | **config proven, no release cut yet** | A `v*` tag runs `make qualify`, then goreleaser: four archives (darwin/linux × amd64/arm64), `checksums.txt`, a SLSA build-provenance attestation, and a Homebrew formula pushed to `mchmarny/homebrew-tap`. `ci`'s `release-dryrun` job builds the real artifacts on every push and runs `scripts/smoke-release.sh` against one, which is the only thing standing between a lost `before` hook and a shipped binary whose console is an empty directory listing |
+| Validation — the **verdict** path | **not yet run on real hardware** | `deployment` phase runs between Apply and Prove and records a verdict on the run (`internal/steps/validate.go`). Proven so far only by `internal/steps` unit tests: no run has yet driven `ValidateState` to completion against real GPUs. Open work item 2 below |
 
 ### Installing twice without a Reset
 
@@ -116,14 +118,11 @@ by design and holds its placement. Nothing polls for `succeeded`; it never comes
 
 Ordered by what unblocks the most. Each item says what it costs and what it is waiting on.
 
-1. **Release automation.** goreleaser + brew + an install script, macOS and Linux, no Windows.
-   Nothing blocks it: the helm 4 obligation that used to gate the first release closed on
-   2026-08-28.
-2. **Time a node image that ships no driver.** Every real run so far has been on GKE H100 pools
+1. **Time a node image that ships no driver.** Every real run so far has been on GKE H100 pools
    with a pre-installed driver, so the one claim in `slowSteps.ts` nobody has measured is the
    `gpu-operator` driver compile. Costs one Apply on any GPU cluster whose nodes come up
    driverless.
-3. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
+2. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
    runs between Apply and Prove (`internal/steps/validate.go`) and records a verdict on the run —
    see the two Validation rows above, which separate what CI proves from what it cannot. `ValidateState` false-passes on KWOK — the validator schedules
    with a blanket toleration, lands on a fake node, and KWOK fakes exit 0 — so the simulated path
@@ -151,20 +150,20 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    recovered run re-resolves from the persisted snapshot — `validateStep.resolve`), and
    **per-component attribution is not derivable** — `ctrf.Builder` hardcodes `Suite` to the phase
    name, so no output identifies a component.
-4. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
+3. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
-5. **UI follow-ups** from the 2026-08-28 real-hardware pass. 27 of 30 shipped; what is left is in
+4. **UI follow-ups** from the 2026-08-28 real-hardware pass. 27 of 30 shipped; what is left is in
    `docs/ux-feedback.md` entry 3 — the timeline still renders Discover's gap findings as bare
    amber warnings on the decision screen (the framing heading only reached the Discover panel),
    the mark is absent from the Confirm screen, and the primary button is a large expanse of
    accent. None blocks a demo.
-6. **Three residue classes block a manual cleanup** — see below. Nothing inventories them, and two
+5. **Three residue classes block a manual cleanup** — see below. Nothing inventories them, and two
    of them deadlock a teardown rather than merely lingering.
-7. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
+6. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
    `ephemeralArtifacts` and is dropped on encode, so the download is broken on exactly the path
    where debugging matters most. The run-log export does not fix it.
-8. **Collapse the docs.** When the work is done, rewrite from current state and delete
-   `docs/phase-*.md` rather than editing them.
+7. **Keep the docs collapsed.** Done once, on going public: `docs/` is STATE.md, the upstream
+   asks, and the UX list. Resist growing a second status document — edit this one.
 
 ### Known and deliberately not fixed
 
