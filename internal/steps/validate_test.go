@@ -2,7 +2,9 @@ package steps_test
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +103,75 @@ func TestValidateRunsTheDeploymentPhaseAndRecordsIt(t *testing.T) {
 	}
 	if _, err := os.Stat(run.Validation.ReportPath); err != nil {
 		t.Errorf("report file missing: %v", err)
+	}
+}
+
+// A validation that errors, and a validation that reports failures, are two
+// different things and NEITHER may fail the run. The install succeeded; the
+// report is a report. Prove still has to run, because placement is the claim
+// the demo is built on.
+func TestValidateNeverFailsTheRun(t *testing.T) {
+	t.Run("the call errors", func(t *testing.T) {
+		recipe := recipeFixture()
+		fake := &aicrclient.Fake{Recipe: recipe, ValidateErr: errors.New("apiserver said no")}
+		step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
+		run := newRunWithRealCluster(t, recipe)
+
+		if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+		if run.Validation.Skipped == "" {
+			t.Error("an errored validation must record why, or the screen shows nothing at all")
+		}
+	})
+
+	t.Run("checks fail", func(t *testing.T) {
+		recipe := recipeFixture()
+		fake := &aicrclient.Fake{
+			Recipe: recipe,
+			PhaseResults: []*aicr.PhaseResult{{
+				Phase: aicr.PhaseDeployment, Status: "failed",
+				Summary: aicr.ReportSummary{Tests: 14, Passed: 11, Failed: 3},
+			}},
+		}
+		step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
+		run := newRunWithRealCluster(t, recipe)
+
+		if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+			t.Fatalf("Run() error = %v, want nil -- a failing check is a finding, not a broken run", err)
+		}
+		if run.Validation.Phases[0].Failed != 3 {
+			t.Errorf("Failed = %d, want 3 recorded", run.Validation.Phases[0].Failed)
+		}
+		if run.Validation.Skipped != "" {
+			t.Errorf("Skipped = %q, want empty -- validation ran, it just found problems", run.Validation.Skipped)
+		}
+	})
+}
+
+// Drift means this console cannot prove the recipe it would validate is the
+// one that was installed. Refusing is the honest outcome; validating anyway
+// would attest to the wrong thing.
+func TestValidateRefusesADriftedRecipe(t *testing.T) {
+	// The fake re-resolves recipeFixture(), but the run's approved recipe.json
+	// describes a DIFFERENT component version -- the shape of an operator who
+	// upgraded the binary between install and validate.
+	recipe := recipeFixture()
+	drifted := recipeFixture()
+	drifted.Components[0].Version = "v9.9.9-not-what-was-installed"
+
+	fake := &aicrclient.Fake{Recipe: recipe}
+	step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
+	run := newRunWithRealCluster(t, drifted)
+
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if fake.ValidateCalls != 0 {
+		t.Errorf("ValidateCalls = %d, want 0 -- a drifted recipe must not be validated", fake.ValidateCalls)
+	}
+	if !strings.Contains(run.Validation.Skipped, "drifted") {
+		t.Errorf("Skipped = %q, want it to name the drift", run.Validation.Skipped)
 	}
 }
 
