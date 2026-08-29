@@ -957,16 +957,48 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		return err
 	}
 
-	// Merge the step's writes back under the lock. Artifacts, Decisions, and
-	// Components (Task 6: Apply's per-component projection) are the only
-	// fields a step may add to; the engine owns everything else. A step can
-	// run for up to twenty minutes (Apply), which is precisely the window in
-	// which this run can be superseded by a retry -- re-check here, not just
-	// at the top of the function.
-	e.mu.Lock()
-	if !e.aliveLocked(epoch) {
-		e.mu.Unlock()
+	// Merge the step's writes back under the lock -- see mergeStepSuccess's
+	// doc comment for which fields move and why. A step can run for up to
+	// twenty minutes (Apply), which is precisely the window in which this
+	// run can be superseded by a retry; mergeStepSuccess re-checks
+	// aliveLocked itself rather than trusting the check at the top of this
+	// function.
+	merged, ok := e.mergeStepSuccess(epoch, scratch, i)
+	if !ok {
 		return nil
+	}
+
+	// The run is leaving Apply on success -- the action cursor is meaningless
+	// once nothing in this step is installing, and the next step (if any)
+	// will set its own Phase before any new marker can arrive.
+	if step.Phase() == PhaseApply {
+		e.clearActiveAction(epoch)
+	}
+
+	if err := e.store.Save(ctx, merged); err != nil {
+		slog.Warn("run checkpoint failed", "run", runID, "error", err)
+	}
+
+	e.bus.Publish(bus.Event{
+		RunID: runID, Kind: bus.KindPhase, Phase: string(step.Phase()),
+		Message: "phase complete",
+	})
+	return nil
+}
+
+// mergeStepSuccess folds a step's scratch copy back onto e.current once Run
+// has returned without error, and advances the cursor past the step that
+// just completed. Artifacts, Decisions, and Components (Task 6: Apply's
+// per-component projection) are the only fields a step may add to; the
+// engine owns everything else. Returns the merged clone runStep should
+// persist, and false if the run was superseded (a retry landed) while the
+// step was executing -- in which case the caller has nothing to save and
+// must not advance a cursor that no longer belongs to it.
+func (e *Engine) mergeStepSuccess(epoch uint64, scratch *Run, i int) (*Run, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.aliveLocked(epoch) {
+		return nil, false
 	}
 	for k, v := range scratch.Artifacts {
 		e.current.Artifacts[k] = v
@@ -975,7 +1007,7 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 		e.current.Decisions[k] = v
 	}
 	// scratch.Components started as a full clone of e.current.Components
-	// (see the Clone call above) and the step only ever upserts rows in
+	// (see the Clone call in runStep) and the step only ever upserts rows in
 	// place, so it is already the complete, current projection -- unlike
 	// Artifacts and Decisions, there is nothing to merge key-by-key.
 	e.current.Components = scratch.Components
@@ -999,11 +1031,11 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// nothing in the unit suite could: internal/steps' tests call step.Run
 	// directly on a run they own, so the merge is not on their path.
 	//
-	// Merged on BOTH paths, unlike Workload. See the failure-path merge
-	// above for why.
+	// Merged on BOTH paths, unlike Workload. See runStep's failure-path
+	// merge for why.
 	e.current.Ownership = scratch.Ownership
-	// AgentNamespace, merged on both paths for the reason stated on the
-	// failure-path merge above.
+	// AgentNamespace, merged on both paths for the reason stated on
+	// runStep's failure-path merge.
 	e.current.AgentNamespace = scratch.AgentNamespace
 	// Validation is an output, same shape as Workload and for the same class
 	// of reason: without this line internal/steps.Validate's write lands on
@@ -1018,25 +1050,7 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// checkpoint replays a completed step on Retry.
 	e.current.StepIndex = i + 1
 	e.current.UpdatedAt = time.Now().UTC()
-	merged := e.current.Clone()
-	e.mu.Unlock()
-
-	// The run is leaving Apply on success -- the action cursor is meaningless
-	// once nothing in this step is installing, and the next step (if any)
-	// will set its own Phase before any new marker can arrive.
-	if step.Phase() == PhaseApply {
-		e.clearActiveAction(epoch)
-	}
-
-	if err := e.store.Save(ctx, merged); err != nil {
-		slog.Warn("run checkpoint failed", "run", runID, "error", err)
-	}
-
-	e.bus.Publish(bus.Event{
-		RunID: runID, Kind: bus.KindPhase, Phase: string(step.Phase()),
-		Message: "phase complete",
-	})
-	return nil
+	return e.current.Clone(), true
 }
 
 func (e *Engine) finish(ctx context.Context, epoch uint64, state State, errMsg string) {

@@ -202,8 +202,8 @@ func TestFileStorePreservesValidation(t *testing.T) {
 			}},
 		},
 	}
-	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatalf("Save() error = %v", err)
+	if saveErr := store.Save(context.Background(), run); saveErr != nil {
+		t.Fatalf("Save() error = %v", saveErr)
 	}
 
 	got, err := store.Load(context.Background(), run.ID)
