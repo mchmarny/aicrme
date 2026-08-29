@@ -358,31 +358,33 @@ post "/api/runs/${RUN_ID}/reset" -d '{"confirm":"reset"}' >/dev/null
 # "The console will start a new run" is the real precondition, it is what the
 # next line needs, and no context can fake it.
 
+# NOTHING REVERTS A NODE TAINT, which is why placement is blocked this way.
+#
+# This used to scale kai-scheduler-default to zero, and that worked only
+# because of the defect this suite now guards against: the Deployment is owned
+# by the SchedulingShard rather than by helm, so it survived a reinstall at
+# zero replicas. With a Reset in between, the shard is purged, the reinstall
+# creates a fresh Deployment, and the kai-operator reconciles any manual scale
+# straight back to one -- the gang then places and the assertion fails having
+# tested nothing.
+#
+# Tainting the simulated GPU nodes is also closer to what this assertion says
+# it is about. "A full or unschedulable cluster" is literally an unschedulable
+# node, the gang stays genuinely Pending, and the cleanup still has something
+# real to race. It is applied BEFORE the run because a taint persists: there
+# is no window to lose, unlike a scale that must land after an install and
+# before a gang that binds in about two seconds.
+#
+# Safe for Apply: the KWOK nodes already carry kwok.x-k8s.io/node=fake, so
+# every real component is on a Kind worker. The only thing that wanted a
+# simulated GPU node is the workload this assertion needs to keep off one.
+echo "--- making the simulated GPU nodes unschedulable"
+for node in $(e2e_kubectl get nodes -o name | grep '^node/gpu-'); do
+  e2e_kubectl taint "${node}" aicrme-e2e-block=true:NoSchedule --overwrite
+done
+
 TIMEOUT_RUN_ID="$(drive_to_prove)"
 echo "second run id: ${TIMEOUT_RUN_ID}"
-
-# Placement is made impossible by taking the scheduler away, which is closer
-# to a real cluster's failure mode (a full or unschedulable cluster) than
-# breaking the manifest would be -- and it leaves the workload genuinely
-# pending, which is what the cleanup has to race.
-#
-# Done DURING Apply, and that timing is the whole point. Before the run, the
-# reinstall would simply bring the scheduler back; after Apply, the gang binds
-# in about two seconds on KWOK and would place before any scale command
-# landed. Scaling once kai-scheduler itself is installed leaves a dozen
-# components still to go, so the scheduler is at zero replicas for minutes
-# before Prove ever starts.
-echo "--- waiting for kai-scheduler to install, then taking the scheduler away"
-SCHED_READY=""
-for _ in $(seq 1 120); do
-  SCHED_READY="$(run_json "${TIMEOUT_RUN_ID}" \
-    | jq -r '[.components[]? | select(.name == "kai-scheduler" and .status == "installed")] | length')"
-  [[ "${SCHED_READY}" == "1" ]] && break
-  sleep 5
-done
-[[ "${SCHED_READY}" == "1" ]] || fail "kai-scheduler never installed in the second run"
-kubectl -n kai-scheduler scale deploy/kai-scheduler-default --replicas=0
-kubectl -n kai-scheduler rollout status deploy/kai-scheduler-default --timeout=120s
 STATE=""
 for _ in $(seq 1 240); do
   STATE="$(run_state "${TIMEOUT_RUN_ID}")"
