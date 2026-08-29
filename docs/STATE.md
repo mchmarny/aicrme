@@ -119,8 +119,23 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    with a pre-installed driver, so the one claim in `slowSteps.ts` nobody has measured is the
    `gpu-operator` driver compile. Costs one Apply on any GPU cluster whose nodes come up
    driverless.
-3. **`ValidateState` false-passes on simulated nodes.** Known and deferred; it is why the demo
-   claims Prove rather than Validate.
+3. **Validation, and then optional evidence.** Both are first-class in the pinned SDK:
+   `Client.ValidateState(ctx, recipe, snapshot, opts...) ([]*PhaseResult, error)` and
+   `Client.EmitRecipeEvidence(ctx, recipe, snapshot, results, opts)`, the latter explicitly
+   documented as unattended-safe. Evidence is strictly downstream of validation.
+
+   **This is built for the real cluster.** `ValidateState` false-passes on KWOK — the validator
+   schedules with a blanket toleration, lands on a fake node, and KWOK fakes exit 0 — but that is
+   a KWOK artifact: on real hardware there are no fake nodes to land on. The standing ruling is
+   that the real cluster is what this project solves for and functionality is not limited to what
+   KWOK supports, so the simulated path skips validation and says so rather than the capability
+   being omitted. This reverses the Phase 3 reasoning that produced Prove-instead-of-Validate.
+
+   Two constraints that survive the ruling and shape the work: both calls need a **live
+   `*RecipeResult` owned by the current Client** (`assertOwns`; a summary will not do, so a
+   recovered run must re-resolve from the persisted snapshot), and **per-component attribution is
+   not derivable** — `ctrf.Builder` hardcodes `Suite` to the phase name, so no output identifies a
+   component.
 4. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
 5. **UI follow-ups** from the 2026-08-28 real-hardware pass. 27 of 30 shipped; what is left is in
