@@ -123,6 +123,12 @@ func TestValidateNeverFailsTheRun(t *testing.T) {
 		if run.Validation.Skipped == "" {
 			t.Error("an errored validation must record why, or the screen shows nothing at all")
 		}
+		if len(run.Validation.Phases) != 0 {
+			t.Errorf("Phases = %+v, want none recorded when validation fails to run", run.Validation.Phases)
+		}
+		if run.Validation.ReportPath != "" {
+			t.Errorf("ReportPath = %q, want empty when validation fails to run", run.Validation.ReportPath)
+		}
 	})
 
 	t.Run("checks fail", func(t *testing.T) {
