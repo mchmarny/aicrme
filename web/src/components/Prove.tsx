@@ -1,5 +1,6 @@
 import { deriveComponents, deploymentActionsTotal, formatSeconds, installedCount, runElapsed } from '../pipeline'
 import type { AicrEvent } from '../useEvents'
+import type { Validation } from '../api'
 import type { RunState } from './Wizard'
 
 /**
@@ -102,6 +103,43 @@ function Summary({ events, run, placed }: { events: AicrEvent[]; run: RunState; 
 }
 
 /**
+ * ValidationPanel reports what AICR's validator found, or why it did not run.
+ *
+ * A skip renders as a skip. On a simulated cluster the validator lands on
+ * KWOK's fake nodes and reports passes for checks that never executed, so
+ * "skipped" is the only honest thing this screen can say there -- the same
+ * reason Prove labels a simulated placement rather than claiming throughput.
+ */
+function ValidationPanel({ validation }: { validation?: Validation }) {
+  if (!validation || (!validation.skipped && !validation.phases?.length)) return null
+
+  if (validation.skipped) {
+    return (
+      <div data-testid="prove-validation" className="text-xs text-ink-faint">
+        <span className="text-warn">Validation skipped.</span> {validation.skipped}
+      </div>
+    )
+  }
+
+  return (
+    <ul data-testid="prove-validation" className="space-y-1 font-mono text-xs">
+      {validation.phases?.map(p => (
+        <li key={p.phase} className="flex items-baseline gap-2">
+          <span className={p.failed > 0 ? 'text-fail' : 'text-pass'}>
+            {p.failed > 0 ? '✗' : '✓'}
+          </span>
+          <span className="text-ink">{p.phase}</span>
+          <span className="text-ink-faint">
+            {p.passed} of {p.tests} checks passed
+            {p.failed > 0 ? `, ${p.failed} failed` : ''}
+          </span>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/**
  * Prove is the payoff screen and the console's only exit from an active run.
  *
  * It replaces the cockpit rather than extending it (the design's own open
@@ -173,6 +211,7 @@ export function Prove({ events, run, busy, onStop }: {
             figures from the capability report, so nothing here re-reads
             another package's prose. */}
         {active && <Summary events={events} run={run} placed={placed.length} />}
+        {active && <ValidationPanel validation={run.validation} />}
         {/* The claim is about what the placement below means, so it is shown
             only when there is a placement to mean anything about. A run that
             failed before anything was bound has nothing to say here, and the

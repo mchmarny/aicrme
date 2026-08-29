@@ -2,6 +2,7 @@ package steps_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -26,8 +27,7 @@ func TestValidateSkipsASimulatedCluster(t *testing.T) {
 	fake := &aicrclient.Fake{}
 	step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
 
-	run := newRun()
-	run.Artifacts["capability.json"] = []byte(`{"totalGpus":0,"usableGpus":0,"analyzed":true}`)
+	run := newRunWithSimulatedCluster(t)
 
 	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
 		t.Fatalf("Run() error = %v, want nil -- Validate never fails the run", err)
@@ -179,6 +179,81 @@ func TestValidateRefusesADriftedRecipe(t *testing.T) {
 	if !strings.Contains(run.Validation.Skipped, "drifted") {
 		t.Errorf("Skipped = %q, want it to name the drift", run.Validation.Skipped)
 	}
+}
+
+// The panel is driven by the payload, not the prose. Both the skip and the
+// verdict have to arrive as data, or the console has nothing to render but a
+// sentence it would have to parse.
+func TestValidatePublishesTheVerdictAsData(t *testing.T) {
+	decode := func(t *testing.T, events []bus.Event) engine.Validation {
+		t.Helper()
+		for i := len(events) - 1; i >= 0; i-- {
+			if len(events[i].Data) == 0 {
+				continue
+			}
+			var got engine.Validation
+			if err := json.Unmarshal(events[i].Data, &got); err != nil {
+				t.Fatalf("Unmarshal(%s) error = %v", events[i].Data, err)
+			}
+			return got
+		}
+		t.Fatal("no event carried a payload -- the panel would never populate")
+		return engine.Validation{}
+	}
+
+	t.Run("a skip", func(t *testing.T) {
+		var events []bus.Event
+		fake := &aicrclient.Fake{Recipe: recipeFixture()}
+		step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
+		run := newRunWithSimulatedCluster(t)
+
+		if err := step.Run(context.Background(), run, func(e bus.Event) { events = append(events, e) }); err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+		got := decode(t, events)
+		if got.Skipped != run.Validation.Skipped {
+			t.Errorf("published Skipped = %q, want %q", got.Skipped, run.Validation.Skipped)
+		}
+		if len(got.Phases) != 0 {
+			t.Errorf("published Phases = %+v, want none -- a skip is not a verdict", got.Phases)
+		}
+	})
+
+	t.Run("a verdict", func(t *testing.T) {
+		var events []bus.Event
+		recipe := recipeFixture()
+		fake := &aicrclient.Fake{
+			Recipe: recipe,
+			PhaseResults: []*aicr.PhaseResult{{
+				Phase: aicr.PhaseDeployment, Status: "passed",
+				Summary:   aicr.ReportSummary{Tests: 14, Passed: 14},
+				RawReport: []byte(`{"results":{}}`),
+			}},
+		}
+		step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
+		run := newRunWithRealCluster(t, recipe)
+
+		if err := step.Run(context.Background(), run, func(e bus.Event) { events = append(events, e) }); err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+		got := decode(t, events)
+		if got.Skipped != "" {
+			t.Errorf("published Skipped = %q, want empty", got.Skipped)
+		}
+		if len(got.Phases) != 1 || got.Phases[0].Passed != 14 {
+			t.Errorf("published Phases = %+v, want one phase with 14 passed", got.Phases)
+		}
+	})
+}
+
+// newRunWithSimulatedCluster is a run whose artifacts describe a cluster
+// WITHOUT GPUs, so skipReason refuses validation before ValidateState is
+// ever called.
+func newRunWithSimulatedCluster(t *testing.T) *engine.Run {
+	t.Helper()
+	run := newRun()
+	run.Artifacts["capability.json"] = []byte(`{"totalGpus":0,"usableGpus":0,"analyzed":true}`)
+	return run
 }
 
 // newRunWithRealCluster is a run whose artifacts describe a cluster WITH

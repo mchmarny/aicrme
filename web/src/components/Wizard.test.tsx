@@ -248,6 +248,22 @@ describe('Wizard', () => {
     expect(screen.queryByTestId('prove-recovered')).toBeNull()
   })
 
+  // The reducer, not just the panel: without this, Prove's validation tests
+  // only prove a component renders props someone hands it, never that the
+  // stream actually populates them.
+  it('carries the validation verdict off the stream', () => {
+    const events: AicrEvent[] = [
+      { id: 1, runId: 'runV', at: '2026-08-21T00:00:00Z', kind: 'phase', level: 'info', phase: 'validate', message: 'phase started' },
+      {
+        id: 2, runId: 'runV', at: '2026-08-21T00:00:01Z', kind: 'log', level: 'info', phase: 'validate',
+        message: 'validation: 14 of 14 checks passed',
+        data: { phases: [{ phase: 'deployment', status: 'passed', seconds: 92, tests: 14, passed: 14, failed: 0, skipped: 0 }] },
+      },
+    ]
+
+    expect(deriveRunState(events).validation?.phases?.[0].passed).toBe(14)
+  })
+
   it('shows a caveat rather than presenting an exhausted-retry provisional set as final', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const fetchMock = mockFetch(url => {

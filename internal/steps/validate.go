@@ -60,8 +60,7 @@ func (v *validateStep) Requires() []string  { return nil }
 func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emit) error {
 	if reason := skipReason(run); reason != "" {
 		run.Validation = engine.Validation{Skipped: reason}
-		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
-			Message: "validation skipped: " + reason})
+		publish(emit, run, bus.LevelWarn, "validation skipped: "+reason)
 		return nil
 	}
 
@@ -73,8 +72,7 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 	result, snap, reason := v.resolve(ctx, run)
 	if reason != "" {
 		run.Validation = engine.Validation{Skipped: reason}
-		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
-			Message: "validation skipped: " + reason})
+		publish(emit, run, bus.LevelWarn, "validation skipped: "+reason)
 		return nil
 	}
 
@@ -89,8 +87,7 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 	)
 	if err != nil {
 		run.Validation = engine.Validation{Skipped: "validation could not run: " + err.Error()}
-		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
-			Message: "validation could not run: " + err.Error()})
+		publish(emit, run, bus.LevelWarn, "validation could not run: "+err.Error())
 		return nil
 	}
 
@@ -101,8 +98,20 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
 			Message: "validation ran but its report could not be written: " + werr.Error()})
 	}
-	emit(bus.Event{Kind: bus.KindLog, Message: verdict(run.Validation.Phases)})
+	publish(emit, run, "", verdict(run.Validation.Phases))
 	return nil
+}
+
+// publish sends the outcome as a payload as well as a sentence. The console
+// renders the structured verdict; the message is for the log beside it. A
+// payload that will not marshal is not worth losing the message over, so a
+// marshal error degrades to the plain event rather than returning.
+func publish(emit engine.Emit, run *engine.Run, level bus.Level, message string) {
+	ev := bus.Event{Kind: bus.KindLog, Level: level, Message: message}
+	if data, err := json.Marshal(run.Validation); err == nil {
+		ev.Data = data
+	}
+	emit(ev)
 }
 
 // resolve rebuilds the inputs ValidateState requires, or returns the reason

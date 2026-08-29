@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AicrEvent } from '../useEvents'
-import { ApiError, decide as decideApi, discardRun, fetchOptions, resetRun, retryRun, stopRun, type Options } from '../api'
+import { ApiError, decide as decideApi, discardRun, fetchOptions, resetRun, retryRun, stopRun, type Options, type Validation } from '../api'
 import { deriveComponents } from '../pipeline'
 import { Cockpit } from './Cockpit'
 import { Discover, type CapabilityReport } from './Discover'
@@ -68,6 +68,8 @@ export interface RunState {
    * after a restart that marker is the only event in the stream carrying it.
    */
   residue?: ResidueSummary
+  /** validation is the Validate step's verdict, absent until it runs. */
+  validation?: Validation
 }
 
 /** ResidueItem mirrors Go's engine.ResidueItem (internal/engine/run.go). */
@@ -92,6 +94,10 @@ export interface ResidueSummary {
 
 function isResidueSummary(data: unknown): data is ResidueSummary {
   return typeof data === 'object' && data !== null && 'incomplete' in data && 'summary' in data
+}
+
+function isValidation(data: unknown): data is Validation {
+  return typeof data === 'object' && data !== null && ('skipped' in data || 'phases' in data)
 }
 
 /**
@@ -233,6 +239,7 @@ export function deriveRunState(events: AicrEvent[]): RunState {
     if (e.kind === 'log' && isResidueSummary(e.data)) out.residue = e.data
     if (e.kind === 'log' && e.phase === 'discover' && isCapabilityReport(e.data)) out.report = e.data
     if (e.kind === 'log' && e.phase === 'recommend' && isRecipeSummary(e.data)) out.recipe = e.data
+    if (e.kind === 'log' && e.phase === 'validate' && isValidation(e.data)) out.validation = e.data
   }
 
   return out

@@ -234,6 +234,39 @@ describe('Prove', () => {
     expect(screen.getByTestId('prove-placements').textContent).toMatch(/placed on node/)
   })
 
+  // The verdict has to be on the screen the operator ends on, beside the
+  // placement claim rather than instead of it.
+  it('shows what validation found', () => {
+    const run = runState({
+      validation: {
+        phases: [{ phase: 'deployment', status: 'passed', seconds: 92, tests: 14, passed: 14, failed: 0, skipped: 0 }],
+      },
+    })
+    render(<Prove events={placementEvents()} run={run} busy={false} onStop={vi.fn()} />)
+
+    const panel = screen.getByTestId('prove-validation')
+    expect(panel.textContent).toMatch(/deployment/)
+    expect(panel.textContent).toMatch(/14/)
+  })
+
+  // A skip is not a pass, and the screen must not let it read as one.
+  it('says why validation was skipped rather than showing a verdict', () => {
+    const run = runState({ validation: { skipped: 'simulated cluster -- AICR’s validator lands on fake nodes' } })
+    render(<Prove events={placementEvents()} run={run} busy={false} onStop={vi.fn()} />)
+
+    const panel = screen.getByTestId('prove-validation')
+    expect(panel.textContent).toMatch(/skipped/i)
+    expect(panel.textContent).toMatch(/simulated/i)
+    expect(panel.textContent).not.toMatch(/passed/i)
+  })
+
+  // No validation at all is a third state, distinct from both.
+  it('shows no validation panel when the step has not run', () => {
+    render(<Prove events={placementEvents()} run={runState()} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.queryByTestId('prove-validation')).toBeNull()
+  })
+
   // internal/observer publishes KindCluster telemetry of its own with no
   // phase at all, and the discover phase publishes gap lines under the same
   // kind. Neither is a placement decision, and rendering either here would

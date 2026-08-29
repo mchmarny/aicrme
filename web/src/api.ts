@@ -162,6 +162,28 @@ export async function connect(contextName: string): Promise<ClusterInfo> {
   return res.json()
 }
 
+/** PhaseSummary mirrors Go's engine.PhaseSummary. */
+export interface PhaseSummary {
+  phase: string
+  status: string
+  seconds: number
+  tests: number
+  passed: number
+  failed: number
+  skipped: number
+}
+
+/**
+ * Validation mirrors Go's engine.Validation. `skipped` and `phases` are
+ * mutually exclusive: a skip is never a pass, and the UI must not render one
+ * as the other.
+ */
+export interface Validation {
+  skipped?: string
+  reportPath?: string
+  phases?: PhaseSummary[]
+}
+
 /** Run mirrors Go's engine.Run field-for-field (internal/engine/run.go). Artifacts is Go json:"-" and never appears here. */
 export interface Run {
   id: string
