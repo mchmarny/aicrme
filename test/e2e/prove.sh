@@ -243,6 +243,23 @@ WORKER_MATCHES="$(echo "${GANG}" | jq --arg p "^${CLUSTER}-worker" '[.items[] | 
 [[ "${WORKER_MATCHES}" -eq 0 ]] || fail "assertion 2 counted ${WORKER_MATCHES} gang members on real workers as GPU-node placements"
 echo "assertion 2: PASS"
 
+echo "--- assert 7: validation was SKIPPED on the simulated cluster, not passed"
+# The whole reason Validate detects a simulated cluster at all: AICR's
+# validator Job carries a blanket toleration, lands on a KWOK fake node, and
+# KWOK reports exit 0 without ever starting the container -- a PASS here is
+# that false pass, not evidence anything ran. This cluster's fake nodes
+# advertise real GPU counts (e2e_apply_kwok_nodes), so a GPU-count check would
+# have missed it; the skip has to come from gap.Report.Simulated instead.
+VALIDATION="$(run_json "${RUN_ID}" | jq -c '.validation // {}')"
+echo "validation record: ${VALIDATION}"
+SKIPPED="$(echo "${VALIDATION}" | jq -r '.skipped // empty')"
+[[ -n "${SKIPPED}" ]] \
+  || fail "validation did not record a skip on a KWOK cluster: ${VALIDATION} -- a pass here is the documented false pass (validator lands on fake nodes, KWOK fakes exit 0)"
+[[ "$(echo "${VALIDATION}" | jq '.phases // [] | length')" == "0" ]] \
+  || fail "a skipped validation recorded phase results: ${VALIDATION}"
+echo "validation skipped as designed: ${SKIPPED}"
+echo "assertion 7: PASS"
+
 echo "--- assert 3: the console restarts over a live workload and can still stop it"
 # The record is recovered from its file store -- which lives under a directory
 # named for this cluster's kube-system UID -- and reconciled against what is
