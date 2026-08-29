@@ -379,8 +379,11 @@ post "/api/runs/${RUN_ID}/reset" -d '{"confirm":"reset"}' >/dev/null
 # every real component is on a Kind worker. The only thing that wanted a
 # simulated GPU node is the workload this assertion needs to keep off one.
 echo "--- making the simulated GPU nodes unschedulable"
-for node in $(e2e_kubectl get nodes -o name | grep '^node/gpu-'); do
-  e2e_kubectl taint "${node}" aicrme-e2e-block=true:NoSchedule --overwrite
+# Bare names, not `-o name`'s node/<name> form: kubectl taint takes a resource
+# type and a name ("taint nodes gpu-0 ..."), and rejects the slash form with
+# `the server doesn't have a resource type "node/gpu-0"`.
+for node in $(e2e_kubectl get nodes -o name | sed 's|^node/||' | grep '^gpu-'); do
+  e2e_kubectl taint nodes "${node}" aicrme-e2e-block=true:NoSchedule --overwrite
 done
 
 TIMEOUT_RUN_ID="$(drive_to_prove)"
