@@ -150,9 +150,23 @@ func resolveGPUs(p probe, c ClusterGPUs) (total, usable int, inferred bool) {
 	return probeTotal, probeUsable, false
 }
 
+// punchline keys the "simulated cluster" sentence off r.Simulated, not off
+// TotalGPUs. The two used to be the same check, and KWOK's fake nodes break
+// that equivalence: they advertise eight GPUs each, so a simulated cluster
+// with a healthy-looking GPU count and a real cluster with none yet are
+// different situations that both need a true sentence, not one borrowed
+// heuristic that happens to fire on the wrong one of them.
 func punchline(r Report) string {
+	if r.Simulated {
+		if r.TotalGPUs == 0 {
+			return "No GPU hardware detected — this is a simulated cluster."
+		}
+		return fmt.Sprintf(
+			"%d of %d GPUs reported, but this is a simulated cluster — kwok-controller is running fake nodes, so nothing here computed a result.",
+			r.UsableGPUs, r.TotalGPUs)
+	}
 	if r.TotalGPUs == 0 {
-		return "No GPU hardware detected — this is a simulated cluster."
+		return "No GPU hardware detected on this cluster."
 	}
 	if r.InferredGPUs {
 		return fmt.Sprintf("%d of %d GPUs are usable by a workload today, inferred from one node.",

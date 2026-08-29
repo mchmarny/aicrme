@@ -27,11 +27,13 @@ function placementEvents(): AicrEvent[] {
 
 /**
  * report mirrors internal/gap.Report as the discover phase publishes it.
- * totalGpus is the field that decides what this screen may claim: gap.go's
- * punchline() calls zero "a simulated cluster" in as many words, and the
- * recorded KWOK stream carries exactly that.
+ * `simulated` defaults false so every existing caller keeps its prior
+ * meaning; totalGpus alone used to decide what this screen could claim,
+ * which is exactly the bug finding 3 fixed -- gap.Report.Simulated is true
+ * whenever kwok-controller is running, independent of how many (possibly
+ * fake) GPUs the nodes report.
  */
-function report(totalGpus: number, usableGpus = 0) {
+function report(totalGpus: number, usableGpus = 0, simulated = false) {
   return {
     headline: 'This is a kind cluster with 7 node(s).',
     punchline: 'punchline',
@@ -39,6 +41,7 @@ function report(totalGpus: number, usableGpus = 0) {
     totalGpus,
     analyzed: true,
     gaps: null,
+    simulated,
   }
 }
 
@@ -123,6 +126,20 @@ describe('Prove', () => {
     expect(screen.queryByTestId('prove-simulated')).toBeNull()
     expect(screen.getByTestId('prove-real').textContent).toMatch(/0 of 64 GPUs/)
     expect(screen.queryByText(/GB\/s/)).toBeNull()
+  })
+
+  // Finding 3 (final-review): totalGpus === 0 used to be the ONLY signal this
+  // screen had for "simulated", and KWOK's fake nodes break that -- the
+  // documented demo path reports 32 GPUs off four simulated p5.48xlarge
+  // nodes (test/e2e/lib.sh), which used to read as real hardware here while
+  // internal/steps.skipReason (using gap.Report.Simulated) had already
+  // refused to validate against the same cluster. Both must agree.
+  it('labels a cluster simulated on gap.Report.Simulated even when it reports GPUs', () => {
+    render(
+      <Prove events={placementEvents()} run={runState({ report: report(32, 32, true) })} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByTestId('prove-simulated')).toBeDefined()
+    expect(screen.queryByTestId('prove-real')).toBeNull()
   })
 
   // A run adopted at startup (internal/engine/reconcile.go) publishes no

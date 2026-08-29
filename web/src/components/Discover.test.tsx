@@ -9,6 +9,7 @@ const report: CapabilityReport = {
   usableGpus: 0,
   totalGpus: 64,
   analyzed: true,
+  simulated: false,
   gaps: [
     { id: 'gpu-driver', title: 'No GPU driver installed, the kernel does not see the devices', component: 'gpu-operator' },
     { id: 'device-plugin', title: 'No device plugin, Kubernetes cannot schedule nvidia.com/gpu', component: 'gpu-operator' },
@@ -48,6 +49,7 @@ describe('Discover', () => {
       usableGpus: 8,
       totalGpus: 8,
       analyzed: true,
+      simulated: false,
       gaps: null as unknown as CapabilityReport['gaps'],
     }
     render(<Discover report={fullyCapable} />)
@@ -71,6 +73,7 @@ describe('Discover', () => {
       usableGpus: 0,
       totalGpus: 0,
       analyzed: false,
+      simulated: false,
       gaps: null as unknown as CapabilityReport['gaps'],
     }
     render(<Discover report={unmeasured} />)

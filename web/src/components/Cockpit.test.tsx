@@ -91,7 +91,7 @@ describe('Cockpit', () => {
       state: 'awaiting_decision',
       phase: 'apply',
       report: {
-        headline: 'h', punchline: 'p', usableGpus: 16, totalGpus: 16, analyzed: true,
+        headline: 'h', punchline: 'p', usableGpus: 16, totalGpus: 16, analyzed: true, simulated: false,
         gaps: [
           { id: 'sched', title: 'No GPU-aware scheduler', component: 'kai-scheduler' },
           { id: 'device-plugin', title: 'No device plugin', component: 'gpu-operator' },

@@ -30,10 +30,15 @@ export function placements(events: AicrEvent[], runId?: string): AicrEvent[] {
  * isSimulated answers the one question this screen must not get wrong, and
  * returns undefined when it cannot answer it.
  *
- * `totalGpus === 0` is internal/gap's own definition of a simulated cluster,
- * not a heuristic invented here: gap.go's punchline() says "No GPU hardware
- * detected — this is a simulated cluster." for exactly that case, and the
- * recorded KWOK stream (src/fixtures/kwok-run.json) carries it.
+ * `report.simulated` is internal/gap's own definition (gap.Report.Simulated):
+ * true when kwok-controller is running, regardless of how many GPUs the fake
+ * nodes report. The `totalGpus === 0` clause stays alongside it rather than
+ * replacing it -- a real cluster that genuinely has no GPU nodes yet is still
+ * not real hardware to claim a result against, and that case has no
+ * kwok-controller to set the first flag. What changed is that the two are no
+ * longer the SAME check: the e2e's four fake nodes advertise 32 GPUs total
+ * (test/e2e/lib.sh), which used to read as a real cluster here while the same
+ * report told Validate's skipReason (internal/steps/validate.go) the opposite.
  *
  * undefined is a real third answer, not a default. A run adopted at startup
  * (internal/engine/reconcile.go) or recovered from a record has no capability
@@ -43,7 +48,7 @@ export function placements(events: AicrEvent[], runId?: string): AicrEvent[] {
  */
 export function isSimulated(run: RunState): boolean | undefined {
   if (!run.report) return undefined
-  return run.report.totalGpus === 0
+  return run.report.simulated || run.report.totalGpus === 0
 }
 
 function Claim({ run }: { run: RunState }) {

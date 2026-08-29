@@ -23,6 +23,12 @@ export interface CapabilityReport {
   // product's own end state, not an edge case, so this type says so instead
   // of promising an array that is sometimes actually null.
   gaps: CapabilityGap[] | null
+  // gap.Report.Simulated (internal/gap/gap.go): true when kwok-controller is
+  // running, independent of totalGpus -- KWOK's fake nodes advertise real-
+  // looking GPU counts, so this is the only field that tells a simulated
+  // cluster apart from a real one with the same numbers. Not optional: the
+  // Go field carries no `omitempty`, so it is always on the wire.
+  simulated: boolean
 }
 
 export function Discover({ report }: { report: CapabilityReport }) {
