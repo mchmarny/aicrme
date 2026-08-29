@@ -41,9 +41,16 @@ func TestValidateSkipsASimulatedCluster(t *testing.T) {
 	}
 }
 
-// The happy path, and the assertions that matter are the OPTIONS: the wrong
-// phase set here is how performance validation ends up saturating the GPUs
-// Prove needs.
+// The happy path. It cannot assert what the five ValidateOptions actually
+// DO -- aicr.ValidateOption is func(*validateConfig) over an unexported
+// struct with no accessor, so nothing outside package aicr can inspect an
+// option's contents, including whether it carries PhaseDeployment or
+// PhasePerformance (the latter would saturate the GPUs Prove needs). The
+// count is the strongest guard available from here: it catches an option
+// silently dropped or duplicated. The five themselves --
+// WithValidationPhases(PhaseDeployment), WithValidationKubeconfig,
+// WithValidationRunID, WithValidationCleanup, WithValidationTimeout -- are
+// pinned by reading validate.go's Run, not by this test.
 func TestValidateRunsTheDeploymentPhaseAndRecordsIt(t *testing.T) {
 	dir := t.TempDir()
 	recipe := recipeFixture()
@@ -69,6 +76,15 @@ func TestValidateRunsTheDeploymentPhaseAndRecordsIt(t *testing.T) {
 	}
 	if fake.ValidateCalls != 1 {
 		t.Fatalf("ValidateCalls = %d, want 1", fake.ValidateCalls)
+	}
+	// Cannot inspect what each option DOES (see the test's doc comment), but
+	// a dropped or duplicated one changes this count -- e.g. losing
+	// WithValidationCleanup(true) would leave validator Jobs behind, and
+	// gaining an extra WithValidationPhases would add a phase Run() never
+	// asked for.
+	if want := 5; len(fake.LastValidateOpts) != want {
+		t.Errorf("len(LastValidateOpts) = %d, want %d -- phases, kubeconfig, run ID, cleanup, timeout",
+			len(fake.LastValidateOpts), want)
 	}
 	if run.Validation.Skipped != "" {
 		t.Errorf("Skipped = %q, want empty on a real cluster", run.Validation.Skipped)
