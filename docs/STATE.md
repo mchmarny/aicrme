@@ -24,7 +24,8 @@ below and Open work item 3.
 | Same-cluster reuse **via Reset** | **real GKE H100s**, and Kind + KWOK | 2026-08-28: Discover→Prove→Reset→Discover→Prove on one cluster; cycle 2 installed 16/16 and **placed its gang**, one pod per H100. Also `repro-kai` and `reset.sh` assertion 3 on every push |
 | Same-cluster reuse **without a Reset** | **does not work, and is now refused** | see below |
 | helm 4 | real cluster, **and CI on every push** | a full install *and* uninstall under v4.2.4 by hand; the `reset` e2e job now pins v4.2.4, so all six assertions — including the FAILED-teardown one — run under helm 4 while the other five jobs keep exercising helm 3.21.4 |
-| Validation | **not yet run on real hardware** | `deployment` phase runs between Apply and Prove and records a verdict on the run (`internal/steps/validate.go`); a simulated cluster skips and says why. Proven so far by `internal/steps` unit tests; the KWOK skip is asserted in `test/e2e/prove.sh` but that assertion has not yet run in CI. A real-cluster pass is open work item 3 below |
+| Validation — the **skip** path | Kind + KWOK, **CI on every push** | `prove.sh` assert 7, first green 2026-08-29: the run record reads `{"skipped":"simulated cluster -- kwok-controller is running its fake nodes…"}` with no phase results. That cluster advertises 32 GPUs across four fake nodes, so the skip is keyed off `gap.Report.Simulated` (kwok-controller in the snapshot's image list), **not** a GPU count — a count check passes it and validates against fakes |
+| Validation — the **verdict** path | **not yet run on real hardware** | `deployment` phase runs between Apply and Prove and records a verdict on the run (`internal/steps/validate.go`). Proven so far only by `internal/steps` unit tests: no run has yet driven `ValidateState` to completion against real GPUs. Open work item 3 below |
 
 ### Installing twice without a Reset
 
@@ -124,7 +125,7 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    driverless.
 3. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
    runs between Apply and Prove (`internal/steps/validate.go`) and records a verdict on the run —
-   see the What works row above. `ValidateState` false-passes on KWOK — the validator schedules
+   see the two Validation rows above, which separate what CI proves from what it cannot. `ValidateState` false-passes on KWOK — the validator schedules
    with a blanket toleration, lands on a fake node, and KWOK fakes exit 0 — so the simulated path
    is detected (`gap.Report.Simulated`, true when kwok-controller is present in the snapshot,
    regardless of the fake GPU count the nodes advertise) and skips validation rather than
