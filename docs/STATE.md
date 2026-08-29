@@ -22,6 +22,7 @@ installs nothing of itself into the cluster it configures.
 | Same-cluster reuse **via Reset** | **real GKE H100s**, and Kind + KWOK | 2026-08-28: Discover→Prove→Reset→Discover→Prove on one cluster; cycle 2 installed 16/16 and **placed its gang**, one pod per H100. Also `repro-kai` and `reset.sh` assertion 3 on every push |
 | Same-cluster reuse **without a Reset** | **does not work, and is now refused** | see below |
 | helm 4 | real cluster, **and CI on every push** | a full install *and* uninstall under v4.2.4 by hand; the `reset` e2e job now pins v4.2.4, so all six assertions — including the FAILED-teardown one — run under helm 4 while the other five jobs keep exercising helm 3.21.4 |
+| Validation | **not yet run on real hardware** | `deployment` phase runs between Apply and Prove and records a verdict on the run (`internal/steps/validate.go`); a simulated cluster skips and says why. Proven so far by `internal/steps` unit tests; the KWOK skip is asserted in `test/e2e/prove.sh` but that assertion has not yet run in CI. A real-cluster pass is open work item 3 below |
 
 ### Installing twice without a Reset
 
@@ -119,23 +120,34 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    with a pre-installed driver, so the one claim in `slowSteps.ts` nobody has measured is the
    `gpu-operator` driver compile. Costs one Apply on any GPU cluster whose nodes come up
    driverless.
-3. **Validation, and then optional evidence.** Both are first-class in the pinned SDK:
-   `Client.ValidateState(ctx, recipe, snapshot, opts...) ([]*PhaseResult, error)` and
-   `Client.EmitRecipeEvidence(ctx, recipe, snapshot, results, opts)`, the latter explicitly
-   documented as unattended-safe. Evidence is strictly downstream of validation.
+3. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
+   runs between Apply and Prove (`internal/steps/validate.go`) and records a verdict on the run —
+   see the What works row above. `ValidateState` false-passes on KWOK — the validator schedules
+   with a blanket toleration, lands on a fake node, and KWOK fakes exit 0 — so the simulated path
+   is detected (`gap.Report.Simulated`, true when kwok-controller is present in the snapshot,
+   regardless of the fake GPU count the nodes advertise) and skips validation rather than
+   reporting the false pass. This reverses the Phase 3 reasoning that produced
+   Prove-instead-of-Validate.
 
-   **This is built for the real cluster.** `ValidateState` false-passes on KWOK — the validator
-   schedules with a blanket toleration, lands on a fake node, and KWOK fakes exit 0 — but that is
-   a KWOK artifact: on real hardware there are no fake nodes to land on. The standing ruling is
-   that the real cluster is what this project solves for and functionality is not limited to what
-   KWOK supports, so the simulated path skips validation and says so rather than the capability
-   being omitted. This reverses the Phase 3 reasoning that produced Prove-instead-of-Validate.
+   What remains:
 
-   Two constraints that survive the ruling and shape the work: both calls need a **live
+   - **Real-hardware confirmation.** No run against a live GPU cluster has yet driven Validate to
+     completion. `make build && HELM_REGISTRY_CONFIG=~/.config/containers/auth.json ./bin/aicrme`
+     on a real cluster still needs to show `validating the deployment` in the timeline, a
+     per-phase verdict rather than a skip on the Prove screen, and
+     `<work-dir>/runs/<id>/validation/ctrf.json` that parses.
+   - **`conformance` and `performance` as post-Stop actions.** They need an out-of-band engine
+     operation modelled on `engine.Reset` (guards, backgrounding, state), plus an API route and a
+     form. That is a separable subsystem and should be its own plan.
+   - **Evidence.** Increment 2 in the spec; depends on this plan's `[]*PhaseResult`.
+     `Client.EmitRecipeEvidence(ctx, recipe, snapshot, results, opts)` is documented as
+     unattended-safe and is strictly downstream of validation.
+
+   Two constraints shape the shipped implementation: both AICR calls need a **live
    `*RecipeResult` owned by the current Client** (`assertOwns`; a summary will not do, so a
-   recovered run must re-resolve from the persisted snapshot), and **per-component attribution is
-   not derivable** — `ctrf.Builder` hardcodes `Suite` to the phase name, so no output identifies a
-   component.
+   recovered run re-resolves from the persisted snapshot — `validateStep.resolve`), and
+   **per-component attribution is not derivable** — `ctrf.Builder` hardcodes `Suite` to the phase
+   name, so no output identifies a component.
 4. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
 5. **UI follow-ups** from the 2026-08-28 real-hardware pass. 27 of 30 shipped; what is left is in
