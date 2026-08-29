@@ -114,8 +114,19 @@ post_status() {
 # terminal state this script waits for differs.
 drive_to_prove() {
   local run_json id state
-  run_json="$(post /api/runs)"
-  id="$(echo "${run_json}" | jq -r '.id')"
+  # Retried while the engine answers 409. Reset is backgrounded server-side,
+  # and the engine refuses a new run until that teardown finishes -- so the
+  # first attempt after a reset legitimately conflicts, for as long as
+  # uninstalling a whole recipe takes. On a cluster with nothing to tear down
+  # the first attempt succeeds and this costs one call.
+  run_json=""
+  id=""
+  for _ in $(seq 1 90); do
+    run_json="$(post /api/runs 2>/dev/null || true)"
+    id="$(echo "${run_json}" | jq -r '.id // empty' 2>/dev/null || true)"
+    [[ -n "${id}" ]] && break
+    sleep 5
+  done
   [[ -n "${id}" && "${id}" != "null" ]] || fail "no run id in POST /api/runs response: ${run_json}"
 
   state="$(await_state "${id}" awaiting_decision 90)"
@@ -330,23 +341,22 @@ echo "--- assert 5: a gang that never places is cleaned up, and says why"
 # around it.
 echo "--- reset the first run so the second has a clean cluster to install into"
 post "/api/runs/${RUN_ID}/reset" -d '{"confirm":"reset"}' >/dev/null
-# Waits on the CLUSTER, not on the run record. reset.sh says why in as many
-# words: "the record is deleted on a clean teardown, so the run may
-# legitimately be unreachable here". A first version of this polled for
-# .residue.summary and could never succeed -- the teardown worked, the record
-# was gone, and the wait ran out. The releases being gone is the condition
-# this assertion actually depends on anyway, since it is what lets the next
-# install proceed.
-RESET_DONE=""
-for _ in $(seq 1 90); do
-  if [[ "$(helm list --namespace kai-scheduler --short 2>/dev/null | wc -l | tr -d ' ')" == "0" ]]; then
-    RESET_DONE="yes"
-    break
-  fi
-  sleep 5
-done
-[[ -n "${RESET_DONE}" ]] || fail "the reset before assert 5 never removed kai-scheduler"
-echo "reset: kai-scheduler releases gone"
+# The wait for it is in drive_to_prove, which retries POST /api/runs while the
+# engine answers 409. Two earlier attempts to wait here were both wrong, in
+# opposite directions:
+#
+#   .residue.summary never arrives -- reset.sh says why in as many words, "the
+#   record is deleted on a clean teardown, so the run may legitimately be
+#   unreachable here".
+#
+#   `helm list -n kai-scheduler` answered "gone" five seconds in, because it
+#   carried no --kube-context. Every kubectl call in this suite is pinned to
+#   kind-${CLUSTER} for exactly that reason (c720207); an unpinned helm read
+#   the runner's ambient kubeconfig, found no such namespace, and reported
+#   success for a teardown that had barely started.
+#
+# "The console will start a new run" is the real precondition, it is what the
+# next line needs, and no context can fake it.
 
 TIMEOUT_RUN_ID="$(drive_to_prove)"
 echo "second run id: ${TIMEOUT_RUN_ID}"
