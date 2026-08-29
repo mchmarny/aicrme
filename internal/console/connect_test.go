@@ -530,7 +530,7 @@ func TestConnectBuildsEveryStepInOrder(t *testing.T) {
 
 	want := []engine.Phase{
 		engine.PhaseDiscover, engine.PhaseRecommend, engine.PhaseBundle,
-		engine.PhaseApply, engine.PhaseProve,
+		engine.PhaseApply, engine.PhaseValidate, engine.PhaseProve,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("built %d steps, want %d", len(got), len(want))

@@ -720,6 +720,13 @@ func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string
 			Helm: steps.NewHelmLister(applier.BashExec{}),
 			Kube: kube,
 		}),
+		steps.NewValidate(w.aicr, steps.ValidateConfig{
+			WorkDir: w.workDir,
+			// The session kubeconfig, not the operator's: the validator
+			// schedules Jobs, and it must run against the cluster this run
+			// is pinned to rather than whatever the ambient context is.
+			Kubeconfig: sessionKubeconfig,
+		}),
 		// The final step: a run that reaches here and returns without error
 		// ends at StateActive rather than StateDone (engine.ActiveStep), with
 		// the reference workload deliberately left running.
