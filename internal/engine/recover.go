@@ -344,6 +344,13 @@ type bootstrapComponentData struct {
 // all (any `helm upgrade` of a release that has completed one demo).
 const recoveryMarkerMsg = "recovered a previous run; retry or discard it before starting a new one"
 
+// recoveryValidationMsg is the bootstrap's replayed Validate verdict. Worded
+// as a replay, not as a fresh result, so an operator scanning the timeline
+// after a restart can tell this line apart from the one the live step
+// itself published (internal/steps/validate.go's publish) -- the same
+// verdict, carried forward rather than recomputed.
+const recoveryValidationMsg = "recovered a previous run's validation verdict"
+
 // recoveryMarkerData is the KindRecovered event's Data payload. It exists so
 // the console can distinguish a recovered run that can be retried from one
 // whose checkpoint lost artifacts to the size guard -- for the latter, Retry
@@ -373,12 +380,18 @@ type recoveryMarkerData struct {
 // It publishes, in order: the KindRecovered marker, which is the only event
 // carrying the fact that this run is blocking Start until an operator acts;
 // one KindComponent event per persisted component row, so deriveComponents
-// redraws the pipeline; the interruption notice as a distinct KindError event
-// when the run carries one, so the console can say "interrupted by a console
-// restart" instead of a generic failure; and last, the run's identity and
-// phase as a KindPhase event worded exactly "run " + state, matching the
-// message engine.go's finish already uses for a live run, so a recovered run
-// resolves through the identical deriveRunState branch.
+// redraws the pipeline; the Validate verdict as a KindLog event when the run
+// carries one, for the same reason recoveryMarkerData.ResidueIncomplete
+// exists -- RunState.validation is derived only from the live event stream
+// (web/src/components/Wizard.tsx's deriveRunState), so after a restart this
+// is the only event carrying it, and without it a recovered run reads as
+// "never validated" even though the record and the CTRF file on disk both
+// kept the true verdict; the interruption notice as a distinct KindError
+// event when the run carries one, so the console can say "interrupted by a
+// console restart" instead of a generic failure; and last, the run's
+// identity and phase as a KindPhase event worded exactly "run " + state,
+// matching the message engine.go's finish already uses for a live run, so a
+// recovered run resolves through the identical deriveRunState branch.
 //
 // The marker goes first so it is set before the state-bearing event that
 // follows, and because a subscriber reading the stream top-down should learn
@@ -412,6 +425,16 @@ func (e *Engine) publishRecoveryBootstrap(r *Run) {
 			RunID: r.ID, Kind: bus.KindComponent, Phase: string(r.Phase),
 			Level: componentLevel(c.Status), Component: c.Name,
 			Message: c.Name + " " + c.Status, Data: data,
+		})
+	}
+	// Zero means Validate never ran (or this record predates the step), the
+	// same "absent means never happened" reasoning envelope.go's Validation
+	// comment already documents for the persisted side.
+	if r.Validation.Skipped != "" || len(r.Validation.Phases) > 0 {
+		data, _ := json.Marshal(r.Validation)
+		e.bus.Publish(bus.Event{
+			RunID: r.ID, Kind: bus.KindLog, Phase: string(PhaseValidate),
+			Level: bus.LevelInfo, Message: recoveryValidationMsg, Data: data,
 		})
 	}
 	if r.Err != "" {

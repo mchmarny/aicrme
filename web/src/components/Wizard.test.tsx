@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { deriveRunState, MAX_PROVISIONAL_OPTIONS_RETRIES, Wizard } from './Wizard'
 import type { AicrEvent } from '../useEvents'
+import type { Validation } from '../api'
 import kwokRun from '../fixtures/kwok-run.json'
 
 // kwok-run.json is a real, recorded stream from the production bus + engine
@@ -320,12 +321,15 @@ const RECOVERED_RUN_ID = '0123456789abcdef'
  * recoveryEvents reproduces, in order, exactly what
  * internal/engine/recover.go's publishRecoveryBootstrap emits for a recovered
  * run: the KindRecovered marker, one KindComponent per persisted component
- * row, the run's error as a KindError when it carries one, and the
- * "run <state>" KindPhase event last. Hand-built rather than sliced from
- * kwok-run.json because no recorded stream contains a restart -- but every
- * field here is pinned on the producing side by
- * TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState and
- * TestRecoverPublishesBootstrapEvents.
+ * row, the Validate verdict as a KindLog event when the record carries one
+ * (finding 4 -- before the fix this event did not exist and a recovered run
+ * silently lost its verdict), the run's error as a KindError when it carries
+ * one, and the "run <state>" KindPhase event last. Hand-built rather than
+ * sliced from kwok-run.json because no recorded stream contains a restart --
+ * but every field here is pinned on the producing side by
+ * TestRecoverPublishesTheRecoveryMarkerInEveryPhaseAndState,
+ * TestRecoverPublishesBootstrapEvents and
+ * TestRecoverRepublishesTheValidationVerdict.
  */
 function recoveryEvents(
   phase: string,
@@ -333,6 +337,7 @@ function recoveryEvents(
   error?: string,
   components: Array<{ name: string; status: string }> = [],
   truncated?: string[],
+  validation?: Validation,
 ): AicrEvent[] {
   const out: AicrEvent[] = [{
     id: 1, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:00:00Z', kind: 'recovered', level: 'warn',
@@ -348,6 +353,13 @@ function recoveryEvents(
       message: `${c.name} ${c.status}`, data: { name: c.name, status: c.status },
     })
   })
+  if (validation) {
+    out.push({
+      id: out.length + 1, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:00:07Z',
+      kind: 'log', level: 'info', phase: 'validate',
+      message: "recovered a previous run's validation verdict", data: validation,
+    })
+  }
   if (error) {
     out.push({
       id: out.length + 1, runId: RECOVERED_RUN_ID, at: '2026-08-17T00:00:08Z',
@@ -545,6 +557,25 @@ describe('Wizard: a recovered run', () => {
   it('shows no truncation warning for an intact recovered record', () => {
     render(<Wizard events={recoveryEvents('apply', 'failed', 'interrupted by a console restart')} />)
     expect(screen.queryByTestId('recovery-truncated')).toBeNull()
+  })
+
+  // Finding 4 (final-review): RunState.validation is derived only from the
+  // live event stream, and publishRecoveryBootstrap used to republish
+  // everything else a recovered record carries except this -- so a restart
+  // after a run reached Validate silently lost the verdict from the
+  // console, even though the record and the CTRF file on disk both still
+  // had it. internal/engine/recover.go now publishes a KindLog event on the
+  // validate phase carrying the persisted Validation; this pins that
+  // deriveRunState (the same reducer Prove's ValidationPanel reads from)
+  // repopulates run.validation from it with no client-side change needed.
+  it('carries a recovered run\'s validation verdict off the bootstrap replay', () => {
+    const validation: Validation = {
+      phases: [{ phase: 'deployment', status: 'passed', seconds: 92, tests: 14, passed: 14, failed: 0, skipped: 0 }],
+    }
+    const state = deriveRunState(recoveryEvents(
+      'prove', 'done', undefined, [], undefined, validation))
+
+    expect(state.validation?.phases?.[0].passed).toBe(14)
   })
 
   /**

@@ -847,7 +847,9 @@ func TestRecoverPublishesBootstrapEvents(t *testing.T) {
 		case bus.KindRecovered:
 			recoveredEvents = append(recoveredEvents, ev)
 		case bus.KindLog, bus.KindCluster, bus.KindDecision:
-			// Bootstrap never publishes these kinds; nothing to collect.
+			// Bootstrap publishes KindLog only when the run carries a
+			// Validation verdict (see TestRecoverRepublishesTheValidationVerdict);
+			// this run has none, so nothing to collect here either.
 		}
 	}
 
@@ -924,6 +926,87 @@ func TestRecoverPublishesBootstrapEvents(t *testing.T) {
 	}
 	if want := "interrupted by a console restart"; errorEvents[0].Message != want {
 		t.Errorf("error event Message = %q, want exactly %q", errorEvents[0].Message, want)
+	}
+}
+
+// TestRecoverRepublishesTheValidationVerdict is finding 4's regression guard.
+// RunState.validation (web/src/components/Wizard.tsx's deriveRunState) is
+// derived only from the live event stream, and publishRecoveryBootstrap used
+// to republish everything else a recovered record carries -- the marker, the
+// components, the error, the phase -- except this, so a restart after a run
+// reached Validate silently dropped the verdict from the console even though
+// the record and the CTRF file on disk both still had it. That is exactly
+// the false claim Run.Validation's own doc comment warns against: a record
+// that lost its verdict "would read as 'never validated', which is
+// different from a true false-pass."
+func TestRecoverRepublishesTheValidationVerdict(t *testing.T) {
+	store := newRecoverStore()
+	run := baseRun(testRunID, engine.StateDone, engine.PhaseProve, 5)
+	run.Validation = engine.Validation{
+		Phases: []engine.PhaseSummary{
+			{Phase: "deployment", Status: "passed", Seconds: 92, Tests: 14, Passed: 14, Failed: 0, Skipped: 0},
+		},
+	}
+	store.loadCurrent = run
+
+	b := bus.New(64)
+	e := engine.New(b, store,
+		newFakeStep(engine.PhaseDiscover),
+		newFakeStep(engine.PhaseRecommend),
+		newFakeStep(engine.PhaseBundle),
+		newFakeStep(engine.PhaseApply),
+		newFakeStep(engine.PhaseValidate),
+		newFakeStep(engine.PhaseProve),
+	)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	events := b.Replay(0)
+	var validationEvents []bus.Event
+	for _, ev := range events {
+		if ev.Kind == bus.KindLog && ev.Phase == string(engine.PhaseValidate) {
+			validationEvents = append(validationEvents, ev)
+		}
+	}
+	if len(validationEvents) != 1 {
+		t.Fatalf("validate-phase KindLog events = %d, want exactly 1: %+v", len(validationEvents), events)
+	}
+	var got engine.Validation
+	if err := json.Unmarshal(validationEvents[0].Data, &got); err != nil {
+		t.Fatalf("unmarshal validation event Data: %v (data=%s)", err, validationEvents[0].Data)
+	}
+	if len(got.Phases) != 1 || got.Phases[0].Passed != 14 {
+		t.Errorf("recovered validation = %+v, want the persisted verdict (14 passed)", got)
+	}
+}
+
+// TestRecoverPublishesNoValidationEventWhenTheStepNeverRan is the negative
+// case: a run recovered before Validate ran -- or a record written before
+// the field existed -- must not publish a fabricated event for it. Zero
+// means "never ran" on both sides of the persisted record; the bootstrap
+// replay must agree.
+func TestRecoverPublishesNoValidationEventWhenTheStepNeverRan(t *testing.T) {
+	store := newRecoverStore()
+	store.loadCurrent = baseRun(testRunID, engine.StateRunning, engine.PhaseApply, 3)
+
+	b := bus.New(64)
+	e := engine.New(b, store,
+		newFakeStep(engine.PhaseDiscover),
+		newFakeStep(engine.PhaseRecommend),
+		newFakeStep(engine.PhaseBundle),
+		newFakeStep(engine.PhaseApply),
+	)
+
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+
+	for _, ev := range b.Replay(0) {
+		if ev.Kind == bus.KindLog && ev.Phase == string(engine.PhaseValidate) {
+			t.Errorf("unexpected validate-phase KindLog event on a run that never reached Validate: %+v", ev)
+		}
 	}
 }
 
