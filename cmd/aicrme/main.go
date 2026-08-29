@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -26,8 +28,18 @@ func main() {
 	open := flag.Bool("open", true, "open the default browser at the tokenized URL")
 	flag.StringVar(&opts.WorkDir, "work-dir", defaultWorkDir(),
 		"scratch and state directory; AICRME_WORK_DIR overrides the default")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	opts.OpenBrowser = *open
+
+	// Before the logger is configured and before anything reaches for a
+	// kubeconfig: asking a downloaded binary what it is must not require a
+	// cluster, a home directory, or a running server. Homebrew's formula test
+	// runs exactly this.
+	if *showVersion {
+		printVersion(os.Stdout)
+		return
+	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	slog.Info("starting aicrme", "version", version.String())
@@ -45,6 +57,13 @@ func main() {
 		slog.Error("aicrme failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// printVersion writes the build identity as one line. The leading program name
+// is what makes the output self-describing when it is pasted into a bug report,
+// and it is what the Homebrew formula's test asserts on.
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "aicrme %s\n", version.String())
 }
 
 // defaultWorkDir is AICRME_WORK_DIR, else ~/.aicrme. A home directory that

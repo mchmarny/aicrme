@@ -40,11 +40,37 @@ workaround each one currently costs.
 
 ## Install
 
-Release automation is not wired up yet. Build from source:
+Homebrew, on macOS or Linux:
+
+```sh
+brew install mchmarny/tap/aicrme
+```
+
+Or the install script, which verifies the download's checksum and — when `gh` is
+present — its build provenance, before installing:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mchmarny/aicrme/main/scripts/install.sh | bash
+```
+
+Or from source:
 
 ```sh
 make build
 ./bin/aicrme
+```
+
+Every release archive is published with a `checksums.txt` and a SLSA build provenance
+attestation tied to the workflow run that produced it. To check one yourself:
+
+```sh
+gh attestation verify aicrme_<version>_<os>_<arch>.tar.gz --repo mchmarny/aicrme
+```
+
+Then run it:
+
+```sh
+aicrme
 ```
 
 It binds a loopback address, prints a tokenized URL, and opens your browser at it.

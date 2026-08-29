@@ -52,3 +52,44 @@ jobs:
       - run: make test-web
       - run: make test-coverage
       - run: make check-aicr-pin
+
+  # A release is cut from a tag, which is the worst place to discover that
+  # .goreleaser.yaml no longer parses or that the binary ships an empty
+  # console. This job builds the real artifacts on every push and never
+  # publishes anything, so both are found at the commit that caused them.
+  release-dryrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # goreleaser reads tags to compute a version; a shallow clone makes
+          # it guess, and the snapshot template then names artifacts wrongly.
+          fetch-depth: 0
+      - id: go
+        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+      # goreleaser's `before` hook runs `make web`, which needs npm.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - id: goreleaser
+        # sed rather than yq, matching the shellcheck step above: a pin that
+        # depends on install order is a trap for whoever reorders this file.
+        run: |
+          set -euo pipefail
+          want="$(sed -n 's/^  goreleaser: *.\(v[0-9.]*\).*/\1/p' .settings.yaml)"
+          [ -n "${want}" ] || { echo "no goreleaser pin in .settings.yaml"; exit 1; }
+          echo "version=${want}" >> "$GITHUB_OUTPUT"
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: ${{ steps.goreleaser.outputs.version }}
+          args: release --snapshot --clean --skip=publish
+      # The check that cannot be made from config alone: run the artifact and
+      # prove the console is in it. See the script's own header.
+      - run: ./scripts/smoke-release.sh dist

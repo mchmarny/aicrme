@@ -42,6 +42,9 @@ bin/
 .e2e-diag/
 .repro/
 
+# goreleaser output, including every --snapshot build CI makes
+dist/
+
 # Superpowers SDD scratch: ledgers, task briefs, implementer reports and
 # review diffs for in-flight work. Useful while a plan runs, meaningless
 # after it lands, and never something a reader of this repo needs.

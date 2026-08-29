@@ -1,0 +1,90 @@
+name: release
+# Tag-triggered, deliberately. The repo merges straight to main with no pull
+# requests, so a release-please style version-bump PR would fight the workflow
+# rather than serve it. Pushing a tag is already the record of what shipped.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      # Create the GitHub Release and upload archives to it.
+      contents: write
+      # Both are required by attest-build-provenance: it mints an OIDC token to
+      # prove which workflow built the artifacts, then records the attestation.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # goreleaser builds the changelog from the commits since the previous
+          # tag, which a shallow clone does not have.
+          fetch-depth: 0
+      - id: go
+        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install pinned shellcheck
+        run: |
+          set -euo pipefail
+          want="$(sed -n 's/^  shellcheck: *.\(v[0-9.]*\).*/\1/p' .settings.yaml)"
+          [ -n "${want}" ] || { echo "no shellcheck pin in .settings.yaml"; exit 1; }
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${want}/shellcheck-${want}.linux.x86_64.tar.xz" \
+            | tar -xJ --strip-components=1 -C /usr/local/bin "shellcheck-${want}/shellcheck"
+      - uses: mikefarah/yq@v4.53.3
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.1
+
+      # BEFORE the release, not after. A tag that cannot pass the gate must not
+      # produce downloadable artifacts: finding out afterwards means yanking a
+      # published release instead of never cutting one, and a yanked release is
+      # still in someone's shell history.
+      - name: gate
+        run: make qualify
+
+      - id: goreleaser
+        run: |
+          set -euo pipefail
+          want="$(sed -n 's/^  goreleaser: *.\(v[0-9.]*\).*/\1/p' .settings.yaml)"
+          [ -n "${want}" ] || { echo "no goreleaser pin in .settings.yaml"; exit 1; }
+          echo "version=${want}" >> "$GITHUB_OUTPUT"
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: ${{ steps.goreleaser.outputs.version }}
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Scoped to mchmarny/homebrew-tap, which GITHUB_TOKEN cannot reach.
+          # Absent, goreleaser fails the cask step and the release with it --
+          # which is the correct failure: a release whose install path silently
+          # did not update is worse than one that stopped and said so.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      # Runs the artifact that is about to be advertised and proves the console
+      # is inside it. The `before` hook in .goreleaser.yaml is the only thing
+      # embedding the SPA, and losing it fails nothing else in this workflow.
+      - name: smoke the built artifact
+        run: ./scripts/smoke-release.sh dist
+
+      # SLSA build provenance over every archive and the checksum file, tied to
+      # this workflow run. Verified by consumers with:
+      #   gh attestation verify <archive> --repo ${{ github.repository }}
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt

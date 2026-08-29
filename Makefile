@@ -117,6 +117,13 @@ check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml
 lint-shell: check-tools ## Lints shell scripts with shellcheck
 	shellcheck -x -P test/e2e -P test/hardware -P scripts test/e2e/*.sh test/hardware/*.sh scripts/*.sh
 
+.PHONY: test-install
+# The installer's platform mapping has to agree with .goreleaser.yaml's
+# archive names. Nothing else compares them, and a mismatch only shows up
+# after a release, as a 404 for whoever ran the install one-liner.
+test-install: ## Tests scripts/install.sh's platform mapping
+	./scripts/install_test.sh
+
 .PHONY: test-e2e-apply
 test-e2e-apply: ## Runs the Discover-to-Apply dry-run e2e on Kind+KWOK (needs Docker)
 	./test/e2e/apply-dryrun.sh
@@ -137,7 +144,7 @@ build: web ## Builds the aicrme binary with the SPA embedded
 	go build -ldflags "$(LDFLAGS)" -o bin/aicrme ./cmd/aicrme
 
 .PHONY: qualify
-qualify: web lint lint-shell test-web test-coverage check-aicr-pin ## Full local gate — must match CI exactly
+qualify: web lint lint-shell test-install test-web test-coverage check-aicr-pin ## Full local gate — must match CI exactly
 # web comes first: internal/web/dist holds only .gitkeep on a clean
 # checkout, and go test ./internal/web/... (part of test-coverage) needs the
 # real embedded index.html, not just a directory that satisfies go:embed.

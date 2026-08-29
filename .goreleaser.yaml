@@ -1,0 +1,117 @@
+# goreleaser builds the release artifacts. Run by .github/workflows/release.yaml
+# on a v* tag, and by ci.yaml as `--snapshot` on every push so a broken config
+# is found at the commit that broke it rather than at the tag.
+#
+# Local dry run, identical to what CI does:
+#   goreleaser release --snapshot --clean
+version: 2
+
+project_name: aicrme
+
+before:
+  hooks:
+    # THE ONE THING THIS FILE CANNOT DO WITHOUT.
+    #
+    # The browser console is a Vite SPA compiled into web/dist, copied to
+    # internal/web/dist, and pulled into the binary by go:embed. `make build`
+    # gets this right because it depends on the `web` target; goreleaser calls
+    # the Go toolchain directly and would not.
+    #
+    # Without this hook the release still succeeds: four platform archives, a
+    # valid checksum file, a signed attestation -- and a binary that serves an
+    # empty console. No Go test catches it either, because internal/web embeds
+    # whatever is on disk when the compiler runs. ci.yaml's smoke check is what
+    # actually guards this; the hook is only what makes it pass.
+    - make web
+
+builds:
+  - id: aicrme
+    main: ./cmd/aicrme
+    binary: aicrme
+    env:
+      # No cgo anywhere in the dependency tree, and a static binary is what
+      # makes one archive work across glibc and musl hosts alike.
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    # The same two variables Makefile's LDFLAGS sets, so a released binary
+    # reports its tag from `aicrme --version` instead of the "dev" default in
+    # internal/version. Changing either path without the other is how a release
+    # ends up claiming to be a dev build.
+    ldflags:
+      - -s -w
+      - -X github.com/mchmarny/aicrme/internal/version.Version={{ .Version }}
+      - -X github.com/mchmarny/aicrme/internal/version.Commit={{ .ShortCommit }}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+archives:
+  - id: aicrme
+    formats: [tar.gz]
+    # Matches what scripts/install.sh constructs from `uname`. These two have to
+    # agree or the installer 404s on every platform; the installer's unit test
+    # pins its side, this template is the other.
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  # Lets --snapshot run with no tag in sight, which is the case on every
+  # ordinary push to main.
+  version_template: '{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}'
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+
+# A FORMULA, deliberately, and on a key goreleaser has deprecated.
+#
+# goreleaser v2.18 deprecated `brews` in favour of `homebrew_casks`. Casks are
+# macOS-only, and this project wants what AICR itself ships: a formula carrying
+# both on_macos and on_linux blocks, so `brew install` works on either.
+# NVIDIA/homebrew-aicr's own tap is generated exactly this way.
+#
+# Two consequences, chosen with eyes open:
+#   - `goreleaser check` FAILS on this file. That is expected, and it is why
+#     `check` is not in CI: the dry-run job runs `release --snapshot`, which
+#     warns and proceeds. Do NOT "fix" the failure by switching to casks
+#     without re-reading this comment -- Linux `brew install` is what is being
+#     bought, and casks cannot provide it.
+#   - Whenever goreleaser removes the key this breaks. The goreleaser version
+#     is pinned in .settings.yaml, so that arrives on a deliberate bump rather
+#     than as a surprise on some future runner image.
+brews:
+  - name: aicrme
+    repository:
+      owner: mchmarny
+      name: homebrew-tap
+      # Not GITHUB_TOKEN: that is scoped to this repository, and the formula is
+      # pushed to another one. Set HOMEBREW_TAP_TOKEN to a PAT with
+      # contents:write on mchmarny/homebrew-tap.
+      token: '{{ .Env.HOMEBREW_TAP_TOKEN }}'
+    directory: Formula
+    homepage: https://github.com/mchmarny/aicrme
+    description: Turns a vanilla GPU cluster into a working AI platform, from a local browser console
+    license: MIT
+    # aicrme shells out to both and checks for them at startup, before anything
+    # touches a cluster. Declaring them means brew reports a missing dependency
+    # at install time rather than the console reporting it at launch.
+    dependencies:
+      - name: helm
+      - name: kubernetes-cli
+    # Runs on `brew test aicrme`. --version has to answer without a cluster, a
+    # kubeconfig, or a running server, which is why cmd/aicrme handles it before
+    # any of that is set up.
+    test: |
+      assert_match "aicrme", shell_output("#{bin}/aicrme --version")
