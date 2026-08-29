@@ -28,12 +28,18 @@ type ValidateConfig struct {
 
 // defaultValidateTimeout bounds the deployment phase.
 //
-// Deliberately far below the SDK's 75-minute facade cap, which is sized for
-// an all-phase run whose largest single check is a 65-minute inference-perf
-// benchmark. This step runs only the cheap install/health phase, sits in the
-// middle of a demo, and a run of it that has not finished in fifteen minutes
-// is stuck rather than slow.
-const defaultValidateTimeout = 15 * time.Minute
+// checks run serially (pkg/client/v1/aicr.go's doc comment on the facade
+// deadline), and recipes/validators/catalog.yaml's five `phase: deployment`
+// entries sum to 24m serially: operator-health 2m, expected-resources 8m,
+// gpu-operator-version 2m, check-nvidia-smi 10m, gke-gpu-nic-networks 2m.
+// 30m leaves slack for the validator Job's own deploy and cleanup on top of
+// that 24m worst case, still well below the SDK's 75-minute facade cap sized
+// for an all-phase run's 65-minute inference-perf benchmark. A tighter cap
+// here is not just slower demos: aicr.go's ValidateState discards partial
+// results on a facade deadline (`results, err := v.ValidatePhases(...); if
+// err != nil { return nil, err }`), so a deadline that fires mid-catalog
+// throws away every check that had already finished.
+const defaultValidateTimeout = 30 * time.Minute
 
 type validateStep struct {
 	client aicrclient.API
