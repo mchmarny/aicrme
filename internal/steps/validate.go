@@ -3,6 +3,10 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
@@ -60,7 +64,139 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 			Message: "validation skipped: " + reason})
 		return nil
 	}
+
+	// Re-resolved rather than handed over, exactly as Bundle does and for the
+	// same reason: ValidateState calls assertOwns and reads unexported state,
+	// so it needs a RecipeResult THIS client produced. Every input is
+	// persisted, and assertMatchesApproved proves the re-resolution did not
+	// drift from what the operator approved.
+	result, snap, reason := v.resolve(ctx, run)
+	if reason != "" {
+		run.Validation = engine.Validation{Skipped: reason}
+		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
+			Message: "validation skipped: " + reason})
+		return nil
+	}
+
+	emit(bus.Event{Kind: bus.KindLog, Message: "validating the deployment"})
+
+	results, err := v.client.ValidateState(ctx, result, snap,
+		aicr.WithValidationPhases(aicr.PhaseDeployment),
+		aicr.WithValidationKubeconfig(v.cfg.Kubeconfig),
+		aicr.WithValidationRunID(run.ID),
+		aicr.WithValidationCleanup(true),
+		aicr.WithValidationTimeout(v.cfg.Timeout),
+	)
+	if err != nil {
+		run.Validation = engine.Validation{Skipped: "validation could not run: " + err.Error()}
+		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
+			Message: "validation could not run: " + err.Error()})
+		return nil
+	}
+
+	run.Validation = engine.Validation{Phases: summarize(results)}
+	if path, werr := v.writeReport(run.ID, results); werr == nil {
+		run.Validation.ReportPath = path
+	} else {
+		emit(bus.Event{Kind: bus.KindLog, Level: bus.LevelWarn,
+			Message: "validation ran but its report could not be written: " + werr.Error()})
+	}
+	emit(bus.Event{Kind: bus.KindLog, Message: verdict(run.Validation.Phases)})
 	return nil
+}
+
+// resolve rebuilds the inputs ValidateState requires, or returns the reason
+// it cannot.
+func (v *validateStep) resolve(ctx context.Context, run *engine.Run) (*aicr.RecipeResult, *aicr.Snapshot, string) {
+	approved := run.Artifacts["recipe.json"]
+	if len(approved) == 0 {
+		return nil, nil, "no approved recipe on this run"
+	}
+	snap, err := decodeSnapshot(run.Artifacts["snapshot.yaml"])
+	if err != nil {
+		return nil, nil, "the stored snapshot is unreadable: " + err.Error()
+	}
+	criteria, err := buildCriteria(v.client, snap, run.Decisions["intent"], run.Decisions["platform"])
+	if err != nil {
+		return nil, nil, "criteria could not be rebuilt: " + err.Error()
+	}
+	result, err := v.client.ResolveRecipeFromSnapshot(ctx, criteria, snap)
+	if err != nil || result == nil {
+		return nil, nil, "the recipe could not be re-resolved for validation"
+	}
+	if err := assertMatchesApproved(result, approved); err != nil {
+		// Refused rather than validated. Attesting to a recipe that is not
+		// the one installed is worse than not attesting at all.
+		return nil, nil, "the re-resolved recipe drifted from the approved one: " + err.Error()
+	}
+	return result, snap, ""
+}
+
+// summarize flattens AICR's results into the record's own shape, so no AICR
+// type is persisted.
+func summarize(results []*aicr.PhaseResult) []engine.PhaseSummary {
+	out := make([]engine.PhaseSummary, 0, len(results))
+	for _, r := range results {
+		if r == nil {
+			continue
+		}
+		out = append(out, engine.PhaseSummary{
+			Phase:   string(r.Phase),
+			Status:  r.Status,
+			Seconds: int(r.Duration.Round(time.Second).Seconds()),
+			Tests:   r.Summary.Tests,
+			Passed:  r.Summary.Passed,
+			Failed:  r.Summary.Failed,
+			Skipped: r.Summary.Skipped,
+		})
+	}
+	return out
+}
+
+// verdict is the one-line result an operator reads in the timeline.
+func verdict(phases []engine.PhaseSummary) string {
+	var tests, passed, failed int
+	for _, p := range phases {
+		tests += p.Tests
+		passed += p.Passed
+		failed += p.Failed
+	}
+	if failed > 0 {
+		return fmt.Sprintf("validation: %d of %d checks passed, %d failed", passed, tests, failed)
+	}
+	return fmt.Sprintf("validation: %d of %d checks passed", passed, tests)
+}
+
+// writeReport persists the merged CTRF payload beside the run's bundle.
+func (v *validateStep) writeReport(runID string, results []*aicr.PhaseResult) (string, error) {
+	dir := filepath.Join(v.cfg.WorkDir, "runs", runID, "validation")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	// PhaseResult.RawReport is, per its own doc, "the marshaled CTRF JSON".
+	// This step runs exactly one phase, so that payload IS the canonical CTRF
+	// document -- writing it verbatim gives a file any CTRF tool can read,
+	// with no merge step and nothing bespoke about the shape.
+	//
+	// When conformance and performance arrive, several phases will need
+	// combining and aicr.Client.MergeReports is the tool for it (it stamps
+	// the same combined document the CLI writes). Reaching for it now, with
+	// one phase, would widen the client seam for a merge of one.
+	var payload []byte
+	for _, r := range results {
+		if r != nil && len(r.RawReport) > 0 {
+			payload = r.RawReport
+			break
+		}
+	}
+	if len(payload) == 0 {
+		return "", errors.New("validation returned no CTRF payload")
+	}
+	path := filepath.Join(dir, "ctrf.json")
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // skipReason reports why validation must not run, or "" when it may.
@@ -88,5 +224,3 @@ func skipReason(run *engine.Run) string {
 	}
 	return ""
 }
-
-var _ = aicr.PhaseDeployment // retained by Task 4

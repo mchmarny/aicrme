@@ -2,10 +2,14 @@ package steps_test
 
 import (
 	"context"
+	"os"
 	"testing"
+	"time"
 
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/bus"
+	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/steps"
 )
 
@@ -35,4 +39,65 @@ func TestValidateSkipsASimulatedCluster(t *testing.T) {
 	if len(run.Validation.Phases) != 0 {
 		t.Errorf("Phases = %+v, want none recorded for a skipped run", run.Validation.Phases)
 	}
+}
+
+// The happy path, and the assertions that matter are the OPTIONS: the wrong
+// phase set here is how performance validation ends up saturating the GPUs
+// Prove needs.
+func TestValidateRunsTheDeploymentPhaseAndRecordsIt(t *testing.T) {
+	dir := t.TempDir()
+	recipe := recipeFixture()
+	fake := &aicrclient.Fake{
+		Recipe: recipe,
+		PhaseResults: []*aicr.PhaseResult{{
+			Phase:    aicr.PhaseDeployment,
+			Status:   "passed",
+			Duration: 92 * time.Second,
+			Summary:  aicr.ReportSummary{Tests: 14, Passed: 14},
+			// A real aicr.Client always populates RawReport ("the marshaled
+			// CTRF JSON", per its own doc); the fixture must too, or
+			// writeReport has nothing to write and ReportPath stays empty.
+			RawReport: []byte(`{"results":{"summary":{"tests":14,"passed":14}}}`),
+		}},
+	}
+	step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: dir, Kubeconfig: "/tmp/kubeconfig"})
+
+	run := newRunWithRealCluster(t, recipe)
+
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if fake.ValidateCalls != 1 {
+		t.Fatalf("ValidateCalls = %d, want 1", fake.ValidateCalls)
+	}
+	if run.Validation.Skipped != "" {
+		t.Errorf("Skipped = %q, want empty on a real cluster", run.Validation.Skipped)
+	}
+	if len(run.Validation.Phases) != 1 {
+		t.Fatalf("Phases = %+v, want one", run.Validation.Phases)
+	}
+	got := run.Validation.Phases[0]
+	if got.Phase != "deployment" || got.Status != "passed" || got.Passed != 14 || got.Seconds != 92 {
+		t.Errorf("PhaseSummary = %+v, want the flattened AICR result", got)
+	}
+	if run.Validation.ReportPath == "" {
+		t.Error("ReportPath is empty -- the CTRF report was not written")
+	}
+	if _, err := os.Stat(run.Validation.ReportPath); err != nil {
+		t.Errorf("report file missing: %v", err)
+	}
+}
+
+// newRunWithRealCluster is a run whose artifacts describe a cluster WITH
+// GPUs, so skipReason lets validation proceed, and whose approved recipe
+// matches what the fake will re-resolve, so assertMatchesApproved passes.
+func newRunWithRealCluster(t *testing.T, recipe *aicr.RecipeResult) *engine.Run {
+	t.Helper()
+	run := newRun()
+	run.Decisions["intent"] = "training"
+	run.Decisions["platform"] = "kubeflow"
+	run.Artifacts["capability.json"] = []byte(`{"totalGpus":16,"usableGpus":16,"analyzed":true}`)
+	run.Artifacts["snapshot.yaml"] = []byte(minimalSnapshot)
+	run.Artifacts["recipe.json"] = approvedFrom(t, recipe)
+	return run
 }
