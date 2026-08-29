@@ -43,6 +43,16 @@ type Bundler interface {
 	MakeBundle(ctx context.Context, r *aicr.RecipeResult, opts aicr.BundleOptions) (aicr.BundleArtifact, error)
 }
 
+// Validator runs the recipe's validation phases against the live cluster.
+//
+// A role interface of its own, like every other seam here, rather than a
+// method bolted onto an existing one: Validate is the only caller, and a
+// step that needs to validate should not have to accept a bundler.
+type Validator interface {
+	ValidateState(ctx context.Context, r *aicr.RecipeResult, s *aicr.Snapshot,
+		opts ...aicr.ValidateOption) ([]*aicr.PhaseResult, error)
+}
+
 // API is the whole console-facing AICR surface.
 type API interface {
 	Snapshotter
@@ -50,6 +60,7 @@ type API interface {
 	CriteriaRegistrar
 	CatalogLister
 	Bundler
+	Validator
 	Close() error
 }
 

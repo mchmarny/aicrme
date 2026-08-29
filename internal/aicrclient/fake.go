@@ -31,6 +31,11 @@ type Fake struct {
 
 	BundleCalls   int
 	LastBundleDir string
+
+	PhaseResults     []*aicr.PhaseResult
+	ValidateErr      error
+	ValidateCalls    int
+	LastValidateOpts []aicr.ValidateOption
 }
 
 var _ API = (*Fake)(nil)
@@ -102,4 +107,19 @@ func (f *Fake) MakeBundle(_ context.Context, _ *aicr.RecipeResult, opts aicr.Bun
 		return &result.Output{OutputDir: opts.OutputDir}, nil
 	}
 	return f.Artifact, nil
+}
+
+// ValidateState records the call and the ValidateOptions it was given, then
+// returns the configured PhaseResults. LastValidateOpts lets a test verify a
+// step asked for the right phases (e.g. WithValidationPhases(PhaseDeployment))
+// without the fake having to interpret the functional options itself.
+func (f *Fake) ValidateState(_ context.Context, _ *aicr.RecipeResult, _ *aicr.Snapshot,
+	opts ...aicr.ValidateOption) ([]*aicr.PhaseResult, error) {
+
+	f.ValidateCalls++
+	f.LastValidateOpts = opts
+	if f.ValidateErr != nil {
+		return nil, f.ValidateErr
+	}
+	return f.PhaseResults, nil
 }

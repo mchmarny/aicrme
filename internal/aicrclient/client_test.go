@@ -176,3 +176,25 @@ func TestFakeCriteriaRegistryAndClose(t *testing.T) {
 		t.Errorf("Close() error = %v, want nil", err)
 	}
 }
+
+// The Fake must satisfy the same aggregate the real client does, or a step
+// written against API cannot be unit tested at all.
+func TestFakeRecordsValidateCalls(t *testing.T) {
+	want := []*aicr.PhaseResult{{Phase: aicr.PhaseDeployment, Status: "passed"}}
+	f := &aicrclient.Fake{PhaseResults: want}
+
+	got, err := f.ValidateState(context.Background(), nil, nil,
+		aicr.WithValidationPhases(aicr.PhaseDeployment))
+	if err != nil {
+		t.Fatalf("ValidateState() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Status != "passed" {
+		t.Errorf("ValidateState() = %+v, want the configured results", got)
+	}
+	if f.ValidateCalls != 1 {
+		t.Errorf("ValidateCalls = %d, want 1", f.ValidateCalls)
+	}
+	if len(f.LastValidateOpts) != 1 {
+		t.Errorf("LastValidateOpts = %d, want the options recorded for assertion", len(f.LastValidateOpts))
+	}
+}
