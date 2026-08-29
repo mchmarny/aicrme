@@ -623,26 +623,35 @@ func (v *validateStep) writeReport(runID string, results []*aicr.PhaseResult) (s
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "ctrf.json")
-	payload := make([]json.RawMessage, 0, len(results))
+	// PhaseResult.RawReport is, per its own doc, "the marshaled CTRF JSON".
+	// This step runs exactly one phase, so that payload IS the canonical CTRF
+	// document -- writing it verbatim gives a file any CTRF tool can read,
+	// with no merge step and nothing bespoke about the shape.
+	//
+	// When conformance and performance arrive, several phases will need
+	// combining and aicr.Client.MergeReports is the tool for it (it stamps
+	// the same combined document the CLI writes). Reaching for it now, with
+	// one phase, would widen the client seam for a merge of one.
+	var payload []byte
 	for _, r := range results {
 		if r != nil && len(r.RawReport) > 0 {
-			payload = append(payload, json.RawMessage(r.RawReport))
+			payload = r.RawReport
+			break
 		}
 	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
+	if len(payload) == 0 {
+		return "", errors.New("validation returned no CTRF payload")
 	}
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+	path := filepath.Join(dir, "ctrf.json")
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 ```
 
-Add `"fmt"`, `"os"` and `"path/filepath"` to the imports and drop the
-`var _ = aicr.PhaseDeployment` placeholder line from Task 3.
+Add `"errors"`, `"fmt"`, `"os"` and `"path/filepath"` to the imports and drop
+the `var _ = aicr.PhaseDeployment` placeholder line from Task 3.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -994,20 +1003,23 @@ git add docs/STATE.md
 git commit -S -m "docs: validation runs between Apply and Prove"
 ```
 
-- [ ] **Step 4: Push and watch CI**
+- [ ] **Step 4: Do NOT push**
 
-```bash
-git push origin main
-gh run list --limit 2
-```
-
-Expected: `ci` and `e2e` both green. The KWOK e2e exercises the **skip** path — `apply-real.sh` and `prove.sh` run against simulated GPU nodes, so `Validation.Skipped` will be set on every CI run. That is the designed outcome, not a gap.
+This work is on the `validate-step` branch and stays local. `ci` and `e2e`
+trigger on pushes to `main` and on pull requests, and the GitHub Actions
+budget is constrained — a full `e2e` run is six jobs. Verification here is
+`make qualify` locally; CI runs when the branch is merged, which is the
+operator's call, not this plan's.
 
 - [ ] **Step 5: Assert the skip in the KWOK e2e**
 
 The spec requires CI to assert the SKIP rather than a validation, because a
-pass on KWOK is the false pass this whole step exists to avoid. Add to
-`test/e2e/apply-real.sh`, after the run reaches `active`:
+pass on KWOK is the false pass this whole step exists to avoid.
+
+Add it to `test/e2e/prove.sh`, NOT apply-real.sh: prove.sh defines the
+`run_json` and `fail` helpers this assertion uses (`prove.sh:55,79`) and
+apply-real.sh defines neither. Place it after the first run reaches
+`active` — after assertion 2 passes:
 
 ```bash
 echo "--- assert: validation was SKIPPED on the simulated cluster, not passed"
@@ -1021,10 +1033,10 @@ SKIPPED="$(echo "${VALIDATION}" | jq -r '.skipped // empty')"
 echo "validation skipped as designed: ${SKIPPED}"
 ```
 
-Run `shellcheck -x -P test/e2e test/e2e/apply-real.sh` before committing.
+Run `shellcheck -x -P test/e2e test/e2e/prove.sh` before committing.
 
 ```bash
-git add test/e2e/apply-real.sh
+git add test/e2e/prove.sh
 git commit -S -m "test(e2e): assert validation skips a simulated cluster"
 ```
 
