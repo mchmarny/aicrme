@@ -196,3 +196,33 @@ Recorded only so they are not re-discovered as surprises. Neither is a request.
   node-feature-discovery/nfd-node-feature-discovery-worker 0/3 nodes ready (cluster activity
   while nfd installs)`. First confirmation from a human-driven run that the attributed condition
   lands on the right row with the temporal copy intact.
+
+---
+
+## 5. The console never says which AICR version it is running — OPEN
+
+**Observed:** 2026-08-29, Mark, after the repo went public.
+
+Every recipe decision, component version and validation verdict the console shows comes from
+AICR, and the console pins one exact version of it — but nothing on screen says which. An
+operator watching a run cannot tell whether they are looking at the output of v0.20.0 or
+something else, and two runs from two binaries are not comparable without that.
+
+It matters more now than it did: the binary is installable from a Homebrew tap and an install
+script, so the person running it is no longer the person who built it and cannot check `go.mod`.
+
+**Proposed:** show the AICR version in the console header, linked to that version's release page
+upstream — `https://github.com/NVIDIA/aicr/releases/tag/v<version>` — so the operator can read
+what changed in the version they are actually running.
+
+**What the fix can rely on:** the version is already pinned in three places that `make
+check-aicr-pin` keeps equal — `.settings.yaml` (`dependencies.aicr`), `go.mod`, and
+`defaultSnapshotAgentImage` in `internal/console/console.go`. Any of them is a source; none of
+them currently reaches the SPA. `internal/version` already carries aicrme's own version and
+commit through ldflags and is the obvious place to carry AICR's alongside them, which would also
+put it in the run record and the evidence bundle rather than only on screen.
+
+**Constraint worth stating before someone builds it:** the header should show the version the
+binary is *pinned to*, not one discovered from the cluster. A cluster can have been configured by
+a different aicrme build, and a header that quietly reported the cluster's version would answer a
+different question than the one being asked.
