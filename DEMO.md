@@ -88,16 +88,27 @@ The condition copy reads *"cluster activity while `<action>` installs"* and neve
 action **caused** it. That is deliberate: `deploy.sh` keeps converging after it exits, so the
 correlation is temporal and the console does not claim more than it knows.
 
-**5. Prove.** The console applies its reference workload — a 2-pod gang, 8 `nvidia.com/gpu`
+**5. Validate.** The console asks AICR's SDK whether what Apply just installed actually
+reconciled — a `deployment`-phase check run across the cluster (operator health, expected
+resources, driver version, `nvidia-smi`, and — on GKE — the GPU NIC networks). On the KWOK
+cluster this demo stands up, it **skips, loudly**: the same `kwok-controller` detection that
+labels Prove's placement simulated (below) stops this step before it calls AICR at all, because
+the validator would otherwise land on KWOK's fake nodes and report every check passed having
+executed nothing. The timeline states the skip reason in one line, and a skip is never rendered
+as a pass — there is no green verdict on this path. On real hardware this step actually runs and
+records a per-phase pass/fail verdict, shown on the Prove screen beside the placement claim.
+
+**6. Prove.** The console applies its reference workload — a 2-pod gang, 8 `nvidia.com/gpu`
 each, `schedulerName: kai-scheduler` — into its own `aicrme-prove` namespace and waits for the
 gang to be placed. On a KWOK cluster that takes about two seconds.
 
 The screen shows the placement decision itself, one line per gang member naming the node it was
-bound to, and it labels the cluster **simulated, no GPU hardware** without apology: nothing here
-computed a result and the screen claims none. What is real is that a GPU-aware scheduler
-admitted a gang and bound every member of it.
+bound to, and it labels the cluster **simulated** without apology — even though KWOK's fake nodes
+report a healthy 32-of-32 GPU count, the same `kwok-controller` detection Validate uses (not the
+GPU count) is what the label is keyed on: nothing here computed a result and the screen claims
+none. What is real is that a GPU-aware scheduler admitted a gang and bound every member of it.
 
-**6. The run stays active.** This is the one state the arc ends in that is not "finished": every
+**7. The run stays active.** This is the one state the arc ends in that is not "finished": every
 step is done and the workload is deliberately still there. **Stop workload** is the only way out
 — Discard is refused while a workload is running, and Retry only applies to a failed run. Stop
 deletes the workload and waits until its pods are actually gone before closing the run.
@@ -123,7 +134,6 @@ deletes the workload and waits until its pods are actually gone before closing t
 
 | | |
 |---|---|
-| **Validate** | Deferred on measurement, not preference — AICR's `ValidateState` reports `passed` for checks that never executed on any cluster with simulated GPU nodes. See `docs/phase-2-handoff.md`. |
 | **A workload that computes anything** | Phase 4, on real hardware. Prove places a gang; the containers never execute here (see below). |
 
 ## Running on a real cluster

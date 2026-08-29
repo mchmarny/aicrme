@@ -10,9 +10,11 @@ maintained and several of their claims are superseded. Read this file instead.
 
 ## What works
 
-The whole arc — Discover, Recommend, Bundle, Apply, Prove, Reset — runs against real GPU
-hardware, driven from a laptop over the operator's own kubeconfig. `aicrme` is a local binary; it
-installs nothing of itself into the cluster it configures.
+The whole arc — Discover, Recommend, Bundle, Apply, Validate, Prove, Reset — runs end to end,
+driven from a laptop over the operator's own kubeconfig. `aicrme` is a local binary; it installs
+nothing of itself into the cluster it configures. Every phase but Validate has run against real
+GPU hardware; Validate is proven so far only on KWOK's simulated nodes — see the Validation row
+below and Open work item 3.
 
 | | Proven on | Evidence |
 |---|---|---|
