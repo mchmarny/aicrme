@@ -115,6 +115,15 @@ type envelope struct {
 	//
 	// omitzero, not omitempty: see Run.AgentNamespace's comment.
 	AgentNamespace AgentNamespace `json:"agentNamespace,omitzero"`
+	// Validation is the same optional-on-both-sides addition, and it must
+	// survive the round trip so a recovered run shows what the Validate step
+	// found, or why it did not run. A record that lost it would read as "never
+	// validated", which is different from a true false-pass. Absent means
+	// "written before this field existed", which decodes to the zero value --
+	// "Validate never ran" -- and that is a correct decode, not a degraded one.
+	//
+	// omitzero, not omitempty: see Run.Validation's comment.
+	Validation Validation `json:"validation,omitzero"`
 }
 
 func gzipJSON(v any) ([]byte, error) {
@@ -202,6 +211,7 @@ func encodeRun(r *Run, maxPayload int) ([]byte, error) {
 		ClusterUID:         r.ClusterUID,
 		Toolchain:          r.Toolchain,
 		AgentNamespace:     r.AgentNamespace,
+		Validation:         r.Validation,
 		Artifacts:          make(map[string][]byte, len(r.Artifacts)),
 		// Carried forward, not recomputed. A run recovered from a truncated
 		// record no longer HAS the shed artifact, so re-encoding it would fit
@@ -322,6 +332,7 @@ func decodeRun(blob []byte, maxPayload int) (*Run, error) {
 		ClusterUID:         env.ClusterUID,
 		Toolchain:          env.Toolchain,
 		AgentNamespace:     env.AgentNamespace,
+		Validation:         env.Validation,
 	}
 	if r.Decisions == nil {
 		r.Decisions = map[string]string{}

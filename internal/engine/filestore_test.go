@@ -182,3 +182,38 @@ func TestFileStoreConcurrentSaveDeleteLoadCurrentDoesNotRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// The verdict has to survive a restart. A recovered run that shows no
+// validation would read as "never validated", which is a different claim
+// from the one the record actually holds.
+func TestFileStorePreservesValidation(t *testing.T) {
+	store, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+	run := &Run{
+		ID:    "run-with-validation",
+		State: StateDone,
+		Validation: Validation{
+			ReportPath: "/tmp/runs/x/validation/deployment.json",
+			Phases: []PhaseSummary{{
+				Phase: "deployment", Status: "passed",
+				Seconds: 92, Tests: 14, Passed: 14,
+			}},
+		},
+	}
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	got, err := store.Load(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(got.Validation.Phases) != 1 || got.Validation.Phases[0].Passed != 14 {
+		t.Errorf("Validation = %+v, want the saved summary", got.Validation)
+	}
+	if got.Validation.ReportPath == "" {
+		t.Error("ReportPath is empty -- the CTRF file is unreachable after a restart")
+	}
+}

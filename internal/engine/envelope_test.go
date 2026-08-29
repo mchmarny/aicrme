@@ -528,6 +528,17 @@ func setDistinctFieldValue(t *testing.T, v reflect.Value, name string) {
 					Name: "parity-ns", Existed: true, SnapshotErr: "parity-err",
 				}},
 			}))
+		case Validation:
+			// Phases slice non-empty with all fields distinct from their zero
+			// values. ReportPath is distinct. Skipped is empty because it is
+			// mutually exclusive with Phases being non-empty.
+			v.Set(reflect.ValueOf(Validation{
+				ReportPath: "parity-report-path",
+				Phases: []PhaseSummary{{
+					Phase: "parity-phase", Status: "parity-status", Seconds: 42,
+					Tests: 10, Passed: 8, Failed: 1, Skipped: 1,
+				}},
+			}))
 		default:
 			t.Fatalf("setDistinctFieldValue: field %s has unhandled struct type %s -- extend this switch", name, v.Type())
 		}

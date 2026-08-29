@@ -1005,6 +1005,11 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	// AgentNamespace, merged on both paths for the reason stated on the
 	// failure-path merge above.
 	e.current.AgentNamespace = scratch.AgentNamespace
+	// Validation is an output, same shape as Workload and for the same class
+	// of reason: without this line internal/steps.Validate's write lands on
+	// the scratch copy and is discarded, and a recovered run would read as
+	// "never validated" when in fact it was.
+	e.current.Validation = scratch.Validation
 	// Advance the cursor before this checkpoint is taken, not after: the
 	// save below must carry the advanced StepIndex, and it must complete
 	// before the next step begins (it does, trivially -- this call is

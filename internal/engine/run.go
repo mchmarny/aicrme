@@ -168,6 +168,9 @@ type Run struct {
 	//
 	// omitzero, not omitempty: see Workload's comment.
 	Residue Residue `json:"residue,omitzero"`
+	// Validation is the Validate step's verdict. Zero when the step has not
+	// run yet.
+	Validation Validation `json:"validation,omitzero"`
 	// AgentNamespace is the namespace AICR's snapshot agent ran in, and
 	// whether Discover created it.
 	//
@@ -249,6 +252,41 @@ type Residue struct {
 	// counted from this, so an item missing from it is one nobody knows to
 	// check.
 	Items []ResidueItem `json:"items,omitempty"`
+}
+
+// Validation is what the Validate step found, or why it did not run.
+//
+// A SUMMARY, deliberately. aicr.PhaseResult carries RawReport and a full
+// CTRF Report; this record is gzipped and about 30KB, and CTRF payloads
+// would dominate it. The raw report is written to disk and named by
+// ReportPath instead.
+//
+// ReportPath lives here rather than in ephemeralArtifacts. That field is
+// dropped on encode, which is exactly why GET /api/runs/{id}/bundle answers
+// 404 for a recovered run today -- a mistake worth not making twice.
+type Validation struct {
+	// Skipped is why validation did not run, empty when it did. A simulated
+	// cluster and a drifted recipe both land here: neither is a pass, and
+	// recording either as one would be the false-pass this step exists to
+	// avoid.
+	Skipped string `json:"skipped,omitempty"`
+	// ReportPath is the merged CTRF report on disk.
+	ReportPath string `json:"reportPath,omitempty"`
+	// Phases is one entry per validation phase that ran, in the order AICR
+	// ran them.
+	Phases []PhaseSummary `json:"phases,omitempty"`
+}
+
+// PhaseSummary is one validation phase's outcome, flattened from
+// aicr.PhaseResult so the record carries no AICR types.
+type PhaseSummary struct {
+	Phase   string `json:"phase"`
+	Status  string `json:"status"`
+	Seconds int    `json:"seconds"`
+	Tests   int    `json:"tests"`
+	Passed  int    `json:"passed"`
+	Failed  int    `json:"failed"`
+	Skipped int    `json:"skipped"`
 }
 
 // Removed counts the items of one kind this Reset actually removed.
@@ -355,5 +393,6 @@ func (r *Run) Clone() *Run {
 	out.Ownership.Releases = append([]ReleaseRef(nil), r.Ownership.Releases...)
 	out.Ownership.Namespaces = append([]NamespaceRef(nil), r.Ownership.Namespaces...)
 	out.Residue.Items = append([]ResidueItem(nil), r.Residue.Items...)
+	out.Validation.Phases = append([]PhaseSummary(nil), r.Validation.Phases...)
 	return &out
 }
