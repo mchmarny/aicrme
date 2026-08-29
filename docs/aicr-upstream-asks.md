@@ -41,13 +41,13 @@ more. This one appears to have been missed rather than withheld.
 `pkg/snapshotter` directly for Discover, replacing a facade call with a deep one for a core
 operation. That trades a missing feature for permanent upgrade exposure, on a console whose
 whole coupling strategy is to stay inside the v1 freeze. Deferring was the cheaper mistake to
-unmake. See `approach.md`'s Phase 5 row.
+unmake.
 
 ---
 
 ## 2. No machine-readable event stream from `deploy.sh`
 
-**Found:** Phase 2a. Carried in `docs/phase-2-handoff.md`.
+**Found:** Phase 2a.
 
 `internal/applier/parse.go` transcribes `deploy.sh.tmpl`'s `printf` output formats into seven
 hand-written regexes. Nothing in the Go type system connects the two, so an upstream wording
@@ -66,7 +66,7 @@ upgrade-fragile surface in this repo.
 
 ## Resolved upstream, no longer an ask
 
-**`Snapshot()` and `Validate()` in `pkg/client/v1`.** `approach.md` Risk 1 was written when the
+**`Snapshot()` and `Validate()` in `pkg/client/v1`.** This project's original Risk 1 was written when the
 console had to import `pkg/snapshotter` and `pkg/validator` directly because the v1 surface
 covered neither. As of **v0.19.0 both are on the facade** — `Client.CollectSnapshot` and
 `Client.ValidateState` — and this console uses `CollectSnapshot` through it. `pkg/validator` is

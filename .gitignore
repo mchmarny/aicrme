@@ -41,3 +41,8 @@ internal/web/dist/*
 bin/
 .e2e-diag/
 .repro/
+
+# Superpowers SDD scratch: ledgers, task briefs, implementer reports and
+# review diffs for in-flight work. Useful while a plan runs, meaningless
+# after it lands, and never something a reader of this repo needs.
+.superpowers/

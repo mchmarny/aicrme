@@ -85,7 +85,7 @@ reports FailedCreate ... and converges shortly after" — it is why `SETTLE_SECO
 resolved, and the row never cleared, because **resolution is keyed to Pod recovery and this is
 a ReplicaSet-involved warning**.
 
-That is exactly the open item recorded in `docs/phase-2-handoff.md` — *"resolution covers
+That is exactly the open item recorded during 2b-iii — *"resolution covers
 Pod-involved Warnings only; a DaemonSet `FailedCreate` survives the DaemonSet's own deletion"* —
 deferred during 2b-iii as narrower than the Pod path. It is not narrower in practice: it is the
 first thing a human saw.

@@ -33,7 +33,7 @@
       "commitMessageTopic": "aicr",
       "prBodyNotes": [
         "### Bump checklist",
-        "`docs/phase-2-handoff.md` carries the full table. Four detectors fire on an AICR bump, and one of them must NOT be answered by updating a number:",
+        "Four detectors fire on an AICR bump, and one of them must NOT be answered by updating a number:",
         "- **`make check-aicr-pin`** — the three pins disagree. Should be green here; if not, this PR bumped some but not all.",
         "- **`internal/steps/recommend_test.go`'s `succeeds` matrix** — which intent/platform pairs resolve on KWOK changed. Re-verify against the new catalog and record reality; a shrinking or growing set is information, not a regression to suppress.",
         "- **`TestDeployTemplateUnchanged`** — ⚠️ upstream's `deploy.sh.tmpl` changed, and `internal/applier/parse.go` transcribes its output format into seven regexes. **Do not reflexively update the sha256.** Re-read the template's output helpers against the regexes first. Updating the hash to turn CI green would silently empty the Apply timeline in production, and every existing test would still pass.",

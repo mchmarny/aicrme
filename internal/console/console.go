@@ -221,9 +221,7 @@ type attributionReader interface {
 // engine.Attribution deliberately does NOT carry Namespaces. Namespaces come
 // from parsing recipe.json into steps.RecipeSummary, and internal/steps
 // imports internal/engine -- so an engine-side accessor that also returned
-// Namespaces would be an import cycle (Ruling 2,
-// docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md Section
-// 2). main already holds both the engine and 2b-ii's cached namespace
+// Namespaces would be an import cycle. main already holds both the engine and 2b-ii's cached namespace
 // parsing (newRunScopeFn), so it is the one place that can see both without
 // creating that cycle. Do not "simplify" this into a single engine-side
 // snapshot later; that is the cycle this shape exists to avoid.

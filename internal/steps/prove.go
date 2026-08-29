@@ -83,8 +83,8 @@ type proveStep struct {
 //
 // WHAT THIS STEP DOES NOT PROVE, on the only substrate it has today
 // Three gaps, measured on the KWOK demo cluster rather than reasoned about,
-// and repeated in DEMO.md and docs/phase-2-handoff.md because they bound
-// what the console may claim on a simulated cluster:
+// and repeated in DEMO.md because they bound what the console may claim
+// on a simulated cluster:
 //
 //   - The workload body never executes. KWOK marks a gang pod Succeeded in
 //     the same second it binds it, without starting the container, so

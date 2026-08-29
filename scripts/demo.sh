@@ -97,7 +97,9 @@ EOF
   placed by kai-scheduler. The run ends ACTIVE, with the workload
   left running and "Stop workload" as the only way out.
 
-  Validate is deferred on measurement (docs/phase-2-handoff.md).
+  Validation runs between Apply and Prove, but SKIPS on this cluster
+  and says why: AICR's validator lands on KWOK's fake nodes and would
+  report passes for checks that never ran.
   Nothing here executes a container -- see DEMO.md's "What this
   demo cannot show you" for what the placement does and does not
   prove.

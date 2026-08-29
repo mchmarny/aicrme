@@ -163,8 +163,7 @@ jobs:
       # way that skipped its EXIT trap, so everything it had captured was dumped
       # nowhere and lost with the runner. A collector that runs regardless is
       # the only one that survives the script dying badly -- and apply-real
-      # still fails intermittently for a reason nobody has captured yet
-      # (docs/phase-2b-iii-regression.md).
+      # still fails intermittently for a reason nobody has captured yet.
       - name: collect e2e diagnostics
         if: always()
         uses: actions/upload-artifact@v4

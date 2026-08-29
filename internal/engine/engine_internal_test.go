@@ -34,8 +34,7 @@ func (s *slowStep) Run(_ context.Context, r *Run, _ Emit) error {
 // caller can legally observe Failed and call Retry, the first goroutine has
 // already done its last piece of shared-state work, so no black-box test
 // can catch a superseded goroutine still trying to write. This test bumps
-// e.epoch directly (as a future Reset, per docs/phase-2-handoff.md, would
-// need to) while a step is still inside Run, to prove the merge-back check
+// e.epoch directly (as Reset does) while a step is still inside Run, to prove the merge-back check
 // actually stops a superseded write rather than merely looking like it does.
 func TestSupersededGoroutineCannotWriteState(t *testing.T) {
 	step := &slowStep{release: make(chan struct{}), entered: make(chan struct{})}

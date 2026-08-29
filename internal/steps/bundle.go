@@ -124,9 +124,8 @@ func (b *bundle) Run(ctx context.Context, run *engine.Run, emit engine.Emit) err
 // removed that guarantee: recipe.json now survives a restart, so a Retry
 // after an image upgrade can re-resolve against a catalog embedded by a
 // different image than the one that wrote the approved recipe.json. This
-// guard is what makes that safe -- see the AICR bump checklist in
-// docs/phase-2-handoff.md, whose assertMatchesApproved row now covers this
-// case too.
+// guard is what makes that safe, and it is one of the things an AICR
+// version bump has to re-check.
 func assertMatchesApproved(result *aicr.RecipeResult, approved []byte) error {
 	var summary RecipeSummary
 	if err := json.Unmarshal(approved, &summary); err != nil {

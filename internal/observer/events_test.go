@@ -156,8 +156,8 @@ func TestControllerWarningResolvesWhenAnOwnedPodRecovers(t *testing.T) {
 }
 
 // The same claim for a DaemonSet, which owns its pods directly rather than
-// through a ReplicaSet -- the case docs/phase-2-handoff.md recorded as open
-// ("a DaemonSet FailedCreate survives the DaemonSet's own deletion"). One
+// through a ReplicaSet -- the case once recorded as open, where a DaemonSet
+// FailedCreate survived the DaemonSet's own deletion. One
 // mechanism has to cover both or the fix is a special case for one kind.
 func TestDaemonSetWarningResolvesWhenAnOwnedPodRecovers(t *testing.T) {
 	const dsUID = types.UID("ds-uid")

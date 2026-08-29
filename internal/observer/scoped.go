@@ -15,8 +15,7 @@ import (
 
 // The observer starts at pod start, before any run exists -- the recipe's
 // namespaces come from recipe.json, which Recommend writes partway through a
-// run (docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md
-// Section 3). So Pods and Events, unlike the three cluster-scoped informers
+// run. So Pods and Events, unlike the three cluster-scoped informers
 // in observer.go, cannot be watched from a factory built once at Start: this
 // file gives them a lifecycle that starts once a scope resolves and tears
 // down when the run that resolved it ends.

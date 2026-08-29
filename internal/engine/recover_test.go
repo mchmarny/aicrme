@@ -15,9 +15,8 @@ import (
 	"github.com/mchmarny/aicrme/internal/engine"
 )
 
-// recoverStore is a Store double for Recover's tests. Per Ruling 1
-// (docs/superpowers/sdd/.../progress.md), it embeds a real store rather than
-// leaving the embedded engine.Store nil: LoadCurrent and Save are the only
+// recoverStore is a Store double for Recover's tests. It embeds a real
+// store rather than leaving the embedded engine.Store nil: LoadCurrent and Save are the only
 // methods overridden below, so Load and Delete fall through to the embedded
 // memoryStore instead of panicking on a nil interface.
 type recoverStore struct {

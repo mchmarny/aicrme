@@ -228,8 +228,7 @@ kubectl rollout restart deploy -n kai-scheduler     # no controller keeps a pre-
 `make demo-down && make demo` does it; on a real cluster it means a new cluster. Either way it is
 the safer choice if you are about to demo in front of someone.
 
-Full measurements, including the arm that ruled out "it just needed more time", are in
-`docs/spikes/2026-08-23-kai-scheduler-reset-cycle.md`.
+This was measured, including an arm that ruled out "it just needed more time".
 
 If a Reset does not finish, the console offers only Reset again: the run record is the only
 inventory of what is still installed, so Start, Retry and Discard are all refused until the

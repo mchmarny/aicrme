@@ -285,8 +285,8 @@ grep -qx 'installed' <<<"${COMPONENT_STATUSES}" || {
 # else. helm 3's --dry-run builds typed k8s objects client-side against
 # live discovery and fails hard when the kind isn't there ("no matches
 # for kind NodeFeatureRule ... ensure CRDs are installed first"); the
-# earlier host probe (docs/phase-2-handoff.md, "The dry-run ceiling"
-# section; helm v4.2.4) happened to tolerate the same missing CRD and
+# earlier host probe (the "dry-run ceiling" measurement; helm v4.2.4)
+# happened to tolerate the same missing CRD and
 # reached exit 0 on all 14 components -- arguably the LESS correct
 # behavior, and evidence that probe validated a code path (install.sh
 # branches on helm major) production doesn't take, not evidence this

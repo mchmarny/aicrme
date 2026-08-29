@@ -47,7 +47,7 @@ func WorkloadName(runID string) string { return "prove-" + runID }
 // Applies of one run, from two differently-configured processes, legitimately
 // want different Jobs. Without this the second is discarded in silence, which
 // is how a toleration fix deployed mid-demo failed to reach the run it was
-// deployed for (docs/phase-4-status.md).
+// deployed for -- observed on a real-cluster run, not reasoned about.
 const SpecHashAnnotation = "aicrme.dev/spec-hash"
 
 // OwnedKinds enumerates what Prove creates. Stop and reconciliation act on

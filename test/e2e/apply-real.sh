@@ -54,7 +54,7 @@ ec=0
 
 # --- resource instrumentation -------------------------------------------
 #
-# Added 2026-08-19 for the phase-2b-iii regression (docs/phase-2b-iii-regression.md):
+# Added 2026-08-19 after a regression in which
 # apply-real failed twice on main with the Kind API server going unreachable
 # mid-Apply, and the script could explain nothing, because every diagnostic it
 # runs fires from the EXIT trap -- by which time the cluster is already gone.
@@ -488,7 +488,7 @@ echo "--- assert 1: cluster events appeared and were attributed to a real deploy
 # deployment action deploy.sh was installing when the condition was observed,
 # and is legitimately empty between actions and outside Apply. run.components
 # IS that action list (14 rows for this recipe -- see the TOTAL assertion
-# above and docs/phase-2-handoff.md's "13 components, 14 deployment actions"),
+# above: 13 components, 14 deployment actions),
 # so matching a cluster event's component against it is matching against
 # actions, per the task brief.
 ACTIONS_JSON="$(echo "${RUN_JSON}" | jq -cS '[.components[].name] | unique')"

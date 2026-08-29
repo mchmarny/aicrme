@@ -2,8 +2,7 @@
 # measure.sh — answer the questions that only real GPU hardware can answer.
 #
 # WHY THIS EXISTS
-# Six open questions in docs/phase-2-handoff.md and approach.md are blocked on
-# Phase 4 hardware. Every one of them is a MEASUREMENT, not a build: the code
+# Six open questions are blocked on real GPU hardware. Every one of them is a MEASUREMENT, not a build: the code
 # to observe them already exists, and what has been missing is a cluster with
 # real GPUs. Writing the probes beforehand means the expensive session is
 # "run this, paste the output" rather than "work out what to collect while the
@@ -71,7 +70,7 @@ RECORD="$(run_json "${RUN_ID}")"
 [[ -n "${RECORD}" ]] || { echo "no run record for ${RUN_ID} at ${CONSOLE_URL}" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-hdr "Q1  MIG resource names (docs/phase-2-handoff.md:272)"
+hdr "Q1  MIG resource names"
 # internal/observer/handlers.go's gpuResource tracks only "nvidia.com/gpu".
 # Whether MIG-partitioned nodes expose their capacity under different names --
 # nvidia.com/mig-1g.10gb and friends -- decides whether the allocatable-diff
@@ -92,7 +91,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-hdr "Q2  how large a real snapshot gets (docs/phase-2-handoff.md:282)"
+hdr "Q2  how large a real snapshot gets"
 # The 800 KiB figure this question was written against was a ConfigMap limit
 # and is gone: a file store has no such cap, and filePayloadCeiling is 64 MiB
 # precisely so shedding is unreachable. The measurement is still worth taking
@@ -138,7 +137,7 @@ echo "${RECORD}" | jq -r '
   end' 2>/dev/null || missing "run record has no truncated field"
 
 # ---------------------------------------------------------------------------
-hdr "Q3  the headline number: N of M GPUs usable (docs/phase-2-handoff.md:369)"
+hdr "Q3  the headline number: N of M GPUs usable"
 # Unit-tested, never exercised by a fixture: even the simulated-H100 KWOK
 # snapshot reports gpu-present: false, because the agent finds no real device.
 # This is the first time the number is computed from real devices.
@@ -207,8 +206,8 @@ if [[ -n "${EVENTS_NDJSON}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-hdr "Q4  Apply duration and the slow-step map (approach.md:503)"
-# approach.md predicts 10-20 minutes on real hardware, most of it driver
+hdr "Q4  Apply duration and the slow-step map"
+# The original estimate was 10-20 minutes on real hardware, most of it driver
 # compilation. The first run to answer this found neither half true on GKE:
 # 15m18s, but with the driver already on the node image, so the two slowest
 # steps were kube-prometheus-stack (137s) and cert-manager (128s) at 44% of
@@ -266,7 +265,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-hdr "Q5  event volume on a real driver rollout (docs/phase-2-handoff.md:230)"
+hdr "Q5  event volume on a real driver rollout"
 # The MECHANISM is pinned by TestPodUnchangedTroubleEmitsExactlyOnce and its
 # siblings: ten identical informer deliveries publish one bus event. What is
 # unmeasured is the real-world number on an 8-node driver rollout, where pods
@@ -285,7 +284,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-hdr "Q6  does ValidateState still false-pass? (docs/superpowers/specs, Validate)"
+hdr "Q6  does ValidateState still false-pass?"
 # Validate was scoped out on 2026-08-18 because ValidateState reported `passed`
 # for checks that never executed on simulated GPU nodes. That measurement was
 # taken on KWOK. Whether it holds on real hardware is the question that decides
@@ -294,7 +293,7 @@ hdr "Q6  does ValidateState still false-pass? (docs/superpowers/specs, Validate)
 # output against what the cluster actually does.
 echo "  NOT probed. Deliberately: answering it means RUNNING ValidateState, which"
 echo "  mutates nothing but is a real call this read-only script will not make."
-echo "  See docs/spikes/2026-08-18-validate-on-kwok.md for the KWOK baseline to"
+echo "  The KWOK baseline to"
 echo "  compare against, and run it by hand on this cluster."
 
 hdr "done"

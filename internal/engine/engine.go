@@ -364,7 +364,7 @@ func (e *Engine) Start(ctx context.Context) (*Run, error) {
 	// StateActive is not isLive -- it has no execute goroutine -- but it does
 	// hold a workload in the cluster, and starting over it would abandon that
 	// workload with nothing tracking it. Teardown is never a side effect of
-	// starting something (approach.md, Reset).
+	// starting something: that is Reset's job, and Reset is never automatic.
 	if e.current != nil && e.current.State == StateActive {
 		e.mu.Unlock()
 		return nil, aicrerrors.New(aicrerrors.ErrCodeConflict,
@@ -502,9 +502,8 @@ func isTerminal(s State) bool {
 // time Retry can even be called -- there is no live second writer for a
 // black-box test to catch. engine_internal_test.go pins the guard anyway by
 // manufacturing the condition directly (bumping epoch mid-step), since a
-// guard no test can break is not a guard. docs/phase-2-handoff.md's
-// "bite when Reset lands" note names the feature that will make this
-// reachable through the public API.
+// guard no test can break is not a guard. Reset is what makes this
+// condition reachable through the public API at all.
 func (e *Engine) aliveLocked(epoch uint64) bool { return e.epoch == epoch }
 
 // CancelAndWait cancels the in-flight run and blocks until its execute

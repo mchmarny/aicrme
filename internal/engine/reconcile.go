@@ -76,7 +76,7 @@ func adoptable(w prove.OwnedWorkload) bool {
 //   - record absent, workload present -- the store lost it. The workload is
 //     adopted into a synthetic StateActive run so the operator gets a Stop
 //     button back. It is NEVER deleted: tearing down a workload nobody asked
-//     to stop is Reset's job, and Reset is never automatic (approach.md).
+//     to stop is Reset's job, and Reset is never automatic.
 //   - record active, workload absent -- the run already ended. It finishes at
 //     StateDone.
 //

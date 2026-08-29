@@ -124,7 +124,7 @@ func TestReconcileKeepsActiveRunWithLiveWorkload(t *testing.T) {
 // Case 2 (spec §3): the workload is there and the store lost the record --
 // the case labels exist for. Adoption is what gives the operator a Stop
 // button back; deleting it instead would be the console tearing down GPUs
-// nobody asked it to touch (approach.md, Reset).
+// nobody asked it to touch. That is Reset's job, and Reset is never automatic.
 func TestReconcileAdoptsOrphanedWorkload(t *testing.T) {
 	ctx := context.Background()
 	cs := fake.NewSimpleClientset(ownedJob(orphanRunID))

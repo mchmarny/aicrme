@@ -41,9 +41,7 @@ const resyncPeriod = 0
 // They cannot be combined on the engine side -- Namespaces come from parsing
 // recipe.json into steps.RecipeSummary, and internal/steps imports
 // internal/engine, so an engine accessor that also returned Namespaces would
-// be an import cycle (Ruling 2,
-// docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md Section 2).
-// Folding both into one struct here, composed by one func in main, is what
+// be an import cycle. Folding both into one struct here, composed by one func in main, is what
 // lets publish still call its scope accessor exactly once per event despite
 // the two underlying sources.
 type RunScope struct {

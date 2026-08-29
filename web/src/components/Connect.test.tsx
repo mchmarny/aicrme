@@ -20,7 +20,11 @@ const manyContexts = [
     server: `https://aicr-test${i}.example:443`,
     current: false,
   })),
-  { name: 'gke_eidosx_us-central1_aicr-uat-day-gh1-0-33169125469', server: 'https://34.55.124.240', current: true },
+  // Shaped like a real GKE context on purpose -- long, underscore-separated,
+  // and sorting nowhere near the front. That is the case this fixture exists
+  // to cover: the current context is selected because it is current, not
+  // because of where it lands in the list.
+  { name: 'gke_example-project_us-central1_aicr-demo-0-00000000000', server: 'https://gke.example:443', current: true },
   { name: 'zzz-last', server: 'https://zzz.example:443', current: false },
 ]
 
@@ -111,7 +115,7 @@ describe('Connect', () => {
     render(<Connect onConnected={() => {}} />)
 
     const radios = await screen.findAllByRole('radio')
-    expect(radios[0].getAttribute('value')).toBe('gke_eidosx_us-central1_aicr-uat-day-gh1-0-33169125469')
+    expect(radios[0].getAttribute('value')).toBe('gke_example-project_us-central1_aicr-demo-0-00000000000')
     // and it is still the selected one.
     expect((radios[0] as HTMLInputElement).checked).toBe(true)
   })

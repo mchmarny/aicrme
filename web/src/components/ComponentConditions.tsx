@@ -23,8 +23,7 @@ const severityClass: Record<number, string> = {
  * Nodewright alone can run 10-20 minutes past the script exiting -- so the
  * console has no basis to say this action's workloads produced the
  * condition, only that the observer saw it while this action was the one
- * installing. See
- * docs/superpowers/specs/2026-08-17-aicrme-phase-2b-iii-design.md, Section 1.
+ * installing.
  *
  * `terminalState` (Ruling 38, Task 7 final fix wave; refined again in the
  * pre-merge fix wave -- see below). Teardown stops the observer's

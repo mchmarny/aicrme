@@ -254,8 +254,8 @@ func newStopTestEngine(t *testing.T, id string, cs *fake.Clientset) (*Engine, *p
 // an error-free return. Asserting absence directly against the fake
 // clientset (rather than trusting Stop's nil error alone) is deliberate --
 // this phase already caught a WaitAbsent test pair that passed against a
-// fake that never polled at all (docs/superpowers/specs' own recorded
-// trap), so a Stop test that only checks err == nil would repeat it.
+// fake that never polled at all, so a Stop test that only checks
+// err == nil would repeat it.
 func TestStopEndsTheRunAtDone(t *testing.T) {
 	const runID = "run-stop-ends-done"
 	cs := fake.NewSimpleClientset()
