@@ -39,6 +39,13 @@ type Report struct {
 	// green "already capable" copy for the second. The headline strings
 	// differ too, but keying UI on prose is how prose changes become bugs.
 	Analyzed bool `json:"analyzed"`
+	// Simulated is true when kwok-controller is running in this cluster, which
+	// means some or all of its nodes are fakes. It is deliberately NOT derived
+	// from the GPU count: KWOK's fake nodes advertise eight GPUs each, so a
+	// simulated cluster and a real one are indistinguishable by that measure.
+	// Anything that would act on the cluster rather than describe it has to
+	// know the difference -- see internal/steps.skipReason.
+	Simulated bool `json:"simulated"`
 }
 
 // probe is the read-only view the rules evaluate against.
@@ -104,6 +111,7 @@ func Analyze(s *aicr.Snapshot, cluster ClusterGPUs) Report {
 		UsableGPUs:   usable,
 		InferredGPUs: inferred,
 		Analyzed:     true,
+		Simulated:    kwokControllerPresent(p),
 	}
 	for _, rule := range rules {
 		if rule.Applies(p) {

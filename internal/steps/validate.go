@@ -210,9 +210,12 @@ func (v *validateStep) writeReport(runID string, results []*aicr.PhaseResult) (s
 
 // skipReason reports why validation must not run, or "" when it may.
 //
-// totalGpus == 0 is internal/gap's own definition of a simulated cluster, not
-// a heuristic invented here -- the same signal Prove uses to decide what it
-// may claim.
+// Simulated is internal/gap's own definition of a simulated cluster, not a
+// heuristic invented here: it is true when kwok-controller is running,
+// regardless of how many GPUs the fake nodes report. Checked before
+// TotalGPUs == 0, because a KWOK cluster with four fake accelerated nodes
+// reports a perfectly healthy GPU count -- that combination is exactly what
+// the old GPU-count-only check got wrong.
 func skipReason(run *engine.Run) string {
 	raw := run.Artifacts["capability.json"]
 	if len(raw) == 0 {
@@ -221,6 +224,7 @@ func skipReason(run *engine.Run) string {
 	var report struct {
 		TotalGPUs int  `json:"totalGpus"`
 		Analyzed  bool `json:"analyzed"`
+		Simulated bool `json:"simulated"`
 	}
 	if err := json.Unmarshal(raw, &report); err != nil {
 		return "the capability report is unreadable, so this console cannot tell a real cluster from a simulated one"
@@ -228,8 +232,11 @@ func skipReason(run *engine.Run) string {
 	if !report.Analyzed {
 		return "nothing was measured about this cluster"
 	}
+	if report.Simulated {
+		return "simulated cluster -- kwok-controller is running its fake nodes, and AICR's validator lands on them and reports passes for checks that never ran"
+	}
 	if report.TotalGPUs == 0 {
-		return "simulated cluster -- AICR's validator lands on KWOK's fake nodes and reports passes for checks that never ran"
+		return "no GPU hardware to validate against"
 	}
 	return ""
 }

@@ -453,6 +453,37 @@ func TestAnalyzeFallsBackToTheProbeWhenNothingIsKnown(t *testing.T) {
 	}
 }
 
+// A KWOK cluster is not detected by counting GPUs -- its fake nodes advertise
+// eight each. It is detected by kwok-controller running in it, which is the
+// only reason those nodes report anything at all.
+func TestAnalyzeFlagsAKWOKClusterAsSimulated(t *testing.T) {
+	// Node counts deliberately non-zero: this is the shape the e2e produces,
+	// four fake accelerated nodes at eight GPUs apiece, and it is exactly the
+	// case the old totalGpus == 0 check got wrong.
+	got := gap.Analyze(loadFixture(t, "snapshot-kwok.yaml"), gap.ClusterGPUs{Nodes: 4, Total: 32, Usable: 32})
+	if !got.Simulated {
+		t.Error("Simulated = false on a snapshot listing kwok-controller -- validation would run for real against fake nodes and report passes for checks that never executed")
+	}
+	if got.TotalGPUs != 32 {
+		t.Errorf("TotalGPUs = %d, want 32 -- the GPU count is still honest, only the verdict about the substrate changes", got.TotalGPUs)
+	}
+}
+
+// TestAnalyzeDoesNotFlagARealClusterAsSimulated is the negative case. Both
+// fixtures the package has (snapshot-kwok.yaml, snapshot-kwok-h100.yaml) are
+// themselves KWOK captures, so the real-cluster shape is built the same way
+// k8sSnapshot's other callers build synthetic K8s measurements: an image list
+// with no "kwok" key.
+func TestAnalyzeDoesNotFlagARealClusterAsSimulated(t *testing.T) {
+	got := gap.Analyze(k8sSnapshot(measurement.Subtype{
+		Name: "image",
+		Data: map[string]measurement.Reading{"coredns": measurement.Str("v1.13.1")},
+	}), gap.ClusterGPUs{Nodes: 1, Total: 8, Usable: 8})
+	if got.Simulated {
+		t.Error("Simulated = true on a real cluster -- validation would be skipped where it is the whole point")
+	}
+}
+
 // TestAnalyzeHeadlineUsesTheResolvedGPUCount closes the half of the fix that
 // the first pass missed.
 //

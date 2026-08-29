@@ -246,6 +246,35 @@ func TestValidatePublishesTheVerdictAsData(t *testing.T) {
 	})
 }
 
+// The e2e's KWOK cluster reports 32 GPUs across four fake nodes. Before this,
+// skipReason saw a healthy GPU count and let validation run against fakes.
+//
+// The run otherwise carries everything resolve() needs to reach
+// ValidateState -- approved recipe, snapshot, decisions -- so this proves
+// skipReason itself is what stops the call. A run missing those artifacts
+// would also show ValidateCalls == 0, but for the wrong reason, and would not
+// catch a skipReason that stopped reading Simulated.
+func TestValidateSkipsASimulatedClusterThatReportsGPUs(t *testing.T) {
+	recipe := recipeFixture()
+	fake := &aicrclient.Fake{Recipe: recipe}
+	step := steps.NewValidate(fake, steps.ValidateConfig{WorkDir: t.TempDir()})
+
+	run := newRunWithSimulatedClusterThatReportsGPUs(t, recipe)
+
+	if err := step.Run(context.Background(), run, func(bus.Event) {}); err != nil {
+		t.Fatalf("Run() error = %v, want nil -- Validate never fails the run", err)
+	}
+	if fake.ValidateCalls != 0 {
+		t.Errorf("ValidateCalls = %d, want 0 -- a healthy GPU count on a simulated cluster must still skip", fake.ValidateCalls)
+	}
+	if run.Validation.Skipped == "" {
+		t.Error("Skipped is empty -- a simulated cluster that reports GPUs must still be recorded as skipped")
+	}
+	if !strings.Contains(run.Validation.Skipped, "simulated") {
+		t.Errorf("Skipped = %q, want it to name the cluster as simulated", run.Validation.Skipped)
+	}
+}
+
 // newRunWithSimulatedCluster is a run whose artifacts describe a cluster
 // WITHOUT GPUs, so skipReason refuses validation before ValidateState is
 // ever called.
@@ -267,5 +296,18 @@ func newRunWithRealCluster(t *testing.T, recipe *aicr.RecipeResult) *engine.Run 
 	run.Artifacts["capability.json"] = []byte(`{"totalGpus":16,"usableGpus":16,"analyzed":true}`)
 	run.Artifacts["snapshot.yaml"] = []byte(minimalSnapshot)
 	run.Artifacts["recipe.json"] = approvedFrom(t, recipe)
+	return run
+}
+
+// newRunWithSimulatedClusterThatReportsGPUs is newRunWithRealCluster's run --
+// approved recipe, snapshot, decisions, everything resolve() needs -- with
+// capability.json swapped for the shape the e2e's KWOK cluster actually
+// produces: a healthy GPU count (four fake nodes at eight apiece) alongside
+// simulated: true. skipReason must refuse on the simulated flag, not on the
+// GPU count -- this is the exact fixture the totalGpus == 0 check got wrong.
+func newRunWithSimulatedClusterThatReportsGPUs(t *testing.T, recipe *aicr.RecipeResult) *engine.Run {
+	t.Helper()
+	run := newRunWithRealCluster(t, recipe)
+	run.Artifacts["capability.json"] = []byte(`{"totalGpus":32,"usableGpus":32,"analyzed":true,"simulated":true}`)
 	return run
 }

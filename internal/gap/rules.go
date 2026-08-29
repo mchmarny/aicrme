@@ -32,6 +32,13 @@ const (
 // unique to this chart.
 var kaiSchedulerImageNames = []string{"podgrouper", "podgroupcontroller", "queuecontroller"}
 
+// kwokControllerImageName is the image key kwok-controller registers itself
+// under in K8s.image (see internal/gap/testdata/snapshot-kwok.yaml:371,
+// "kwok: v0.7.0", inside the subtype: image block). Its fake nodes are the
+// only reason a KWOK cluster reports GPUs, taints, or anything else at all,
+// so its presence is the mechanism itself rather than a proxy for it.
+const kwokControllerImageName = "kwok"
+
 // componentGPUOperator names the AICR recipe component (recipes/registry.yaml)
 // that closes gpu-driver, device-plugin, and gpu-metrics: all three are
 // GPU-Operator-managed — the driver, device plugin, and DCGM exporter are
@@ -178,6 +185,23 @@ func gpuSchedulerAbsent(p probe) bool {
 		}
 	}
 	return true
+}
+
+// kwokControllerPresent reports whether K8s.image lists kwok-controller,
+// which is the ground truth for a simulated cluster: KWOK's fake nodes only
+// report anything -- capacity, taints, GPUs -- because kwok-controller is
+// running and answering for them. Detects presence of the key, not its
+// version, so an image tag bump does not silently stop the detection.
+func kwokControllerPresent(p probe) bool {
+	m := p.measurement(measurement.TypeK8s)
+	if m == nil {
+		return false
+	}
+	st := m.GetSubtype(subtypeK8sImage)
+	if st == nil {
+		return false
+	}
+	return st.Has(kwokControllerImageName)
 }
 
 // providerName reads K8s.node's provider field, e.g. "kind" or "eks".
