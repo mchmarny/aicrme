@@ -248,6 +248,34 @@ describe('Wizard', () => {
     expect(screen.queryByTestId('prove-recovered')).toBeNull()
   })
 
+  // Finding 1 (final-review): `validate` matched none of renderBody's
+  // branches and fell through to the Discover fallback, so on a real
+  // cluster the screen redrew the capability report captured before
+  // anything was installed -- for as long as validation ran, with nothing
+  // indicating work in progress. The fix adds `validate` to the `cockpit`
+  // condition; this pins that the cockpit (which still shows the installed
+  // component rows) is on screen instead, the way the `prove` branch above
+  // it was pinned once already.
+  it('stays on the cockpit through the validate phase instead of redrawing Discover', () => {
+    const validating: AicrEvent[] = [
+      { id: 1, runId: 'runQ', at: '2026-08-28T00:00:00Z', kind: 'phase', level: 'info', phase: 'apply', message: 'phase started' },
+      {
+        id: 2, runId: 'runQ', at: '2026-08-28T00:00:01Z', kind: 'component', level: 'info', phase: 'apply',
+        component: 'gpu-operator', message: 'gpu-operator installed',
+        data: { name: 'gpu-operator', status: 'installed' },
+      },
+      { id: 3, runId: 'runQ', at: '2026-08-28T00:00:02Z', kind: 'phase', level: 'info', phase: 'apply', message: 'phase complete' },
+      { id: 4, runId: 'runQ', at: '2026-08-28T00:00:03Z', kind: 'phase', level: 'info', phase: 'validate', message: 'phase started' },
+      { id: 5, runId: 'runQ', at: '2026-08-28T00:00:04Z', kind: 'log', level: 'info', phase: 'validate', message: 'validating the deployment' },
+    ]
+
+    render(<Wizard events={validating} />)
+
+    expect(screen.getByTestId('component-gpu-operator')).toBeDefined()
+    expect(screen.queryByTestId('punchline')).toBeNull()
+    expect(screen.queryByText('Discovering the cluster…')).toBeNull()
+  })
+
   // The reducer, not just the panel: without this, Prove's validation tests
   // only prove a component renders props someone hands it, never that the
   // stream actually populates them.

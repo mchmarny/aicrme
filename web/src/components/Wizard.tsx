@@ -607,14 +607,21 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     )
   }
 
-  // The layout expands into the cockpit once the run reaches Bundle/Apply:
-  // the timeline rail narrows from w-96 to w-80, and Cockpit itself (unlike
-  // Discover/Recommend) renders full-width rather than centered under
-  // mx-auto max-w-2xl, so the live component pipeline gets the room a
-  // one-line-per-decision wizard screen never needed. A recovered run is
-  // never the cockpit, whatever phase it stopped in: it is a decision, not a
-  // pipeline, and Recovered redraws the persisted component rows itself.
-  const cockpit = !recovered && (run.phase === 'bundle' || run.phase === 'apply')
+  // The layout expands into the cockpit once the run reaches Bundle/Apply,
+  // and stays there through Validate: the timeline rail narrows from w-96 to
+  // w-80, and Cockpit itself (unlike Discover/Recommend) renders full-width
+  // rather than centered under mx-auto max-w-2xl, so the live component
+  // pipeline gets the room a one-line-per-decision wizard screen never
+  // needed. Validate belongs on this screen because it is not a new
+  // pipeline: run.state during it is 'running' with nothing else claiming
+  // that phase, so without this Cockpit's own fallback to Running keeps the
+  // just-installed component rows on screen while the timeline narrates
+  // "validating the deployment" and then the verdict -- the same reasoning
+  // that put `prove` on this screen once already (see the comment on that
+  // branch below). A recovered run is never the cockpit, whatever phase it
+  // stopped in: it is a decision, not a pipeline, and Recovered redraws the
+  // persisted component rows itself.
+  const cockpit = !recovered && (run.phase === 'bundle' || run.phase === 'apply' || run.phase === 'validate')
 
   function renderBody() {
     // First of all, before even the active branch. A teardown in flight is
