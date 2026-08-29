@@ -184,7 +184,15 @@ export interface Validation {
   phases?: PhaseSummary[]
 }
 
-/** Run mirrors Go's engine.Run field-for-field (internal/engine/run.go). Artifacts is Go json:"-" and never appears here. */
+/**
+ * Run is the shape these action endpoints return -- a subset of Go's
+ * engine.Run (internal/engine/run.go), not a field-for-field mirror of it,
+ * and was not one before this branch either. Everything else Run carries
+ * (Components, Workload, Ownership, Residue, Validation, ...) arrives over
+ * the event stream (useEvents.ts) instead, which is what Wizard.tsx's
+ * deriveRunState actually reads from. Artifacts is Go json:"-" and never
+ * appears anywhere.
+ */
 export interface Run {
   id: string
   state: 'idle' | 'running' | 'awaiting_decision' | 'failed' | 'active' | 'done' | 'resetting'

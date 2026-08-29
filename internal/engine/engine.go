@@ -288,8 +288,11 @@ func (e *Engine) SetStore(st Store) {
 }
 
 // SetSteps installs the pipeline the connect path built. Same shape and same
-// timing as SetStore, and for the same reason: three of the five steps hold a
-// clientset that does not exist until a cluster is chosen.
+// timing as SetStore, and for the same reason: three of the six steps hold a
+// clientset that does not exist until a cluster is chosen (Discover and
+// Apply directly, Prove through the prove.Client it is handed; Validate
+// takes only the session kubeconfig path and the aicr.Client, not a
+// kubernetes.Interface).
 func (e *Engine) SetSteps(steps ...Step) {
 	e.mu.Lock()
 	e.steps = steps

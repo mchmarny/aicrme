@@ -81,9 +81,13 @@ func TestValidateRunsTheDeploymentPhaseAndRecordsIt(t *testing.T) {
 	}
 	// Cannot inspect what each option DOES (see the test's doc comment), but
 	// a dropped or duplicated one changes this count -- e.g. losing
-	// WithValidationCleanup(true) would leave validator Jobs behind, and
+	// WithValidationRunID would break the per-run namespace scoping, and
 	// gaining an extra WithValidationPhases would add a phase Run() never
-	// asked for.
+	// asked for. WithValidationCleanup(true) itself is a no-op today --
+	// validator.New already defaults Cleanup to true -- but the count still
+	// has to survive it being dropped in a refactor that later flips that
+	// default, which is exactly the kind of change this count is here to
+	// catch before it ships silently.
 	if want := 5; len(fake.LastValidateOpts) != want {
 		t.Errorf("len(LastValidateOpts) = %d, want %d -- phases, kubeconfig, run ID, cleanup, timeout",
 			len(fake.LastValidateOpts), want)

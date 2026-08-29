@@ -170,6 +170,8 @@ type Run struct {
 	Residue Residue `json:"residue,omitzero"`
 	// Validation is the Validate step's verdict. Zero when the step has not
 	// run yet.
+	//
+	// omitzero, not omitempty: see Workload's comment.
 	Validation Validation `json:"validation,omitzero"`
 	// AgentNamespace is the namespace AICR's snapshot agent ran in, and
 	// whether Discover created it.

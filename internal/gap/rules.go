@@ -187,11 +187,17 @@ func gpuSchedulerAbsent(p probe) bool {
 	return true
 }
 
-// kwokControllerPresent reports whether K8s.image lists kwok-controller,
-// which is the ground truth for a simulated cluster: KWOK's fake nodes only
-// report anything -- capacity, taints, GPUs -- because kwok-controller is
-// running and answering for them. Detects presence of the key, not its
-// version, so an image tag bump does not silently stop the detection.
+// kwokControllerPresent reports whether K8s.image lists kwok-controller -- a
+// deliberately conservative proxy for "some or all of this cluster's nodes
+// are fake," not the mechanism itself. The e2e's own cluster is a hybrid of
+// real kind workers and KWOK's fake accelerated nodes, and a real cluster
+// that happened to run kwok-controller alongside genuine H100s would be
+// flagged simulated too. Erring toward skipping is the right call anyway:
+// the cost of a false positive is a validation that skipped when it did not
+// strictly need to; the cost of a false negative is AICR's validator landing
+// on a fake node and reporting a pass for a check that never ran. Detects
+// presence of the key, not its version, so an image tag bump does not
+// silently stop the detection.
 func kwokControllerPresent(p probe) bool {
 	m := p.measurement(measurement.TypeK8s)
 	if m == nil {

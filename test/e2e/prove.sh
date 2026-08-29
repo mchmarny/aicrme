@@ -200,6 +200,12 @@ WORKLOAD="$(echo "${RUN_JSON}" | jq -c '.workload')"
   || fail "run.workload does not name this run's Job: ${WORKLOAD}"
 echo "run.workload: ${WORKLOAD}"
 
+# The assert numbers below are ordered by dependency -- what has to be true
+# on the cluster before the next check makes sense -- not by their position
+# in this file. assert 7 (validation) sits right after assert 2 because it
+# reads the same run while its workload is still active, well before assert
+# 3 restarts the console; renumbering it to fit the file's line order would
+# just as quickly go stale the next time an assertion moves.
 echo "--- assert 1: kai-scheduler ran on a real Kind worker, not a simulated node"
 # KAI's own components tolerate broadly. A controller that lands on a KWOK
 # node receives a synthesized Ready without its container ever executing, so
