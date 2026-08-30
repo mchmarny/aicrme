@@ -56,7 +56,7 @@ func crossCheckFixtures(t *testing.T) map[string]*aicr.Snapshot {
 // real run takes.
 func resolvesFor(t *testing.T, client aicrclient.API, snap *aicr.Snapshot, intent, platform string) bool {
 	t.Helper()
-	step := steps.NewRecommend(client)
+	step := steps.NewRecommend(client, nil)
 	run := newRun()
 	run.Decisions["intent"] = intent
 	run.Decisions["platform"] = platform

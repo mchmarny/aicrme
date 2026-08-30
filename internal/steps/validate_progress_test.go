@@ -148,3 +148,50 @@ func TestProgressHandlerIsAPassThroughUntilAttached(t *testing.T) {
 		t.Errorf("base handler did not receive the record: %q", buf.String())
 	}
 }
+
+// AICR raises advisories about the recipe it is resolving, stamped with the
+// component they concern. On real EKS hardware 2026-08-30 this exact warning
+// predicted the failure that stalled the install twenty minutes later --
+// nvidia kernel setup ran on Amazon Linux nodes because no accelerated-node
+// selector was set -- and it went to stderr and nowhere else.
+func TestProgressHandlerForwardsAICRComponentWarnings(t *testing.T) {
+	var got []bus.Event
+	h := steps.NewProgressHandler(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	defer h.Attach(func(e bus.Event) { got = append(got, e) })()
+
+	r := slog.NewRecord(time.Now(), slog.LevelWarn,
+		"nodewright-customizations is enabled but --accelerated-node-selector is not set", 0)
+	r.Add("component", "nodewright-customizations")
+	handle(t, h, r)
+
+	if len(got) != 1 {
+		t.Fatalf("published %d events, want 1: %+v", len(got), got)
+	}
+	if got[0].Component != "nodewright-customizations" {
+		t.Errorf("Component = %q, want the component the advisory names", got[0].Component)
+	}
+	if got[0].Level != bus.LevelWarn {
+		t.Errorf("Level = %q, want warn -- it is a warning", got[0].Level)
+	}
+	if !strings.Contains(got[0].Message, "accelerated-node-selector") {
+		t.Errorf("Message = %q, want AICR's own wording preserved", got[0].Message)
+	}
+}
+
+// Matched on level and the presence of a component, NOT on message text: the
+// wording is AICR's to change, and the next advisory should surface without a
+// code change here. But an INFO record with a component is ordinary narration
+// and must not become a warning on screen.
+func TestProgressHandlerIgnoresInfoLevelComponentRecords(t *testing.T) {
+	var got []bus.Event
+	h := steps.NewProgressHandler(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	defer h.Attach(func(e bus.Event) { got = append(got, e) })()
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "auto-disabled gpu-operator driver install", 0)
+	r.Add("component", "gpu-operator")
+	handle(t, h, r)
+
+	if len(got) != 0 {
+		t.Errorf("published %+v, want nothing -- info is not an advisory", got)
+	}
+}

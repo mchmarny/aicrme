@@ -60,7 +60,7 @@ func loadH100Snapshot(t *testing.T) *aicr.Snapshot {
 }
 
 func TestRecommendRequiresExactlyTwoDecisions(t *testing.T) {
-	step := steps.NewRecommend(&aicrclient.Fake{})
+	step := steps.NewRecommend(&aicrclient.Fake{}, nil)
 	got := step.Requires()
 	want := []string{"intent", "platform"}
 	if len(got) != len(want) {
@@ -75,7 +75,7 @@ func TestRecommendRequiresExactlyTwoDecisions(t *testing.T) {
 
 func TestRecommendMapsDecisionsToCriteria(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -109,7 +109,7 @@ func TestRecommendMapsDecisionsToCriteria(t *testing.T) {
 // verbatim.
 func TestRecommendDerivesCriteriaFromTheSnapshot(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -146,7 +146,7 @@ func TestRecommendDerivesCriteriaFromTheSnapshot(t *testing.T) {
 // components is unusual but not impossible, and it must serialize as [].
 func TestRecommendMarshalsEmptyComponentsAsArray(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: &aicr.RecipeResult{Name: "empty", Version: "0.19.0"}}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -165,7 +165,7 @@ func TestRecommendMarshalsEmptyComponentsAsArray(t *testing.T) {
 
 func TestRecommendStoresComponentSummary(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -190,7 +190,7 @@ func TestRecommendStoresComponentSummary(t *testing.T) {
 
 func TestRecommendPropagatesResolveFailure(t *testing.T) {
 	fake := &aicrclient.Fake{ResolveErr: errors.New("no recipe for these coordinates")}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -208,7 +208,7 @@ func TestRecommendFailsOnNilResult(t *testing.T) {
 	// concrete type — this guards against a future or alternate
 	// implementation doing so silently.
 	fake := &aicrclient.Fake{}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -221,7 +221,7 @@ func TestRecommendFailsOnNilResult(t *testing.T) {
 }
 
 func TestRecommendPhase(t *testing.T) {
-	if got := steps.NewRecommend(&aicrclient.Fake{}).Phase(); got != engine.PhaseRecommend {
+	if got := steps.NewRecommend(&aicrclient.Fake{}, nil).Phase(); got != engine.PhaseRecommend {
 		t.Errorf("Phase() = %q, want %q", got, engine.PhaseRecommend)
 	}
 }
@@ -236,7 +236,7 @@ func TestRecommendPhase(t *testing.T) {
 // test file, since aicrclient.Fake never validates its arguments.
 func TestRecommendFailsLoudlyWithoutSnapshot(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -258,7 +258,7 @@ func TestRecommendFailsLoudlyWithoutSnapshot(t *testing.T) {
 
 func TestRecommendFailsOnUnparseableSnapshot(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "training"
@@ -294,7 +294,7 @@ func TestRecommendRejectsEmptyDecisionValues(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &aicrclient.Fake{Recipe: recipeFixture()}
-			step := steps.NewRecommend(fake)
+			step := steps.NewRecommend(fake, nil)
 
 			run := newRun()
 			run.Decisions["intent"] = tc.intent
@@ -339,7 +339,7 @@ func TestRecommendResolveAgainstRealFixture(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 
-	step := steps.NewRecommend(client)
+	step := steps.NewRecommend(client, nil)
 	run := newRun()
 	run.Decisions["intent"] = "training"
 	run.Decisions["platform"] = "kubeflow"
@@ -373,7 +373,7 @@ func TestRecommendResolveAgainstRealFixture(t *testing.T) {
 // proves Recommend does, before ever calling the resolver.
 func TestRecommendFailsOnZeroSpecificityCriteria(t *testing.T) {
 	fake := &aicrclient.Fake{Recipe: recipeFixture()}
-	step := steps.NewRecommend(fake)
+	step := steps.NewRecommend(fake, nil)
 
 	run := newRun()
 	run.Decisions["intent"] = "any"
@@ -431,7 +431,7 @@ func TestRecommendKWOKGPUlessFixtureMatrix(t *testing.T) {
 			key := intent + "/" + platform
 			wantErr := !succeeds[key]
 			t.Run(key, func(t *testing.T) {
-				step := steps.NewRecommend(client)
+				step := steps.NewRecommend(client, nil)
 				run := newRun()
 				run.Decisions["intent"] = intent
 				run.Decisions["platform"] = platform
@@ -486,7 +486,7 @@ func TestRecommendResolvesAgainstSimulatedH100Fixture(t *testing.T) {
 			key := intent + "/" + platform
 			wantErr := !succeeds[key]
 			t.Run(key, func(t *testing.T) {
-				step := steps.NewRecommend(client)
+				step := steps.NewRecommend(client, nil)
 				run := newRun()
 				run.Decisions["intent"] = intent
 				run.Decisions["platform"] = platform

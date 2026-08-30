@@ -31,7 +31,8 @@ type RecipeSummary struct {
 }
 
 type recommend struct {
-	client aicrclient.API
+	client   aicrclient.API
+	progress *ProgressHandler
 }
 
 // NewRecommend returns the Recommend step. It gates on the only two decisions
@@ -39,14 +40,24 @@ type recommend struct {
 // derived from the snapshot's own fingerprint (see buildCriteria); component
 // set, versions, and values are all then derived by AICR from the resolved
 // recipe.
-func NewRecommend(c aicrclient.API) engine.Step {
-	return &recommend{client: c}
+// NewRecommend returns the Recommend step. progress may be nil; when set,
+// AICR's own component advisories raised while resolving the recipe are teed
+// onto the bus instead of going only to stderr.
+func NewRecommend(c aicrclient.API, progress *ProgressHandler) engine.Step {
+	return &recommend{client: c, progress: progress}
 }
 
 func (r *recommend) Phase() engine.Phase { return engine.PhaseRecommend }
 func (r *recommend) Requires() []string  { return []string{"intent", "platform"} }
 
 func (r *recommend) Run(ctx context.Context, run *engine.Run, emit engine.Emit) error {
+	// Attached for the resolve, which is where AICR raises its recipe
+	// advisories -- the ones that predict an install failure and previously
+	// only reached stderr.
+	if r.progress != nil {
+		defer r.progress.Attach(emit)()
+	}
+
 	snap, err := decodeSnapshot(run.Artifacts["snapshot.yaml"])
 	if err != nil {
 		return err

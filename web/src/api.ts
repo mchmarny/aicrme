@@ -83,6 +83,12 @@ export interface NodeGroup {
 export interface NodeComposition {
   total: number
   gpuNodes: number
+  /**
+   * untainted is how many nodes accept a pod carrying no tolerations — which
+   * is what most of a recipe's charts are. Zero means the install cannot
+   * proceed, and it is knowable before the first component is attempted.
+   */
+  untainted: number
   groups?: NodeGroup[]
   /** more: shapes beyond the display cap, counted rather than dropped. */
   more?: number

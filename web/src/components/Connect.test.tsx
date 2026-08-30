@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Connect } from './Connect'
+import { Connect, contextLabel } from './Connect'
 import type { ClusterInfo, NodeComposition } from '../api'
 
 const contexts = [
@@ -41,6 +41,7 @@ const manyContexts = [
 const taintedNodes: NodeComposition = {
   total: 6,
   gpuNodes: 2,
+  untainted: 3,
   groups: [
     {
       count: 2,
@@ -201,7 +202,7 @@ describe('Connect', () => {
     expect(screen.getByText(/nvidia-h100-mega-80gb/)).toBeDefined()
     expect(screen.getByText(/8 GPU each/)).toBeDefined()
     expect(screen.getByText(/3 × e2-standard-4/)).toBeDefined()
-    expect(screen.getByText(/2 with GPUs/)).toBeDefined()
+    expect(screen.getByText(/2 advertising GPUs/)).toBeDefined()
   })
 
   // The Phase 4 failure, now handled rather than delegated. The screen used to
@@ -226,6 +227,7 @@ describe('Connect', () => {
     const healthy: NodeComposition = {
       total: 6,
       gpuNodes: 2,
+      untainted: 3,
       groups: [
         {
           count: 2,
@@ -284,6 +286,7 @@ describe('Connect', () => {
     const many: NodeComposition = {
       total: 90,
       gpuNodes: 0,
+      untainted: 3,
       groups: [{ count: 10, instanceType: 'e2-standard-4' }],
       more: 3,
     }
@@ -343,5 +346,75 @@ describe('Connect', () => {
     render(<Connect onConnected={() => {}} />)
 
     expect(await screen.findByText(/failed to read your kubeconfig/i)).toBeDefined()
+  })
+})
+
+// Observed on EKS 2026-08-30: every node carried dedicated=worker-workload, so
+// the first chart sat Unschedulable for 3m23s and the install stalled. Nothing
+// said so at Connect, where it was already knowable.
+it('warns before connecting when no node can take an untolerated pod', async () => {
+  mockFetch({
+    contexts: () => new Response(JSON.stringify([{ name: 'eks', server: 'https://x', current: true }]), { status: 200 }),
+    connect: () => new Response(
+      JSON.stringify(withNodes({ ...taintedNodes, untainted: 0 })), { status: 200 }),
+  })
+
+  render(<Connect onConnected={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+  const warning = await screen.findByTestId('nothing-schedulable')
+  expect(warning.textContent).toMatch(/will not schedule/i)
+  expect(warning.textContent).toMatch(/install will stall/i)
+})
+
+// The ordinary case must not show it: a cluster with any untainted node is fine.
+it('does not warn when some node can take an untolerated pod', async () => {
+  mockFetch({
+    contexts: () => new Response(JSON.stringify([{ name: 'gke', server: 'https://x', current: true }]), { status: 200 }),
+    connect: () => new Response(JSON.stringify(clusterInfo), { status: 200 }),
+  })
+
+  render(<Connect onConnected={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+  await screen.findByText(/Connected/i)
+  expect(screen.queryByTestId('nothing-schedulable')).toBeNull()
+})
+
+// A p5.48xlarge has eight H100s and advertises none of them until a device
+// plugin lands, so "no GPUs" was a false claim about the hardware on real EKS
+// nodes. The screen reports what the scheduler can see, and now says so.
+it('says GPUs are unadvertised rather than absent', async () => {
+  mockFetch({
+    connect: () => new Response(JSON.stringify(withNodes({
+      total: 2,
+      gpuNodes: 0,
+      untainted: 2,
+      groups: [{ count: 2, instanceType: 'p5.48xlarge' }],
+    })), { status: 200 }),
+  })
+
+  render(<Connect onConnected={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+  expect(await screen.findByText(/none advertised/)).toBeDefined()
+  expect(screen.queryByText(/no GPUs/)).toBeNull()
+})
+
+describe('contextLabel', () => {
+  // Every AWS row shares the same ~40-character ARN prefix, so the only part
+  // that identifies the cluster is last -- and wraps to a second line.
+  // Observed on real EKS 2026-08-30.
+  it('leads with the cluster name for an EKS ARN', () => {
+    const got = contextLabel('arn:aws:eks:us-east-1:615299774277:cluster/aicr-uat-day-ah1-0-33316327543')
+    expect(got.lead).toBe('aicr-uat-day-ah1-0-33316327543')
+    expect(got.prefix).toBe('arn:aws:eks:us-east-1:615299774277:cluster/')
+  })
+
+  // GKE and plain names front-load what matters already; splitting them would
+  // invent structure that is not there.
+  it('leaves a non-ARN name whole', () => {
+    expect(contextLabel('gke_proj_us-central1_cluster-1')).toEqual({ lead: 'gke_proj_us-central1_cluster-1' })
+    expect(contextLabel('minikube')).toEqual({ lead: 'minikube' })
   })
 })

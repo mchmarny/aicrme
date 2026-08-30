@@ -734,7 +734,7 @@ func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string
 			// installs anything, which is the same moment Connect measured.
 			ClusterGPUs: gpus,
 		}),
-		steps.NewRecommend(w.aicr),
+		steps.NewRecommend(w.aicr, w.progress),
 		steps.NewBundle(w.aicr, steps.BundleConfig{
 			WorkDir: w.workDir,
 		}),

@@ -94,10 +94,22 @@ type NodeGroup struct {
 // each Node object is fat, so sending per-node data to a browser would make
 // this screen scale with the cluster. Groups do not.
 type NodeComposition struct {
-	Total    int         `json:"total"`
-	GPUNodes int         `json:"gpuNodes"`
-	Groups   []NodeGroup `json:"groups,omitempty"`
-	More     int         `json:"more,omitempty"`
+	Total    int `json:"total"`
+	GPUNodes int `json:"gpuNodes"`
+	// Untainted is how many nodes accept a pod carrying no tolerations at all.
+	//
+	// That is what most of a recipe is: helm charts whose Deployments declare
+	// no tolerations. When this is zero, the install cannot proceed and the
+	// operator learns it component by component instead of up front -- on real
+	// EKS 2026-08-30 every node carried dedicated=worker-workload, the first
+	// component sat Unschedulable for 3m23s, and nothing had said so at
+	// Connect. Deliberately NOT the same question as the GPU-node taint
+	// remedy: that one asks whether AICR's agent and the reference workload can
+	// reach the GPUs, which aicrme can fix with its own tolerations. This asks
+	// whether anybody else's pods can land anywhere, which it cannot.
+	Untainted int         `json:"untainted"`
+	Groups    []NodeGroup `json:"groups,omitempty"`
+	More      int         `json:"more,omitempty"`
 	// TotalGPUs and UsableGPUs are cluster-wide, summed across every node.
 	//
 	// They exist because the snapshot cannot answer this. gap.Analyze derives
@@ -148,6 +160,11 @@ func groupNodes(nodes []corev1.Node, tolerations []corev1.Toleration) NodeCompos
 
 	for i := range nodes {
 		g := describe(&nodes[i], tolerations)
+		// Counted against an EMPTY toleration set, not the console's own: the
+		// question is whether a chart that tolerates nothing can land here.
+		if len(untoleratedTaints(&nodes[i], nil)) == 0 {
+			comp.Untainted++
+		}
 		if g.GPUsPerNode > 0 {
 			comp.GPUNodes++
 			comp.TotalGPUs += gpuQuantity(nodes[i].Status.Capacity)

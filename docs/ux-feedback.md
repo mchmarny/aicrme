@@ -444,3 +444,31 @@ could not schedule at all.
 20. **Long ARN context names wrap and bury the cluster name.** `aws eks update-kubeconfig`
     writes ARNs, so every row shares the same 40-character prefix and the identifying part is
     last.
+
+---
+
+## 9. Findings 19-25 shipped, and one deliberately not — 2026-08-30
+
+All of the EKS findings are addressed except one, which is recorded here as a decision rather
+than a gap.
+
+**Shipped:** the condition debounce (19), the Connect-time "nothing can schedule" warning (23),
+"none advertised" instead of "no GPUs" (21), AICR's component advisories teed onto the timeline
+(24), ARN context names leading with the cluster (20), the inferred-GPU-count fix (22), and the
+qualified success line when a component never finished (25).
+
+**Not fixed, and not a gap: a failed validator's logs (14).**
+
+`WithValidationCleanup(false)` is the only lever, and it does not mean "keep the failing pod" —
+it means keep **Jobs, ConfigMaps and RBAC** for every validator, including the per-run
+cluster-admin ClusterRoleBinding. Trading a permanent privileged binding, in a namespace Reset
+already cannot remove, for post-hoc diagnostics is the wrong bargain.
+
+Capturing the logs ourselves is not available either. AICR's own failure message reads *"no pod
+remains for it, so its logs are unavailable"* — the pod is gone before AICR builds that string,
+so there is nothing for a caller to race for. `ValidateState` is one blocking call with no
+mid-flight hook.
+
+It is a real problem, it is just not aicrme's: the check whose failure most needs explaining is
+the only one guaranteed to have no evidence. That is ask 2 of
+[NVIDIA/aicr#2473](https://github.com/NVIDIA/aicr/issues/2473), where it can actually be fixed.

@@ -51,6 +51,24 @@ export function matches(c: ContextInfo, query: string): boolean {
   return c.name.toLowerCase().includes(q) || (c.server ?? '').toLowerCase().includes(q)
 }
 
+/**
+ * contextLabel splits a context name into the part that identifies the cluster
+ * and the boilerplate in front of it.
+ *
+ * `aws eks update-kubeconfig` writes ARNs, so every row on an AWS engineer's
+ * screen begins with the same ~40 characters — `arn:aws:eks:us-east-1:
+ * 615299774277:cluster/` — and the only distinguishing part is last, where a
+ * wrap puts it on a second line. Observed on real EKS 2026-08-30.
+ *
+ * The full name is never hidden: it stays in the title and is what the filter
+ * matches, so nothing an operator might search for disappears.
+ */
+export function contextLabel(name: string): { lead: string; prefix?: string } {
+  const arn = /^(arn:aws:[^:]*:[^:]*:[^:]*:cluster\/)(.+)$/.exec(name)
+  if (arn) return { lead: arn[2], prefix: arn[1] }
+  return { lead: name }
+}
+
 export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => void }) {
   const [contexts, setContexts] = useState<ContextInfo[] | null>(null)
   const [selected, setSelected] = useState('')
@@ -145,7 +163,12 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
                 />
                 <span className="min-w-0 flex-1">
                   <span className="flex items-baseline gap-2">
-                    <span className="break-all font-mono text-sm text-ink-strong">{c.name}</span>
+                    <span className="min-w-0 font-mono text-sm" title={c.name}>
+                      {contextLabel(c.name).prefix && (
+                        <span className="text-ink-faint">{contextLabel(c.name).prefix}</span>
+                      )}
+                      <span className="break-all text-ink-strong">{contextLabel(c.name).lead}</span>
+                    </span>
                     {c.current && (
                       <span className="shrink-0 rounded bg-accent/15 px-1.5 text-xs text-accent">current</span>
                     )}
@@ -248,7 +271,7 @@ function Composition({ nodes }: { nodes: NodeComposition }) {
       <div className="flex gap-3 text-sm">
         <span className="w-20 shrink-0 text-ink-faint">nodes</span>
         <span className="text-ink">
-          {`${nodes.total} total · ${nodes.gpuNodes} with GPUs`}
+          {`${nodes.total} total · ${nodes.gpuNodes} advertising GPUs`}
         </span>
       </div>
 
@@ -268,6 +291,25 @@ function Composition({ nodes }: { nodes: NodeComposition }) {
             Your GPU nodes are tainted. This run will tolerate:
           </p>
           <code className="mt-1 block break-all text-ink">{nodes.tolerating}</code>
+        </div>
+      )}
+
+      {/* The install-cannot-start condition, stated before the button rather
+          than discovered component by component. On EKS 2026-08-30 every node
+          carried an untolerated taint, the first chart sat Unschedulable for
+          3m23s, and nothing had said so. Distinct from the GPU remedy above:
+          that one aicrme can fix with its own tolerations, this one it cannot
+          — the charts are somebody else's. */}
+      {nodes.total > 0 && nodes.untainted === 0 && (
+        <div data-testid="nothing-schedulable" className="rounded border border-fail/40 bg-fail/10 px-3 py-2 text-xs">
+          <p className="text-fail">
+            No node accepts a workload without tolerations, so the recipe's components
+            will not schedule and the install will stall on the first one.
+          </p>
+          <p className="mt-1 text-ink-soft">
+            Every one of the {nodes.total} nodes is tainted. Remove the taint from the nodes
+            that should run platform components, or the install cannot proceed.
+          </p>
         </div>
       )}
 
@@ -304,7 +346,13 @@ function GroupRow({ group }: { group: NodeGroup }) {
           {`${group.count} × ${group.instanceType || 'unlabelled'}`}
         </span>
         <span className={`shrink-0 ${hasGPUs ? 'text-accent' : 'text-ink-faint'}`}>
-          {hasGPUs ? `${group.gpusPerNode} GPU each` : 'no GPUs'}
+          {/* "none advertised", not "no GPUs". This reads node capacity, and
+              a p5.48xlarge with eight H100s advertises nothing until a device
+              plugin lands -- so the screen told an operator on real EKS
+              hardware that their GPU nodes had no GPUs. The new wording is
+              true of a CPU node and of a GPU node that is not yet configured,
+              which is precisely the state this console exists to fix. */}
+          {hasGPUs ? `${group.gpusPerNode} GPU each` : 'none advertised'}
         </span>
       </div>
 

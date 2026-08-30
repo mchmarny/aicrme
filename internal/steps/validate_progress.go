@@ -18,6 +18,8 @@ const (
 	aicrValidatorStartMsg = "running validator"
 	aicrValidatorDoneMsg  = "validator completed"
 	aicrValidatorNameAttr = "name"
+	// AICR stamps its recipe-time advisories with the component they concern.
+	aicrComponentAttr     = "component"
 	aicrValidatorStatAttr = "status"
 	aicrPhaseSelectedAttr = "selected"
 )
@@ -105,13 +107,7 @@ func (h *ProgressHandler) Handle(ctx context.Context, r slog.Record) error {
 
 // progressEvent translates one AICR record, or reports that it is not one.
 func progressEvent(r slog.Record) (bus.Event, bool) {
-	switch r.Message {
-	case aicrPhaseStartMsg, aicrValidatorStartMsg, aicrValidatorDoneMsg:
-	default:
-		return bus.Event{}, false
-	}
-
-	var name, status, selected string
+	var name, status, selected, component string
 	r.Attrs(func(a slog.Attr) bool {
 		switch a.Key {
 		case aicrValidatorNameAttr:
@@ -120,9 +116,36 @@ func progressEvent(r slog.Record) (bus.Event, bool) {
 			status = a.Value.String()
 		case aicrPhaseSelectedAttr:
 			selected = a.Value.String()
+		case aicrComponentAttr:
+			component = a.Value.String()
 		}
 		return true
 	})
+
+	// A warning AICR raises about a specific component, forwarded whatever its
+	// wording. These are advisories about the recipe being resolved, and they
+	// went to stderr and nowhere else: on real EKS hardware
+	// "nodewright-customizations is enabled but --accelerated-node-selector is
+	// not set. Without this selector, the customization will run on all nodes"
+	// predicted, exactly, the failure that stalled the install twenty minutes
+	// later -- and the operator never saw it. Matched on level and the presence
+	// of a component rather than on message text, because the text is AICR's to
+	// change and the next such warning should surface without a code change
+	// here.
+	if r.Level >= slog.LevelWarn && component != "" {
+		return bus.Event{
+			Kind:      bus.KindLog,
+			Level:     bus.LevelWarn,
+			Component: component,
+			Message:   r.Message,
+		}, true
+	}
+
+	switch r.Message {
+	case aicrPhaseStartMsg, aicrValidatorStartMsg, aicrValidatorDoneMsg:
+	default:
+		return bus.Event{}, false
+	}
 
 	ev := bus.Event{Kind: bus.KindLog}
 	switch r.Message {
