@@ -292,6 +292,10 @@ type Options struct {
 	Kubeconfig  string // explicit --kubeconfig, empty for the default loading rules
 	Context     string // explicit --context, empty for the kubeconfig's current-context
 	OpenBrowser bool
+	// Progress is the slog handler AICR's validation logging is teed through.
+	// Optional: nil means validation still runs, it just narrates nothing --
+	// which is how it behaved before, and is what the tests use.
+	Progress *steps.ProgressHandler
 }
 
 // Run starts the console and blocks until ctx is done and shutdown completes.
@@ -430,6 +434,7 @@ func Run(ctx context.Context, opts Options) error {
 		engine:         eng,
 		session:        &sess,
 		obsStop:        obsStop,
+		progress:       opts.Progress,
 	})
 
 	httpSrv, err := startServer(ctx, opts, srv.Handler(), token, cancel)
@@ -548,6 +553,8 @@ type clusterWiring struct {
 	engine         *engine.Engine
 	session        *sessionState
 	obsStop        <-chan struct{}
+	// progress tees AICR's validation logging onto the bus; nil is valid.
+	progress *steps.ProgressHandler
 }
 
 // connectHook is everything that has to be true before the console answers a
@@ -719,7 +726,8 @@ func (w clusterWiring) steps(kube kubernetes.Interface, sessionKubeconfig string
 			Kube: kube,
 		}),
 		steps.NewValidate(w.aicr, steps.ValidateConfig{
-			WorkDir: w.workDir,
+			WorkDir:  w.workDir,
+			Progress: w.progress,
 			// The session kubeconfig, not the operator's: the validator
 			// schedules Jobs, and it must run against the cluster this run
 			// is pinned to rather than whatever the ambient context is.

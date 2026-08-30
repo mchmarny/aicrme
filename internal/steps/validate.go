@@ -39,6 +39,10 @@ type ValidateConfig struct {
 	Kubeconfig string
 	// Timeout bounds the whole validation. Zero uses defaultValidateTimeout.
 	Timeout time.Duration
+	// Progress tees AICR's own per-check logging onto the bus for the duration
+	// of the ValidateState call. Nil is valid and means the phase narrates
+	// nothing, which is how it behaved before ProgressHandler existed.
+	Progress *ProgressHandler
 }
 
 // defaultValidateTimeout bounds the deployment phase.
@@ -98,6 +102,13 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 	}
 
 	emit(bus.Event{Kind: bus.KindLog, Message: "validating the deployment"})
+
+	// Attached only around this call. AICR reports each check as it starts and
+	// finishes, and those records are the only progress that exists -- the SDK
+	// takes no callback and returns nothing until every check is done.
+	if v.cfg.Progress != nil {
+		defer v.cfg.Progress.Attach(emit)()
+	}
 
 	results, err := v.client.ValidateState(ctx, result, snap,
 		aicr.WithValidationPhases(aicr.PhaseDeployment),

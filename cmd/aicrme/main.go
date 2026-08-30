@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/mchmarny/aicrme/internal/console"
+	"github.com/mchmarny/aicrme/internal/steps"
 	"github.com/mchmarny/aicrme/internal/version"
 )
 
@@ -41,7 +42,13 @@ func main() {
 		return
 	}
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	// AICR logs each validation check through slog's DEFAULT logger, so the
+	// handler installed here is the one that sees them. Teeing it lets the
+	// Validate step narrate a phase the SDK otherwise runs in total silence.
+	progress := steps.NewProgressHandler(
+		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(slog.New(progress))
+	opts.Progress = progress
 	slog.Info("starting aicrme", "version", version.String())
 
 	// SIGINT and SIGTERM cancel ctx, which is the only thing that stops Run.
