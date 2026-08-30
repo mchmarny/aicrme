@@ -146,11 +146,16 @@ and bound every member to a node advertising GPUs. `test/e2e/prove.sh` asserts t
 
 Ordered by what unblocks the most. Each item says what it costs and what it is waiting on.
 
-1. **AWS/EKS.** First run 2026-08-30 on a mixed-OS cluster: it completed (15 of 16 installed,
-   gang placed, 3 of 4 validation checks passed) but surfaced four aicrme findings and two
-   upstream issues — see `docs/ux-feedback.md` entry 8. The blockers were a cluster where every
-   node carried an untolerated taint, and a recipe whose node customizations ran NVIDIA kernel
-   setup on Amazon Linux nodes. **AKS remains untested.**
+1. **AWS/EKS runs clean end to end; the Operator's own validator does not.** Second run
+   2026-08-30: 16 of 16 installed in 8m23s, a gang of 2 placed on 8 of 8 GPUs, validation
+   reaching a verdict inside its timeout. `expected-resources` has now failed on every real
+   cluster tried. On EKS the mechanism is visible for the first time: AICR warns at recommend
+   time that a pre-installed driver was found but the resolved overlay is not a
+   preinstalled-driver profile, leaving the toolkit enabled with no operator-managed driver
+   root — and 20 minutes later the cluster reports `nvidia-operator-validator:
+   FailedCreatePodSandBox ... no runtime for "nvidia" is configured`. AICR offers
+   preinstalled-driver overlays for AKS, GKE-COS and OKE, but not for EKS, where a Deep Learning
+   AMI ships the driver. That gap is the upstream ask. **AKS remains untested.**
 2. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
    runs between Apply and Prove (`internal/steps/validate.go`) and records a verdict on the run —
    see the two Validation rows above, which separate what CI proves from what it cannot. `ValidateState` false-passes on KWOK — the validator schedules
@@ -184,11 +189,11 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    name, so no output identifies a component.
 3. **AKS**, unblocked by AICR v0.20.0 and now the only untested cloud. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
-4. **UI follow-ups** from the 2026-08-28 real-hardware pass. 27 of 30 shipped; what is left is in
-   `docs/ux-feedback.md` entry 3 — the timeline still renders Discover's gap findings as bare
-   amber warnings on the decision screen (the framing heading only reached the Discover panel),
-   the mark is absent from the Confirm screen, and the primary button is a large expanse of
-   accent. None blocks a demo.
+4. **UI follow-ups** from the real-hardware passes. Every finding raised through 2026-08-30 is
+   shipped or recorded as a decision. Three cosmetic items remain: the timeline renders
+   Discover's gap findings as bare amber warnings on the decision screen (the framing heading
+   only reached the Discover panel), the mark is absent from the Confirm screen, and the primary
+   button is a large expanse of accent. None blocks a demo. New findings go to GitHub issues.
 5. **Three residue classes block a manual cleanup** — see below. Nothing inventories them, and two
    of them deadlock a teardown rather than merely lingering.
 6. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
@@ -201,11 +206,11 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    "gpu-operator caused this". That restraint is what makes the attribution trustworthy, and it
    is the thing to lead with. Also worth capturing: the gap report before anything is installed,
    the run record surviving a restart, and validation refusing to attest to a drifted recipe.
-8. **Keep the docs collapsed, and move tracking to GitHub issues.** `docs/` is now STATE.md and
-   the UX list. The upstream-asks file is gone: a genuine SDK gap goes to
-   [NVIDIA/aicr](https://github.com/NVIDIA/aicr/issues) as an issue rather than being carried
-   here. `docs/ux-feedback.md` retires the same way once its open findings are closed — after
-   that, work items live as issues on this repo. Resist growing a second status document.
+8. **Docs stay collapsed; tracking lives in GitHub issues.** `docs/` is this file and nothing
+   else. The upstream-asks list and the UX feedback list have both retired into it: a genuine SDK
+   gap goes to [NVIDIA/aicr](https://github.com/NVIDIA/aicr/issues) as an issue, a console defect
+   goes to this repo's issues, and the reasoning behind a decision not to fix something goes in a
+   comment beside the code it constrains. Resist growing a second status document.
 
 ### Known and deliberately not fixed
 

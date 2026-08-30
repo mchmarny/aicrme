@@ -54,7 +54,8 @@ func testEvent(involvedUID types.UID, name, evType string) *corev1.Event {
 
 // reasonFailedCreate is the Warning a ReplicaSet or DaemonSet reports when it
 // cannot create a pod -- the reason in the real, observed defect this file's
-// controller-owner tests exist for (docs/ux-feedback.md item 2).
+// controller-owner tests exist for: a controller's Warning left standing on a
+// healthy row of the success screen.
 const reasonFailedCreate = "FailedCreate"
 
 // testControllerName is the ReplicaSet in the observed defect, named the way
@@ -66,8 +67,8 @@ const testControllerName = "kai-scheduler-default-b5c69699f"
 // ReplicaSet/DaemonSet itself, which is exactly why nothing keyed on a Pod
 // identity can ever resolve it.
 //
-// The message is the one a human actually saw on a green success screen
-// (docs/ux-feedback.md item 2), kept verbatim so the fixture cannot drift
+// The message is the one a human actually saw on a green success screen,
+// kept verbatim so the fixture cannot drift
 // into a shape the defect never had.
 func testControllerEvent(kind string, uid types.UID, name string) *corev1.Event {
 	return &corev1.Event{
@@ -100,8 +101,8 @@ func withController(pod *corev1.Pod, kind, name string, uid types.UID) *corev1.P
 	return pod
 }
 
-// TestControllerWarningResolvesWhenAnOwnedPodRecovers is docs/ux-feedback.md
-// item 2, which a human hit within minutes of first using the product: a
+// TestControllerWarningResolvesWhenAnOwnedPodRecovers is the defect a human
+// hit within minutes of first using the product: a
 // success screen reading "Every component installed successfully", every row
 // INSTALLED, and one row still carrying a red FailedCreate that had in fact
 // converged minutes earlier.

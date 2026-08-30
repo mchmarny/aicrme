@@ -28,7 +28,7 @@ describe('Timeline', () => {
     expect(screen.getByText(/waiting for events/i)).toBeDefined()
   })
 
-  // docs/ux-feedback.md item 1, observed during a real demo run: the stream
+  // Observed during a real demo run: the stream
   // appended, so during a 14-action install it grew past the viewport and the
   // operator had to scroll to see what was happening NOW -- during precisely
   // the five minutes the demo exists to be watched.

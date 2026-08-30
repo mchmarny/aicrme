@@ -401,7 +401,7 @@ func (o *Observer) onEventUpdate(_, newObj any) {
 //     full recovery) or deletion (handlers.go's onDelete Pod case) speaks for
 //     both.
 //   - controllerEventKey(pod), for a Warning about the CONTROLLER that owns a
-//     recovering pod (docs/ux-feedback.md item 2) -- the ownerReference names
+//     recovering pod -- the ownerReference names
 //     the same Kind/Name/UID InvolvedObject does.
 //
 // key is therefore NOT always a Pod key, which an earlier version of this
@@ -444,7 +444,8 @@ func (o *Observer) onEventUpdate(_, newObj any) {
 // THREE calling FUNCTIONS already hold o.mu for their OWN reasons (Minor 4,
 // pre-merge fix: this paragraph had the identical "both" miscount the
 // Namespace-field comment above did) -- pods.go's onPodChange, inside its
-// withNamespaceLive+o.mu closure, which since ux-feedback item 2 calls this
+// withNamespaceLive+o.mu closure, which since the stale-controller-warning
+// fix calls this
 // TWICE under that one hold (the pod's own key, then its controller's);
 // handlers.go's onDelete Pod case, inside its own lock/unlock around o.pods;
 // and events.go's onEventChange, inside the plain o.mu.Lock()/Unlock() pair

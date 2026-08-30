@@ -114,6 +114,22 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 		aicr.WithValidationPhases(aicr.PhaseDeployment),
 		aicr.WithValidationKubeconfig(v.cfg.Kubeconfig),
 		aicr.WithValidationRunID(run.ID),
+		// Cleanup stays on, and it costs us the one thing an operator asks for
+		// first: the logs of the check that failed. The trade was examined and
+		// this is the right side of it.
+		//
+		// WithValidationCleanup(false) does not mean "keep the failing pod". It
+		// keeps the Jobs, ConfigMaps and RBAC of EVERY validator, including the
+		// per-run cluster-admin ClusterRoleBinding, in a namespace Reset already
+		// cannot remove. A permanent privileged binding is too much to pay for
+		// post-hoc diagnostics.
+		//
+		// Capturing the logs ourselves is not on the table either: AICR's own
+		// failure text reads "no pod remains for it, so its logs are
+		// unavailable" -- the pod is gone before that string is built, so there
+		// is nothing for a caller to race for, and ValidateState is one blocking
+		// call with no mid-flight hook. Filed upstream as ask 2 of
+		// https://github.com/NVIDIA/aicr/issues/2473, where it can be fixed.
 		aicr.WithValidationCleanup(true),
 		aicr.WithValidationTimeout(v.cfg.Timeout),
 	)

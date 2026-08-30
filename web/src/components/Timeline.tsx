@@ -44,8 +44,8 @@ function renderMessage(message: string) {
  *
  * It appended until 2026-08-23, which meant that during a 14-action install
  * the line describing what was happening NOW sat below the fold, and the
- * operator had to scroll to follow a live run (docs/ux-feedback.md item 1,
- * observed during a real demo). Newest first costs the chronological reading
+ * operator had to scroll to follow a live run, observed during a real
+ * demo. Newest first costs the chronological reading
  * -- "phase started" now sits below "phase complete" -- and buys never having
  * to scroll during the five minutes the demo exists to be watched.
  *
