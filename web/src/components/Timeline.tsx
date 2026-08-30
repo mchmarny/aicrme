@@ -82,16 +82,10 @@ export function Timeline({ events, runId }: { events: AicrEvent[]; runId?: strin
   const newestFirst = [...shown].sort((a, b) => b.id - a.id)
   return (
     <div className="space-y-2">
-      <ol className="font-mono text-sm space-y-1">
-        {newestFirst.map(e => (
-          <li key={e.id} data-testid={`event-${e.id}`} className={levelClass[e.level]}>
-            <span className="text-notrun mr-2">{new Date(e.at).toLocaleTimeString()}</span>
-            {e.component && <span className="text-ink-soft mr-2">[{e.component}]</span>}
-            {renderMessage(e.message)}
-          </li>
-        ))}
-      </ol>
-
+      {/* Above the list, not below it. These are what an operator reaches for
+          when something has gone wrong -- which is exactly when the list is
+          longest and they are furthest off-screen. A 1,000-event run buried
+          them entirely. */}
       <div className="flex flex-wrap gap-3 text-xs">
         {hiddenCluster && (
           <button
@@ -126,6 +120,16 @@ export function Timeline({ events, runId }: { events: AicrEvent[]; runId?: strin
           </button>
         )}
       </div>
+      <ol className="font-mono text-sm space-y-1">
+        {newestFirst.map(e => (
+          <li key={e.id} data-testid={`event-${e.id}`} className={levelClass[e.level]}>
+            <span className="text-notrun mr-2">{new Date(e.at).toLocaleTimeString()}</span>
+            {e.component && <span className="text-ink-soft mr-2">[{e.component}]</span>}
+            {renderMessage(e.message)}
+          </li>
+        ))}
+      </ol>
+
     </div>
   )
 }

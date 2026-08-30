@@ -738,7 +738,14 @@ export function Wizard({ events, onDiscarded, onStartNewRun }: {
         {renderBody()}
       </div>
 
-      <aside className={`${cockpit ? 'w-80' : 'w-96'} shrink-0 border-l border-line pl-8`}>
+      {/* Proportional, not fixed. The rail was pinned at 320-384px beside a
+          flex-1 column whose content is capped at max-w-2xl, so on a wide
+          screen the main column padded empty margin while the rail wrapped
+          "recommend phase / complete" onto two lines. It carries timestamps
+          plus text and is the thing an operator reads continuously during a
+          twenty-minute install, so it gets a share of the viewport with a
+          floor for narrow windows. */}
+      <aside className="w-full max-w-2xl min-w-80 shrink-0 basis-2/5 border-l border-line pl-8">
         <Timeline events={events} runId={run.runId} />
       </aside>
     </div>

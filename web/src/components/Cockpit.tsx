@@ -321,9 +321,22 @@ function Running({ components, recipeCount, phase }: {
       {components.length === 0 ? (
         <p className="text-ink-faint text-sm">Generating the bundle…</p>
       ) : (
-        <ul className="space-y-3">
-          {components.map(c => <ComponentRow key={c.name} c={c} now={now} />)}
-        </ul>
+        // Dimmed during validate, and labelled. These rows are Apply's
+        // results, and leaving them at full strength under a "Validating"
+        // heading is worse than showing nothing: the operator read finished
+        // install checkmarks and durations as live validation progress and
+        // said so. Observed on real H100s 2026-08-30. Validation's own
+        // progress arrives in the timeline, from AICR's per-check logging.
+        <>
+          {validating && (
+            <p className="text-ink-faint text-xs uppercase tracking-wide">
+              Installed — from the previous step
+            </p>
+          )}
+          <ul className={validating ? 'space-y-3 opacity-40' : 'space-y-3'}>
+            {components.map(c => <ComponentRow key={c.name} c={c} now={now} />)}
+          </ul>
+        </>
       )}
     </section>
   )
