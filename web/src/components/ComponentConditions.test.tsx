@@ -15,7 +15,7 @@ describe('ComponentConditions', () => {
   it("shows the highest-severity condition's reason and a temporal caption, never an ownership claim", () => {
     const warn = condition({ uid: 'uid-warn', reason: 'FailedScheduling', severity: 1 })
     const error = condition({ uid: 'uid-error', reason: 'ImagePullBackOff', severity: 2 })
-    render(<ComponentConditions name="gpu-operator" conditions={[warn, error]} />)
+    render(<ComponentConditions name="gpu-operator" conditions={[warn, error]} installing />)
 
     const el = screen.getByTestId('condition-gpu-operator')
     expect(el.textContent).toContain('ImagePullBackOff')
@@ -36,7 +36,7 @@ describe('ComponentConditions', () => {
 
   it('names the row itself, not just "installing" in the abstract (Minor 2, fix round 1)', () => {
     const error = condition({ reason: 'FailedScheduling' })
-    render(<ComponentConditions name="kai-scheduler" conditions={[error]} />)
+    render(<ComponentConditions name="kai-scheduler" conditions={[error]} installing />)
     const el = screen.getByTestId('condition-kai-scheduler')
     expect(el.textContent).toMatch(/while kai-scheduler installs/i)
   })
@@ -93,7 +93,7 @@ describe('ComponentConditions', () => {
 
   it('defaults to the live, present-tense caption when terminalState is omitted', () => {
     const error = condition({ reason: 'ImagePullBackOff' })
-    render(<ComponentConditions name="gpu-operator" conditions={[error]} />)
+    render(<ComponentConditions name="gpu-operator" conditions={[error]} installing />)
     const el = screen.getByTestId('condition-gpu-operator')
     expect(el.textContent).toMatch(/cluster activity while gpu-operator installs\)/i)
     expect(el.textContent).not.toMatch(/last observed/i)
@@ -109,4 +109,22 @@ describe('ComponentConditions', () => {
     render(<ComponentConditions name="cert-manager" conditions={[]} />)
     expect(screen.queryByTestId('condition-cert-manager')).toBeNull()
   })
+})
+
+// The bug this distinction exists for. A condition that recurs after its
+// component has finished -- during Validate, which is still a "running" run --
+// used to be captioned "cluster activity while nodewright-operator installs",
+// naming an install that ended minutes earlier. Observed on real H100s
+// 2026-08-30. The tense follows the COMPONENT's own action, not the run's.
+it('does not claim a finished component is still installing', () => {
+  const error = condition({
+    uid: 'u-9', reason: 'Unhealthy', severity: 2, at: '2026-08-30T13:55:18Z',
+    message: 'skyhook/skyhook-operator-controller-manager: Readiness probe failed',
+  })
+
+  render(<ComponentConditions name="nodewright-operator" conditions={[error]} />)
+
+  const text = screen.getByTestId('condition-nodewright-operator').textContent ?? ''
+  expect(text).not.toMatch(/installs/)
+  expect(text).toMatch(/while nodewright-operator installed/)
 })

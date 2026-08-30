@@ -87,7 +87,12 @@ function ComponentRow({ c, now, terminalState }: {
         )}
       </div>
       {note && <p className="mt-1 max-w-2xl text-xs text-ink-faint">{note}</p>}
-      <ComponentConditions name={c.name} conditions={c.conditions} terminalState={terminalState} />
+      <ComponentConditions
+        name={c.name}
+        conditions={c.conditions}
+        terminalState={terminalState}
+        installing={active}
+      />
     </li>
   )
 }

@@ -64,7 +64,19 @@ const severityClass: Record<number, string> = {
  * terminal states that tear down the observer identically); Running
  * leaves it undefined.
  */
-export function ComponentConditions({ name, conditions, terminalState }: { name: string; conditions: ClusterCondition[]; terminalState?: 'done' | 'failed' }) {
+export function ComponentConditions({ name, conditions, terminalState, installing }: {
+  name: string
+  conditions: ClusterCondition[]
+  terminalState?: 'done' | 'failed'
+  // Whether THIS component's own action is still in flight. The tense used to
+  // follow the run's terminal state, so a condition that recurred long after a
+  // component finished -- during Validate, say -- was still labelled "cluster
+  // activity while nodewright-operator installs", naming an install that ended
+  // minutes earlier. Observed on real H100s 2026-08-30. attribution.go's
+  // ActiveAction is empty outside Apply, so a recurrence keeps the row it was
+  // first attributed to; that placement is right, the present tense was not.
+  installing?: boolean
+}) {
   const active = activeCondition(conditions)
   if (!active) return null
 
@@ -81,7 +93,9 @@ export function ComponentConditions({ name, conditions, terminalState }: { name:
     ? `last observed while ${name} installed`
     : terminalState === 'failed'
       ? `last observed while ${name} was installing`
-      : `cluster activity while ${name} installs`
+      : installing
+        ? `cluster activity while ${name} installs`
+        : `last observed while ${name} installed`
 
   return (
     <p data-testid={`condition-${name}`} className={`mt-1 max-w-2xl text-xs ${severityClass[active.severity] ?? 'text-ink-soft'}`}>
