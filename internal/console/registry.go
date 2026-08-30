@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -139,4 +140,72 @@ func helmRegistryConfigPath(ctx context.Context) string {
 		line = value
 	}
 	return strings.Trim(strings.TrimSpace(line), `"`)
+}
+
+// sanitizedRegistryConfigName is where the rewritten config is written, under
+// the work directory beside everything else this run owns.
+const sanitizedRegistryConfigName = "helm-registry.json"
+
+// repairRegistryConfig writes a copy of helm's registry config with the
+// unusable credential helpers removed, and returns its path.
+//
+// WHY THIS IS AICRME'S JOB
+// The probe above is accurate and its advice works -- an operator who exports
+// HELM_REGISTRY_CONFIG gets a clean run. But aicrme spawns every helm process
+// itself, so it can hand them a working config instead of asking a human to.
+// Telling someone to fix their environment for a problem you are already
+// holding the fix for is a poor trade, and it is a step between them and a
+// working cluster on the very first screen.
+//
+// It is a REWRITE, not a replacement. credsStore and the specific credHelpers
+// entries naming missing binaries are dropped; `auths` and everything else are
+// preserved verbatim, so credentials for a private registry that actually work
+// keep working. Pointing helm at an empty config would fix the public charts
+// and silently break the private ones, which is a worse failure than the one
+// being fixed because it appears later and looks like a permissions problem.
+//
+// Only the helpers that are MISSING are removed. A machine with a working
+// osxkeychain helper is untouched.
+func repairRegistryConfig(srcPath, workDir string) (string, error) {
+	raw, err := os.ReadFile(srcPath) //nolint:gosec // G304: path comes from `helm env`, not from a request.
+	if err != nil {
+		return "", err
+	}
+	// Decoded as a generic map rather than helmRegistryConfig: this file is
+	// docker's format and carries fields aicrme has no business understanding,
+	// and a round-trip through a typed struct would drop every one of them.
+	var cfg map[string]any
+	if decodeErr := json.Unmarshal(raw, &cfg); decodeErr != nil {
+		return "", decodeErr
+	}
+
+	if store, ok := cfg["credsStore"].(string); ok && !helperInstalled(store) {
+		delete(cfg, "credsStore")
+	}
+	if helpers, ok := cfg["credHelpers"].(map[string]any); ok {
+		for registry, helper := range helpers {
+			if name, ok := helper.(string); ok && !helperInstalled(name) {
+				delete(helpers, registry)
+			}
+		}
+		if len(helpers) == 0 {
+			delete(cfg, "credHelpers")
+		}
+	}
+
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	dst := filepath.Join(workDir, sanitizedRegistryConfigName)
+	// 0600: this is a copy of a credentials file.
+	if err := os.WriteFile(dst, out, 0o600); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+func helperInstalled(name string) bool {
+	_, err := exec.LookPath(helmCredentialHelperPrefix + name)
+	return err == nil
 }

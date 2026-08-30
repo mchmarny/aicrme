@@ -349,7 +349,31 @@ func Run(ctx context.Context, opts Options) error {
 	// name a helper for a registry this recipe never touches -- so it is
 	// reported and carried to the Connect screen, where the operator is
 	// already deciding whether to proceed.
+	// Probed, then FIXED rather than merely reported. aicrme spawns every helm
+	// process, so it can hand them a config without the unusable helper instead
+	// of asking the operator to export one -- which was a step between them and
+	// a working cluster on the first screen, for a problem the console was
+	// already holding the fix for. The rewrite keeps any working credentials;
+	// see repairRegistryConfig.
 	registryWarning := checkHelmCredentialHelpers(ctx)
+	if registryWarning != "" {
+		if src := helmRegistryConfigPath(ctx); src != "" {
+			fixed, repairErr := repairRegistryConfig(src, opts.WorkDir)
+			switch {
+			case repairErr != nil:
+				slog.Warn("could not rewrite helm's registry config; the warning stands", "error", repairErr)
+			// Set on this process so every helm child inherits it. Helm reads
+			// this variable itself, which is why the operator's own workaround
+			// is the same one.
+			case os.Setenv("HELM_REGISTRY_CONFIG", fixed) != nil:
+				slog.Warn("could not point helm at the rewritten registry config", "path", fixed)
+			default:
+				slog.Info("rewrote helm's registry config without the missing credential helper",
+					"path", fixed)
+				registryWarning = ""
+			}
+		}
+	}
 	if registryWarning != "" {
 		slog.Warn("helm cannot resolve registry credentials", "problem", registryWarning)
 	}
