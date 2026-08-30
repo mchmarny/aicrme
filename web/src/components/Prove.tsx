@@ -172,6 +172,11 @@ export function Prove({ events, run, busy, onStop }: {
   onStop: () => void
 }) {
   const placed = placements(events, run.runId)
+  // Components that never reached a terminal state. A run can reach Prove with
+  // one still installing: Apply moves on, and the success line above must not
+  // outrun what actually landed.
+  const incomplete = deriveComponents(events, run.recipe?.components.map(c => c.name))
+    .filter(c => c.status !== 'installed' && c.status !== 'skipped').length
   // Four states reach this screen, and each of them makes a different claim
   // true. Wizard renders it for the whole prove phase, not only for an active
   // run, so a two-way active/not-active split would tell an operator watching
@@ -215,10 +220,23 @@ export function Prove({ events, run, busy, onStop }: {
             Deliberately about the RUN, not the hardware: it is equally true
             on a simulated cluster, where the placement is exactly as real.
             Claim, below, is what keeps the hardware story honest. */}
-        {active && (
+        {/* "Succeeded" is qualified when a component never finished. On EKS
+            2026-08-30 kube-prometheus-stack was still `started` -- its pods
+            unschedulable the whole time -- and the run went on to Prove and
+            claimed success with "15 of 16 installed" printed directly below
+            it. The gang really did place, so this is not a failure; it is a
+            success that has to name what it did not include. */}
+        {active && incomplete === 0 && (
           <p data-testid="prove-success" className="text-sm text-pass">
             This run succeeded. Prove is the last step and it ends here — the workload
             holds its placement until you stop it, so nothing further happens on its own.
+          </p>
+        )}
+        {active && incomplete > 0 && (
+          <p data-testid="prove-partial" className="text-sm text-warn">
+            The gang placed, but {incomplete} component{incomplete === 1 ? '' : 's'} never
+            finished installing. Prove is the last step and it ends here — what did install
+            is running, and the rest is listed on the install screen.
           </p>
         )}
         {/* WHAT THE RUN ACHIEVED, in one line.

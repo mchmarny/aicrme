@@ -82,6 +82,17 @@ type ClusterGPUs struct {
 	// the ordinary state of a cluster this console is about to configure.
 	Total  int64
 	Usable int64
+	// AllNodes is how many nodes the caller saw, GPU-bearing or not.
+	//
+	// It exists to tell two situations apart that Nodes == 0 cannot: "no node
+	// list was supplied" and "a node list was supplied and none of it looks
+	// GPU-bearing". The second is a vanilla EKS cluster, where nothing
+	// advertises nvidia.com/gpu until a device plugin lands, and it is exactly
+	// where a single node's PCI probe must NOT be reported as a measured
+	// cluster total -- on real H100s 2026-08-30 that stated 8 on a 16-GPU
+	// cluster, unqualified. Zero keeps the pre-existing behavior for callers
+	// that pass no node list at all.
+	AllNodes int
 }
 
 // Analyze produces the capability statement and gap list. A nil or empty
@@ -147,7 +158,17 @@ func resolveGPUs(p probe, c ClusterGPUs) (total, usable int, inferred bool) {
 	if c.Nodes > 1 && probeTotal > 0 {
 		return probeTotal * c.Nodes, probeUsable * c.Nodes, true
 	}
-	return probeTotal, probeUsable, false
+	// A node list that saw MULTIPLE nodes and found no GPU capacity on any of
+	// them cannot vouch for the probe's number being cluster-wide: the nodes
+	// are there, they simply do not advertise GPUs yet. That is a vanilla EKS
+	// cluster, and it is where an unqualified total misleads -- 8 reported on
+	// a 16-GPU cluster, real H100s 2026-08-30. Saying "inferred from one node"
+	// is the honest answer when the denominator is unknowable.
+	//
+	// c.AllNodes == 0 (no node list at all) and c.AllNodes == 1 (a genuinely
+	// single-node cluster) both keep the plain reading: there, one node's probe
+	// really is the whole truth.
+	return probeTotal, probeUsable, c.AllNodes > 1 && probeTotal > 0
 }
 
 // punchline keys the "simulated cluster" sentence off r.Simulated, not off

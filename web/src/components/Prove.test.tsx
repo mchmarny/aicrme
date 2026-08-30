@@ -290,6 +290,34 @@ describe('Prove', () => {
     expect(screen.getByTestId('prove-stopping')).toBeDefined()
   })
 
+  // Observed on EKS 2026-08-30: kube-prometheus-stack never finished, the
+  // summary said "15 of 16 installed", and the line above it said the run
+  // succeeded. The gang did place, so this is a qualified success, not a
+  // failure -- but it must not claim more than happened.
+  it('qualifies success when a component never finished installing', () => {
+    const events: AicrEvent[] = [
+      ...placementEvents(),
+      {
+        id: 900, runId: RUN_ID, at: '2026-08-30T00:00:00Z', kind: 'component',
+        level: 'info', phase: 'apply', component: 'cert-manager',
+        message: 'cert-manager installed', data: { name: 'cert-manager', status: 'installed' },
+      },
+      {
+        id: 901, runId: RUN_ID, at: '2026-08-30T00:00:01Z', kind: 'component',
+        level: 'info', phase: 'apply', component: 'kube-prometheus-stack',
+        message: 'installing kube-prometheus-stack',
+        data: { name: 'kube-prometheus-stack', status: 'started' },
+      },
+    ]
+
+    render(<Prove events={events} run={runState()} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.queryByTestId('prove-success')).toBeNull()
+    const partial = screen.getByTestId('prove-partial').textContent ?? ''
+    expect(partial).toMatch(/1 component never finished/)
+    expect(partial).toMatch(/gang placed/i)
+  })
+
   // A skip is not a pass, and the screen must not let it read as one.
   it('says why validation was skipped rather than showing a verdict', () => {
     const run = runState({ validation: { skipped: 'simulated cluster -- AICR’s validator lands on fake nodes' } })

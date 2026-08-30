@@ -601,6 +601,9 @@ func clusterGPUs(info *ClusterInfo) gap.ClusterGPUs {
 		Nodes:  info.Nodes.GPUNodes,
 		Total:  info.Nodes.TotalGPUs,
 		Usable: info.Nodes.UsableGPUs,
+		// Every node, GPU-bearing or not: it is what lets Analyze tell "no node
+		// list" apart from "a node list that can see no GPUs yet".
+		AllNodes: info.NodeCount,
 	}
 }
 

@@ -442,6 +442,42 @@ func TestAnalyzeInfersFromNodeCountBeforeTheDevicePlugin(t *testing.T) {
 
 // TestAnalyzeFallsBackToTheProbeWhenNothingIsKnown keeps the old behavior for
 // callers with no node list, which is what the zero ClusterGPUs means.
+// A vanilla EKS cluster: five nodes visible, none advertising nvidia.com/gpu
+// because no device plugin has landed, while the snapshot's PCI probe sees the
+// eight H100s on the node the agent reached. Reporting that 8 as a measured
+// cluster total said "8" on a cluster with 16 -- real H100s 2026-08-30, where
+// the success screen went on to claim "0 of 8 GPUs usable" above a gang running
+// on those very GPUs.
+//
+// The number stays 8, because 16 is not derivable from what is known. What
+// changes is that it is labeled inferred rather than asserted.
+func TestAnalyzeInfersWhenTheNodeListSeesNoGPUsButTheProbeDoes(t *testing.T) {
+	got := gap.Analyze(gpuSnapshot(gpuHardware()), gap.ClusterGPUs{Nodes: 0, AllNodes: 5})
+
+	if !got.InferredGPUs {
+		t.Error("InferredGPUs = false -- one node's probe was stated as a cluster total")
+	}
+}
+
+// The distinction that makes the above safe: no node list at all is the
+// pre-existing caller, and there the probe is all anyone ever had.
+func TestAnalyzeDoesNotInferWithNoNodeListAtAll(t *testing.T) {
+	got := gap.Analyze(gpuSnapshot(gpuHardware()), gap.ClusterGPUs{})
+
+	if got.InferredGPUs {
+		t.Error("InferredGPUs = true with no node list; nothing changed about what is known")
+	}
+}
+
+// A genuinely single-node cluster: the probe IS the whole cluster.
+func TestAnalyzeDoesNotInferOnASingleNodeCluster(t *testing.T) {
+	got := gap.Analyze(gpuSnapshot(gpuHardware()), gap.ClusterGPUs{Nodes: 1, AllNodes: 1})
+
+	if got.InferredGPUs {
+		t.Error("InferredGPUs = true on a one-node cluster, where one node is the whole truth")
+	}
+}
+
 func TestAnalyzeFallsBackToTheProbeWhenNothingIsKnown(t *testing.T) {
 	report := gap.Analyze(gpuSnapshot(gpuHardware()), gap.ClusterGPUs{})
 
