@@ -49,3 +49,10 @@ dist/
 # review diffs for in-flight work. Useful while a plan runs, meaningless
 # after it lands, and never something a reader of this repo needs.
 .superpowers/
+
+# Design specs and implementation plans, kept local on purpose. They are
+# working documents for one change: written before it, argued over during
+# it, and stale the moment it lands. The durable record of a decision goes
+# in a comment beside the code it constrains, and the architecture write-up
+# that captures the design as a whole comes at the end of the project.
+docs/superpowers/

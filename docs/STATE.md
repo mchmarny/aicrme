@@ -234,6 +234,16 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    goes to this repo's issues, and the reasoning behind a decision not to fix something goes in a
    comment beside the code it constrains. Resist growing a second status document.
 
+   `docs/superpowers/` may exist locally — design specs and implementation plans for in-flight
+   work — but it is gitignored and never committed. Those are working documents for one change,
+   stale the moment it lands.
+
+9. **Write the architecture docs, at the very end.** The design and the decisions behind it are
+   currently spread across code comments, this file, and nothing else. One write-up capturing the
+   architecture as a whole is owed — but only once the work stops moving, for the same reason the
+   phase docs were collapsed rather than maintained mid-flight. Item 7's "what this does that
+   nothing else does" is a section of it, not a separate document.
+
 ### Known and deliberately not fixed
 
 - **Uninstall is best-effort about completeness, never about destructiveness.** Reset removes helm
