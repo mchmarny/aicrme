@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
@@ -57,7 +57,16 @@ function mockFetch(routes: Routes = {}) {
 
 describe('App bootstrap', () => {
   beforeEach(() => window.history.replaceState({}, '', '/'))
-  afterEach(() => vi.unstubAllGlobals())
+  // Unmount BEFORE unstubbing, not after. App's console half opens its
+  // EventSource from an effect that only fires once the session probe and
+  // cluster fetch resolve -- after the assertions above have already passed.
+  // Leaving the tree mounted let that effect land after unstubAllGlobals had
+  // removed the EventSource stub, which is a race that loses only under load:
+  // green on every local run, and it failed CI on a docs-only commit.
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
 
   // The token is a one-shot credential printed in a URL. Exchanging it for a
   // cookie and stripping it is what keeps it out of bookmarks, copied links
