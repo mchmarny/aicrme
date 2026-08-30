@@ -191,7 +191,14 @@ export function Prove({ events, run, busy, onStop }: {
               claimed a running computation would be false on the substrate
               this screen most often renders against. Placement is the claim
               that holds on both. */}
-          {active && 'Your cluster placed a gang-scheduled workload'}
+          {/* While a Stop is in flight the heading leads with it. Otherwise
+              the screen was dominated by "Your cluster placed a gang-scheduled
+              workload / This run succeeded" -- a description of what already
+              happened -- and the only copy explaining the one-to-two minute
+              wait sat in small grey text under a disabled button. Observed on
+              real H100s 2026-08-30. */}
+          {active && busy && 'Stopping the reference workload…'}
+          {active && !busy && 'Your cluster placed a gang-scheduled workload'}
           {stopped && 'The reference workload has stopped'}
           {failed && 'The reference workload did not run'}
           {!active && !stopped && !failed && 'Placing the reference workload…'}
@@ -278,7 +285,11 @@ export function Prove({ events, run, busy, onStop }: {
               operation. Naming what it is waiting on is what makes the wait
               read as work. */}
           {busy ? (
-            <p data-testid="prove-stopping" className="text-xs text-ink-soft">
+            // text-sm and text-ink, not text-xs and text-ink-soft: during the
+            // wait this is the only sentence describing what is happening, and
+            // it was the least prominent thing on a screen still celebrating
+            // the finished run.
+            <p data-testid="prove-stopping" className="text-sm text-ink">
               Deleting the workload and waiting for its pods to actually be gone. On a real
               cluster this takes a minute or two; the run closes when they are.
             </p>

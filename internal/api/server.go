@@ -235,6 +235,7 @@ func (s *Server) Handler() http.Handler {
 	gated.HandleFunc("GET /api/runs/{id}/log", s.handleRunLog)
 
 	protected := http.NewServeMux()
+	protected.HandleFunc("GET /api/version", s.handleVersion)
 	protected.HandleFunc("GET /api/contexts", s.handleContexts)
 	protected.HandleFunc("POST /api/connect", s.handleConnect)
 	protected.HandleFunc("GET /api/cluster", s.handleCluster)

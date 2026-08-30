@@ -278,6 +278,18 @@ describe('Prove', () => {
     expect(claim).not.toMatch(/is placed and running/)
   })
 
+  // During a Stop the screen used to lead with "Your cluster placed a
+  // gang-scheduled workload / This run succeeded" -- the past -- while the only
+  // copy explaining a two-minute wait was small grey text under a disabled
+  // button. Observed on real H100s 2026-08-30.
+  it('leads with the stop while one is in flight', () => {
+    render(<Prove events={placementEvents()} run={runState()} busy={true} onStop={vi.fn()} />)
+
+    expect(screen.getByRole('heading', { name: /stopping the reference workload/i })).toBeDefined()
+    expect(screen.queryByRole('heading', { name: /placed a gang-scheduled workload/i })).toBeNull()
+    expect(screen.getByTestId('prove-stopping')).toBeDefined()
+  })
+
   // A skip is not a pass, and the screen must not let it read as one.
   it('says why validation was skipped rather than showing a verdict', () => {
     const run = runState({ validation: { skipped: 'simulated cluster -- AICR’s validator lands on fake nodes' } })

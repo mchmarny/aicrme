@@ -37,6 +37,10 @@ function mockFetch(routes: Routes = {}) {
       return routes.cluster?.() ?? new Response('not connected', { status: 409 })
     }
     if (url === '/api/contexts') return new Response(JSON.stringify(contexts), { status: 200 })
+    // Identity is fetched on every mount now, independent of the cluster.
+    if (url === '/api/version') {
+      return new Response(JSON.stringify({ version: 'v0.1.0', commit: 'abc1234', aicr: 'v0.20.0' }), { status: 200 })
+    }
     if (url === '/api/runs') return new Response(JSON.stringify({ id: 'run', state: 'running' }), { status: 200 })
     if (url === '/api/options') return new Response(JSON.stringify({
       intents: [], platforms: [], platformsByIntent: {}, provisional: false,
@@ -121,6 +125,22 @@ describe('App bootstrap', () => {
   // where the operator grants cluster-admin to install fourteen components --
   // named no cluster at all. On the laptop this was built against, the
   // kubeconfig holds 144 contexts.
+  // The AICR version rode on ClusterInfo, which is null until a context is
+  // chosen, so it was missing from the Connect screen -- the first screen
+  // anyone sees. It now comes from /api/version and appears on every stage.
+  it('names the build and its AICR version before a cluster is connected', async () => {
+    mockFetch({ cluster: () => new Response(null, { status: 404 }) })
+
+    render(<App />)
+
+    expect((await screen.findByTestId('aicr-version')).textContent).toMatch(/v0\.20\.0/)
+    expect(screen.getByTestId('aicrme-version').textContent).toMatch(/aicrme v0\.1\.0/)
+    // Genuinely pre-connect: no cluster has been selected, so the header that
+    // carries the cluster identity is not on screen at all. That is exactly the
+    // stage where the version used to be missing.
+    expect(screen.queryByTestId('cluster-badge')).toBeNull()
+  })
+
   it('keeps the connected cluster named in the header', async () => {
     mockFetch({ cluster: () => new Response(JSON.stringify(clusterInfo), { status: 200 }) })
 

@@ -2,8 +2,13 @@ GO_VERSION          := $(shell cat .go-version)
 COVERAGE_THRESHOLD  ?= $(shell yq -r '.quality.coverage_threshold' .settings.yaml)
 VERSION             ?= $(shell git describe --tags --always --dirty)
 COMMIT              ?= $(shell git rev-parse --short HEAD)
+# The COMMIT date, not `date -u`: .goreleaser.yaml pins mod_timestamp to the
+# commit timestamp so a tag rebuilds bit-for-bit, and a wall-clock stamp here
+# would make two builds of one tag differ.
+BUILD_DATE          ?= $(shell git show -s --format=%cs HEAD)
 LDFLAGS             := -X github.com/mchmarny/aicrme/internal/version.Version=$(VERSION) \
-                       -X github.com/mchmarny/aicrme/internal/version.Commit=$(COMMIT)
+                       -X github.com/mchmarny/aicrme/internal/version.Commit=$(COMMIT) \
+                       -X github.com/mchmarny/aicrme/internal/version.Date=$(BUILD_DATE)
 
 .PHONY: all
 all: help

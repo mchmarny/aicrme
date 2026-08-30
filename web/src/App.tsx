@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { ApiError, currentCluster, establishSession, probeSession, startRun, type ClusterInfo } from './api'
+import { ApiError, buildInfo, currentCluster, establishSession, probeSession, startRun, type BuildInfo, type ClusterInfo } from './api'
 import { Connect } from './components/Connect'
 import { Wizard } from './components/Wizard'
 import { useEvents } from './useEvents'
@@ -21,6 +21,9 @@ export default function App() {
   // screen forgot it, including the gate that grants cluster-admin -- see the
   // ClusterBadge doc comment.
   const [cluster, setCluster] = useState<ClusterInfo | null>(null)
+  // Fetched once, independent of the cluster: this is the binary's identity and
+  // has to be on screen before a context is chosen.
+  const [build, setBuild] = useState<BuildInfo | null>(null)
 
   // Two ways in, and both end at the same cookie. A fresh launch arrives with
   // ?t= and exchanges it; a reload, a restored tab, or a retyped address
@@ -31,6 +34,10 @@ export default function App() {
     let canceled = false
     const url = new URL(window.location.href)
     const token = url.searchParams.get(launchTokenParam)
+
+    // Best effort and never fatal: a console that refused to start because it
+    // could not name itself would trade a working tool for a label.
+    buildInfo().then(b => { if (!canceled) setBuild(b) }).catch(() => {})
 
     async function bootstrap(): Promise<Stage> {
       if (token) {
@@ -72,6 +79,15 @@ export default function App() {
   // div its own block formatting context so the margin stays inside it.
   return (
     <div className="min-h-screen flow-root bg-bg text-ink-strong">
+      {/* On EVERY stage, not just the console. Connect renders on its own path
+          with no header of its own, so the identity used to be absent from the
+          first screen anyone sees. Fixed positioning keeps it out of the way of
+          layouts it is not part of. */}
+      {build && stage !== 'console' && (
+        <div className="fixed right-6 top-4 z-10">
+          <BuildBadge build={build} />
+        </div>
+      )}
       {authError && <p className="mx-auto mt-32 w-[28rem] text-fail text-sm">{authError}</p>}
       {!authError && stage === 'authenticating' && (
         <p className="mx-auto mt-32 w-[28rem] text-ink-faint text-sm">Starting…</p>
@@ -86,6 +102,7 @@ export default function App() {
       {stage === 'console' && (
         <Console
           cluster={cluster}
+          build={build}
           onUnauthorized={() => {
             setStage('authenticating')
             setAuthError('This console session has expired. Re-open the tokenized URL aicrme printed at startup — the one ending in ?t=…')
@@ -125,7 +142,44 @@ function ClusterBadge({ cluster }: { cluster: ClusterInfo | null }) {
   )
 }
 
-function Console({ cluster, onUnauthorized }: { cluster: ClusterInfo | null; onUnauthorized: () => void }) {
+/**
+ * BuildBadge is the console's own identity: which aicrme, from when, and which
+ * AICR its answers come from.
+ *
+ * Two lines rather than one. The AICR version is the load-bearing half -- every
+ * component version and validation verdict on screen is AICR's -- and aicrme's
+ * own version, commit date and digest are what make a run reproducible and let
+ * an operator tie the running process to an archive they verified.
+ */
+function BuildBadge({ build }: { build: BuildInfo }) {
+  return (
+    <div className="ml-auto text-right font-mono text-xs leading-tight">
+      <a
+        href={`https://github.com/NVIDIA/aicr/releases/tag/${build.aicr}`}
+        target="_blank"
+        rel="noreferrer"
+        title="The AICR release this console is built against"
+        data-testid="aicr-version"
+        className="text-ink-faint hover:text-accent block underline underline-offset-4"
+      >
+        AICR {build.aicr}
+      </a>
+      <span data-testid="aicrme-version" className="text-notrun block">
+        aicrme {build.version}
+        {build.date && ` · ${build.date}`}
+        {/* Twelve characters is enough to compare against a checksums.txt line
+            by eye; the full 64 would dominate the header. */}
+        {build.digest && ` · ${build.digest.slice(0, 12)}`}
+      </span>
+    </div>
+  )
+}
+
+function Console({ cluster, build, onUnauthorized }: {
+  cluster: ClusterInfo | null
+  build: BuildInfo | null
+  onUnauthorized: () => void
+}) {
   // useEvents depends on this callback's identity to decide whether to
   // re-run its connection effect (see useEvents.ts's doc comment): wrapping
   // it in useCallback keeps it stable across Console's own re-renders, even
@@ -172,21 +226,12 @@ function Console({ cluster, onUnauthorized }: { cluster: ClusterInfo | null; onU
         </span>
         <ClusterBadge cluster={cluster} />
         {/* Pushed right, away from the cluster identity: this describes the
-            binary, not the cluster, and sitting them together invites reading
-            it as something discovered from the cluster. Links to the release
-            notes for the exact version whose decisions are on screen. */}
-        {cluster?.aicrVersion && (
-          <a
-            href={`https://github.com/NVIDIA/aicr/releases/tag/${cluster.aicrVersion}`}
-            target="_blank"
-            rel="noreferrer"
-            title="The AICR release this console is built against"
-            data-testid="aicr-version"
-            className="text-ink-faint hover:text-accent ml-auto font-mono text-xs underline underline-offset-4"
-          >
-            AICR {cluster.aicrVersion}
-          </a>
-        )}
+            BINARY, not the cluster, and sitting the two together invites
+            reading it as something discovered from the cluster. Sourced from
+            /api/version rather than ClusterInfo so it is present before a
+            cluster is chosen -- it used to vanish on the Connect screen, which
+            is the first screen anyone sees. */}
+        {build && <BuildBadge build={build} />}
       </header>
       {eventsLost > 0 && (
         <p className="mb-4 text-warn text-xs">

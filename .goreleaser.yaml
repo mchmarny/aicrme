@@ -42,6 +42,9 @@ builds:
       - -s -w
       - -X github.com/mchmarny/aicrme/internal/version.Version={{ .Version }}
       - -X github.com/mchmarny/aicrme/internal/version.Commit={{ .ShortCommit }}
+      # CommitDate, not Date: Date is the build wall-clock and would defeat
+      # mod_timestamp's bit-for-bit rebuild of a tag.
+      - -X github.com/mchmarny/aicrme/internal/version.Date={{ .CommitDate }}
     mod_timestamp: '{{ .CommitTimestamp }}'
 
 archives:

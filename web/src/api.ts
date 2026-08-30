@@ -333,3 +333,25 @@ export async function resetRun(runId: string): Promise<Run> {
   if (!res.ok) throw new ApiError(res.status, 'Failed to reset the run')
   return res.json()
 }
+
+/** BuildInfo mirrors Go's api.BuildInfo (internal/api/version.go). */
+export interface BuildInfo {
+  version: string
+  commit: string
+  date?: string
+  digest?: string
+  aicr: string
+}
+
+/**
+ * buildInfo is who this console is and what it is built against.
+ *
+ * Pre-connect, deliberately. The AICR version used to ride on ClusterInfo,
+ * which is null until a cluster is chosen, so it was missing from the first
+ * screen an operator sees. This hangs off nothing in the cluster.
+ */
+export async function buildInfo(): Promise<BuildInfo | null> {
+  const res = await fetch('/api/version')
+  if (!res.ok) return null
+  return res.json()
+}
