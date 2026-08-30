@@ -90,6 +90,26 @@ keeps the two apart deliberately (OVERRIDE 1) and so should any note about them.
 **`StateActive` is Prove's terminal success state.** The reference workload is `sleep infinity`
 by design and holds its placement. Nothing polls for `succeeded`; it never comes.
 
+### What a simulated (KWOK) cluster cannot prove
+
+The e2e suite and any local KWOK cluster run on fakes: **they never execute containers.** That
+environment proves the install chain, recipe resolution and the telemetry, and it cannot prove
+anything requiring a container to run on a GPU. Measured on that substrate rather than assumed:
+
+- **The workload body never runs.** KWOK marks a gang pod `Succeeded` in the *same second* it
+  binds it, without starting the container. The reference workload's `echo` is never printed and
+  its image is never pulled.
+- **The gang never holds its GPUs at once.** Each member completes instantly, so its resources
+  are released before the next is bound — which is why both members routinely land on the same
+  simulated node. Normal there, impossible on a real cluster where the pods keep running.
+- **DRA is entirely unexercised.** The workload requests scalar `nvidia.com/gpu` and the fake
+  nodes advertise scalar capacity only, publishing no DRA `ResourceSlices`. The DRA driver the
+  recipe installs is never asked to bind a device.
+- **Validation false-passes**, which is why it is skipped there — see the Validation rows above.
+
+What it *does* prove about Prove: a GPU-aware scheduler admitted a gang, evaluated it as a group,
+and bound every member to a node advertising GPUs. `test/e2e/prove.sh` asserts that and no more.
+
 ### Measurements taken on real hardware
 
 - **MIG resource names:** none. Nodes advertise only `nvidia.com/gpu`, so `gpuResource`'s single
@@ -170,8 +190,11 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
 6. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
    `ephemeralArtifacts` and is dropped on encode, so the download is broken on exactly the path
    where debugging matters most. The run-log export does not fix it.
-7. **Keep the docs collapsed.** Done once, on going public: `docs/` is STATE.md, the upstream
-   asks, and the UX list. Resist growing a second status document — edit this one.
+7. **Keep the docs collapsed, and move tracking to GitHub issues.** `docs/` is now STATE.md and
+   the UX list. The upstream-asks file is gone: a genuine SDK gap goes to
+   [NVIDIA/aicr](https://github.com/NVIDIA/aicr/issues) as an issue rather than being carried
+   here. `docs/ux-feedback.md` retires the same way once its open findings are closed — after
+   that, work items live as issues on this repo. Resist growing a second status document.
 
 ### Known and deliberately not fixed
 
@@ -235,7 +258,6 @@ any `Scheduled` or `Bound` event.
 
 ```sh
 make qualify        # the full local gate; must match CI exactly
-make demo           # the whole arc on Kind + KWOK, in a browser
 ```
 
 **End-to-end suites** (`test/e2e/`) each create and destroy their own Kind cluster and need a

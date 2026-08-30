@@ -34,9 +34,9 @@ what happened.**
 | Bundles install; taking them back out is left to you and `helm` | Reset — uninstalls every release the run created, plus the objects charts tell helm to keep, and reports what it could not remove rather than pretending |
 | A process that dies mid-install leaves a cluster in an unknown state | The run is persisted and recovered on restart, reconciled against what is actually in the cluster |
 
-aicrme does not fork, patch, or work around AICR's recipe content. Where it has found genuine gaps
-in the SDK, they are recorded in [docs/aicr-upstream-asks.md](docs/aicr-upstream-asks.md) with the
-workaround each one currently costs.
+aicrme does not fork, patch, or work around AICR's recipe content. Where it finds a genuine gap in
+the SDK, that goes upstream as an issue on
+[NVIDIA/aicr](https://github.com/NVIDIA/aicr/issues) rather than being carried here.
 
 ## Install
 
@@ -131,19 +131,6 @@ precondition. Air-gapped clusters are not supported.
   exchanged once for a process-lifetime session cookie. There is no password, no user management,
   and no OIDC. The session dies with the process.
 - Do not point it at a production cluster. Use disposable demo and eval clusters.
-
-## Demo
-
-To run the whole arc locally in a browser — Kind + simulated GPU nodes, a real install of every
-component, live cockpit telemetry — see **[DEMO.md](DEMO.md)**:
-
-```sh
-make demo
-```
-
-The demo cluster's GPU nodes are simulated, which bounds what the run can claim. DEMO.md's "What
-this demo cannot show you" says exactly what, and the console labels it in place rather than
-letting a simulated result read as a real one.
 
 ## Development
 

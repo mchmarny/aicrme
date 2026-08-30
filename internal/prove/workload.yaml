@@ -30,7 +30,7 @@ PLACEHOLDER_POD_LABELS
       # cleaned up, and failed the run -- on the only path Phase 3 has.
       #
       # kwok.x-k8s.io/node=fake is on every simulated node test/e2e/lib.sh
-      # creates, which is what `make demo` and every e2e job stand up.
+      # creates, which is what every e2e job stands up.
       # nvidia.com/gpu is what GKE puts on a GPU node pool (and what EKS and
       # AKS optionally put on theirs), so this is not simulation-only
       # scaffolding -- a reference GPU workload that tolerates neither cannot

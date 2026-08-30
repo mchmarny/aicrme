@@ -543,7 +543,7 @@ echo "releases the blocked teardown named with an error: ${STUCK_N}"
 # the residue is the operator dead end the guard exists to prevent.
 kubectl delete validatingwebhookconfiguration aicrme-e2e-block-deploy-delete
 
-# Now the operator's own move, run exactly as DEMO.md documents it.
+# Now the operator's own move, run exactly as the console instructs it.
 #
 # An uninstall interrupted mid-flight leaves the helm release in
 # `uninstalling`, and helm refuses to uninstall a release in that state -- so
@@ -553,11 +553,11 @@ kubectl delete validatingwebhookconfiguration aicrme-e2e-block-deploy-delete
 # artefact of the webhook.
 #
 # The console's answer is to name it and let the operator clear it, and
-# running those instructions HERE is what proves they actually work. If
-# DEMO.md's remedy ever stops working, this fails.
+# running those instructions HERE is what proves they actually work. If the
+# remedy the console prints ever stops working, this fails.
 while IFS=$'\t' read -r stuck_name stuck_ns; do
   [[ -z "${stuck_name}" ]] && continue
-  echo "clearing wedged release ${stuck_name} in ${stuck_ns}, per DEMO.md"
+  echo "clearing wedged release ${stuck_name} in ${stuck_ns}, as the console instructs"
   helm uninstall "${stuck_name}" -n "${stuck_ns}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${stuck_ns}" delete secret -l "name=${stuck_name},owner=helm" --ignore-not-found >/dev/null 2>&1 || true
 done <<<"${STUCK_LIST}"
@@ -569,7 +569,7 @@ AGAIN_JSON="$(run_json "${FAIL_RUN_ID}")"
 AGAIN_INCOMPLETE="$(echo "${AGAIN_JSON}" | jq -r '.residue.incomplete // false')"
 echo "second reset settled at state=${AGAIN_STATE} incomplete=${AGAIN_INCOMPLETE}"
 [[ "${AGAIN_INCOMPLETE}" != "true" ]] \
-  || fail "the guard is still set after the documented manual cleanup -- DEMO.md's remedy does not work"
+  || fail "the guard is still set after the documented manual cleanup -- the remedy the console prints does not work"
 echo "assertion 5: PASS"
 
 echo "--- assert 6: the console accepts a new run afterward"

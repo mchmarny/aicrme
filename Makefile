@@ -88,18 +88,6 @@ check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.
 		echo "check-aicr-pin: OK — AICRVersion $$constant matches pin"; \
 	fi
 
-.PHONY: demo
-demo: ## Stands up a local browser-usable demo cluster and leaves it running
-	./scripts/demo.sh up
-
-.PHONY: demo-down
-demo-down: ## Deletes the local demo cluster
-	./scripts/demo.sh down
-
-.PHONY: demo-status
-demo-status: ## Shows whether the local demo is running, and the console's URL
-	./scripts/demo.sh status
-
 .PHONY: check-tools
 check-tools: ## Warns when a local lint tool has drifted from its .settings.yaml pin
 	@# Warns, never fails: tooling here is Homebrew-managed and upgrades on its

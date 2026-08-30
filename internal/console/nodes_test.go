@@ -129,7 +129,7 @@ func TestGroupNodesFlagsUntoleratedGPUTaint(t *testing.T) {
 // Reporting that as a problem would be true and useless: it would prompt the
 // operator to set AICRME_GPU_TOLERATIONS to the very taint whose whole purpose
 // is to stay untolerated, turning a working demo into a silent false success.
-// Every `make demo` run would show the warning, which is how a warning stops
+// Every local KWOK run would show the warning, which is how a warning stops
 // being read.
 func TestGroupNodesDoesNotFlagSimulatedGPUNodes(t *testing.T) {
 	nodes := []corev1.Node{
