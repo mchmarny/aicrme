@@ -13,6 +13,9 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/go-logr/logr"
+	"k8s.io/klog/v2"
+
 	"github.com/mchmarny/aicrme/internal/console"
 	"github.com/mchmarny/aicrme/internal/steps"
 	"github.com/mchmarny/aicrme/internal/version"
@@ -46,9 +49,15 @@ func main() {
 	// handler installed here is the one that sees them. Teeing it lets the
 	// Validate step narrate a phase the SDK otherwise runs in total silence.
 	progress := steps.NewProgressHandler(
-		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		newQuietHandler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	slog.SetDefault(slog.New(progress))
 	opts.Progress = progress
+
+	// client-go logs through klog, which writes to stderr on its own and knows
+	// nothing about the handler above -- so its reflector churn arrived
+	// unleveled and unfiltered, interleaved with the console's own output.
+	// Routing it through the same handler is what lets quietHandler see it.
+	klog.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
 	slog.Info("starting aicrme", "version", version.String())
 
 	// SIGINT and SIGTERM cancel ctx, which is the only thing that stops Run.
