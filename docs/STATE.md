@@ -190,7 +190,14 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
 6. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
    `ephemeralArtifacts` and is dropped on encode, so the download is broken on exactly the path
    where debugging matters most. The run-log export does not fix it.
-7. **Keep the docs collapsed, and move tracking to GitHub issues.** `docs/` is now STATE.md and
+7. **Write up what the console actually does that nothing else does.** The README's gap table
+   names live telemetry in one line; the distinctive part is unwritten. Chiefly: a cluster
+   condition is attributed to the component that was installing when it appeared, **temporally
+   and without claiming causation** — "cluster activity while gpu-operator installs", never
+   "gpu-operator caused this". That restraint is what makes the attribution trustworthy, and it
+   is the thing to lead with. Also worth capturing: the gap report before anything is installed,
+   the run record surviving a restart, and validation refusing to attest to a drifted recipe.
+8. **Keep the docs collapsed, and move tracking to GitHub issues.** `docs/` is now STATE.md and
    the UX list. The upstream-asks file is gone: a genuine SDK gap goes to
    [NVIDIA/aicr](https://github.com/NVIDIA/aicr/issues) as an issue rather than being carried
    here. `docs/ux-feedback.md` retires the same way once its open findings are closed — after

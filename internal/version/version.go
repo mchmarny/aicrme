@@ -39,11 +39,14 @@ var (
 //
 // Computed at runtime rather than injected, because it cannot be injected: a
 // build-time constant would have to contain the hash of the artifact being
-// built, and goreleaser computes checksums only after the binary exists. Self
-// hashing is the only way to answer the question an operator actually has --
-// "is the process I am watching the archive I verified with gh attestation
-// verify" -- which is otherwise a gap between checking a download and running
-// it.
+// built, and goreleaser computes checksums only after the binary exists.
+//
+// What it is FOR, stated carefully. It identifies the exact build on screen, so
+// two people can tell whether they are running the same bytes and a bug report
+// names something precise. It does NOT match a release's checksums.txt or its
+// attestation: both cover the .tar.gz, not the binary inside it, so comparing
+// them means extracting and hashing the binary yourself. An earlier version of
+// this comment claimed that chain existed; it does not.
 //
 // Failure is not an error. A binary whose own path is unreadable still works,
 // and refusing to start over a missing identity string would be a poor trade.
