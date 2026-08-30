@@ -275,3 +275,102 @@ of this. The cap being right is why the run produced a diagnosis instead of a sh
 
 A validation run whose checks actually execute. Every check failed on the image pull, so a
 **passing** verdict on real hardware remains unproven.
+
+---
+
+## 7. Second real-hardware run, with the validation fixes in — 2026-08-30
+
+**Observed:** Mark, new GKE H100 cluster, `make build` from `419b424`. The run succeeded:
+16 of 16 installed in 11m 6s, gang of 2 placed, and **AICR validation executed for the first
+time on real GPUs** — 4 of 5 checks passed.
+
+### Confirmed working
+
+All five fixes from the 2026-08-29 run, verified on hardware: validator images resolve
+(`:v0.20.0`, containers Running); Stop no longer starts a new run and leaves Reset reachable;
+the Validate phase has its own heading and phase events name themselves; the AICR version shows
+in the header; and the residue names `aicr-validation` verbatim. Also confirmed: the current
+kubeconfig context is preselected and badged, and the kai purge removed all four keep-policy
+objects.
+
+### Measured
+
+| | |
+|---|---|
+| Apply, 16 of 16 | 11m 6s (within 2s of the previous run) |
+| Validate, wall clock | 8m 39s |
+| **A healthy deployment validation** | **~20s** — the four passing checks total about that |
+| `operator-health` | passed, 6s |
+| `expected-resources` | **failed** — hit AICR's own 8m deadline |
+| `gpu-operator-version` | passed, 1s |
+| `check-nvidia-smi` | passed, 13s |
+| `gke-gpu-nic-networks` | passed, <1s |
+
+The `expected-resources` timeout is not an aicrme defect. Every workload the cluster runs was
+healthy minutes later, so it is a tight deadline on a fresh 16-component install, not a broken
+cluster. It cannot be confirmed, because there is no way to re-run validation and the failed
+validator's pod is deleted with its logs.
+
+### The theme, which matters more than any single item
+
+**The console is clear about what happened and vague about what is happening.** Four of the
+findings below are the same bug wearing different clothes: a superseding phase appends to the
+previous one instead of taking over. Fix them together.
+
+### Findings
+
+1. **Validate shows Apply's component rows, which read as validation progress.** Not merely
+   missing progress — actively misleading. The operator read completed install checkmarks and
+   durations as live validation state. Worse: `run.validation` does not exist until the phase
+   ends, so an exported log carries nothing either. **AICR already emits per-check progress
+   through `log/slog`'s default logger** (`running validator name=X`, `validator completed
+   name=X status=passed`, `catalog=5 selected=5`) — the console receives those records today and
+   drops them. A `slog.Handler` that republishes them onto the bus is the cheap fix; there is no
+   SDK progress hook.
+2. **Stopping is subordinate to the success screen.** During the one-to-two minute wait, the
+   screen is dominated by "Your cluster placed a gang-scheduled workload / This run succeeded",
+   and the only copy explaining the wait is small grey text under a disabled button.
+3. **Reset never declares completion, and still offers Reset.** After a successful teardown the
+   main panel is unchanged and its primary button invites the operation that just finished. The
+   only evidence is one wrapped line in the rail. Asked twice, by the operator, whether it was
+   done.
+4. **The reset summary contradicts its own detail lines.** Summary: "12 left in place because
+   this run did not create them." Detail, immediately below: "namespace aicrme skipped: this run
+   created it for the snapshot agent". The detail is right; the summary invents a false reason
+   for correct behaviour.
+5. **Resolved conditions stay on component rows.** `skyhook-operator-controller-manager-…-6vfmk:
+   Unhealthy` was resolved at 13:44:44 and the row still showed the failure. 192 resolution
+   events in that run.
+6. **Post-Apply conditions are attributed to Apply actions.** A cert-manager webhook condition
+   recurred at 13:55:49, during Validate, and was labelled "cluster activity while
+   kube-prometheus-stack installs" — an action that finished minutes earlier. The attribution
+   logic predates there being a phase after Apply.
+7. **The AICR version is absent before connect.** It hangs off `ClusterInfo`, which is null until
+   a cluster is selected. It should be on every screen.
+8. **aicrme's own identity is not shown at all** — wants version, build date and digest, likely
+   its own line. Two constraints: use the commit timestamp, not wall-clock, or `mod_timestamp`
+   reproducibility breaks; and goreleaser cannot inject the binary's own digest (it is computed
+   after the binary exists), so a true artifact digest means self-hashing at startup.
+9. **The activity rail is too narrow and the main column too wide.** `Wizard.tsx` pins the rail
+   at `w-80`/`w-96` beside a `flex-1` column whose content is capped at `max-w-2xl`. Short lines
+   wrap for no reason while the main column pads empty margin.
+10. **"show cluster activity" and "download run log" sit below the event list** — hardest to
+    find exactly when the list is longest and you need them most.
+11. **`REMOVED` and `REMOVING` are visually identical.** Same weight, same colour, two letters
+    apart. The operator who raised this then misread it himself a minute later. Apply's ✓ +
+    colour + duration treatment already exists and should carry over.
+12. **The reset gate says "Remove 14 releases" and removes 16.** It counts components; the
+    teardown acts on releases, and the generated `-pre`/`-post` actions make up the difference.
+13. **The stopped screen still says the gang "is placed and running"** under a heading that says
+    it has stopped.
+14. **A failed validator's logs are deleted**, so the one check worth diagnosing is the one that
+    cannot be. `WithValidationCleanup` is the lever; flipping it preserves every validator's pods
+    and leaves residue in a namespace Reset already will not remove. Also an upstream ask.
+15. **klog reflector spam bypasses the logger.** 15+ of `watch ended with error … very short
+    watch` from client-go's `*v1.Event` reflector, printed straight to stderr. Worth understanding
+    rather than silencing — the Event informer re-establishing constantly may mean dropped events.
+16. **The `gpu-operator` driver auto-detect warning repeats ~10×**, five times in one second.
+17. **The helm registry-credential warning is accurate but self-inflicted.** aicrme spawns every
+    helm process, so it could hand them a registry config without the broken `credsStore` instead
+    of asking the operator to. Needs a rule — override only when the named helper is missing —
+    since overriding unconditionally would discard working private-registry credentials.
