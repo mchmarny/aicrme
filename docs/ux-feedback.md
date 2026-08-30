@@ -374,3 +374,73 @@ previous one instead of taking over. Fix them together.
     helm process, so it could hand them a registry config without the broken `credsStore` instead
     of asking the operator to. Needs a rule — override only when the named helper is missing —
     since overriding unconditionally would discard working private-registry credentials.
+
+---
+
+## 8. First EKS run — a mixed-OS AWS cluster — 2026-08-30
+
+**Observed:** Mark, EKS `us-east-1`, 2 × `p5.48xlarge` (Ubuntu 24.04, **no driver**) and
+3 × `m7i.xlarge` (Amazon Linux 2023). Every prior real-hardware run was GKE, so this is the
+first evidence from a second cloud — and it produced findings no GKE run could.
+
+The run finished: 15 of 16 installed in 39m 34s, validation 3 of 4 passed, gang placed on both
+GPU nodes. Two upstream issues were filed from it
+([NVIDIA/aicr#2473](https://github.com/NVIDIA/aicr/issues/2473),
+[#2476](https://github.com/NVIDIA/aicr/issues/2476)).
+
+### Confirmed working, from the fixes made earlier the same day
+
+The helm registry config was repaired automatically — launched with no `HELM_REGISTRY_CONFIG`
+and no warning appeared. The validation narration read AICR's **real** check count:
+`validating: 4 checks to run`, correctly excluding `gke-gpu-nic-networks` on a recipe with no
+TCPXO. Apply's rows dimmed under "INSTALLED — FROM THE PREVIOUS STEP" during Validate, and
+condition captions used past tense for components that had finished.
+
+### Measured — the one that closes an open item
+
+**`gpu-operator` took 5m on a node image with no pre-installed driver**, against 30–36s on
+every GKE run. That is the driverless compile `slowSteps.ts` has never had a number for
+(previously open work item 2). Two other figures from this run are **contaminated** and must
+not be used: `kube-prometheus-stack` 22m and Apply 39m 34s both include long stalls where pods
+could not schedule at all.
+
+### Findings
+
+21. **Connect reports "no GPUs" for GPU hardware with no device plugin.** A `p5.48xlarge` has
+    8 H100s; the screen said `2 × p5.48xlarge — no GPUs` and `0 with GPUs`, because it counts
+    `nvidia.com/gpu` capacity. On GKE that view coincides with reality since GKE ships a device
+    plugin; on EKS it does not. The console is reporting the scheduler's view as the hardware's.
+    Minimal honest fix is copy — "no GPUs **schedulable**" — which is true everywhere and frames
+    it as the gap this tool closes.
+22. **The GPU count is wrong and never revised.** Discover reported **8 GPUs on a 16-GPU
+    cluster**: with node capacity at 0, `gap.resolveGPUs` falls back to the snapshot's
+    single-node PCI probe and only multiplies by node count when `c.Nodes > 1` — and `c.Nodes`
+    is itself the count of nodes with `nvidia.com/gpu` capacity, so the guard fails. Worse, the
+    console **watched the correction happen** (`ip-10-0-181-55: nvidia.com/gpu allocatable
+    0 → 8`, and the same for the second node) and never updated. The success screen ends up
+    saying `0 of 8 GPUs usable` directly above a gang running on those GPUs.
+23. **Nothing warns that the recipe's components cannot schedule anywhere.** Every node carried
+    an untolerated `dedicated=worker-workload` taint, so the first component sat Unschedulable
+    for 3m 23s and the install could not proceed. This is knowable at Connect in the same pass
+    that already computes untolerated taints — it just only does that for GPU nodes, against
+    aicrme's own pods. Same shape as the helm-credential preflight: a fail-before-you-start
+    condition, discovered minutes into an install instead.
+24. **AICR's own warnings are terminal-only.** `nodewright-customizations is enabled but
+    --accelerated-node-selector is not set` predicted the failure that became #2476, and was
+    invisible in the UI. There is now a slog handler that could surface component-level warnings
+    on the recipe screen exactly as it surfaces validation progress.
+25. **A component stuck in `started` does not prevent "This run succeeded."**
+    `kube-prometheus-stack` never completed, and the screen said `15 of 16 installed` directly
+    beneath a heading claiming success.
+19. **(upgraded, now quantified) Transient conditions drown the timeline.** In one run:
+    **845 of 903 events (93%) were cluster conditions**, and of 373 arise→resolve pairs,
+    **297 (79%) resolved within two seconds**. Roughly two-thirds of the entire run log is
+    churn no human can act on — `FailedCreatePodSandBox … resolved`, `NodeNotReady … resolved` —
+    which buries the 6 validation-narration events that matter. The fix is a **debounce, not a
+    filter**: hold a condition briefly, and if its resolution arrives first, publish neither.
+    Persistent conditions (the skyhook CrashLoopBackOff, which ran for 20 minutes) are
+    unaffected. It also fixes the attribution smear, where transients get stamped onto whichever
+    component happened to be installing.
+20. **Long ARN context names wrap and bury the cluster name.** `aws eks update-kubeconfig`
+    writes ARNs, so every row shares the same 40-character prefix and the identifying part is
+    last.

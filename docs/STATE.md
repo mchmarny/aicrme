@@ -128,6 +128,9 @@ and bound every member to a node advertising GPUs. `test/e2e/prove.sh` asserts t
   — the cold run pulled every image and provisioned Prometheus a volume, the warm one reused
   both — so `slowSteps.ts` gives it a range and **no component is called "the longest step"**:
   which one leads changed between two runs of the same recipe on the same cluster.
+- **`gpu-operator` driver compile, measured at last: 5m** on EKS Ubuntu nodes that ship no
+  driver (2026-08-30), against 30–36s on every GKE run whose COS image has one. That is an
+  order of magnitude, and it is the claim `slowSteps.ts` had never been able to ground.
 - **`gpu-operator` is not the long pole** where the node image already ships a driver. AICR
   detects that and logs `auto-disabled gpu-operator driver install: pre-installed driver detected
   in snapshot`. It also warns that this is decided from a **single sampled node** and applies
@@ -143,10 +146,11 @@ and bound every member to a node advertising GPUs. `test/e2e/prove.sh` asserts t
 
 Ordered by what unblocks the most. Each item says what it costs and what it is waiting on.
 
-1. **Time a node image that ships no driver.** Every real run so far has been on GKE H100 pools
-   with a pre-installed driver, so the one claim in `slowSteps.ts` nobody has measured is the
-   `gpu-operator` driver compile. Costs one Apply on any GPU cluster whose nodes come up
-   driverless.
+1. **AWS/EKS.** First run 2026-08-30 on a mixed-OS cluster: it completed (15 of 16 installed,
+   gang placed, 3 of 4 validation checks passed) but surfaced four aicrme findings and two
+   upstream issues — see `docs/ux-feedback.md` entry 8. The blockers were a cluster where every
+   node carried an untolerated taint, and a recipe whose node customizations ran NVIDIA kernel
+   setup on Amazon Linux nodes. **AKS remains untested.**
 2. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
    runs between Apply and Prove (`internal/steps/validate.go`) and records a verdict on the run —
    see the two Validation rows above, which separate what CI proves from what it cannot. `ValidateState` false-passes on KWOK — the validator schedules
@@ -178,7 +182,7 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    recovered run re-resolves from the persisted snapshot — `validateStep.resolve`), and
    **per-component attribution is not derivable** — `ctrf.Builder` hardcodes `Suite` to the phase
    name, so no output identifies a component.
-3. **AKS**, unblocked by AICR v0.20.0. **Verification-screen polish** via `VerifyBundle`. GitOps
+3. **AKS**, unblocked by AICR v0.20.0 and now the only untested cloud. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
 4. **UI follow-ups** from the 2026-08-28 real-hardware pass. 27 of 30 shipped; what is left is in
    `docs/ux-feedback.md` entry 3 — the timeline still renders Discover's gap findings as bare
