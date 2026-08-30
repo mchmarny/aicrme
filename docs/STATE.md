@@ -164,12 +164,19 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    delivers the driver (on GKE that is Google's practice, and the driver arrives with the
    infrastructure). EKS is absent from that list by construction, not by omission.
 
-   Two live questions remain, and neither has been investigated. Why a driver read as
-   pre-installed at all — this cluster has been reused across several installs, so it plausibly
-   carried one from an earlier gpu-operator. And whether `expected-resources` is simply racing the
-   Operator's own driver install: the check burns its full 8-minute timeout, and a driver install
-   on p5 nodes can outlast that, which would make the failure a timing artefact rather than a
-   misconfiguration. Answering it needs a run on a cluster with no prior install.
+   The driver AICR detected is explained, and the explanation disqualifies the cluster. It was
+   put there by the internal pipeline that brought the cluster up, which installs a driver and
+   also applies Nodewright EKS node optimization. Both are functions of that tooling, neither is
+   a defect, and together they mean **this cluster is not a representative EKS** — AICR's advisory
+   was it correctly noticing a machine-made state, and every EKS conclusion drawn from these two
+   runs is about the pipeline's output rather than about EKS. A plain, manually created cluster is
+   needed to test the configuration that actually ships.
+
+   `expected-resources` stays open and stays unexplained. It burns its full 8-minute timeout on
+   every real cluster tried. The obvious theory — that it races the GPU Operator's driver install
+   — does not survive GKE, where the driver arrives with the infrastructure and there is no long
+   install to race, and the check failed anyway. So either the cause differs per cloud or it is in
+   the check itself. Do not write a third confident story about this without a clean-room run.
    **AKS remains untested.**
 2. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
    runs between Apply and Prove (`internal/steps/validate.go`) and records a verdict on the run —
