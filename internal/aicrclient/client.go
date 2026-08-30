@@ -7,9 +7,26 @@ import (
 	"context"
 
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
-
-	"github.com/mchmarny/aicrme/internal/version"
 )
+
+// AICRVersion is the version of github.com/NVIDIA/aicr this console is built
+// against. `make check-aicr-pin` keeps it equal to .settings.yaml, go.mod, and
+// the snapshot agent image tag.
+//
+// IT MUST BE AICR'S VERSION, NEVER THIS CONSOLE'S. AICR uses whatever
+// WithVersion is given to rewrite its validator catalog's `:latest` images to a
+// release tag (pkg/validator/catalog.ResolveImage), so passing aicrme's version
+// makes every validator Job pull
+// ghcr.io/nvidia/aicr-validators/deployment:<aicrme tag> -- an image that does
+// not exist. Measured on real H100s 2026-08-29, one hour after aicrme's first
+// tagged release: all five deployment validators ImagePullBackOff'd, each burned
+// its full per-check deadline, and validation reported 0 of 5 passed after 24
+// minutes of nothing.
+//
+// It was invisible before that release because AICR only rewrites the tag when
+// the version LOOKS like a release (`^v?\d+\.\d+\.\d+`). Every dev build
+// passed "dev" or a git SHA, which it ignores, leaving `:latest` to pull fine.
+const AICRVersion = "v0.20.0"
 
 // Snapshotter deploys the AICR snapshot agent Job and returns the result.
 type Snapshotter interface {
@@ -76,6 +93,6 @@ var _ API = (*aicr.Client)(nil)
 func New() (API, error) {
 	return aicr.NewClient(
 		aicr.WithRecipeSource(aicr.EmbeddedSource()),
-		aicr.WithVersion(version.Version),
+		aicr.WithVersion(AICRVersion),
 	)
 }

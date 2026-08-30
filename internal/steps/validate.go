@@ -125,7 +125,10 @@ func (v *validateStep) Run(ctx context.Context, run *engine.Run, emit engine.Emi
 		return nil
 	}
 
-	run.Validation = engine.Validation{Phases: summarize(results)}
+	// Namespace is recorded on the success path too, not only on the error
+	// path's warning: the namespace outlives a PASSING validation just as
+	// surely, and residue an operator is never told about is the problem.
+	run.Validation = engine.Validation{Phases: summarize(results), Namespace: aicrValidationNamespace}
 	if path, werr := v.writeReport(run.ID, results); werr == nil {
 		run.Validation.ReportPath = path
 	} else {

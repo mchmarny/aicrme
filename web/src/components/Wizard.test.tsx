@@ -275,6 +275,15 @@ describe('Wizard', () => {
     expect(screen.getByTestId('component-gpu-operator')).toBeDefined()
     expect(screen.queryByTestId('punchline')).toBeNull()
     expect(screen.queryByText('Discovering the cluster…')).toBeNull()
+    // Staying on the cockpit is only half the fix. The heading and progress
+    // line describe Apply, and leaving them up made the phase change
+    // invisible -- a full green bar and a running Apply timer for the whole of
+    // a 24-minute validation, observed on real H100s.
+    // By role: the timeline rail is also replaying the step's own
+    // "validating the deployment" log line, so a bare text query matches twice.
+    expect(screen.getByRole('heading', { name: /validating the deployment/i })).toBeDefined()
+    expect(screen.queryByRole('heading', { name: /installing the bundle/i })).toBeNull()
+    expect(screen.getByTestId('cockpit-validating')).toBeDefined()
   })
 
   // The reducer, not just the panel: without this, Prove's validation tests
@@ -603,19 +612,44 @@ describe('Wizard: a recovered run', () => {
     expect(screen.getByTestId('prove-recovered')).toBeDefined()
   })
 
-  it('stops through POST and lets the console start a new run without a reload', async () => {
+  // Stop must NOT start a new run. It used to: App bumped a token on the stop
+  // callback, the effect POSTed /api/runs, and the new run took the `current`
+  // slot -- which is the only run engine.Reset will act on. Measured on real
+  // H100s 2026-08-29: Stop left 16 releases installed with no way to remove
+  // them from the console. Starting over is now a deliberate click.
+  it('stops through POST without starting a new run', async () => {
     const fetchMock = mockFetch(url => {
       if (url !== `/api/runs/${RECOVERED_RUN_ID}/stop`) throw new Error(`unexpected fetch: ${url}`)
       return new Response(JSON.stringify({ id: RECOVERED_RUN_ID, state: 'done' }), { status: 200 })
     })
-    const onStopped = vi.fn()
+    const onStartNewRun = vi.fn()
 
-    render(<Wizard events={recoveryEvents('prove', 'active')} onStopped={onStopped} />)
+    render(<Wizard events={recoveryEvents('prove', 'active')} onStartNewRun={onStartNewRun} />)
     fireEvent.click(screen.getByTestId('prove-stop'))
 
-    await waitFor(() => expect(onStopped).toHaveBeenCalled())
-    expect(fetchMock).toHaveBeenCalledWith(
-      `/api/runs/${RECOVERED_RUN_ID}/stop`, { method: 'POST' })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/runs/${RECOVERED_RUN_ID}/stop`, { method: 'POST' }))
+    // The assertion that matters: nothing asked App for a new run.
+    expect(onStartNewRun).not.toHaveBeenCalled()
+  })
+
+  // The other half of the same fix: removing the auto-start would strand the
+  // operator if nothing replaced it, which is what the old callback existed to
+  // prevent. Reset stays in reach and there is a deliberate way forward.
+  it('offers an explicit new run on a stopped run', () => {
+    // A run that reached Prove and has since been stopped -- NOT a recovered
+    // one, which the branch above claims first.
+    const stopped: AicrEvent[] = [
+      { id: 1, runId: 'runS', at: '2026-08-21T00:00:00Z', kind: 'phase', level: 'info', phase: 'prove', message: 'phase started' },
+      { id: 2, runId: 'runS', at: '2026-08-21T00:00:01Z', kind: 'phase', level: 'info', message: 'run done' },
+    ]
+    expect(deriveRunState(stopped).state).toBe('done')
+
+    const onStartNewRun = vi.fn()
+    render(<Wizard events={stopped} onStartNewRun={onStartNewRun} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /start a new run/i }))
+    expect(onStartNewRun).toHaveBeenCalled()
   })
 
   // engine.Stop leaves the run exactly where it was on any failure and says
@@ -627,13 +661,13 @@ describe('Wizard: a recovered run', () => {
       if (url !== `/api/runs/${RECOVERED_RUN_ID}/stop`) throw new Error(`unexpected fetch: ${url}`)
       return new Response(JSON.stringify({ error: 'stopping the workload failed' }), { status: 503 })
     })
-    const onStopped = vi.fn()
+    const onStartNewRun = vi.fn()
 
-    render(<Wizard events={recoveryEvents('prove', 'active')} onStopped={onStopped} />)
+    render(<Wizard events={recoveryEvents('prove', 'active')} onStartNewRun={onStartNewRun} />)
     fireEvent.click(screen.getByTestId('prove-stop'))
 
     await waitFor(() => expect(screen.getByText(/Failed to stop the workload/)).toBeDefined())
-    expect(onStopped).not.toHaveBeenCalled()
+    expect(onStartNewRun).not.toHaveBeenCalled()
     expect(screen.getByTestId('prove-stop')).toBeDefined()
   })
 

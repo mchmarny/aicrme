@@ -251,10 +251,40 @@ func TestResetReportsEveryNamespaceAndDeletesNone(t *testing.T) {
 // them. A run that reached Discover and stopped there installed nothing, so
 // this is the ONLY thing it left behind -- and before this it was reported
 // nowhere.
+// AICR's validator creates its own namespace and cleans up everything inside
+// it except the namespace. Reset does not own it and will not remove it, so the
+// only honest thing left is to NAME it: an operator told the teardown is clean
+// who then finds a namespace has been told something false. Confirmed on real
+// H100s 2026-08-29, where aicr-validation outlived the run unmentioned.
+func TestNamespaceResidueReportsTheValidationNamespace(t *testing.T) {
+	items := namespaceResidue(Ownership{}, AgentNamespace{}, "aicr-validation")
+
+	if len(items) != 1 {
+		t.Fatalf("reported %d namespaces, want the validation namespace: %+v", len(items), items)
+	}
+	if items[0].Name != "aicr-validation" || items[0].Kind != KindNamespace {
+		t.Errorf("item = %+v, want the aicr-validation namespace", items[0])
+	}
+	if !items[0].Created {
+		t.Error("Created = false; the validator brought this namespace into existence")
+	}
+	if items[0].Skip == "" {
+		t.Error("Skip is empty -- a residue row with no reason tells the operator nothing")
+	}
+}
+
+// A run that skipped validation created no namespace, and reporting one would
+// send an operator to look for something that was never there.
+func TestNamespaceResidueOmitsTheValidationNamespaceWhenItNeverRan(t *testing.T) {
+	if items := namespaceResidue(Ownership{}, AgentNamespace{}, ""); len(items) != 0 {
+		t.Errorf("reported %+v, want nothing", items)
+	}
+}
+
 func TestNamespaceResidueReportsTheAgentNamespaceThisRunCreated(t *testing.T) {
 	items := namespaceResidue(Ownership{}, AgentNamespace{
 		Name: "aicrme", UID: "u-1", Created: true,
-	})
+	}, "")
 
 	if len(items) != 1 {
 		t.Fatalf("reported %d namespaces, want the agent namespace: %+v", len(items), items)
@@ -274,7 +304,7 @@ func TestNamespaceResidueReportsTheAgentNamespaceThisRunCreated(t *testing.T) {
 // namespace that a Job briefly ran in, and reporting it would send an operator
 // to delete something this console never created.
 func TestNamespaceResidueOmitsAnAgentNamespaceThisRunDidNotCreate(t *testing.T) {
-	items := namespaceResidue(Ownership{}, AgentNamespace{Name: "kube-system", UID: "u-1"})
+	items := namespaceResidue(Ownership{}, AgentNamespace{Name: "kube-system", UID: "u-1"}, "")
 
 	if len(items) != 0 {
 		t.Errorf("reported %+v for a namespace this run did not create", items)
@@ -287,7 +317,7 @@ func TestNamespaceResidueOmitsAnAgentNamespaceThisRunDidNotCreate(t *testing.T) 
 // clean teardown from a partial one.
 func TestNamespaceResidueDoesNotReportOneNamespaceTwice(t *testing.T) {
 	own := Ownership{Namespaces: []NamespaceRef{{Name: "aicrme"}}}
-	items := namespaceResidue(own, AgentNamespace{Name: "aicrme", UID: "u-1", Created: true})
+	items := namespaceResidue(own, AgentNamespace{Name: "aicrme", UID: "u-1", Created: true}, "")
 
 	if len(items) != 1 {
 		t.Fatalf("reported %d rows for one namespace: %+v", len(items), items)

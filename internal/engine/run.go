@@ -277,6 +277,14 @@ type Validation struct {
 	// Phases is one entry per validation phase that ran, in the order AICR
 	// ran them.
 	Phases []PhaseSummary `json:"phases,omitempty"`
+	// Namespace is where AICR's validator ran, set only when validation
+	// actually ran. AICR cleans up the RBAC and Jobs it created there; the
+	// namespace itself survives, and Reset does not own it. Recorded so the
+	// residue inventory can NAME it -- an operator who is told nothing is left
+	// and then finds a namespace has been told something false. Confirmed on
+	// real H100s 2026-08-29: aicr-validation outlived the run and no part of
+	// the console mentioned it.
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // PhaseSummary is one validation phase's outcome, flattened from

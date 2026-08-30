@@ -48,6 +48,10 @@ test-coverage: test ## Runs tests and enforces the coverage floor
 # carry, and neither Go's module graph nor yq can see it — check-aicr-pin
 # below greps it so all three stay equal or the build fails.
 AICR_IMAGE_SRC := internal/console/console.go
+# Source file holding the AICR version constant. A THIRD copy of the same
+# literal, and the one that decides which validator images AICR pulls --
+# see the comment on aicrclient.AICRVersion for what a wrong value costs.
+AICR_VERSION_SRC := internal/aicrclient/client.go
 
 .PHONY: check-aicr-pin
 check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.com/NVIDIA/aicr to the version in .settings.yaml
@@ -74,6 +78,14 @@ check-aicr-pin: ## Verifies go.mod and the snapshot agent image both pin github.
 		echo "ERROR: $(AICR_IMAGE_SRC) pins snapshot agent image $$image, expected tag $$expected (see .settings.yaml dependencies.aicr)"; exit 1; \
 	else \
 		echo "check-aicr-pin: OK — snapshot agent image $$image matches pin"; \
+	fi; \
+	constant=$$(sed -n 's/^const AICRVersion = "\(.*\)"$$/\1/p' $(AICR_VERSION_SRC)); \
+	if [ -z "$$constant" ]; then \
+		echo "ERROR: no AICRVersion constant in $(AICR_VERSION_SRC) — aicr.WithVersion would receive an empty version and AICR would leave its validator images on :latest"; exit 1; \
+	elif [ "$$constant" != "$$expected" ]; then \
+		echo "ERROR: $(AICR_VERSION_SRC) pins AICRVersion=$$constant, expected $$expected (see .settings.yaml dependencies.aicr). This is the value AICR rewrites its validator image tags with — a wrong one makes every validator Job pull an image that does not exist"; exit 1; \
+	else \
+		echo "check-aicr-pin: OK — AICRVersion $$constant matches pin"; \
 	fi
 
 .PHONY: demo

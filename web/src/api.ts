@@ -115,6 +115,12 @@ export interface ClusterInfo {
   uid: string
   toolchain?: Record<string, string>
   /**
+   * aicrVersion is the AICR release this binary is BUILT AGAINST, not one
+   * read from the cluster. Every version and verdict the console shows comes
+   * from it, so a run is not reproducible without it.
+   */
+  aicrVersion?: string
+  /**
    * registryWarning: a helm credential helper this machine does not have,
    * named by helm's own registry config. Every oci:// chart fails on it,
    * including public ones, so it is worth reading before an install rather

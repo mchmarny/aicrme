@@ -403,17 +403,17 @@ function Recovered({ events, run, busy, onRetry, onDiscard }: {
  * deletes the run rather than transitioning it -- so nothing in the stream
  * would otherwise tell App.tsx that POST /api/runs has stopped 409ing.
  *
- * onStopped is the same signal for the same reason, one state over. A
- * successful Stop clears every gate that was refusing new runs -- the active
- * workload itself, and the recovery gate engine.Stop clears on success -- so
- * without it the console sits on a stopped run with no way forward but a page
- * reload, which is precisely the dead end the recovery panel was built to
- * remove.
+ * onStartNewRun is deliberately NOT wired to Stop. Stop used to start a new
+ * run automatically, which handed the `current` slot to the new run and left
+ * the finished one unresettable -- engine.Reset refuses any run that is not
+ * current, so an installed cluster had no teardown path at all. Measured on
+ * real H100s 2026-08-29. The stopped screen now keeps Reset in reach and asks
+ * for a deliberate click to move on.
  */
-export function Wizard({ events, onDiscarded, onStopped }: {
+export function Wizard({ events, onDiscarded, onStartNewRun }: {
   events: AicrEvent[]
   onDiscarded?: () => void
-  onStopped?: () => void
+  onStartNewRun?: () => void
 }) {
   const run = useMemo(() => deriveRunState(events), [events])
   const [options, setOptions] = useState<Options | null>(null)
@@ -523,7 +523,6 @@ export function Wizard({ events, onDiscarded, onStopped }: {
     setBusy(true)
     try {
       await stopRun(run.runId)
-      onStopped?.()
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : (err as Error).message)
     } finally {
@@ -702,6 +701,20 @@ export function Wizard({ events, onDiscarded, onStopped }: {
             busy={busy}
             onReset={handleReset}
           />
+          {/* Under Reset, not beside it. What this run installed is still in
+              the cluster, and starting over it is the one thing that produces
+              a cluster reporting success while its scheduler is the previous
+              install's -- so the deliberate order is Reset first. */}
+          {onStartNewRun && (
+            <button
+              type="button"
+              onClick={onStartNewRun}
+              disabled={busy}
+              className="text-ink-faint hover:text-ink text-sm underline underline-offset-4 disabled:opacity-50"
+            >
+              Start a new run
+            </button>
+          )}
         </div>
       )
     }

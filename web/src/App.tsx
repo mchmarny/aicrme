@@ -171,6 +171,22 @@ function Console({ cluster, onUnauthorized }: { cluster: ClusterInfo | null; onU
           {connected ? 'connected' : 'reconnecting…'}
         </span>
         <ClusterBadge cluster={cluster} />
+        {/* Pushed right, away from the cluster identity: this describes the
+            binary, not the cluster, and sitting them together invites reading
+            it as something discovered from the cluster. Links to the release
+            notes for the exact version whose decisions are on screen. */}
+        {cluster?.aicrVersion && (
+          <a
+            href={`https://github.com/NVIDIA/aicr/releases/tag/${cluster.aicrVersion}`}
+            target="_blank"
+            rel="noreferrer"
+            title="The AICR release this console is built against"
+            data-testid="aicr-version"
+            className="text-ink-faint hover:text-accent ml-auto font-mono text-xs underline underline-offset-4"
+          >
+            AICR {cluster.aicrVersion}
+          </a>
+        )}
       </header>
       {eventsLost > 0 && (
         <p className="mb-4 text-warn text-xs">
@@ -202,7 +218,14 @@ function Console({ cluster, onUnauthorized }: { cluster: ClusterInfo | null; onU
       <Wizard
         events={events}
         onDiscarded={() => setRetryToken(n => n + 1)}
-        onStopped={() => setRetryToken(n => n + 1)}
+        // NOT wired to Stop. A successful Stop used to bump retryToken, which
+        // re-ran the effect above and started a new run immediately -- so the
+        // finished run lost the `current` slot, and with it the only path to
+        // Reset (engine.Reset refuses any run that is not current). Observed on
+        // real H100s 2026-08-29: Stop left 16 releases installed and no way in
+        // the console to remove them. Starting a new run is now an explicit
+        // action on the stopped screen.
+        onStartNewRun={() => setRetryToken(n => n + 1)}
       />
     </main>
   )

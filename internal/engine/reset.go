@@ -255,7 +255,7 @@ func (e *Engine) runReset(ctx, cancelCtx context.Context, epoch uint64, runID st
 	// Reported, not removed -- and reported even when the release half was
 	// cut short, because a half-finished teardown is exactly when the
 	// operator most needs the inventory.
-	for _, it := range namespaceResidue(run.Ownership, run.AgentNamespace) {
+	for _, it := range namespaceResidue(run.Ownership, run.AgentNamespace, run.Validation.Namespace) {
 		emit(it)
 		items = append(items, it)
 	}
@@ -367,7 +367,7 @@ func (e *Engine) recordResidue(epoch uint64, runID string, items []ResidueItem, 
 // that remains; adding teardown code to chase it would put this console in the
 // business of undoing a deployer's work, which is the line this repo has
 // drawn. The deployer owns its cleanup, and aicrme prints what is left.
-func namespaceResidue(own Ownership, agent AgentNamespace) []ResidueItem {
+func namespaceResidue(own Ownership, agent AgentNamespace, validation string) []ResidueItem {
 	out := make([]ResidueItem, 0, len(own.Namespaces)+1)
 	for _, ns := range own.Namespaces {
 		note := "this run created it; remove it when you no longer need it"
@@ -386,6 +386,14 @@ func namespaceResidue(own Ownership, agent AgentNamespace) []ResidueItem {
 	// the recipe also installs into, and two residue rows for one namespace
 	// would double it in the summary counts the operator reads to tell a clean
 	// teardown from a partial one.
+	if validation != "" && !namesNamespace(out, validation) {
+		out = append(out, ResidueItem{
+			Kind:    KindNamespace,
+			Name:    validation,
+			Skip:    "AICR's validator created it; its Jobs and RBAC are already cleaned up, but the namespace remains",
+			Created: true,
+		})
+	}
 	if agent.Created && agent.Name != "" && !namesNamespace(out, agent.Name) {
 		out = append(out, ResidueItem{
 			Kind:    KindNamespace,

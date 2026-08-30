@@ -283,17 +283,41 @@ function useNow(live: boolean): number {
   return now
 }
 
-function Running({ components, recipeCount }: { components: ComponentState[]; recipeCount?: number }) {
+function Running({ components, recipeCount, phase }: {
+  components: ComponentState[]
+  recipeCount?: number
+  phase?: string
+}) {
   const actionTotal = deploymentActionsTotal(components)
   const now = useNow(true)
   const done = installedCount(components)
   const elapsed = runElapsed(components, now)
 
+  // Validate runs on this same screen, deliberately -- the just-installed
+  // component rows are still the useful context. But the heading and the
+  // progress line describe Apply, and leaving them unchanged made the phase
+  // change invisible: the operator saw "Installing the bundle", a full green
+  // bar and a still-counting Apply timer while validation ran for 24 minutes.
+  // Observed on real H100s 2026-08-29. The rows stay; the words above them
+  // have to say what is happening now.
+  const validating = phase === 'validate'
+
   return (
     <section className="space-y-4">
-      <h2 className="text-2xl font-semibold text-ink-strong">Installing the bundle</h2>
-      {recipeCount === undefined && <RecipeUnknownNote />}
-      <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} done={done} elapsed={elapsed} />
+      <h2 className="text-2xl font-semibold text-ink-strong">
+        {validating ? 'Validating the deployment' : 'Installing the bundle'}
+      </h2>
+      {validating ? (
+        <p data-testid="cockpit-validating" className="text-ink-soft text-sm">
+          Everything below is installed. AICR is now checking that it actually
+          reconciled — this can take several minutes and the run continues either way.
+        </p>
+      ) : (
+        <>
+          {recipeCount === undefined && <RecipeUnknownNote />}
+          <ProgressLine recipeCount={recipeCount} actionTotal={actionTotal} done={done} elapsed={elapsed} />
+        </>
+      )}
       {components.length === 0 ? (
         <p className="text-ink-faint text-sm">Generating the bundle…</p>
       ) : (
@@ -404,5 +428,5 @@ export function Cockpit({ events, run, onDecide, onRetry }: {
     return <Done components={components} recipeCount={recipeCount} />
   }
 
-  return <Running components={components} recipeCount={recipeCount} />
+  return <Running components={components} recipeCount={recipeCount} phase={run.phase} />
 }

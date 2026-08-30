@@ -831,9 +831,13 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 	if err := e.store.Save(ctx, snapshot); err != nil {
 		slog.Warn("run checkpoint failed", "run", runID, "error", err)
 	}
+	// The phase NAME is in the Phase field, but the timeline renders messages,
+	// so a bare "phase started" left the operator unable to tell which phase
+	// began -- most visibly when Validate follows Apply and the screen keeps
+	// showing Apply's heading. Observed on real H100s 2026-08-29.
 	e.bus.Publish(bus.Event{
 		RunID: runID, Kind: bus.KindPhase, Phase: string(step.Phase()),
-		Message: "phase started",
+		Message: string(step.Phase()) + " phase started",
 	})
 
 	emit := func(ev bus.Event) {
@@ -983,7 +987,7 @@ func (e *Engine) runStep(ctx context.Context, epoch uint64, i int, step Step) er
 
 	e.bus.Publish(bus.Event{
 		RunID: runID, Kind: bus.KindPhase, Phase: string(step.Phase()),
-		Message: "phase complete",
+		Message: string(step.Phase()) + " phase complete",
 	})
 	return nil
 }

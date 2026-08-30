@@ -11,6 +11,7 @@ import (
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/steps"
 	corev1 "k8s.io/api/core/v1"
@@ -57,6 +58,13 @@ type ClusterInfo struct {
 	// resolved versions; §5 asks the run to record them. Preflight runs once,
 	// before connect, so one map answers both.
 	Toolchain Toolchain `json:"toolchain,omitempty"`
+	// AICRVersion is the AICR release this binary is BUILT AGAINST, not one
+	// discovered from the cluster. Every component version, recipe decision
+	// and validation verdict the console shows comes from it, and two runs
+	// from two binaries are not comparable without knowing which. Reporting a
+	// cluster-derived version here would answer a different question: a
+	// cluster may well have been configured by a different aicrme build.
+	AICRVersion string `json:"aicrVersion,omitempty"`
 	// RegistryWarning names a helm credential helper this machine does not
 	// have, when helm's registry config names one. Empty on a healthy machine,
 	// which is the ordinary case. See checkHelmCredentialHelpers for why this
@@ -416,13 +424,14 @@ func (c *connector) dial(ctx context.Context, contextName string) (ClusterInfo, 
 	composition.Tolerating = strings.Join(derived, ",")
 
 	return ClusterInfo{
-		Context:   contextName,
-		Server:    restCfg.Host,
-		Version:   version,
-		NodeCount: len(nodes),
-		Nodes:     composition,
-		UID:       string(ns.UID),
-		Toolchain: c.toolchain,
+		Context:     contextName,
+		Server:      restCfg.Host,
+		Version:     version,
+		NodeCount:   len(nodes),
+		Nodes:       composition,
+		UID:         string(ns.UID),
+		Toolchain:   c.toolchain,
+		AICRVersion: aicrclient.AICRVersion,
 		// Carried on every connect response, not just the first: the Connect
 		// screen is re-rendered per attempt and the condition does not change
 		// between them.
