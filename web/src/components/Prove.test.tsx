@@ -318,6 +318,79 @@ describe('Prove', () => {
     expect(partial).toMatch(/gang placed/i)
   })
 
+  // Observed on real EKS H100s 2026-08-30: expected-resources failed, the
+  // panel printed "✗ deployment 3 of 4 checks passed, 1 failed", and the
+  // green line directly above it said the run succeeded. Everything did
+  // install and the gang did place -- the claim is not wrong about those, it
+  // is wrong about being finished.
+  it('qualifies success when a validation check failed', () => {
+    const run = runState({
+      validation: {
+        phases: [{ phase: 'deployment', status: 'failed', seconds: 501, tests: 4, passed: 3, failed: 1, skipped: 0 }],
+      },
+    })
+    render(<Prove events={placementEvents()} run={run} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.queryByTestId('prove-success')).toBeNull()
+    const unverified = screen.getByTestId('prove-unverified').textContent ?? ''
+    expect(unverified).toMatch(/1 validation check failed/)
+    expect(unverified).toMatch(/not\s+verified/)
+    // The good news is still true and still said.
+    expect(unverified).toMatch(/gang placed/i)
+  })
+
+  // Plural, because "1 validation checks failed" on the console's own summary
+  // line is the kind of thing that gets screenshotted.
+  it('counts failures across every phase', () => {
+    const run = runState({
+      validation: {
+        phases: [
+          { phase: 'deployment', status: 'failed', seconds: 501, tests: 4, passed: 3, failed: 1, skipped: 0 },
+          { phase: 'runtime', status: 'failed', seconds: 60, tests: 3, passed: 1, failed: 2, skipped: 0 },
+        ],
+      },
+    })
+    render(<Prove events={placementEvents()} run={run} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByTestId('prove-unverified').textContent).toMatch(/3 validation checks failed/)
+  })
+
+  // A skip is an absence of evidence, not a failure. Qualifying the success
+  // line on it would put a warning on every KWOK run, where the skip is the
+  // correct and expected outcome.
+  it('does not qualify success when validation was skipped', () => {
+    const run = runState({ validation: { skipped: 'simulated cluster' } })
+    render(<Prove events={placementEvents()} run={run} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByTestId('prove-success')).toBeDefined()
+    expect(screen.queryByTestId('prove-unverified')).toBeNull()
+  })
+
+  // Both wrong at once. A component that never installed is the bigger fact
+  // and the message that names it wins; showing two contradicting
+  // qualifications is how the screen got into trouble in the first place.
+  it('leads with the missing component when a check also failed', () => {
+    const events: AicrEvent[] = [
+      ...placementEvents(),
+      {
+        id: 902, runId: RUN_ID, at: '2026-08-30T00:00:01Z', kind: 'component',
+        level: 'info', phase: 'apply', component: 'kube-prometheus-stack',
+        message: 'installing kube-prometheus-stack',
+        data: { name: 'kube-prometheus-stack', status: 'started' },
+      },
+    ]
+    const run = runState({
+      validation: {
+        phases: [{ phase: 'deployment', status: 'failed', seconds: 501, tests: 4, passed: 3, failed: 1, skipped: 0 }],
+      },
+    })
+    render(<Prove events={events} run={run} busy={false} onStop={vi.fn()} />)
+
+    expect(screen.getByTestId('prove-partial')).toBeDefined()
+    expect(screen.queryByTestId('prove-unverified')).toBeNull()
+    expect(screen.queryByTestId('prove-success')).toBeNull()
+  })
+
   // A skip is not a pass, and the screen must not let it read as one.
   it('says why validation was skipped rather than showing a verdict', () => {
     const run = runState({ validation: { skipped: 'simulated cluster -- AICR’s validator lands on fake nodes' } })

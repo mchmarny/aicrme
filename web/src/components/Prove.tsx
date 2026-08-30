@@ -51,6 +51,19 @@ export function isSimulated(run: RunState): boolean | undefined {
   return run.report.simulated || run.report.totalGpus === 0
 }
 
+/**
+ * validationFailures totals the checks AICR reported as failed.
+ *
+ * Absence of evidence is not a failure, and all three ways of having none
+ * return 0: no validation record at all (an adopted or recovered run, or one
+ * from before Validate existed), a skip, and a clean pass. Only a phase
+ * summary that counted failures qualifies the success line.
+ */
+export function validationFailures(v?: Validation): number {
+  if (!v || v.skipped) return 0
+  return v.phases?.reduce((n, p) => n + p.failed, 0) ?? 0
+}
+
 function Claim({ run }: { run: RunState }) {
   const simulated = isSimulated(run)
 
@@ -177,6 +190,10 @@ export function Prove({ events, run, busy, onStop }: {
   // outrun what actually landed.
   const incomplete = deriveComponents(events, run.recipe?.components.map(c => c.name))
     .filter(c => c.status !== 'installed' && c.status !== 'skipped').length
+  // Checks AICR failed. `incomplete` still takes precedence when both are
+  // non-zero: a component that never installed is the bigger fact, and the
+  // validation panel below is showing the ✗ either way.
+  const failedChecks = validationFailures(run.validation)
   // Four states reach this screen, and each of them makes a different claim
   // true. Wizard renders it for the whole prove phase, not only for an active
   // run, so a two-way active/not-active split would tell an operator watching
@@ -226,10 +243,24 @@ export function Prove({ events, run, busy, onStop }: {
             claimed success with "15 of 16 installed" printed directly below
             it. The gang really did place, so this is not a failure; it is a
             success that has to name what it did not include. */}
-        {active && incomplete === 0 && (
+        {active && incomplete === 0 && failedChecks === 0 && (
           <p data-testid="prove-success" className="text-sm text-pass">
             This run succeeded. Prove is the last step and it ends here — the workload
             holds its placement until you stop it, so nothing further happens on its own.
+          </p>
+        )}
+        {/* A failed check qualifies the claim too. On EKS 2026-08-30 the green
+            "This run succeeded" rendered directly above a red "✗ deployment
+            3 of 4 checks passed, 1 failed" -- the two lines contradicting each
+            other, because this branch was gated on installs alone and knew
+            nothing about the verdict. The gang really did place, so this is
+            not a failure; it is a success that has to say what went unverified. */}
+        {active && incomplete === 0 && failedChecks > 0 && (
+          <p data-testid="prove-unverified" className="text-sm text-warn">
+            Every component installed and the gang placed, but {failedChecks} validation
+            check{failedChecks === 1 ? '' : 's'} failed: this deployment is running, not
+            verified. Prove is the last step and it ends here — the failing phase is below,
+            and the timeline names the check.
           </p>
         )}
         {active && incomplete > 0 && (

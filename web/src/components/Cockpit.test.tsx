@@ -28,6 +28,23 @@ function baseRun(overrides: Partial<RunState>): RunState {
 }
 
 describe('Cockpit', () => {
+  // Cockpit renders for both bundle and apply, and before the first component
+  // reports there is nothing on screen but this one line. On EKS 2026-08-30 it
+  // claimed the bundle was being generated for the ~40 seconds of apply's
+  // pre-flight checks -- while the timeline beside it said `applying the
+  // bundle` and `bundle phase complete` a minute earlier.
+  it('names the phase it is actually waiting on before any component reports', () => {
+    const props = { events: [], onDecide: vi.fn(), onRetry: vi.fn() }
+
+    const { unmount } = render(<Cockpit {...props} run={baseRun({ phase: 'bundle' })} />)
+    expect(screen.getByText(/generating the bundle/i)).toBeDefined()
+    unmount()
+
+    render(<Cockpit {...props} run={baseRun({ phase: 'apply' })} />)
+    expect(screen.queryByText(/generating the bundle/i)).toBeNull()
+    expect(screen.getByText(/pre-flight checks/i)).toBeDefined()
+  })
+
   it('gate: renders the recipe components, a bundle download link, and sends {apply: yes} on Install', () => {
     const onDecide = vi.fn()
     const run = baseRun({ state: 'awaiting_decision', phase: 'apply' })

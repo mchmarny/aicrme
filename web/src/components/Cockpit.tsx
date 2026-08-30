@@ -324,7 +324,18 @@ function Running({ components, recipeCount, phase }: {
         </>
       )}
       {components.length === 0 ? (
-        <p className="text-ink-faint text-sm">Generating the bundle…</p>
+        // Cockpit renders for bundle AND apply, so this empty state has to
+        // name which one. It said "Generating the bundle…" unconditionally,
+        // and on EKS 2026-08-30 that sat on screen for the ~40s between
+        // `apply phase started` and the first component -- the timeline
+        // saying `applying the bundle` while the panel beside it claimed the
+        // bundle was still being built. Apply's pre-flight checks are what
+        // actually occupy that gap.
+        <p className="text-ink-faint text-sm">
+          {phase === 'bundle'
+            ? 'Generating the bundle…'
+            : 'Running pre-flight checks, then the first component…'}
+        </p>
       ) : (
         // Dimmed during validate, and labelled. These rows are Apply's
         // results, and leaving them at full strength under a "Validating"
