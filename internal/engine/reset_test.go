@@ -256,6 +256,30 @@ func TestResetReportsEveryNamespaceAndDeletesNone(t *testing.T) {
 // only honest thing left is to NAME it: an operator told the teardown is clean
 // who then finds a namespace has been told something false. Confirmed on real
 // H100s 2026-08-29, where aicr-validation outlived the run unmentioned.
+// The summary counts; it must not explain. It used to assert that skipped
+// items were "left in place because this run did not create them", printed
+// directly above items reading "this run created it for the snapshot agent" --
+// two contradictory claims on one screen, and the summary was the wrong one.
+// Namespaces survive because Reset never deletes a namespace.
+func TestResetSummaryDoesNotContradictItsItems(t *testing.T) {
+	res := Residue{Items: []ResidueItem{
+		{Kind: KindRelease, Name: "cert-manager", Removed: true},
+		{Kind: KindNamespace, Name: "aicrme", Created: true,
+			Skip: "this run created it for the snapshot agent; remove it when you no longer need it"},
+		{Kind: KindNamespace, Name: "monitoring", Created: true,
+			Skip: "this run created it; remove it when you no longer need it"},
+	}}
+
+	got := resetSummary(res)
+
+	if strings.Contains(got, "did not create") {
+		t.Errorf("summary = %q -- it claims this run did not create namespaces whose own reasons say it did", got)
+	}
+	if !strings.Contains(got, "2 left in place") {
+		t.Errorf("summary = %q, want it to count the two skipped namespaces", got)
+	}
+}
+
 func TestNamespaceResidueReportsTheValidationNamespace(t *testing.T) {
 	items := namespaceResidue(Ownership{}, AgentNamespace{}, "aicr-validation")
 

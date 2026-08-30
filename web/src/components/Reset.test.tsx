@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { deriveComponents } from '../pipeline'
 import type { AicrEvent } from '../useEvents'
-import { Reset, ResetGate } from './Reset'
+import { Reset, ResetGate, plannedRemovals } from './Reset'
 import { deriveRunState, type ResidueItem, type RunState } from './Wizard'
 
 const RUN_ID = '00112233445566ff'
@@ -252,5 +252,59 @@ describe('the teardown screen', () => {
     // An operator must be able to tell a clean teardown from a partial one
     // without reading the timeline (design section 6).
     expect(screen.getByTestId('reset-summary').textContent).toContain('2 of 3 releases removed')
+  })
+})
+
+describe('plannedRemovals and the generated actions', () => {
+  // The gate is a promise about what the next click does. It excluded
+  // generated actions, so it said "Remove 14 releases" and then removed 16 --
+  // gpu-operator-pre and kubeflow-trainer-post are real helm releases and Reset
+  // uninstalls them. Observed on real H100s 2026-08-30.
+  it('includes generated actions, because Reset removes them', () => {
+    const events: AicrEvent[] = [
+      installEvent('gpu-operator', 'gpu-operator', 8, 'installed'),
+      installEvent('gpu-operator-pre', 'gpu-operator', 7, 'installed'),
+      installEvent('kubeflow-trainer', 'kubeflow', 12, 'installed'),
+    ]
+    const names = plannedRemovals(deriveComponents(events, undefined)).map(r => r.name)
+
+    expect(names).toContain('gpu-operator-pre')
+    expect(names).toContain('gpu-operator')
+    expect(names).toContain('kubeflow-trainer')
+  })
+})
+
+describe('knowing when a teardown is over', () => {
+  // The operator asked twice whether it was done, and the second time it WAS
+  // -- the screen just never said so, and its primary button still offered the
+  // reset that had already finished. Observed on real H100s 2026-08-30.
+  it('declares completion once the residue inventory exists', () => {
+    const events = [
+      ...installed().map(e => e),
+      teardownEvent('gpu-operator', 'gpu-operator', 'release', 'removed'),
+    ]
+    const run = runState({ residue: residue([
+      { kind: 'release', name: 'gpu-operator', namespace: 'gpu-operator', removed: true },
+    ]) })
+
+    render(<Reset events={events} run={run} />)
+
+    expect(screen.getByRole('heading', { name: /reset complete/i })).toBeDefined()
+    expect(screen.getByTestId('reset-done').textContent).toMatch(/close this tab/i)
+  })
+
+  // Before it finishes it must NOT claim completion, and it has to answer
+  // "how far along" -- rows flipping one at a time never did.
+  it('counts progress and does not claim completion while running', () => {
+    const events = [
+      ...installed().map(e => e),
+      teardownEvent('gpu-operator', 'gpu-operator', 'release', 'removed'),
+    ]
+
+    render(<Reset events={events} run={runState()} />)
+
+    expect(screen.queryByTestId('reset-done')).toBeNull()
+    expect(screen.queryByRole('heading', { name: /reset complete/i })).toBeNull()
+    expect(screen.getByTestId('teardown-progress').textContent).toMatch(/1 of 3 removed/)
   })
 })

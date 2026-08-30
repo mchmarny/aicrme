@@ -29,8 +29,13 @@ export interface Removal {
  * and summarized at the end (see Skipped, below).
  */
 export function plannedRemovals(components: ComponentState[]): Removal[] {
+  // Generated actions are INCLUDED. They were filtered out here on the grounds
+  // that they are not recipe components, which is true and irrelevant:
+  // gpu-operator-pre and kubeflow-trainer-post are real helm releases and Reset
+  // uninstalls them. Excluding them made the gate promise "Remove 14 releases"
+  // and then remove 16 -- the operator approving a smaller set than the one
+  // that ran. Observed on real H100s 2026-08-30.
   return [...components]
-    .filter(c => !c.generated)
     .sort((a, b) => (b.index ?? 0) - (a.index ?? 0))
     .map(c => ({ name: c.name, namespace: c.namespace }))
 }
@@ -155,7 +160,7 @@ export function ResetGate({
       {skipped.length > 0 && (
         <div data-testid="reset-skipped">
           <h3 className="text-xs uppercase tracking-wide text-ink-faint">
-            Left in place — not created by this run
+            Left in place
           </h3>
           <ItemList items={skipped} tone="text-warn" />
         </div>
@@ -193,23 +198,52 @@ export function Reset({ events, run }: { events: AicrEvent[]; run: RunState }) {
   const skipped = skippedItems(run)
   const failed = failedItems(run)
 
+  // A teardown is finished when the residue inventory exists: Reset publishes
+  // it once, at the end, after the last release is gone.
+  const finished = run.residue !== undefined
+  const done = components.filter(c => c.status === 'removed').length
+
   return (
     <section className="space-y-4">
-      <h2 className="text-lg text-ink">Removing what this run installed</h2>
+      <h2 className="text-lg text-ink">
+        {finished ? 'Reset complete' : 'Removing what this run installed'}
+      </h2>
+      {/* A count, because rows flipping one at a time never answered "is it
+          done". The operator asked twice on real H100s 2026-08-30, and the
+          second time it HAD finished -- the screen just never said so. */}
+      <p data-testid="teardown-progress" className="text-sm text-ink-soft">
+        {done} of {components.length} removed
+        {!finished && components.length > 0 && ' — this takes a couple of minutes'}
+      </p>
       <ul data-testid="teardown-rows" className="space-y-1">
-        {components.map(c => (
-          <li key={c.name} data-testid={`teardown-${c.name}`} className="font-mono text-sm text-ink">
-            <span>{c.name}</span>
-            <span className="ml-2 text-xs uppercase text-ink-faint">{c.status}</span>
-            {c.reason && <span className="ml-2 text-xs text-ink-soft">{c.reason}</span>}
-          </li>
-        ))}
+        {components.map(c => {
+          // REMOVED and REMOVING are two letters apart in the same weight and
+          // colour, so the list could not be scanned -- the person who reported
+          // it misread it himself a minute later. Apply's row vocabulary (mark,
+          // colour) already solved this; reuse it rather than invent a third.
+          const removed = c.status === 'removed'
+          return (
+            <li key={c.name} data-testid={`teardown-${c.name}`} className="font-mono text-sm">
+              <span className={removed ? 'text-pass' : 'text-ink-faint'}>{removed ? '✓' : '·'}</span>
+              <span className={`ml-2 ${removed ? 'text-ink-faint' : 'text-ink'}`}>{c.name}</span>
+              <span className={`ml-2 text-xs uppercase ${removed ? 'text-ink-faint' : 'text-warn'}`}>
+                {c.status}
+              </span>
+              {c.reason && <span className="ml-2 text-xs text-ink-soft">{c.reason}</span>}
+            </li>
+          )
+        })}
       </ul>
       {run.residue && (
         <p data-testid="reset-summary" className="text-sm text-ink">{run.residue.summary}</p>
       )}
       {failed.length > 0 && <ItemList items={failed} tone="text-fail" />}
       {skipped.length > 0 && <ItemList items={skipped} tone="text-warn" />}
+      {finished && (
+        <p data-testid="reset-done" className="text-sm text-pass">
+          Nothing further is running. You can close this tab.
+        </p>
+      )}
     </section>
   )
 }

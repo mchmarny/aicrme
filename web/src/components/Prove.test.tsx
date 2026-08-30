@@ -266,6 +266,18 @@ describe('Prove', () => {
     expect(panel.textContent).toMatch(/14/)
   })
 
+  // The heading says the workload has stopped; this sentence used to say the
+  // gang "is placed and running" two lines below it. Observed on real H100s
+  // 2026-08-30 -- the screen contradicting itself.
+  it('speaks in the past tense once the run has stopped', () => {
+    const stopped = runState({ state: 'done', report: report(16, 16) })
+    render(<Prove events={placementEvents()} run={stopped} busy={false} onStop={vi.fn()} />)
+
+    const claim = screen.getByTestId('prove-real').textContent ?? ''
+    expect(claim).toMatch(/was placed/)
+    expect(claim).not.toMatch(/is placed and running/)
+  })
+
   // A skip is not a pass, and the screen must not let it read as one.
   it('says why validation was skipped rather than showing a verdict', () => {
     const run = runState({ validation: { skipped: 'simulated cluster -- AICR’s validator lands on fake nodes' } })

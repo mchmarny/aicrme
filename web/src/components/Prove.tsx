@@ -74,11 +74,17 @@ function Claim({ run }: { run: RunState }) {
     )
   }
 
+  // Past tense once the run is over. This sentence used to say the gang "is
+  // placed and running" underneath a heading reading "The reference workload
+  // has stopped" -- the screen contradicting itself two lines apart, observed
+  // on real H100s 2026-08-30.
+  const running = run.state === 'active'
+
   return (
     <p data-testid="prove-real" className="text-sm text-ink-soft">
       Discover found <strong>{run.report?.usableGpus} of {run.report?.totalGpus} GPUs</strong>{' '}
-      usable by a workload. The gang below is placed and running on the components this
-      console installed since.
+      usable by a workload. The gang below {running ? 'is placed and running' : 'was placed'} on
+      the components this console installed since.
     </p>
   )
 }

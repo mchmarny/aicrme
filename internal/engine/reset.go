@@ -434,7 +434,14 @@ func resetSummary(res Residue) string {
 		s += fmt.Sprintf("; %d failed", failed)
 	}
 	if skipped > 0 {
-		s += fmt.Sprintf("; %d left in place because this run did not create them", skipped)
+		// No reason is given here on purpose. This line used to say "because
+		// this run did not create them", which contradicted the items printed
+		// directly beneath it -- most of those namespaces DID come from this
+		// run, and they survive because Reset never deletes a namespace, not
+		// because it disclaimed them. Observed on real H100s 2026-08-30. Each
+		// item carries its own accurate reason; the summary counts, it does not
+		// explain.
+		s += fmt.Sprintf("; %d left in place, each with its reason below", skipped)
 	}
 	return s
 }
