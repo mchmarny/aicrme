@@ -146,16 +146,31 @@ and bound every member to a node advertising GPUs. `test/e2e/prove.sh` asserts t
 
 Ordered by what unblocks the most. Each item says what it costs and what it is waiting on.
 
-1. **AWS/EKS runs clean end to end; the Operator's own validator does not.** Second run
-   2026-08-30: 16 of 16 installed in 8m23s, a gang of 2 placed on 8 of 8 GPUs, validation
-   reaching a verdict inside its timeout. `expected-resources` has now failed on every real
-   cluster tried. On EKS the mechanism is visible for the first time: AICR warns at recommend
-   time that a pre-installed driver was found but the resolved overlay is not a
-   preinstalled-driver profile, leaving the toolkit enabled with no operator-managed driver
-   root — and 20 minutes later the cluster reports `nvidia-operator-validator:
-   FailedCreatePodSandBox ... no runtime for "nvidia" is configured`. AICR offers
-   preinstalled-driver overlays for AKS, GKE-COS and OKE, but not for EKS, where a Deep Learning
-   AMI ships the driver. That gap is the upstream ask. **AKS remains untested.**
+1. **AWS/EKS runs clean end to end; `expected-resources` still fails and is still unexplained.**
+   Second run 2026-08-30: 16 of 16 installed in 8m23s, a gang of 2 placed on 8 of 8 GPUs,
+   validation reaching a verdict inside its timeout. `expected-resources` has now failed on every
+   real cluster tried, while `operator-health`, `gpu-operator-version` and `check-nvidia-smi`
+   passed and workloads scheduled normally.
+
+   What was observed on EKS, and what it is **not**. AICR warned at recommend time that a
+   pre-installed driver was found on the sampled node while the resolved overlay was not a
+   preinstalled-driver profile, and declined to inject `driver.enabled=false`. Twenty minutes
+   later the cluster reported `nvidia-operator-validator: FailedCreatePodSandBox ... no runtime
+   for "nvidia" is configured`. This was first written up here as a missing EKS overlay and an
+   upstream ask. **That was wrong, and no issue was filed.** Default EKS bring-up does not
+   pre-install the driver; the GPU Operator installs it, which is NVIDIA's own best practice.
+   AICR leaving the standard overlay in place is therefore the correct behaviour, not a gap.
+   The overlays AICR offers — GKE-COS, AKS, OKE — are exactly the platforms whose own bring-up
+   delivers the driver (on GKE that is Google's practice, and the driver arrives with the
+   infrastructure). EKS is absent from that list by construction, not by omission.
+
+   Two live questions remain, and neither has been investigated. Why a driver read as
+   pre-installed at all — this cluster has been reused across several installs, so it plausibly
+   carried one from an earlier gpu-operator. And whether `expected-resources` is simply racing the
+   Operator's own driver install: the check burns its full 8-minute timeout, and a driver install
+   on p5 nodes can outlast that, which would make the failure a timing artefact rather than a
+   misconfiguration. Answering it needs a run on a cluster with no prior install.
+   **AKS remains untested.**
 2. **Validation shipped; real-hardware confirmation and evidence remain.** The `deployment` phase
    runs between Apply and Prove (`internal/steps/validate.go`) and records a verdict on the run —
    see the two Validation rows above, which separate what CI proves from what it cannot. `ValidateState` false-passes on KWOK — the validator schedules
