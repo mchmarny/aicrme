@@ -199,7 +199,7 @@ Recorded only so they are not re-discovered as surprises. Neither is a request.
 
 ---
 
-## 5. The console never says which AICR version it is running — OPEN
+## 5. The console never says which AICR version it is running — SHIPPED 2026-08-29
 
 **Observed:** 2026-08-29, Mark, after the repo went public.
 
@@ -226,3 +226,52 @@ put it in the run record and the evidence bundle rather than only on screen.
 binary is *pinned to*, not one discovered from the cluster. A cluster can have been configured by
 a different aicrme build, and a header that quietly reported the cluster's version would answer a
 different question than the one being asked.
+
+---
+
+## 6. The first real-hardware validation run — 2026-08-29
+
+**Observed:** Mark, GKE H100s, driving aicrme v0.1.0 installed from the Homebrew tap.
+The run itself succeeded: 16 of 16 installed in 11m 8s, gang of 2 placed, 16 of 16 GPUs usable.
+Five findings came out of it, all now shipped.
+
+### Shipped
+
+- **AICR pulled validator images tagged with aicrme's version.** AICR rewrites its validator
+  catalog's `:latest` images using whatever `WithVersion` receives, and it was receiving
+  aicrme's. Every deployment validator tried to pull
+  `ghcr.io/nvidia/aicr-validators/deployment:v0.1.0`, which does not exist; each burned its full
+  per-check deadline, and validation reported 0 of 5 passed after 24 minutes of nothing. Latent
+  from day one and impossible to see before the first tagged release, because AICR only rewrites
+  the tag when the version looks like a release — every dev build passed `dev` or a git SHA.
+  Fixed by `aicrclient.AICRVersion`, guarded by `make check-aicr-pin`.
+- **A stopped run could not be reset.** Stop started a new run, the new run took the engine's
+  `current` slot, and `engine.Reset` refuses any run that is not current — so a cluster with 16
+  releases installed had no teardown path in the console at all. The cleanup had to be done by
+  hand. The auto-start is gone; starting over is an explicit control on the stopped screen.
+- **The Validate phase was invisible.** It ran under Apply's heading, Apply's full green progress
+  bar and Apply's still-counting elapsed timer for 24 minutes. The only signal was one line in
+  the timeline rail — and the phase events themselves said a bare `phase started` without naming
+  the phase.
+- **No AICR version anywhere** — entry 5 above.
+- **`aicr-validation` survived and nothing mentioned it.** Reset still will not remove it, which
+  is the standing rule for a deployer's own namespaces, but the residue inventory now names it.
+
+### Measured, not inferred
+
+| | |
+|---|---|
+| Apply, 16 of 16 | 11m 8s |
+| Validate (all five checks hitting their deadlines) | 24m 11s |
+| `kube-prometheus-stack` | 3m 14s |
+| `gpu-operator` | 36s, driver pre-installed |
+
+The 24m 11s is the serial sum of the five per-check ceilings, and it landed under the 30-minute
+facade cap. At the 15 minutes originally specified, AICR would have discarded every partial
+result and reported only a deadline — no per-check messages, no CTRF, and no way to diagnose any
+of this. The cap being right is why the run produced a diagnosis instead of a shrug.
+
+### Still not observed
+
+A validation run whose checks actually execute. Every check failed on the image pull, so a
+**passing** verdict on real hardware remains unproven.

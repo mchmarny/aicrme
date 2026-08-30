@@ -13,9 +13,9 @@ Git history has them if a decision ever needs archaeology.
 
 The whole arc — Discover, Recommend, Bundle, Apply, Validate, Prove, Reset — runs end to end,
 driven from a laptop over the operator's own kubeconfig. `aicrme` is a local binary; it installs
-nothing of itself into the cluster it configures. Every phase but Validate has run against real
-GPU hardware; Validate is proven so far only on KWOK's simulated nodes — see the two Validation
-rows below and Open work item 2.
+nothing of itself into the cluster it configures. Every phase has now run against real GPU
+hardware, but Validate has never had a check actually execute there — see the two Validation rows
+below and Open work item 2.
 
 | | Proven on | Evidence |
 |---|---|---|
@@ -26,8 +26,8 @@ rows below and Open work item 2.
 | Same-cluster reuse **without a Reset** | **does not work, and is now refused** | see below |
 | helm 4 | real cluster, **and CI on every push** | a full install *and* uninstall under v4.2.4 by hand; the `reset` e2e job now pins v4.2.4, so all six assertions — including the FAILED-teardown one — run under helm 4 while the other five jobs keep exercising helm 3.21.4 |
 | Validation — the **skip** path | Kind + KWOK, **CI on every push** | `prove.sh` assert 7, first green 2026-08-29: the run record reads `{"skipped":"simulated cluster -- kwok-controller is running its fake nodes…"}` with no phase results. That cluster advertises 32 GPUs across four fake nodes, so the skip is keyed off `gap.Report.Simulated` (kwok-controller in the snapshot's image list), **not** a GPU count — a count check passes it and validates against fakes |
-| Release automation | **config proven, no release cut yet** | A `v*` tag runs `make qualify`, then goreleaser: four archives (darwin/linux × amd64/arm64), `checksums.txt`, a SLSA build-provenance attestation, and a Homebrew formula pushed to `mchmarny/homebrew-tap`. `ci`'s `release-dryrun` job builds the real artifacts on every push and runs `scripts/smoke-release.sh` against one, which is the only thing standing between a lost `before` hook and a shipped binary whose console is an empty directory listing |
-| Validation — the **verdict** path | **not yet run on real hardware** | `deployment` phase runs between Apply and Prove and records a verdict on the run (`internal/steps/validate.go`). Proven so far only by `internal/steps` unit tests: no run has yet driven `ValidateState` to completion against real GPUs. Open work item 2 below |
+| Release automation | **v0.1.0 released and verified** | Published 2026-08-29 and checked end to end against the published artifacts: checksum, `gh attestation verify` (with wrong-repo and tampered-byte negative controls), the formula in `mchmarny/homebrew-tap`, and the downloaded binary serving its console. A `v*` tag runs `make qualify`, then goreleaser: four archives (darwin/linux × amd64/arm64), `checksums.txt`, a SLSA build-provenance attestation, and a Homebrew formula pushed to `mchmarny/homebrew-tap`. `ci`'s `release-dryrun` job builds the real artifacts on every push and runs `scripts/smoke-release.sh` against one, which is the only thing standing between a lost `before` hook and a shipped binary whose console is an empty directory listing |
+| Validation — the **verdict** path | **ran on real GKE H100s; a PASSING verdict is still unproven** | 2026-08-29: the phase ran end to end, recorded a per-phase verdict, wrote `ctrf.json`, rendered counts on the Prove screen, and did not fail the run — all first confirmations. But all five checks failed on an image pull, because AICR was being handed aicrme's version and rewrote its validator image tags with it (fixed; see below). So the plumbing is proven and the checks are not: no validation has yet actually executed against real GPUs |
 
 ### Installing twice without a Reset
 
@@ -39,8 +39,9 @@ scheduler against a control plane replaced underneath it — Apply reports 16/16
 
 Observed 2026-08-28 on real H100s. The shard and the scheduler Deployment were two hours older
 than the five kai Deployments beside them; the run records showed **no Reset had ever completed**,
-though the operator believed one had, because Stop and Reset are silent and a new run appears the
-instant the old one ends.
+though the operator believed one had, because Stop and Reset were silent and a new run appeared
+the instant the old one ended. That auto-start is gone as of 2026-08-29 — it also left a stopped
+run unresettable, since `engine.Reset` acts only on the current run.
 
 `internal/steps`' `alreadyInstalled` refuses this at Apply, before anything is touched. The purge
 cannot cover it: it runs only after a **confirmed uninstall**, and here there was none.
@@ -74,8 +75,12 @@ teardown finishing at all:
 - **Orphaned finalizers.** `Skyhook/tuning` held `skyhook.nvidia.com/skyhook` after its controller
   was uninstalled.
 
-None is fixed. A full manual clean currently needs, in order: delete namespaces, delete stale
-APIServices, delete orphaned webhooks, strip finalizers, delete CRDs.
+None is fixed. A full manual clean needs, in this order: `helm uninstall` every release, delete
+the four kai objects the chart tells helm to keep, **delete the stale APIServices, delete the
+orphaned webhooks**, and only THEN delete namespaces, strip finalizers and delete CRDs. The
+ordering is not cosmetic and this file had it backwards until 2026-08-29: deleting namespaces
+while `prometheus-adapter`'s APIServices still point at a dead Service hangs every namespace
+deletion in the cluster. Walked by hand on real H100s 2026-08-29 and it works in this order.
 
 **A component count and a deployment-action count are different numbers.** The GKE recipe resolves
 **14 components**; `deploy.sh` runs **16 deployment actions**, because `gpu-operator-pre` and
@@ -133,8 +138,11 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
 
    What remains:
 
-   - **Real-hardware confirmation.** No run against a live GPU cluster has yet driven Validate to
-     completion. `make build && HELM_REGISTRY_CONFIG=~/.config/containers/auth.json ./bin/aicrme`
+   - **A passing verdict.** Validate has now run on real H100s, but every check failed on an image
+     pull rather than executing — AICR rewrites its validator catalog's `:latest` tags with
+     whatever `WithVersion` receives, and it was receiving aicrme's version. Fixed by
+     `aicrclient.AICRVersion` with a `make check-aicr-pin` guard, and **not yet re-run**. What
+     remains is one more cluster run to see the checks actually execute. `make build && HELM_REGISTRY_CONFIG=~/.config/containers/auth.json ./bin/aicrme`
      on a real cluster still needs to show `validating the deployment` in the timeline, a
      per-phase verdict rather than a skip on the Prove screen, and
      `<work-dir>/runs/<id>/validation/ctrf.json` that parses.
