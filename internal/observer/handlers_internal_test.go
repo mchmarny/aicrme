@@ -50,6 +50,11 @@ func newTestObserver(t *testing.T) (*Observer, <-chan bus.Event) {
 		return RunScope{RunID: "run-1", Namespaces: map[string]struct{}{"gpu-operator": {}}}
 	})
 	o.scoped.entries["gpu-operator"] = &factoryEntry{stop: make(chan struct{})}
+	// No debounce window here. Every test using this helper asserts that an
+	// event WAS published, and the production window would make each of them
+	// wait two seconds; a zero delay publishes inline. The window itself is
+	// covered directly in debounce_test.go.
+	o.debounce = newDebouncer(0)
 	return o, sub
 }
 

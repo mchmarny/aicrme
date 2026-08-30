@@ -95,6 +95,10 @@ type Observer struct {
 	// namespace-scoped to a recipe that has not resolved yet when Start runs
 	// (scoped.go).
 	scoped *scopedInformers
+	// debounce holds newly observed conditions briefly so a problem that
+	// corrects itself within the window never reaches the timeline. See
+	// debounce.go for the measurement that set the window.
+	debounce *debouncer
 
 	mu sync.Mutex
 	// workload holds DaemonSet/Deployment readiness summaries.
@@ -159,6 +163,7 @@ func New(client kubernetes.Interface, b *bus.Bus, scope func() RunScope) *Observ
 		client:   client,
 		bus:      b,
 		scope:    scope,
+		debounce: newDebouncer(defaultDebounce),
 		workload: make(map[stateKey]string),
 		gpuQty:   make(map[stateKey]resource.Quantity),
 		pods:     make(map[stateKey]map[string]podCondition),
@@ -277,6 +282,12 @@ func (o *Observer) Start(stopCh <-chan struct{}) error {
 	// It never blocks this call -- see scopedInformers.reconcile's own doc
 	// comment for why.
 	go o.scoped.run(o.scope, o.bus, stopCh, reconcileInterval)
+	// A condition still inside its debounce window when the run ends belongs
+	// to that run, not to whatever the console shows next.
+	go func() {
+		<-stopCh
+		o.debounce.stop()
+	}()
 
 	factory := informers.NewSharedInformerFactory(o.client, resyncPeriod)
 
@@ -332,14 +343,24 @@ func (o *Observer) register(inf cache.SharedIndexInformer, onUpdate func(any)) e
 // active-action transition, filtering an event against one snapshot's
 // namespaces while stamping it with a different snapshot's action. See
 // TestPublishDoesNotStampAcrossARunTransition.
+// publish routes a condition through the debouncer; everything else goes
+// straight out. cd.At is stamped HERE rather than at emit, so a condition
+// released after its window carries the time it was observed, not the time it
+// was let go.
 func (o *Observer) publish(ns, msg string, cd bus.ClusterData) {
+	if cd.At.IsZero() {
+		cd.At = time.Now().UTC()
+	}
+	o.debounce.submit(ns, msg, cd, o.emit)
+}
+
+func (o *Observer) emit(ns, msg string, cd bus.ClusterData) {
 	sc := o.scope()
 	if ns != "" {
 		if _, ok := sc.Namespaces[ns]; !ok {
 			return
 		}
 	}
-	cd.At = time.Now().UTC()
 	// ClusterData holds only strings, ints, bools and a time.Time, so Marshal
 	// cannot fail.
 	data, _ := json.Marshal(cd)
