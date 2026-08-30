@@ -153,7 +153,7 @@ function ClusterBadge({ cluster }: { cluster: ClusterInfo | null }) {
  */
 function BuildBadge({ build }: { build: BuildInfo }) {
   return (
-    <div className="ml-auto text-right font-mono text-xs leading-tight">
+    <div className="ml-auto space-y-1 text-right font-mono text-xs">
       <a
         href={`https://github.com/NVIDIA/aicr/releases/tag/${build.aicr}`}
         target="_blank"

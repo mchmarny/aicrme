@@ -197,6 +197,13 @@ func repairRegistryConfig(srcPath, workDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// MkdirAll first: this runs during the startup probe, BEFORE the work
+	// directory is created for the session, so writing straight in failed with
+	// ENOENT and the repair silently fell back to the warning it replaces.
+	// Caught by a local smoke run 2026-08-30 rather than on a cluster.
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		return "", err
+	}
 	dst := filepath.Join(workDir, sanitizedRegistryConfigName)
 	// 0600: this is a copy of a credentials file.
 	if err := os.WriteFile(dst, out, 0o600); err != nil {
