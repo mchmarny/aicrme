@@ -84,3 +84,16 @@ func (s execReturning) Run(_ context.Context, _ []string, out io.Writer) error {
 	_, err := io.WriteString(out, string(s))
 	return err
 }
+
+func TestBashExecCapturesStderr(t *testing.T) {
+	e := BashExec{}
+	var stdout bytes.Buffer
+	// A command that writes to stderr and fails
+	err := e.Run(context.Background(), []string{"sh", "-c", "echo boom >&2; exit 1"}, &stdout)
+	if err == nil {
+		t.Fatal("Run() should have failed")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("boom")) {
+		t.Errorf("error message does not contain stderr: %v", err)
+	}
+}
