@@ -26,6 +26,7 @@ type fakeCluster struct {
 	connectErr   error
 	connectedTo  string
 	connectCalls int
+	uid          string
 }
 
 func (c *fakeCluster) Contexts() (any, error) {
@@ -51,12 +52,15 @@ func (c *fakeCluster) Info() (any, bool) {
 	if !c.connected {
 		return nil, false
 	}
-	return map[string]string{"context": c.connectedTo}, true
+	// uid is what handleSurvey reads to stamp the survey with the cluster it
+	// describes. Without it the fake connects but has no identity, and every
+	// survey request answers 409.
+	return map[string]string{"context": c.connectedTo, "uid": c.uid}, true
 }
 
 // connectedCluster is the state every test that exercises a cluster-touching
 // route needs: a console that has already connected.
-func connectedCluster() *fakeCluster { return &fakeCluster{connected: true} }
+func connectedCluster() *fakeCluster { return &fakeCluster{connected: true, uid: "cluster-uid-1"} }
 
 // newTestServer is the default server every test that does not care about
 // connect state uses: a launch token, a fake AICR client, and a cluster

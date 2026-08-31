@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { ApiError, buildInfo, currentCluster, establishSession, probeSession, startRun, type BuildInfo, type ClusterInfo } from './api'
-import { Connect } from './components/Connect'
+import { Confirm, Connect } from './components/Connect'
 import { Wizard } from './components/Wizard'
 import { useEvents } from './useEvents'
 
@@ -12,7 +12,7 @@ import { useEvents } from './useEvents'
  */
 const launchTokenParam = 't'
 
-type Stage = 'authenticating' | 'connecting' | 'console'
+type Stage = 'authenticating' | 'connecting' | 'connected' | 'console'
 
 export default function App() {
   const [stage, setStage] = useState<Stage>('authenticating')
@@ -51,12 +51,17 @@ export default function App() {
       // Skipping Connect is not a convenience: the connection is
       // single-assignment, so a second attempt would answer 409 and leave the
       // operator on a screen that will not let them past.
-      // The response, not just its truthiness: this is the reload path, and
-      // the header needs the same cluster identity a fresh connect provides.
+      //
+      // It returns 'connected', NOT 'console'. Going straight to Console
+      // starts a run immediately and swallows the 409 that comes back, which
+      // meant a reload skipped the Connected screen entirely -- so the
+      // already-installed survey was unreachable on the path an operator most
+      // often takes, and an auto-start fired over a cluster nobody had looked
+      // at. Continue is what advances now, on both paths.
       const connected = await currentCluster()
       if (!connected) return 'connecting'
       setCluster(connected)
-      return 'console'
+      return 'connected'
     }
 
     bootstrap()
@@ -94,6 +99,18 @@ export default function App() {
       )}
       {stage === 'connecting' && (
         <Connect onConnected={info => { setCluster(info); setStage('console') }} />
+      )}
+      {/* The reload path: bootstrap already found a cluster (see its comment)
+          and set it above, so there is no context list to walk through again
+          -- only the same report Connect would have shown after a fresh
+          connect. Rendered from the state bootstrap set rather than a second
+          copy fetched here, and reusing Console's own advance-on-Continue
+          handler rather than inventing a second one, so there remains exactly
+          one way this console decides a cluster has been shown to the
+          operator. The `cluster &&` guard is for the type checker, not a real
+          case: this stage is only ever reached right after setCluster ran. */}
+      {stage === 'connected' && cluster && (
+        <Confirm info={cluster} onContinue={() => setStage('console')} />
       )}
       {/* A 401 on the event stream means this cookie is not recognized, which
           in a process-lifetime session means the process that minted it is

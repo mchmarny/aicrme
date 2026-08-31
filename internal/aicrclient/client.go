@@ -53,6 +53,14 @@ type CatalogLister interface {
 	ListCatalog(ctx context.Context, filter *aicr.Criteria) ([]aicr.CatalogEntry, error)
 }
 
+// CatalogResolver resolves a recipe from criteria alone, with no cluster
+// snapshot. That is the property Clear's survey needs: it runs at Connect,
+// before any run exists, and must learn which charts AICR could install
+// without first collecting a snapshot of the cluster it is about to describe.
+type CatalogResolver interface {
+	ResolveRecipeFromCriteria(ctx context.Context, criteria *aicr.Criteria) (*aicr.RecipeResult, error)
+}
+
 // Bundler generates the on-disk deployer bundle for a resolved recipe. Kept
 // as its own single-method interface for the same reason as the others: a
 // step that only bundles should not be able to collect a snapshot.
@@ -76,6 +84,7 @@ type API interface {
 	Resolver
 	CriteriaRegistrar
 	CatalogLister
+	CatalogResolver
 	Bundler
 	Validator
 	Close() error

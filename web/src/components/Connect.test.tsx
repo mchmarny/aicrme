@@ -77,7 +77,11 @@ function withNodes(nodes: NodeComposition): ClusterInfo {
  * is part of what this screen has to get right, and mocking the client would
  * make it untestable.
  */
-function mockFetch(overrides: { connect?: () => Response; contexts?: () => Response } = {}) {
+function mockFetch(overrides: {
+  connect?: () => Response
+  contexts?: () => Response
+  survey?: () => Response
+} = {}) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input.toString()
     if (url === '/api/contexts') {
@@ -85,6 +89,11 @@ function mockFetch(overrides: { connect?: () => Response; contexts?: () => Respo
     }
     if (url === '/api/connect') {
       return overrides.connect?.() ?? new Response(JSON.stringify(clusterInfo), { status: 200 })
+    }
+    // Defaults to 'unavailable' (surveyCluster treats 503 that way) so every
+    // test written before the survey panel existed is unaffected by it.
+    if (url === '/api/cluster/survey') {
+      return overrides.survey?.() ?? new Response(null, { status: 503 })
     }
     throw new Error(`unexpected fetch: ${url}`)
   })
@@ -346,6 +355,42 @@ describe('Connect', () => {
     render(<Connect onConnected={() => {}} />)
 
     expect(await screen.findByText(/failed to read your kubeconfig/i)).toBeDefined()
+  })
+
+  // Fetched on the Connected screen rather than at connect time: it costs a
+  // helm list plus one helm history per matched release, and paying that
+  // during Connect would delay the screen for a panel most clusters do not
+  // need.
+  it('shows already-installed components on the connected screen', async () => {
+    mockFetch({
+      survey: () => new Response(JSON.stringify({
+        clusterUid: '1111-2222', driverMode: 'host', complete: true,
+        releases: [{
+          name: 'gpu-operator', namespace: 'gpu-operator', chart: 'gpu-operator',
+          chartVersion: 'v26.3.3', component: 'gpu-operator', revision: 1,
+          firstDeployed: '2026-08-30T20:29:00Z', lastUpdated: '2026-08-30T20:40:00Z',
+          nodeLevel: false, recommended: true,
+        }],
+      }), { status: 200 }),
+    })
+
+    render(<Connect onConnected={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    expect(await screen.findByTestId('clear-panel')).toBeDefined()
+  })
+
+  // The survey is advisory. Blocking an install because an advisory panel
+  // could not load would let a helm timeout stop the console.
+  it('keeps Continue enabled while the survey is still running', async () => {
+    mockFetch({ survey: () => new Promise(() => {}) as unknown as Response })
+
+    render(<Connect onConnected={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: /connect/i }))
+
+    const cont = await screen.findByRole('button', { name: /continue/i })
+    expect(cont.hasAttribute('disabled')).toBe(false)
+    expect(screen.getByTestId('clear-loading')).toBeDefined()
   })
 })
 
