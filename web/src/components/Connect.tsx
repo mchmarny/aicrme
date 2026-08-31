@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { connect, fetchContexts, type ClusterInfo, type ContextInfo, type NodeComposition, type NodeGroup } from '../api'
+import { connect, fetchContexts, surveyCluster, type ClusterInfo, type ContextInfo, type NodeComposition, type NodeGroup, type SurveyResult } from '../api'
+import { ClearPanel } from './Clear'
 
 /**
  * Connect is the screen that stands where the password prompt used to.
@@ -209,6 +210,17 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
  */
 export function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => void }) {
   const tools = Object.entries(info.toolchain ?? {}).sort(([a], [b]) => a.localeCompare(b))
+
+  const [surveyResult, setSurveyResult] = useState<SurveyResult | 'loading'>('loading')
+  // Fetched here rather than at connect: it costs a helm list plus one helm
+  // history per matched release, and paying that during Connect would delay the
+  // screen for a panel most clusters do not need.
+  useEffect(() => {
+    let canceled = false
+    surveyCluster().then(r => { if (!canceled) setSurveyResult(r) })
+    return () => { canceled = true }
+  }, [])
+
   return (
     <div className="mx-auto mt-24 w-full max-w-3xl px-8 space-y-4">
       <h1 className="text-2xl font-semibold text-ink-strong">Connected</h1>
@@ -243,6 +255,10 @@ export function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: (
           A previous run on this cluster was interrupted and has been recovered.
         </p>
       )}
+      <ClearPanel result={surveyResult} recoveredRun={Boolean(info.recoveredRun)} />
+      {/* Continue stays enabled throughout. The survey is advisory, and
+          blocking an install because an advisory panel could not load would
+          let a helm timeout stop the console. */}
       <button onClick={onContinue} className="w-full rounded bg-accent py-2 font-medium text-bg">
         Continue
       </button>
