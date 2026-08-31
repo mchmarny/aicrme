@@ -25,6 +25,7 @@ import (
 	"github.com/mchmarny/aicrme/internal/api"
 	"github.com/mchmarny/aicrme/internal/applier"
 	"github.com/mchmarny/aicrme/internal/bus"
+	"github.com/mchmarny/aicrme/internal/clear"
 	"github.com/mchmarny/aicrme/internal/engine"
 	"github.com/mchmarny/aicrme/internal/gap"
 	"github.com/mchmarny/aicrme/internal/observer"
@@ -431,6 +432,11 @@ func Run(ctx context.Context, opts Options) error {
 		AICR:    client,
 		WorkDir: workDir,
 		Cluster: clusterGate{conn},
+		// Constructed before a connection exists, which is safe: Survey takes
+		// the cluster UID as an argument and handleSurvey gates on the
+		// connection. ReadOnly is not optional -- it is what makes "increment 1
+		// deletes nothing" a property of the process rather than of a review.
+		Surveyor: &clear.Surveyor{Exec: clear.ReadOnly(clear.BashExec{}), Client: client},
 	}, b, eng, static)
 	if err != nil {
 		return fmt.Errorf("server configuration invalid: %w", err)

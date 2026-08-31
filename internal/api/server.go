@@ -16,6 +16,7 @@ import (
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/mchmarny/aicrme/internal/aicrclient"
 	"github.com/mchmarny/aicrme/internal/bus"
+	"github.com/mchmarny/aicrme/internal/clear"
 	"github.com/mchmarny/aicrme/internal/engine"
 )
 
@@ -41,6 +42,22 @@ type Config struct {
 	// Cluster is the process's one cluster connection. Every route that needs
 	// a cluster is gated on it having been established.
 	Cluster Cluster
+	// Surveyor backs GET /api/cluster/survey: what AICR components are already
+	// on the connected cluster, and how sure this console is about them.
+	//
+	// Optional. A nil Surveyor makes the route answer 503 rather than 404, so
+	// the SPA can tell "this console cannot do that" from "no such route".
+	// Safe to construct before a connection exists: it takes the cluster UID
+	// as an argument and the handler gates on the connection.
+	Surveyor Surveyor
+}
+
+// Surveyor reads the cluster for AICR components no run owns.
+//
+// An interface rather than *clear.Surveyor so this package's tests can answer
+// without a helm binary, matching every other cluster-touching seam here.
+type Surveyor interface {
+	Survey(ctx context.Context, clusterUID string) (*clear.Survey, error)
 }
 
 // Cluster is the connect-state seam. internal/console owns the connection and
@@ -72,6 +89,7 @@ type Server struct {
 	options  aicrclient.OptionsCache
 	workDir  string
 	cluster  Cluster
+	surveyor Surveyor
 	draining atomic.Bool
 }
 
@@ -95,7 +113,7 @@ func New(cfg Config, b *bus.Bus, e *engine.Engine, static fs.FS) (*Server, error
 	}
 	return &Server{
 		launch: newLaunchToken(cfg.Token), bus: b, engine: e, static: static, aicr: cfg.AICR, workDir: cfg.WorkDir,
-		cluster: cfg.Cluster,
+		cluster: cfg.Cluster, surveyor: cfg.Surveyor,
 	}, nil
 }
 
@@ -204,6 +222,30 @@ func (s *Server) handleCluster(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
+// connectedClusterUID is the UID of the cluster this process is connected to.
+//
+// ClusterInfo carries UID as a struct field rather than a method, and this
+// package deliberately does not depend on internal/console, so it is read
+// through the JSON tag. One small allocation, on a screen already making a
+// helm call.
+func (s *Server) connectedClusterUID() (string, bool) {
+	info, ok := s.cluster.Info()
+	if !ok {
+		return "", false
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		return "", false
+	}
+	var c struct {
+		UID string `json:"uid"`
+	}
+	if err := json.Unmarshal(b, &c); err != nil || c.UID == "" {
+		return "", false
+	}
+	return c.UID, true
+}
+
 // Handler returns the fully routed http.Handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -239,6 +281,7 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("GET /api/contexts", s.handleContexts)
 	protected.HandleFunc("POST /api/connect", s.handleConnect)
 	protected.HandleFunc("GET /api/cluster", s.handleCluster)
+	protected.HandleFunc("GET /api/cluster/survey", s.handleSurvey)
 	// GET /api/session exists so the SPA can tell a dead console from a
 	// network blip: EventSource surfaces no HTTP status on error, so without
 	// this probe the console had no way to learn its session was no longer
