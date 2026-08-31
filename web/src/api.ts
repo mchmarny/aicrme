@@ -361,3 +361,79 @@ export async function buildInfo(): Promise<BuildInfo | null> {
   if (!res.ok) return null
   return res.json()
 }
+
+/** DriverMode mirrors Go's clear.DriverMode. 'unknown' is a third answer, not a default. */
+export type DriverMode = 'managed' | 'host' | 'unknown'
+
+/** SurveyRelease mirrors Go's clear.Release. */
+export interface SurveyRelease {
+  name: string
+  namespace: string
+  chart: string
+  chartVersion: string
+  /** AICR's identifier for the chart, which an operator reading a recipe sees. */
+  component: string
+  revision: number
+  /** Revision 1's timestamp. The only signal separating a fresh install from an old release upgraded today. */
+  firstDeployed: string
+  lastUpdated: string
+  /** Effects outlive the release: GRUB parameters and sysctls no CR deletion reverts. Never removable. */
+  nodeLevel: boolean
+  recommended: boolean
+  /** Why `recommended` is false. Absent when it is true. */
+  reason?: string
+}
+
+/** ClusterSurvey mirrors Go's clear.Survey. */
+export interface ClusterSurvey {
+  clusterUid: string
+  driverMode: DriverMode
+  /** False when any evidence is missing. Nothing is recommended on an incomplete survey. */
+  complete: boolean
+  /** Explains `complete: false`, in the operator's terms. */
+  incomplete?: string
+  releases: SurveyRelease[]
+}
+
+/**
+ * SurveyResult keeps the five outcomes apart.
+ *
+ * They were one value once -- null for loading, unavailable, failure and
+ * empty alike -- and that told an operator their cluster was clean when this
+ * console had simply failed to look. 'empty' is a real answer; 'error' is not.
+ */
+export type SurveyResult =
+  | { state: 'found'; survey: ClusterSurvey }
+  | { state: 'empty'; survey: ClusterSurvey }
+  | { state: 'unavailable' }
+  | { state: 'error'; message: string }
+
+/**
+ * surveyCluster reports the AICR components already on the connected cluster.
+ *
+ * 404, 503 and 409 are 'unavailable' rather than errors: an older console has
+ * no such route, one built without a surveyor answers 503, and 409 means no
+ * cluster is connected yet. None is something the operator can act on, and the
+ * panel is simply not offered. Everything else that goes wrong is an error the
+ * screen has to show.
+ */
+export async function surveyCluster(): Promise<SurveyResult> {
+  let res: Response
+  try {
+    res = await fetch('/api/cluster/survey')
+  } catch {
+    return { state: 'error', message: 'Could not reach this console to survey the cluster' }
+  }
+  if (res.status === 404 || res.status === 503 || res.status === 409) return { state: 'unavailable' }
+  if (!res.ok) {
+    return { state: 'error', message: `Could not survey this cluster (HTTP ${res.status})` }
+  }
+  try {
+    const survey: ClusterSurvey = await res.json()
+    return survey.releases.length === 0
+      ? { state: 'empty', survey }
+      : { state: 'found', survey }
+  } catch {
+    return { state: 'error', message: 'This console returned a survey it could not read' }
+  }
+}
