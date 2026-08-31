@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
@@ -18,6 +18,7 @@ type Routes = {
   session?: () => Response
   sessionProbe?: () => Response
   cluster?: () => Response
+  survey?: () => Response
 }
 
 /**
@@ -35,6 +36,11 @@ function mockFetch(routes: Routes = {}) {
     }
     if (url === '/api/cluster') {
       return routes.cluster?.() ?? new Response('not connected', { status: 409 })
+    }
+    // 503 by default: the survey panel is simply not offered, so every
+    // existing bootstrap test keeps its current expectations.
+    if (url === '/api/cluster/survey') {
+      return routes.survey?.() ?? new Response(null, { status: 503 })
     }
     if (url === '/api/contexts') return new Response(JSON.stringify(contexts), { status: 200 })
     // Identity is fetched on every mount now, independent of the cluster.
@@ -104,12 +110,15 @@ describe('App bootstrap', () => {
 
   // The connection is single-assignment, so a reload that went back to Connect
   // would ask again and be refused with a 409 the operator cannot get past.
+  // It lands on Connected instead (see the two tests below for what that
+  // screen does on its own); Continue is what reaches Console from here now.
   it('skips Connect when this console is already connected', async () => {
     const fetchMock = mockFetch({
       cluster: () => new Response(JSON.stringify(clusterInfo), { status: 200 }),
     })
 
     render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /continue/i }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/runs', expect.anything()))
     expect(screen.queryByRole('heading', { name: /connect a cluster/i })).toBeNull()
@@ -145,6 +154,10 @@ describe('App bootstrap', () => {
     mockFetch({ cluster: () => new Response(JSON.stringify(clusterInfo), { status: 200 }) })
 
     render(<App />)
+    // This header is Console's; a reload now lands on Connected first (see
+    // the reload tests below), so reaching it takes the same Continue click
+    // an operator would give.
+    fireEvent.click(await screen.findByRole('button', { name: /continue/i }))
 
     // The context is the name the operator chose it by, so it is the name the
     // header has to carry.
@@ -170,5 +183,36 @@ describe('App bootstrap', () => {
     render(<App />)
 
     expect(await screen.findByText(/launch token was not accepted/i)).toBeDefined()
+  })
+
+  // A reload used to land straight in Console, which starts a run immediately
+  // and swallows the 409 that comes back. That skipped the Connected screen
+  // entirely -- so anything it has to say was unreachable on the path an
+  // operator most often takes, and an auto-start fired over a cluster nobody
+  // had looked at.
+  it('shows the connected screen after a reload rather than starting a run', async () => {
+    const fetchMock = mockFetch({
+      cluster: () => new Response(JSON.stringify(clusterInfo), { status: 200 }),
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('button', { name: /continue/i })).toBeDefined()
+    expect(fetchMock.mock.calls.some(([url]) => url === '/api/runs')).toBe(false)
+  })
+
+  it('starts the run only once Continue is pressed', async () => {
+    const fetchMock = mockFetch({
+      cluster: () => new Response(JSON.stringify(clusterInfo), { status: 200 }),
+    })
+
+    render(<App />)
+    const cont = await screen.findByRole('button', { name: /continue/i })
+    fireEvent.click(cont)
+
+    await waitFor(() => {
+      const runs = fetchMock.mock.calls.filter(([url]) => url === '/api/runs')
+      expect(runs).toHaveLength(1)
+    })
   })
 })

@@ -201,8 +201,13 @@ export function Connect({ onConnected }: { onConnected: (info: ClusterInfo) => v
  * screen before something gets installed, and "am I pointed at the right
  * cluster" is a question a server version and a node count answer far better
  * than a context name does.
+ *
+ * Exported: App renders this directly for a reload's 'connected' stage,
+ * where a cluster is already chosen and there is no context list to walk
+ * back through -- Connect's own fresh-connect path is not the only way to
+ * reach it.
  */
-function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => void }) {
+export function Confirm({ info, onContinue }: { info: ClusterInfo; onContinue: () => void }) {
   const tools = Object.entries(info.toolchain ?? {}).sort(([a], [b]) => a.localeCompare(b))
   return (
     <div className="mx-auto mt-24 w-full max-w-3xl px-8 space-y-4">
