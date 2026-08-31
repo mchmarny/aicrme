@@ -11,11 +11,6 @@ drives the cluster from there.
 
 ![The console, from picking a cluster to a placed gang-scheduled workload](.github/demo.gif)
 
-> **The animation above is an illustration, not a recording.** No cluster was contacted to produce
-> it: the durations, counts and component versions are representative of a real run's shape rather
-> than evidence from one, and the AWS account id is a placeholder. The styling is the product's own
-> — every frame links the stylesheet the application ships. Regenerate with `scripts/make-demo.sh`.
-
 > An independent, MIT-licensed project built on AICR. Not an NVIDIA product and not affiliated
 > with or endorsed by NVIDIA.
 
