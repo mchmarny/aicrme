@@ -110,17 +110,20 @@ describe('App bootstrap', () => {
 
   // The connection is single-assignment, so a reload that went back to Connect
   // would ask again and be refused with a 409 the operator cannot get past.
-  // It lands on Connected instead (see the two tests below for what that
-  // screen does on its own); Continue is what reaches Console from here now.
-  it('skips Connect when this console is already connected', async () => {
-    const fetchMock = mockFetch({
+  // This is the one thing this test proves: the context-picker never comes
+  // back once a cluster is already connected. What the reload lands on
+  // instead, and when a run actually starts, is covered precisely by the two
+  // tests below -- Console's own startRun effect fires on every path into
+  // Console, so asserting `/api/runs` here would not distinguish this case
+  // from any other.
+  it('does not re-prompt for a cluster after a reload', async () => {
+    mockFetch({
       cluster: () => new Response(JSON.stringify(clusterInfo), { status: 200 }),
     })
 
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /continue/i }))
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/runs', expect.anything()))
+    expect(await screen.findByRole('button', { name: /continue/i })).toBeDefined()
     expect(screen.queryByRole('heading', { name: /connect a cluster/i })).toBeNull()
   })
 
