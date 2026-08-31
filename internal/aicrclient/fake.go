@@ -26,6 +26,15 @@ type Fake struct {
 	LastAgentConfig   *aicr.AgentConfig
 	LastCatalogFilter *aicr.Criteria
 
+	// Recipes is keyed by Criteria.Service so one Fake can script a different
+	// component set per catalog entry, which is what Universe's union is for.
+	Recipes map[string]*aicr.RecipeResult
+	// ResolveErrs is keyed the same way, so a test can fail ONE entry and
+	// assert the universe reports itself incomplete rather than empty.
+	ResolveErrs         map[string]error
+	CriteriaResolves    int
+	LastResolveCriteria []*aicr.Criteria
+
 	Artifact  aicr.BundleArtifact
 	BundleErr error
 
@@ -82,6 +91,29 @@ func (f *Fake) ListCatalog(_ context.Context, filter *aicr.Criteria) ([]aicr.Cat
 		return nil, f.CatalogErr
 	}
 	return f.CatalogEntries, nil
+}
+
+func (f *Fake) ResolveRecipeFromCriteria(ctx context.Context, c *aicr.Criteria) (*aicr.RecipeResult, error) {
+	f.CriteriaResolves++
+	f.LastResolveCriteria = append(f.LastResolveCriteria, c)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c != nil {
+		if err, ok := f.ResolveErrs[c.Service]; ok {
+			return nil, err
+		}
+		if r, ok := f.Recipes[c.Service]; ok {
+			return r, nil
+		}
+	}
+	if f.ResolveErr != nil {
+		return nil, f.ResolveErr
+	}
+	if f.Recipe != nil {
+		return f.Recipe, nil
+	}
+	return &aicr.RecipeResult{}, nil
 }
 
 // Close is a no-op; Fake holds no resources to release.
