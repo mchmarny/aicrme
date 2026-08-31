@@ -42,6 +42,21 @@ describe('ClearPanel', () => {
     expect(screen.getByTestId('clear-empty')).toBeDefined()
   })
 
+  // THE DEFECT THE REVIEW FOUND. Matching nothing is not the same as looking
+  // and finding nothing: an incomplete universe can mean the chart that would
+  // have matched this cluster's real gpu-operator never made it into the map.
+  // "Clean" is the one wrong answer an operator acts on destructively.
+  it('refuses to call the cluster clean when the survey that found nothing is incomplete', () => {
+    render(<ClearPanel result={{
+      state: 'empty',
+      survey: survey({ releases: [], complete: false, incomplete: 'this console could not read 3 of AICR’s recipe overlays' }),
+    }} />)
+
+    const warning = screen.getByTestId('clear-empty-incomplete')
+    expect(warning.textContent).toMatch(/could not read 3/)
+    expect(screen.queryByTestId('clear-empty')).toBeNull()
+  })
+
   it('renders nothing when the survey is unavailable', () => {
     render(<ClearPanel result={{ state: 'unavailable' }} />)
     expect(screen.queryByTestId('clear-panel')).toBeNull()
@@ -64,6 +79,21 @@ describe('ClearPanel', () => {
     expect(panel.textContent).toMatch(/gpu-operator/)
     expect(panel.textContent).toMatch(/v26\.3\.3/)
     expect(panel.textContent).toMatch(/2026-08-30/)
+  })
+
+  // THE DEFECT THE REVIEW FOUND. Release.FirstDeployed has no `omitempty`, so
+  // a `helm history` read that failed server-side marshals as Go's zero
+  // time.Time ("0001-01-01T00:00:00Z") rather than as an empty string -- a
+  // valid-looking date directly above a reason saying the console could not
+  // establish when the release was deployed.
+  it('renders a Go zero time as unknown, not as a fabricated date', () => {
+    render(<ClearPanel result={found({
+      releases: [release({ firstDeployed: '0001-01-01T00:00:00Z' })],
+    })} />)
+
+    const panel = screen.getByTestId('clear-panel')
+    expect(panel.textContent).toMatch(/first deployed unknown/)
+    expect(panel.textContent).not.toMatch(/0001-01-01/)
   })
 
   it('states why a release is not recommended', () => {

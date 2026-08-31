@@ -96,7 +96,12 @@ func (s *Surveyor) Survey(ctx context.Context, clusterUID string) (*Survey, erro
 		hctx, hcancel := context.WithTimeout(ctx, commandTimeout)
 		t, err := firstDeployed(hctx, s.Exec, hr.Name, hr.Namespace)
 		hcancel()
-		if err != nil {
+		// t.IsZero() is checked alongside err: a zero time.Time is the
+		// unreadable-history return value, not a legitimate answer, and
+		// treating it as one would leave Complete true while recommend
+		// still stamps every row with the incomplete-evidence reason --
+		// a panel that contradicts its own banner.
+		if err != nil || t.IsZero() {
 			reasons = append(reasons, "this console could not read when "+hr.Namespace+"/"+hr.Name+" was first deployed")
 		} else {
 			r.FirstDeployed = t

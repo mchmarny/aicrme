@@ -8,7 +8,15 @@ import type { SurveyRelease, SurveyResult } from '../api'
 function day(iso: string): string {
   if (!iso) return 'unknown'
   const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? 'unknown' : d.toISOString().slice(0, 10)
+  if (Number.isNaN(d.getTime())) return 'unknown'
+  // Release.FirstDeployed has no `omitempty`, so a Go zero time.Time -- the
+  // value a failed `helm history` read leaves behind -- marshals as
+  // "0001-01-01T00:00:00Z": truthy, and a valid JS Date. Kubernetes did not
+  // exist in year 1, so any such date is that zero-value artifact rather
+  // than a real first-deployed timestamp, and rendering it fabricates the
+  // one field the whole recommendation rests on.
+  if (d.getUTCFullYear() < 1990) return 'unknown'
+  return d.toISOString().slice(0, 10)
 }
 
 function Row({ r }: { r: SurveyRelease }) {
@@ -79,6 +87,22 @@ export function ClearPanel({ result, recoveredRun }: {
   }
 
   if (result.state === 'empty') {
+    // THE DEFECT THE REVIEW FOUND. Matching nothing is not the same as
+    // looking and finding nothing: if a catalog overlay fails to resolve,
+    // aicrclient.Universe comes back incomplete and the chart that would
+    // have matched this cluster's real gpu-operator is simply missing from
+    // the map, so nothing matches and `incomplete` explains why. Saying
+    // "clean" here is the one wrong answer an operator acts on
+    // destructively, so an incomplete survey must say it could not look
+    // properly rather than that it found nothing.
+    if (!result.survey.complete) {
+      return (
+        <p data-testid="clear-empty-incomplete" className="mt-8 text-xs text-warn">
+          This console could not look at this cluster properly, so it cannot say it is clean:{' '}
+          {result.survey.incomplete}
+        </p>
+      )
+    }
     return (
       <p data-testid="clear-empty" className="mt-8 text-xs text-ink-faint">
         No AICR components found on this cluster.

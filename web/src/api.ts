@@ -409,6 +409,28 @@ export type SurveyResult =
   | { state: 'error'; message: string }
 
 /**
+ * surveyErrorMessage recovers the server's own diagnostic from a failed
+ * response body, in preference to the bare status code.
+ *
+ * writeErr (internal/api/runs.go) puts the real reason in `{"error": "..."}`
+ * -- an RBAC denial, an unreachable cluster, the bounded stderr this branch
+ * deliberately captures from clear.BashExec -- and discarding it here at the
+ * last hop would strand that diagnostic on the server after all that work to
+ * carry it this far. A body that is absent or not JSON is not itself an
+ * error worth throwing over; it just leaves the status-code string as the
+ * fallback.
+ */
+async function surveyErrorMessage(res: Response): Promise<string> {
+  try {
+    const body = await res.json()
+    if (body && typeof body.error === 'string' && body.error) return body.error
+  } catch {
+    // No body, or not JSON. Fall through to the status-code string below.
+  }
+  return `Could not survey this cluster (HTTP ${res.status})`
+}
+
+/**
  * surveyCluster reports the AICR components already on the connected cluster.
  *
  * 404, 503 and 409 are 'unavailable' rather than errors: an older console has
@@ -426,7 +448,7 @@ export async function surveyCluster(): Promise<SurveyResult> {
   }
   if (res.status === 404 || res.status === 503 || res.status === 409) return { state: 'unavailable' }
   if (!res.ok) {
-    return { state: 'error', message: `Could not survey this cluster (HTTP ${res.status})` }
+    return { state: 'error', message: await surveyErrorMessage(res) }
   }
   try {
     const survey: ClusterSurvey = await res.json()

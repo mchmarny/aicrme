@@ -47,6 +47,25 @@ describe('surveyCluster', () => {
     }
   })
 
+  // THE DEFECT THE REVIEW FOUND. writeErr (internal/api/runs.go) puts the
+  // real diagnostic in the response body -- an RBAC denial, an unreachable
+  // cluster, the bounded stderr clear.BashExec deliberately captures -- and
+  // it must survive to the operator rather than being discarded for a bare
+  // status code at this last hop.
+  it('surfaces the server body\'s error over the bare status code', async () => {
+    stub(500, { error: 'exec: "helm": executable file not found in $PATH' })
+    const got = await surveyCluster()
+    expect(got.state).toBe('error')
+    if (got.state === 'error') expect(got.message).toBe('exec: "helm": executable file not found in $PATH')
+  })
+
+  it('falls back to the status code when the error body is unparseable, without throwing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not json', { status: 502 })))
+    const got = await surveyCluster()
+    expect(got.state).toBe('error')
+    if (got.state === 'error') expect(got.message).toMatch(/HTTP 502/)
+  })
+
   it('reports an error when the network fails', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }))
     expect((await surveyCluster()).state).toBe('error')

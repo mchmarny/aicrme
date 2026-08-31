@@ -134,6 +134,31 @@ func TestSurveyKeepsAReleaseWhoseHistoryIsUnreadableAndGoesIncomplete(t *testing
 	}
 }
 
+// A zero first-deployed time is firstDeployed's own failure return, not a
+// legitimate revision-1 timestamp -- so it must make the survey incomplete
+// exactly as an outright read error does, not read as evidence that
+// happens to say "year one".
+func TestSurveyGoesIncompleteOnAZeroFirstDeployedTime(t *testing.T) {
+	e := surveyExec()
+	e.out["helm history cert-manager"] = `[{"revision":1,"updated":"0001-01-01T00:00:00Z","status":"deployed"}]`
+
+	got, err := surveyor(e, surveyClient()).Survey(context.Background(), "uid-1")
+	if err != nil {
+		t.Fatalf("Survey() error = %v", err)
+	}
+	if got.Complete {
+		t.Error("Complete = true with a zero first-deployed time")
+	}
+	for _, r := range got.Releases {
+		if r.Name == "cert-manager" && !r.FirstDeployed.IsZero() {
+			t.Errorf("FirstDeployed = %v, want zero", r.FirstDeployed)
+		}
+		if r.Recommended {
+			t.Errorf("%s recommended while evidence is incomplete", r.Name)
+		}
+	}
+}
+
 // An unknown driver mode is itself incomplete: the operator is missing the
 // warning that decides whether their nodes need rebooting.
 func TestSurveyIsIncompleteWhenDriverModeIsUnknown(t *testing.T) {
