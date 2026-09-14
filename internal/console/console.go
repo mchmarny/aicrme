@@ -44,7 +44,7 @@ const replayCapacity = 20000
 // version (also pinned in .settings.yaml under dependencies.aicr) -- a stale
 // tag here is the first thing that breaks on a fresh customer cluster, since
 // Discover cannot fall back to anything else.
-const defaultSnapshotAgentImage = "ghcr.io/nvidia/aicr:v0.20.0"
+const defaultSnapshotAgentImage = "ghcr.io/nvidia/aicr:v0.21.1"
 
 // defaultApplyRetries is deploy.sh's per-component retry budget, matching
 // the script's own default. Its backoff is quadratic and each attempt

@@ -43,7 +43,7 @@ jobs:
       - uses: mikefarah/yq@v4.53.3
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.13.1
+          version: v2.13.2
       # Every gate below is a make target, so `make qualify` locally runs the
       # identical commands. They stay listed separately here only so a failure
       # names the gate that broke rather than the whole target.

@@ -26,7 +26,7 @@ import (
 // It was invisible before that release because AICR only rewrites the tag when
 // the version LOOKS like a release (`^v?\d+\.\d+\.\d+`). Every dev build
 // passed "dev" or a git SHA, which it ignores, leaving `:latest` to pull fine.
-const AICRVersion = "v0.20.0"
+const AICRVersion = "v0.21.1"
 
 // Snapshotter deploys the AICR snapshot agent Job and returns the result.
 type Snapshotter interface {

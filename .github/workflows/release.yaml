@@ -46,7 +46,7 @@ jobs:
       - uses: mikefarah/yq@v4.53.3
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.13.1
+          version: v2.13.2
 
       # BEFORE the release, not after. A tag that cannot pass the gate must not
       # produce downloadable artifacts: finding out afterwards means yanking a

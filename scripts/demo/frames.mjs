@@ -58,7 +58,7 @@ function shell(body, railLines) {
       <span class="truncate font-mono text-xs text-ink-soft">${esc(CTX + CTX_NAME)}</span>
     </div>
     <div class="shrink-0 text-right">
-      <span class="block font-mono text-xs text-ink-soft underline">AICR v0.20.0</span>
+      <span class="block font-mono text-xs text-ink-soft underline">AICR v0.21.1</span>
       <span class="block font-mono text-xs text-ink-faint">aicrme v0.2.0 · 2026-08-31 · 6a69f04</span>
     </div>
   </header>

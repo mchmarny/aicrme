@@ -20,7 +20,7 @@ drives the cluster from there.
 known-good combinations of drivers, operators, kernels and system configuration as version-locked
 **recipes**, resolves the right one for a given cluster, renders it into a deployable bundle,
 validates the result, and signs evidence of what it found. aicrme carries the AICR Go SDK as a
-pinned dependency (`v0.20.0`) and calls it directly — no CLI shell-out, no reimplementation of
+pinned dependency (`v0.21.1`) and calls it directly — no CLI shell-out, no reimplementation of
 recipe logic. Every recipe decision, every component version, and every validation verdict comes
 from AICR.
 
