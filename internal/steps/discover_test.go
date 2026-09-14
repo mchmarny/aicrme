@@ -314,14 +314,19 @@ func TestDiscoverDefaultsTimeout(t *testing.T) {
 	}
 }
 
-// TestDiscoverDefaultsAgentName proves JobName and ServiceAccountName are
-// defaulted when left blank rather than reaching CollectSnapshot as "".
-// aicr.Client.CollectSnapshot applies no default of its own for either field
-// (unlike the `aicr` CLI, which defaults both via its own flag layer) — an
-// empty JobName or ServiceAccountName reaches the API server as
-// `metadata.name: ""` and is rejected outright, failing Discover on every
-// cluster. See the identical reasoning on defaultAgentName in discover.go.
-func TestDiscoverDefaultsAgentName(t *testing.T) {
+// TestDiscoverPassesNoAgentName proves JobName and ServiceAccountName reach
+// CollectSnapshot as "" when the caller left them blank, rather than being
+// defaulted to a literal name here.
+//
+// ServiceAccountName is exact-if-exists from AICR v0.21.0 on: a matching
+// ServiceAccount in the agent namespace is adopted verbatim and the run then
+// creates no RBAC at all, while an empty one is documented as never probed.
+// Defaulting it to "aicr" — which this console did, and which is the name
+// every v0.20.0 run left behind — hands that switch to whatever a previous
+// run failed to clean up. The name AICR generates is identical either way,
+// because its own NameBase fallback is the same string. See the reasoning on
+// NewDiscover in discover.go.
+func TestDiscoverPassesNoAgentName(t *testing.T) {
 	fake := &aicrclient.Fake{Snapshot: loadSnapshot(t)}
 	// JobName and ServiceAccountName left zero-valued.
 	step := steps.NewDiscover(fake, steps.DiscoverConfig{
@@ -335,11 +340,11 @@ func TestDiscoverDefaultsAgentName(t *testing.T) {
 	if fake.LastAgentConfig == nil {
 		t.Fatal("CollectSnapshot was called with a nil AgentConfig")
 	}
-	if fake.LastAgentConfig.JobName == "" {
-		t.Error("JobName is empty — CollectSnapshot would reach the API server as metadata.name: \"\"")
+	if got := fake.LastAgentConfig.JobName; got != "" {
+		t.Errorf("JobName = %q, want \"\" so AICR's NameBase supplies the prefix", got)
 	}
-	if fake.LastAgentConfig.ServiceAccountName == "" {
-		t.Error("ServiceAccountName is empty — CollectSnapshot would reach the API server as metadata.name: \"\"")
+	if got := fake.LastAgentConfig.ServiceAccountName; got != "" {
+		t.Errorf("ServiceAccountName = %q, want \"\" — a literal name is exact-if-exists and adopts a stale ServiceAccount, creating no RBAC", got)
 	}
 }
 

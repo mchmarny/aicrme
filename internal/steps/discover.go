@@ -39,10 +39,12 @@ type DiscoverConfig struct {
 	// connection, which Run reports rather than dereferences -- a panic in a
 	// step goroutine takes the console down with it.
 	Kube kubernetes.Interface
-	// JobName and ServiceAccountName name the transient Job and the
-	// ServiceAccount/Role/RoleBinding trio AICR's agent deployer creates for
-	// it (see NewDiscover for why they cannot be left blank). Both are
-	// deleted after each run: DiscoverConfig.Cleanup is always true below.
+	// JobName and ServiceAccountName are optional name PREFIXES for the
+	// transient Job and the ServiceAccount/Role/RoleBinding trio AICR's agent
+	// deployer creates for it. Both are left blank in production -- see
+	// NewDiscover for why blank is the safe value rather than merely the lazy
+	// one. All of it is deleted after each run: DiscoverConfig.Cleanup is
+	// always true below.
 	JobName            string
 	ServiceAccountName string
 	Timeout            time.Duration
@@ -133,28 +135,30 @@ type discover struct {
 	cfg    DiscoverConfig
 }
 
-// defaultAgentName is both the default Job name and the default
-// ServiceAccount/Role/RoleBinding name AICR's own `aicr` CLI uses for the
-// snapshot agent (pkg/cli/root.go's `name = "aicr"`, applied as the
-// --job-name / --service-account-name flag defaults in pkg/cli/snapshot.go).
-// aicr.Client.CollectSnapshot -- the Go entry point this console calls
-// instead of the CLI -- applies no such default itself: an empty JobName or
-// ServiceAccountName reaches the API server as `metadata.name: ""` and is
-// rejected outright (see pkg/k8s/agent/job.go and rbac.go in the pinned
-// module), failing Discover on every cluster, not just KWOK.
-const defaultAgentName = "aicr"
-
 // NewDiscover returns the Discover step. It runs automatically on first load —
 // no decisions gate it.
+//
+// JobName and ServiceAccountName are deliberately NOT defaulted, and this
+// console used to default both to "aicr". AICR v0.21.0 made every agent object
+// run-scoped ("<prefix>-<RunID>") and gave ServiceAccountName a second meaning:
+// it is EXACT-IF-EXISTS. A ServiceAccount whose name matches it EXACTLY in the
+// agent namespace is adopted verbatim, and the run then creates NO
+// ServiceAccount, Role, RoleBinding, ClusterRole or ClusterRoleBinding -- the
+// escape hatch for an IRSA or Workload Identity account, whose cloud trust is
+// pinned to a name a run-scoped one cannot carry. This console wants none of
+// that, and passing a literal "aicr" would arm it: every run under AICR
+// v0.20.0 created a ServiceAccount named exactly "aicr" in this namespace, so
+// one console killed mid-Discover leaves the trap set for the next run, which
+// would then deploy a cluster-reading Job under an identity it never granted
+// anything to.
+//
+// Blank costs nothing in return. pkg/k8s/agent falls back to Config.NameBase
+// (itself "aicr"), so the objects are named exactly as they would have been --
+// and the empty prefix is documented as never probed for existence, which is
+// the whole point.
 func NewDiscover(c aicrclient.Snapshotter, cfg DiscoverConfig) engine.Step {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Minute
-	}
-	if cfg.JobName == "" {
-		cfg.JobName = defaultAgentName
-	}
-	if cfg.ServiceAccountName == "" {
-		cfg.ServiceAccountName = defaultAgentName
 	}
 	return &discover{client: c, cfg: cfg}
 }

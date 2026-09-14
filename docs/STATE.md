@@ -209,26 +209,42 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    recovered run re-resolves from the persisted snapshot — `validateStep.resolve`), and
    **per-component attribution is not derivable** — `ctrf.Builder` hardcodes `Suite` to the phase
    name, so no output identifies a component.
-3. **AKS**, unblocked by AICR v0.20.0 and now the only untested cloud. **Verification-screen polish** via `VerifyBundle`. GitOps
+3. **The AICR pin is v0.21.1 and no cluster has seen it.** `make qualify` is green, the marker
+   parser's `deploy.sh.tmpl` hash guard still matches, and the GKE-COS and EKS H100 component sets
+   are byte-identical to v0.20.0's — so nothing predicts a break. What is untested is everything a
+   fake cluster cannot reach, and this release moved a lot of it: GPU Operator to **v26.7.0**, the
+   DRA driver to **0.5.0** (with a workaround for the ComputeDomain CRD conflict v26.7.0
+   introduces), Kubernetes client libraries to **0.37.0**, and every recipe's K8s floor up to
+   `>= 1.32`. The Apply-cost table below was measured against the previous component set and should
+   be re-measured rather than trusted.
+
+   One upstream behaviour change is already handled and is worth not re-deriving: **AICR v0.21.0
+   made every snapshot-agent object run-scoped, and `AgentConfig.ServiceAccountName` is now
+   EXACT-IF-EXISTS.** A ServiceAccount matching that name exactly in the agent namespace is adopted
+   verbatim and the run then creates *no* RBAC at all. This console used to pass a literal `"aicr"`
+   — which is precisely the name every v0.20.0 run created — so a console killed mid-Discover would
+   have left the trap set for the next run. `steps.NewDiscover` now passes blank and lets AICR's own
+   `NameBase` supply the identical prefix; blank is documented as never probed.
+4. **AKS** is the only untested cloud. **Verification-screen polish** via `VerifyBundle`. GitOps
    export is deprioritised.
-4. **UI follow-ups** from the real-hardware passes. Every finding raised through 2026-08-30 is
+5. **UI follow-ups** from the real-hardware passes. Every finding raised through 2026-08-30 is
    shipped or recorded as a decision. Three cosmetic items remain: the timeline renders
    Discover's gap findings as bare amber warnings on the decision screen (the framing heading
    only reached the Discover panel), the mark is absent from the Confirm screen, and the primary
    button is a large expanse of accent. None blocks a demo. New findings go to GitHub issues.
-5. **Three residue classes block a manual cleanup** — see below. Nothing inventories them, and two
+6. **Three residue classes block a manual cleanup** — see below. Nothing inventories them, and two
    of them deadlock a teardown rather than merely lingering.
-6. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
+7. **`GET /api/runs/{id}/bundle` 404s for a recovered run.** `bundle.path` lives in
    `ephemeralArtifacts` and is dropped on encode, so the download is broken on exactly the path
    where debugging matters most. The run-log export does not fix it.
-7. **Write up what the console actually does that nothing else does.** The README's gap table
+8. **Write up what the console actually does that nothing else does.** The README's gap table
    names live telemetry in one line; the distinctive part is unwritten. Chiefly: a cluster
    condition is attributed to the component that was installing when it appeared, **temporally
    and without claiming causation** — "cluster activity while gpu-operator installs", never
    "gpu-operator caused this". That restraint is what makes the attribution trustworthy, and it
    is the thing to lead with. Also worth capturing: the gap report before anything is installed,
    the run record surviving a restart, and validation refusing to attest to a drifted recipe.
-8. **Docs stay collapsed; tracking lives in GitHub issues.** `docs/` is this file and nothing
+9. **Docs stay collapsed; tracking lives in GitHub issues.** `docs/` is this file and nothing
    else. The upstream-asks list and the UX feedback list have both retired into it: a genuine SDK
    gap goes to [NVIDIA/aicr](https://github.com/NVIDIA/aicr/issues) as an issue, a console defect
    goes to this repo's issues, and the reasoning behind a decision not to fix something goes in a
@@ -238,11 +254,11 @@ Ordered by what unblocks the most. Each item says what it costs and what it is w
    work — but it is gitignored and never committed. Those are working documents for one change,
    stale the moment it lands.
 
-9. **Write the architecture docs, at the very end.** The design and the decisions behind it are
-   currently spread across code comments, this file, and nothing else. One write-up capturing the
-   architecture as a whole is owed — but only once the work stops moving, for the same reason the
-   phase docs were collapsed rather than maintained mid-flight. Item 7's "what this does that
-   nothing else does" is a section of it, not a separate document.
+10. **Write the architecture docs, at the very end.** The design and the decisions behind it are
+    currently spread across code comments, this file, and nothing else. One write-up capturing the
+    architecture as a whole is owed — but only once the work stops moving, for the same reason the
+    phase docs were collapsed rather than maintained mid-flight. Item 8's "what this does that
+    nothing else does" is a section of it, not a separate document.
 
 ### Known and deliberately not fixed
 
